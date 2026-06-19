@@ -73,10 +73,13 @@ CREATE TABLE dataset_versions (id INTEGER PRIMARY KEY AUTOINCREMENT, dataset_id 
   version TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')));
 `;
 
-// The production single-table GET /datasets list SELECT, copied verbatim from
-// routes/datasets.ts so a regression in the alias mapping (the highest-risk
-// part of #652: subject_count->participants, the COALESCE defaults, the
-// sentinel source_type discriminator, COALESCE(uploader,username)) is caught.
+// A representative excerpt of the production single-table GET /datasets list
+// SELECT (routes/datasets.ts) so a regression in the alias mapping (the
+// highest-risk part of #652: subject_count->participants, the COALESCE
+// defaults, the sentinel source_type discriminator, COALESCE(uploader,username))
+// is caught. NOT exhaustive: it intentionally omits later additive columns whose
+// mapping is a plain COALESCE pass-through (e.g. license #653, the #804 citation
+// counts) — assertions below use partial (toMatchObject) matching.
 const LIST_SELECT = `
   SELECT d.dataset_id, d.dataset_id AS id, d.name, d.description, d.status, d.visibility,
          d.github_repo, d.concept_doi, d.concept_doi AS doi, d.created_at, d.updated_at,

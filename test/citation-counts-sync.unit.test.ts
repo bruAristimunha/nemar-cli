@@ -3,8 +3,8 @@
  *
  * Runs against a real in-memory SQLite via bun:sqlite behind a thin D1 shim
  * (no mocks — every result comes from SQLite executing the real statement).
- * Covers: match by dataset_id, match by source_id alias (manifest ds-* hitting
- * an on-* row), skip rows not in the catalog, and idempotency.
+ * Covers: match by dataset_id (catalog + legacy ds-*), skip rows not in the
+ * catalog, citations_updated_at stamping, never-insert, and idempotency.
  */
 
 import { Database } from "bun:sqlite";
@@ -56,17 +56,8 @@ let db: Database;
 beforeEach(() => {
   db = new Database(":memory:");
   db.exec(SCHEMA);
-  for (const [id, src] of [
-    ["on005964", "ds005964"], // matches by dataset_id
-    ["nm000207", null], // matches by dataset_id
-    ["on007000", "ds007000"], // matched by source_id alias below
-    ["ds999999", null], // legacy stored as ds-*, matches by dataset_id
-  ] as const) {
-    db.query("INSERT INTO datasets (dataset_id, source_id, name) VALUES (?, ?, ?)").run(
-      id,
-      src,
-      `Dataset ${id}`,
-    );
+  for (const id of ["on005964", "nm000207", "ds007000", "ds999999"]) {
+    db.query("INSERT INTO datasets (dataset_id, name) VALUES (?, ?)").run(id, `Dataset ${id}`);
   }
 });
 
@@ -88,7 +79,7 @@ const ROWS: CitationCountRow[] = [
     num_citations: 8,
     num_dataset_citations: 8,
     num_datapaper_citations: 0,
-  }, // alias -> on007000
+  }, // legacy ds-*, matches by dataset_id
   {
     dataset_id: "ds999999",
     num_citations: 2,
@@ -112,7 +103,7 @@ function counts(id: string): Record<string, number> {
 }
 
 describe("syncCitationCounts", () => {
-  test("updates by dataset_id and by source_id alias; skips unknown ids", async () => {
+  test("updates matched datasets by dataset_id; skips unknown ids", async () => {
     const res = await syncCitationCounts(realD1(db), ROWS);
     expect(res.updated).toBe(4);
     expect(res.skipped).toBe(1); // ds111111 not in catalog
@@ -123,8 +114,7 @@ describe("syncCitationCounts", () => {
       num_datapaper_citations: 7,
     });
     expect(counts("nm000207").num_citations).toBe(5);
-    // ds007000 alias landed on the on007000 row.
-    expect(counts("on007000")).toEqual({
+    expect(counts("ds007000")).toEqual({
       num_citations: 8,
       num_dataset_citations: 8,
       num_datapaper_citations: 0,

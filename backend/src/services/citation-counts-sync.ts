@@ -70,10 +70,12 @@ export async function fetchCitationManifest(
 }
 
 /**
- * UPDATE citation counts onto existing datasets, matched by `dataset_id` or by
- * `source_id` (so a manifest `ds-*` entry reaches an `on-*` catalog row via its
- * OpenNeuro alias). Rows whose id is not in the catalog are left untouched —
- * the catalog owns dataset existence; this never INSERTs. Returns rows updated.
+ * UPDATE citation counts onto existing datasets, matched by `dataset_id`.
+ * The manifest is keyed by the catalog `dataset_id` (the
+ * dataset_citations pipeline discovers datasets from api.nemar.org/datasets), so
+ * `dataset_id` (a UNIQUE column) is the exact join key — at most one row per
+ * manifest entry. Rows whose id is not in the catalog are left untouched: the
+ * catalog owns dataset existence, this never INSERTs. Returns rows updated.
  */
 export async function syncCitationCounts(
   db: D1Database,
@@ -91,15 +93,9 @@ export async function syncCitationCounts(
                  num_dataset_citations = ?,
                  num_datapaper_citations = ?,
                  citations_updated_at = datetime('now')
-           WHERE dataset_id = ? OR source_id = ?`,
+           WHERE dataset_id = ?`,
         )
-        .bind(
-          r.num_citations,
-          r.num_dataset_citations,
-          r.num_datapaper_citations,
-          r.dataset_id,
-          r.dataset_id,
-        ),
+        .bind(r.num_citations, r.num_dataset_citations, r.num_datapaper_citations, r.dataset_id),
     );
     const results = await db.batch(statements);
     for (const res of results) {

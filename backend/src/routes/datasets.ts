@@ -700,10 +700,11 @@ datasetRoutes.get("/", optionalAuthMiddleware, async (c) => {
     }
 
     const params: (string | number)[] = [status, user.id];
-    // Read managed facts from the `datasets` source of truth (#646). 22-column
-    // ?mine wire shape. latest_version is the most recently minted DOI version
-    // (null when none); scripts/hallu-sync.sh reads it to skip the per-dataset
-    // /manifest call, so keep the ordering in sync with /datasets/:id/manifest.
+    // Read managed facts from the `datasets` source of truth (#646). 25-column
+    // ?mine wire shape (+ #804 citation counts appended after latest_version, so
+    // existing positional readers are unaffected). latest_version is the most
+    // recently minted DOI version (null when none); scripts/hallu-sync.sh reads
+    // it to skip the per-dataset /manifest call, so keep its position stable.
     let query = `
       SELECT d.dataset_id, d.name, d.description, d.status, d.visibility,
              d.github_repo, d.concept_doi, d.created_at, d.updated_at,
@@ -722,7 +723,10 @@ datasetRoutes.get("/", optionalAuthMiddleware, async (c) => {
                WHERE dv.dataset_id = d.dataset_id
                ORDER BY created_at DESC
                LIMIT 1
-             ) AS latest_version
+             ) AS latest_version,
+             COALESCE(d.num_citations, 0) AS num_citations,
+             COALESCE(d.num_dataset_citations, 0) AS num_dataset_citations,
+             COALESCE(d.num_datapaper_citations, 0) AS num_datapaper_citations
       FROM datasets d
       JOIN users u ON d.owner_user_id = u.id
       WHERE d.status = ? AND d.owner_user_id = ?
@@ -913,8 +917,9 @@ function buildSortClause(sort: string): string {
     case "size":
       return " ORDER BY file_size DESC";
     case "citations":
-      // Most-cited first; ties fall back to newest so the order is stable (#804).
-      return " ORDER BY COALESCE(d.num_citations, 0) DESC, d.created_at DESC";
+      // Most-cited first; ties fall back to newest so the order is stable.
+      // Plain column (no COALESCE) so idx_datasets_num_citations is usable (#804).
+      return " ORDER BY d.num_citations DESC, d.created_at DESC";
     default:
       return " ORDER BY d.created_at DESC";
   }
