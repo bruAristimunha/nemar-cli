@@ -13,7 +13,7 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
-## 0.10.16 - 2026-10-10
+## 0.10.16 - 2026-10-11
 
 Epic #1671 (upload and integrity fixes) reaches `main` together with the automated review of
 dataset pull requests and the admin command that works through it, publication requests that
