@@ -378,12 +378,15 @@ describe("every way of not getting a report still mails the admins, and says so"
     test(`dispatch impossible (${label}): error, dispatch-unconfigured, mailed at once`, async () => {
       envOverrides = override as Partial<Bindings>;
       await withFakeResend(async (calls) => {
-        // Without a credential the CI readiness check blocks first; the screen
-        // cases that reach the dispatch are the other two. Both are asserted on
-        // what the row and the mail say, not on the status code.
+        // Without a credential the CI readiness check cannot run and blocks
+        // first (a recorded request, answered 503 because nothing promises it
+        // continues); the screen cases that reach the dispatch are the other
+        // two. Both are asserted on what the row and the mail say.
         const res = await requestPublication();
         if (label === "no GitHub credential") {
-          expect(res.status).toBe(422);
+          expect(res.status).toBe(503);
+          expect(((await res.json()) as { error: string }).error).toBe("ci_check_unavailable");
+          expect(row().status).toBe("blocked");
           expect(row().identifier_screen_status).toBeNull();
           return;
         }
@@ -1446,11 +1449,12 @@ describe("re-requesting a blocked request resets the screen", () => {
   });
 });
 
-/** The notice of ADR 0090 (amendment 2026-10-07), spelled out so a change to the shared words fails here. */
+/** The notice of ADR 0090 (amendment "what an accepted request is told"), spelled out so a change to the shared words fails here. */
 const NOTICE = (id: string) => [
   "Your request was received.",
   "NEMAR is checking publication eligibility.",
   "If every check passes, an administrator is notified to approve it.",
+  "You will be emailed if a check needs your attention, and when an administrator decides.",
   `Run 'nemar dataset publish status ${id}' to see where it stands.`,
 ];
 
@@ -1462,7 +1466,7 @@ type RequestBody = {
   status?: string;
 };
 
-describe("an accepted request answers with the neutral notice (ADR 0090, 2026-10-07)", () => {
+describe("an accepted request answers with the neutral notice (ADR 0090, what an accepted request is told)", () => {
   test("a new request: the notice, for this dataset, beside a screen that is still running", async () => {
     await withFakeResend(async () => {
       const res = await requestPublication();

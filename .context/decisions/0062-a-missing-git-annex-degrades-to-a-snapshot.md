@@ -55,10 +55,11 @@ length across a patch bump -- which is exactly what the version stamp refuses. A
 can add the strict pass; it is not the default, because the default runs after every interrupted
 transfer.
 
-**Bytes come from each entry's `bytes_url`, never the presigned `url`.** `url` expires in about an
-hour, which a large transfer outlives; `bytes_url` is durable by contract (#615). Which HOST that
-names is a separate question and currently a problem: most git-tracked entries point at
-`raw.githubusercontent.com`, which is why a private repo breaks this path today (#1403).
+**Bytes come from each entry's `bytes_url`.** It is the durable download contract (#615); under
+ADR 0095, `url` now equals it and also names the stable data-plane route. The CLI continues to use
+`bytes_url` explicitly so stored download URLs do not depend on the optional immediate-fetch field.
+The data-plane host is addressed as the configured API origin, which serves git-tracked bytes
+without relying on the dataset repository being public (#1403).
 
 **The data plane is addressed as the configured API origin plus `/data`, not `data.nemar.org`.**
 That mount exists in production, staging and the workers.dev dev deployment while the pretty

@@ -59,6 +59,8 @@ import { createHash } from "node:crypto";
 export const MIN_PART_BYTES = 5 * 1024 * 1024;
 
 export type StandinOp =
+  | "GetBucketLocation"
+  | "CreateBucket"
   | "ListObjectsV2"
   | "ListObjectVersions"
   | "HeadObject"
@@ -102,6 +104,8 @@ export interface StandinLogEntry {
   partNumber?: number;
   /** The access key id the request was signed with. */
   keyId?: string;
+  /** SHA-256 fingerprint of the session token header; token material is never logged. */
+  sessionTokenFingerprint?: string;
   /** A PutObject or UploadPart request that carried an `x-amz-checksum-*` header (or Content-MD5). */
   checksum?: boolean;
   size?: number;
@@ -119,6 +123,8 @@ export interface Fault {
   times?: number;
   /** Only calls for this key. */
   key?: string;
+  /** Only calls signed with this access key id. */
+  keyId?: string;
   /**
    * The request takes effect, THEN the error is returned: an answer lost on the way back. Only
    * CreateMultipartUpload honors it (the upload is created and left open).
@@ -261,7 +267,7 @@ function parseRange(header: string | null, size: number): [number, number] | "ba
   return [start, end];
 }
 
-export function startS3Standin(): S3Standin {
+export function startS3Standin(options: { region?: string } = {}): S3Standin {
   const store = new Map<string, StoredVersion[]>(); // oldest -> newest
   const uploads = new Map<string, Upload>();
   const log: StandinLogEntry[] = [];
@@ -294,12 +300,13 @@ export function startS3Standin(): S3Standin {
     return v.versionId;
   };
 
-  const enter = (op: StandinOp, key: string): Fault | null => {
+  const enter = (op: StandinOp, key: string, keyId?: string): Fault | null => {
     const n = (opCounts.get(op) ?? 0) + 1;
     opCounts.set(op, n);
     for (const h of hooks.get(op) ?? []) if (h.nth === n) h.fn();
     for (const f of faults.get(op) ?? []) {
       if (f.key !== undefined && f.key !== key) continue;
+      if (f.keyId !== undefined && f.keyId !== keyId) continue;
       f.seen += 1;
       if (f.seen <= (f.after ?? 0)) continue;
       if (f.times !== undefined && f.failed >= f.times) continue;
@@ -339,7 +346,12 @@ export function startS3Standin(): S3Standin {
       const q = url.searchParams;
       const versionId = q.get("versionId");
       const keyId = /Credential=([^/]+)\//.exec(req.headers.get("authorization") ?? "")?.[1];
-      const record = (e: Omit<StandinLogEntry, "bucket">) => log.push({ bucket, keyId, ...e });
+      const sessionToken = req.headers.get("x-amz-security-token");
+      const sessionTokenFingerprint = sessionToken
+        ? createHash("sha256").update(sessionToken).digest("hex")
+        : undefined;
+      const record = (e: Omit<StandinLogEntry, "bucket">) =>
+        log.push({ bucket, keyId, sessionTokenFingerprint, ...e });
       const fail = (op: StandinOp, f: Fault, extra: Partial<StandinLogEntry> = {}) => {
         record({ op, key, status: f.status, ...extra });
         return s3Error(f.code, f.status, `induced ${f.code} (test)`);
@@ -427,6 +439,21 @@ export function startS3Standin(): S3Standin {
 
       // ---- bucket-level: listings ----
       if (key === "") {
+        if (req.method === "GET" && q.has("location")) {
+          const fault = enter("GetBucketLocation", "");
+          if (fault) return fail("GetBucketLocation", fault);
+          record({ op: "GetBucketLocation", key: "", status: 200 });
+          const region = options.region === "us-east-1" ? "" : (options.region ?? "");
+          return xml(
+            `<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">${xmlEscape(region)}</LocationConstraint>`,
+          );
+        }
+        if (req.method === "PUT") {
+          const fault = enter("CreateBucket", "");
+          if (fault) return fail("CreateBucket", fault);
+          record({ op: "CreateBucket", key: "", status: 200 });
+          return new Response(null, { status: 200 });
+        }
         const encode = q.get("encoding-type") === "url";
         const limit = Math.min(Number(q.get("max-keys") ?? pageSize), pageSize);
         const prefix = q.get("prefix") ?? "";
@@ -829,7 +856,7 @@ export function startS3Standin(): S3Standin {
       // ---- PutObject ----
       if (req.method === "PUT" && !req.headers.has("x-amz-copy-source")) {
         const body = new Uint8Array(await req.arrayBuffer());
-        const fault = enter("PutObject", key);
+        const fault = enter("PutObject", key, keyId);
         if (fault) return fail("PutObject", fault);
         const lock = parseLock(req);
         if (lock === "bad") {

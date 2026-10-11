@@ -2,9 +2,10 @@
  * Web-dashboard auth routes (#569).
  *
  * Passwordless 6-digit code flow for the dashboard at nemar.org
- * (moving to app.nemar.org per nemarOrg/website#46). The CLI's
- * password + API-token flow in `auth.ts` is untouched; these routes
- * exist alongside it under the same `/auth` mount.
+ * (moving to app.nemar.org per nemarOrg/website#46). The API-key routes in
+ * `auth.ts` (verification, key login, key regeneration) are separate; these
+ * routes exist alongside them under the same `/auth` mount. There is no
+ * password anywhere (ADR 0097).
  *
  *   POST  /auth/code/request          - mail a code
  *   POST  /auth/code/verify           - check the code, set a session cookie
@@ -855,7 +856,7 @@ authWebRoutes.get("/me", webSessionMiddleware, async (c) => {
 // `username` is bounded at 60 rather than at its real 30 so that a 31-character
 // attempt is refused by validateUsernameFormat with `username_too_long` — the
 // code the website maps to a field message — instead of by zod's issue tree.
-// given_name/family_name match signupSchema's 100.
+// given_name/family_name are bounded at 100.
 const profilePatchSchema = z.object({
   github_username: z.string().max(60).optional(),
   city: z.string().max(120).optional(),

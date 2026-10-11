@@ -73,7 +73,7 @@ jobs:
         if: steps.tag.outputs.skip != 'true'
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.4.3
 
       - name: Install dependencies
         if: steps.tag.outputs.skip != 'true'

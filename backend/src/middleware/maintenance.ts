@@ -22,7 +22,8 @@ const ALWAYS_ALLOWED_PATHS = new Set(["/", "/health", "/notices"]);
 
 // Mutating routes that remain open in read-only so admins can still moderate
 // (admin), GitHub webhooks can still deliver (webhooks), and a locked-out
-// admin can re-authenticate (auth/login). Signup stays blocked.
+// admin can re-authenticate (auth/login). Every other /auth mutation stays
+// blocked.
 const READ_ONLY_MUTATION_ALLOWLIST = ["/admin/", "/webhooks/"];
 const READ_ONLY_EXACT_MUTATIONS = new Set(["/auth/login"]);
 

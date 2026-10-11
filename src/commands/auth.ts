@@ -40,7 +40,6 @@ import {
   requestKeyRegeneration,
   requestUploadAccess,
   resendVerification,
-  retrieveKey,
   revokeApiKey,
   revokeApiKeyWithBearer,
   startOrcidCliLink,
@@ -76,7 +75,7 @@ import {
   YES_OPTION,
   confirm,
 } from "../lib/confirm.js";
-import { markUsageExit, recordStep } from "../lib/debug-log.js";
+import { markReportedExit, markUsageExit, recordStep } from "../lib/debug-log.js";
 import {
   type DeviceLoginOutcome,
   describeDeviceOutcome,
@@ -115,9 +114,8 @@ Keys:
   Every browser-based 'nemar auth login' names a key for the machine it
   runs on (list/create/revoke the whole set with 'nemar auth keys'); the
   -k/--key or NEMAR_API_KEY path stores the key you paste and mints
-  nothing new. 'retrieve-key' and 'regenerate-key' still work for a
-  password-era account but are deprecated; 'nemar auth login' is the
-  replacement for both.
+  nothing new. 'regenerate-key' replaces a lost key by an emailed link and
+  revokes the key on every machine; there is no password sign-in.
 
 Examples:
   $ nemar auth signup                    # Sign in with your browser; complete your profile
@@ -1470,104 +1468,29 @@ Examples:
 );
 
 // ============================================================================
-// Retrieve Key (after email verification)
+// Retired: retrieve-key (ADR 0097)
 // ============================================================================
 
-/** Epic #1272 phase 3 (ADR 0047: `retrieve-key` and `regenerate-key` survive
- *  this release, each printing a deprecation sentence before its first
- *  prompt). */
-const PASSWORD_ERA_DEPRECATION =
-  "Password sign-in is deprecated and will be removed in the next release; run `nemar auth login`.";
-
-const retrieveKeyCmd = authCommand
-  .command("retrieve-key")
-  .description("Retrieve your API key once your email is verified (requires email and password)")
-  .action(async () => {
-    console.log(chalk.yellow(PASSWORD_ERA_DEPRECATION));
-    console.log();
-    const answers = await inquirer.prompt([
-      {
-        type: "input",
-        name: "email",
-        message: "Email address:",
-        validate: (input) => {
-          if (!input || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input)) {
-            return "Please enter a valid email address";
-          }
-          return true;
-        },
-      },
-      {
-        type: "password",
-        name: "password",
-        message: "Password:",
-        mask: "*",
-        validate: (input) => {
-          if (!input) return "Password is required";
-          return true;
-        },
-      },
-    ]);
-
-    const spinner = ora("Retrieving API key...").start();
-
-    try {
-      const result = await retrieveKey(answers.email, answers.password);
-
-      spinner.succeed("API key retrieved");
-      console.log();
-      console.log(chalk.yellow("Your API Key (store this securely):"));
-      console.log(chalk.dim(`  ${result.api_key}`));
-      console.log();
-      console.log("Next step:");
-      console.log(`  Run ${chalk.cyan("nemar auth login")} and paste your API key`);
-    } catch (error) {
-      if (error instanceof ApiError) {
-        if (error.statusCode === 409) {
-          // Key already issued - extract prefix from error details
-          const details = error.details as { api_key_prefix?: string } | undefined;
-          spinner.info("API key already issued");
-          if (details?.api_key_prefix) {
-            console.log();
-            console.log(`  Key prefix: ${chalk.dim(details.api_key_prefix)}`);
-          }
-          console.log();
-          console.log("  If you lost your API key, regenerate it:");
-          console.log(`  ${chalk.cyan("nemar auth regenerate-key")}`);
-        } else {
-          spinner.fail(error.message);
-          if (error.statusCode === 401) {
-            console.log(chalk.dim("  Check your email and password"));
-          } else if (error.statusCode === 403) {
-            console.log(chalk.dim("  Verify your email address first, then try again"));
-          }
-        }
-      } else {
-        const msg = error instanceof Error ? error.message : "Unknown error";
-        spinner.fail(`Failed to retrieve API key: ${msg}`);
-      }
-    }
+// A hidden stub rather than a deletion. The "your API key is ready" mail sent
+// when an account verified its email, and pages outside this repository, told
+// people to run it, so "unknown command" would leave them with no next step.
+// It takes no input, prompts for nothing and calls no endpoint.
+authCommand
+  .command("retrieve-key", { hidden: true })
+  .description("Removed: there is no password sign-in")
+  .allowUnknownOption()
+  .allowExcessArguments()
+  .action(() => {
+    console.error(
+      chalk.yellow("Password sign-in was removed, so 'nemar auth retrieve-key' no longer exists."),
+    );
+    console.error(
+      `  Run ${chalk.cyan("nemar auth login")} to sign in with your browser; it also creates your API key.`,
+    );
+    // A command retired on purpose is an answer, not a crash: no "attach a debug log" hint.
+    markReportedExit();
+    process.exitCode = 1;
   });
-
-addVerboseHelp(
-  retrieveKeyCmd,
-  `
-Description:
-  Deprecated: password sign-in is being removed in favor of 'nemar auth
-  login' (browser device sign-in). This command still works for a
-  password-era account in the meantime.
-
-  Once you have verified your email address, use this command to securely
-  retrieve your API key. You will need the email and password you used
-  during signup. No admin approval is needed for the key; approval is the
-  separate, one-time grant that lets you upload datasets.
-
-  API keys are not sent via email for security. This is the only way
-  to obtain your key.
-
-Examples:
-  $ nemar auth retrieve-key`,
-);
 
 // ============================================================================
 // Regenerate Key
@@ -1577,10 +1500,9 @@ const regenerateKeyCmd = authCommand
   .command("regenerate-key")
   .description("Request a new API key (revokes current key, requires email verification)")
   .action(async () => {
-    console.log(chalk.yellow(PASSWORD_ERA_DEPRECATION));
     console.log(
       chalk.dim(
-        "  It also revokes the key on EVERY machine, not just this one; see 'nemar auth keys revoke'.",
+        "  This revokes the key on EVERY machine, not just this one; see 'nemar auth keys revoke'.",
       ),
     );
     console.log();
@@ -1610,11 +1532,18 @@ const regenerateKeyCmd = authCommand
       console.log("Next steps:");
       console.log("  1. Check your email for a verification link");
       console.log("  2. Click the link to generate your new API key");
-      console.log("  3. Copy the new key and run 'nemar auth login'");
+      console.log("  3. Copy the new key and run 'nemar auth login -k <new-key>'");
       console.log();
       console.log(chalk.dim("The link expires in 1 hour"));
     } catch (error) {
+      // This is the only way to replace a lost key without an already signed-in
+      // machine, so a failure has to be visible to a script, not only a person.
+      process.exitCode = 1;
       if (error instanceof ApiError) {
+        // A refusal the server explained (not allowed, rate limit) is reported, not a bug. A
+        // 400, 404 or 405 is a client and server that disagree about the route, which is when the
+        // debug-log nudge is wanted.
+        if ([401, 403, 429].includes(error.statusCode)) markReportedExit();
         spinner.fail(error.message);
       } else {
         spinner.fail("Failed to send verification email");
@@ -1627,10 +1556,6 @@ addVerboseHelp(
   regenerateKeyCmd,
   `
 Description:
-  Deprecated: password sign-in is being removed in favor of 'nemar auth
-  login' (browser device sign-in). This command still works for a
-  password-era account in the meantime.
-
   If you lost your API key or it was compromised, use this command to
   request a new one. A verification email will be sent to confirm the
   request. Clicking the link will:
@@ -1638,7 +1563,8 @@ Description:
   1. Revoke your current API key ON EVERY MACHINE, not just this one --
      use 'nemar auth keys revoke' instead to remove only one machine's key
   2. Generate a new API key (shown in the browser)
-  3. You will need to login again with the new key
+  3. Use the new key with 'nemar auth login -k <new-key>'; a plain
+     'nemar auth login' signs in with your browser and makes another key
 
 Examples:
   $ nemar auth regenerate-key`,

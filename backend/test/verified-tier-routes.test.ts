@@ -8,9 +8,8 @@
  * authenticate, which cannot, and what a refused one is told to do.
  *
  * Real engine throughout: bun:sqlite behind realD1 with every migration
- * applied, real Hono dispatch through authMiddleware, real hashed API keys and
- * real bcrypt-free password verification via the production hashPassword. No
- * mocks. RESEND_API_KEY is unset so no route here attempts a send.
+ * applied, real Hono dispatch through authMiddleware and real hashed API keys.
+ * No mocks. RESEND_API_KEY is unset so no route here attempts a send.
  */
 
 import type { Database } from "bun:sqlite";
@@ -20,13 +19,11 @@ import { authRoutes } from "../src/routes/auth";
 import { datasetRoutes } from "../src/routes/datasets";
 import { sandboxRoutes } from "../src/routes/sandbox";
 import { userRoutes } from "../src/routes/users";
-import { hashPassword } from "../src/services/password";
 import { hashApiKey } from "../src/services/token";
 import { issueSession } from "../src/services/web-session";
 import type { Bindings, Variables } from "../src/types/bindings";
 import { freshDb, realD1 } from "./helpers/d1";
 
-const PASSWORD = "correct horse battery staple";
 const KEY_PREFIX = "tierkey-0123456789abcdef0123456789abcdef-";
 
 let db: Database;
@@ -55,13 +52,12 @@ async function seedUser(
   const { withToken = true, serviceAccess = 0, sandbox = 0 } = opts;
   const email = `${username}@example.org`;
   db.run(
-    `INSERT INTO users (username, email, password_hash, github_username, status, role,
+    `INSERT INTO users (username, email, github_username, status, role,
                         signup_source, email_verified, service_access, sandbox_completed)
-     VALUES (?, ?, ?, ?, ?, 'member', 'cli', ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, 'member', 'cli', ?, ?, ?)`,
     [
       username,
       email,
-      await hashPassword(PASSWORD),
       `${username}-gh`,
       status,
       status === "pending" ? 0 : 1,
@@ -207,38 +203,8 @@ describe("POST /auth/login", () => {
   });
 });
 
-describe("POST /auth/retrieve-key", () => {
-  test("mints the first API key for a `verified` account", async () => {
-    const user = await seedUser("keyverified", "verified", { withToken: false });
-
-    const res = await postJson("/auth/retrieve-key", { email: user.email, password: PASSWORD });
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(typeof body.api_key).toBe("string");
-
-    // The key is real: it resolves through the production hash to the row
-    // that was just written, which is what the CLI will send next.
-    const stored = db
-      .query<{ user_id: number }, [string]>("SELECT user_id FROM tokens WHERE api_key_hash = ?")
-      .get(await hashApiKey(body.api_key));
-    expect(stored?.user_id).toBe(user.id);
-  });
-
-  test("a `pending` account is refused and told to verify first", async () => {
-    const user = await seedUser("keypending", "pending", { withToken: false });
-    const res = await postJson("/auth/retrieve-key", { email: user.email, password: PASSWORD });
-    expect(res.status).toBe(403);
-    expect((await res.json()).message).toContain("Verify your email");
-    expect(db.query("SELECT COUNT(*) AS n FROM tokens").get()).toEqual({ n: 0 });
-  });
-
-  test("a `verified` account that already holds a key gets the 409, not a second key", async () => {
-    const user = await seedUser("keyverified2", "verified");
-    const res = await postJson("/auth/retrieve-key", { email: user.email, password: PASSWORD });
-    expect(res.status).toBe(409);
-    expect((await res.json()).details.api_key_prefix).toBe(user.apiKey.slice(0, 8));
-  });
-});
+// `POST /auth/retrieve-key` used to be tested here. It is retired (ADR 0097) and
+// is pinned through the production entry point in password-routes-retired.test.ts.
 
 describe("the sandbox routes", () => {
   test("a `verified` account can read its training status", async () => {

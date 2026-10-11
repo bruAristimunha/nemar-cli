@@ -94,7 +94,7 @@ export const BRANCH_RULESET_NAME = "NEMAR branch protection";
  * `bids-validation`. Everything else is on the central shim that posts
  * `Run BIDS Validation`.
  */
-const LEGACY_INLINE_BIDS_REPOS = new Set(["nm000103", "nm000105", "nm000106", "nm000107"]);
+export const LEGACY_INLINE_BIDS_REPOS = new Set(["nm000103", "nm000105", "nm000106", "nm000107"]);
 
 /**
  * A required status check. `integration_id` pins the check to a specific

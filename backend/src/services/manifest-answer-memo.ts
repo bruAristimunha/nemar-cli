@@ -32,10 +32,9 @@
  * pushes hard on (#1502) -- an isolate juggling several concurrent scans of a
  * large manifest must not ALSO be carrying a memo sized like another one. A
  * single entry may use at most half the cap: `manifest.json`'s own answer
- * (`EntriesQuery`) is capped PER BRANCH, not at one number (ADR 0074): 38,000
- * entries unsigned (`MAX_MANIFEST_JSON_ENTRIES`, `routes/data.ts`), 30,000
- * presigned (`MAX_MANIFEST_JSON_ENTRIES_PRESIGNED`, smaller because a
- * presigned URL is far longer than a plain S3 object URL). Either bound is
+ * (`EntriesQuery`) is capped at 38,000 entries for every dataset
+ * (`MAX_MANIFEST_JSON_ENTRIES`, `routes/data.ts`) because all URLs use the
+ * same compact, stable data-plane route. That bound is
  * large enough that memoizing the answer whole could otherwise evict every
  * small, hot per-file entry this memo mainly exists for; past that fraction,
  * the answer is still returned to the caller, it is just not remembered.

@@ -1,6 +1,7 @@
 {
   "name": "nemar-cli",
-  "version": "0.10.15",
+  "packageManager": "bun@1.4.3",
+  "version": "0.10.16-dev8",
   "description": "CLI for NEMAR (Neuroelectromagnetic Data Archive and Tools Resource) dataset management",
   "type": "module",
   "main": "dist/index.js",
@@ -74,6 +75,7 @@
     ]
   },
   "devDependencies": {
+    "@anthropic-ai/sdk": "^0.132.1",
     "@asteasolutions/zod-to-openapi": "^7.3.4",
     "@biomejs/biome": "1.9.4",
     "@types/bun": "latest",
@@ -81,7 +83,6 @@
     "@types/semver": "^7.8.0",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
-    "bcryptjs": "^3.0.3",
     "husky": "^9.1.7",
     "lint-staged": "^16.3.2",
     "typescript": "^5.5.4",

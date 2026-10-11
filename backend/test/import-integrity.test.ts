@@ -1,9 +1,10 @@
 /**
  * Tests for the per-key S3 integrity primitive (epic #967 Phase 2, #969):
- * annexKeyDeclaredSize / isKeyPresentAtDeclaredSize (a Workers-side port of
- * the identically-named Phase 1 CLI helpers in src/lib/s3-server-copy.ts) and
- * the pure manifest-vs-listing comparison, compareManifestToListing. No mocks
- * -- these are pure functions over plain data.
+ * annexKeyDeclaredSize / isKeyPresentAtDeclaredSize (re-exports of the one
+ * definition in shared/annex-key.ts, which the CLI's src/lib/s3-server-copy.ts
+ * shares) and the pure manifest-vs-listing comparison, compareManifestToListing.
+ * No mocks -- these are pure functions over plain data. Chunked keys are covered
+ * in import-integrity-chunked.test.ts and test/annex-key.unit.test.ts.
  */
 
 import { describe, expect, test } from "bun:test";

@@ -142,3 +142,13 @@ For new data, "Nothing is rewritten" above no longer holds: a first import sets 
 Everything else in this decision stands.
 The gate, the verdicts and the acknowledgment rules are unchanged; the warning, its one definition and its surfaces are unchanged; and datasets already on NEMAR keep their dates and this warning.
 The warning now appears only for date findings that remain after ADR 0091's rule (a layout the rule leaves, a recording the upload could not change, an upload's scans table, a dataset published before), so "NEMAR does not change them" is said only of dates NEMAR did not change.
+
+## Amendment 2026-10-07 (#1646): the notice says when the requester is emailed
+
+The maintainer added one sentence to the notice, between the administrator sentence and the status pointer: "You will be emailed if a check needs your attention, and when an administrator decides."
+`publicationRequestNotice` spells it, and `request_notice` carries it, so the notice has five lines: the four above, with that one inserted before "Run 'nemar dataset publish status <id>' to see where it stands."
+
+The sentence promises only the mail the requester gets.
+The identifier screen mails the requester when it blocks the request (`sendIdentifierScreenBlockedEmail`), and the approval and denial paths mail the requester when an administrator decides (`sendPublicationApprovedEmail`, `sendPublicationDeniedEmail`).
+A clean screen mails the administrators and not the requester, so the notice does not say the requester is told when the checks complete.
+The approval mail goes to the dataset owner, who is the requester except when an administrator requests on the owner's behalf.

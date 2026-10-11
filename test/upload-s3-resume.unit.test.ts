@@ -327,6 +327,29 @@ describe("uploadDataToS3 resume when s3_upload is already stamped complete (#107
     const oldFile: UploadFileEntry = { path: "sub-01/eeg/a.edf", size: 4096, type: "data" };
     writeDataFile(dir, oldFile.path, "a".repeat(oldFile.size));
     expect((await gitAnnexAdd(dir, [oldFile.path])).success).toBe(true);
+    // A genuinely finished upload has its files recorded at the S3 remote. (Annexed files
+    // with no remote at all are NOT a finished upload, and step 9 now reopens on them;
+    // test/upload-data-steps.unit.test.ts covers that.) A directory remote stands in.
+    const store = join(TMP_DIR, `store-${Date.now()}`);
+    mkdirSync(store, { recursive: true });
+    const remote = await runCmd(
+      [
+        "git",
+        "annex",
+        "initremote",
+        "nemar-s3",
+        "type=directory",
+        `directory=${store}`,
+        "encryption=none",
+      ],
+      dir,
+    );
+    expect(remote.exitCode).toBe(0);
+    const copied = await runCmd(
+      ["git", "annex", "copy", "--to", "nemar-s3", "--", oldFile.path],
+      dir,
+    );
+    expect(copied.exitCode).toBe(0);
 
     const progress: UploadProgress = initUploadProgress(dir, "nm000901", [oldFile]);
     markStepCompleted(progress, "tracking");

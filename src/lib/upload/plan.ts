@@ -18,6 +18,7 @@ import {
   readUploadProgress,
 } from "../upload-progress.js";
 import type { DatasetAnalysis } from "./enrich.js";
+import { DEFAULT_UPLOAD_ANNEX_JOBS } from "./transfer.js";
 import { STOP, type StepOk, type StepStop, ok } from "./types.js";
 
 /**
@@ -49,7 +50,7 @@ export function showUploadPlan(
   absolutePath: string,
   datasetName: string,
   manifest: DatasetAnalysis["manifest"],
-  options: { jobs: string; dryRun?: boolean },
+  options: { jobs: string; annexJobs?: string; dryRun?: boolean },
 ): StepOk<{ existingConfig: LocalDatasetConfig | null }> | StepStop {
   // Check for existing local config (resume scenario)
   const existingConfig = readLocalConfig(absolutePath);
@@ -68,7 +69,8 @@ export function showUploadPlan(
   console.log(`  Size: ${formatBytesCli(manifest.totalSize)}`);
   console.log(`  Data files: ${manifest.dataFiles} (will be uploaded to S3)`);
   console.log(`  Metadata files: ${manifest.metadataFiles} (will be stored in git)`);
-  console.log(`  Parallel jobs: ${options.jobs}`);
+  console.log(`  Local git-annex add workers: ${options.annexJobs ?? DEFAULT_UPLOAD_ANNEX_JOBS}`);
+  console.log(`  Parallel S3 copy streams: ${options.jobs}`);
   console.log();
 
   // Dry run mode

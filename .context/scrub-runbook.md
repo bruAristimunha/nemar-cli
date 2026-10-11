@@ -1279,22 +1279,41 @@ jq '{status, incomplete, edf_bdf: .files.edf_bdf, flagged: .edf_bdf_files_flagge
 The scan reads the public catalog, the data plane and public S3, with `--out` required and `--only` taking this one dataset.
 It exits 2 for a usage error such as a dataset that is not public yet, and 3 if a server was struggling.
 Expect no direct finding (`status` is not `direct-identifiers`), and never read `unchecked`, `incomplete` or `not-screened` as clean.
-Then an anonymous download of one file per version, hashing to its new key, and the data plane's manifest naming only new keys:
+Then verify each served manifest uses stable URLs and agrees with the raw version manifest, whose annex keys step 12 confirmed are new. Download one recording per version and hash it to the checksum in the served manifest:
 
 ```bash
 DATA=https://data.nemar.org
 for tag in $(jq -r '.tags[]' $W/plan.json); do
-  curl -s "$DATA/$D/$tag/manifest.json" | jq -r '.[].url' > $W/public-urls-$tag.txt
-  echo "$tag old keys named: $(jq -r 'keys[]' $W/keymap.json | grep -c -F -f - $W/public-urls-$tag.txt)"
-  U=$(curl -s "$DATA/$D/$tag/manifest.json" | jq -r '[.[] | select(.path | test("\\.(edf|bdf)$"; "i"))] | min_by(.size) | .url')
-  WANT=$(basename "${U%%\?*}" | sed -E 's/^SHA256E-s[0-9]+--([0-9a-f]{64}).*/\1/')
-  GOT=$(curl -s "$U" | shasum -a 256 | cut -d' ' -f1)
-  [ "$WANT" = "$GOT" ] && echo "$tag download ok" || echo "$tag DOWNLOAD DOES NOT MATCH ITS KEY"
+  aws s3 cp "s3://nemar/$D/version/$tag.json" "$W/raw-$tag.json"
+  curl -fsS "$DATA/$D/$tag/manifest.json" -o "$W/served-$tag.json"
+  jq -e 'all(.[]; .url == .bytes_url and (.url | type == "string"))' "$W/served-$tag.json" >/dev/null
+  jq -r 'keys[]' $W/keymap.json | LC_ALL=C sort -u > "$W/old-keys.txt"
+  jq -r '.files[].key' "$W/raw-$tag.json" | LC_ALL=C sort -u > "$W/raw-keys-$tag.txt"
+  comm -12 "$W/old-keys.txt" "$W/raw-keys-$tag.txt" > "$W/old-keys-still-named-$tag.txt"
+  echo "$tag old keys named: $(wc -l < "$W/old-keys-still-named-$tag.txt" | tr -d ' ')"
+  jq -r '.[] | [.path, (.size | tostring), .checksum_algorithm, .checksum] | @tsv' "$W/served-$tag.json" | LC_ALL=C sort > "$W/served-checksums-$tag.tsv"
+  jq -r '.files | to_entries[] | [.key, (.value.size | tostring), (.value.checksum | split(":")[0]), (.value.checksum | sub("^[^:]+:"; ""))] | @tsv' "$W/raw-$tag.json" | LC_ALL=C sort > "$W/raw-checksums-$tag.tsv"
+  diff -u "$W/raw-checksums-$tag.tsv" "$W/served-checksums-$tag.tsv"
+  ROW=$(jq -ce '[.[] | select(.path | test("\\.(edf|bdf)$"; "i"))] | min_by(.size)' "$W/served-$tag.json")
+  U=$(printf '%s' "$ROW" | jq -r '.url')
+  ALG=$(printf '%s' "$ROW" | jq -r '.checksum_algorithm')
+  WANT=$(printf '%s' "$ROW" | jq -r '.checksum')
+  curl -fsSL "$U" -o "$W/download-$tag"
+  case "$ALG" in
+    sha256) GOT=$(shasum -a 256 "$W/download-$tag" | cut -d' ' -f1) ;;
+    sha1) GOT=$(shasum -a 1 "$W/download-$tag" | cut -d' ' -f1) ;;
+    md5) GOT=$(md5 -q "$W/download-$tag") ;;
+    *) echo "$tag unsupported checksum algorithm: $ALG"; exit 1 ;;
+  esac
+  [ "$WANT" = "$GOT" ] && echo "$tag download ok" || { echo "$tag DOWNLOAD CHECKSUM DOES NOT MATCH"; exit 1; }
 done
 ```
 
-Each tag must say `old keys named: 0` and `download ok`.
-A manifest can lag by its cache (`max-age=60`), so repeat after a minute before concluding.
+Each tag must say `old keys named: 0` and `download ok`, and `diff` must be empty.
+The served data-plane `url` no longer reveals an S3 key; the raw version manifest is the
+authority for which keys are named, while the served manifest's paths, sizes and checksums
+must agree with it. A manifest can remain in a downstream cache for up to five minutes, so
+repeat after five minutes before concluding.
 
 Then the Zarr copy, as an anonymous reader reads it:
 

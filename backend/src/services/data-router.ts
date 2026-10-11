@@ -70,17 +70,13 @@ export interface PublicManifestEntry {
   size: number;
   checksum_algorithm: string;
   checksum: string;
-  // For an annex-backed entry: the plain, never-expiring public S3 URL
-  // (#1522) when the bucket policy does not exclude the dataset from public
-  // read, or the legacy 1h-presigned S3 GET when it does
-  // (`services/public-read-cache.ts` decides which, per request). For a
-  // git-tracked entry, the same value as `bytes_url`.
+  // Stable per-file data-plane URL for every entry. It is identical to
+  // `bytes_url`; annex delivery resolves a correctly sized plain object or a
+  // complete chunk set behind the visibility/version/path gates.
   url: string | null;
-  // Stable, same-origin contract URL for the bytes (#615), durable: a
-  // consumer can persist it and re-fetch later. annex -> the per-file
-  // data-plane route (302s to a fresh `url`, whichever form that request
-  // gets); git -> the same raw.githubusercontent URL as `url`. Always
-  // present; never expires.
+  // Stable data-plane contract URL for the bytes (#615), durable: a consumer
+  // can persist it and re-fetch later. Always the same route as `url` and
+  // never expires.
   bytes_url: string;
   // Populated when url could not be built for this row; lets clients
   // download the rest of the dataset instead of failing the whole listing.
@@ -285,21 +281,16 @@ export async function buildRedirectUrl(args: {
 }
 
 /**
- * Build the plain public S3 URL for an annex-backed manifest entry (#1522),
- * for a dataset `services/public-read-cache.ts` confirms the bucket policy
- * does NOT exclude from public read. Same key shape and the same
- * git/annex-format validation as {@link buildRedirectUrl} -- a git-tracked
- * file never reaches this (the caller routes it to `bytes_url` instead, the
- * same as the presigned path), and an unrecognized key throws the same way.
+ * Build a plain public S3 URL for an annex-backed object. Kept for internal
+ * callers that explicitly need an unsigned object URL; public manifest entries
+ * now use the stable data-plane route under ADR 0095. Same key shape and the
+ * same git/annex-format validation as {@link buildRedirectUrl}.
  *
  * Unlike `buildRedirectUrl` this never expires and carries no
  * `response-content-disposition`: an unsigned GET cannot force S3 to rewrite
- * the response's filename the way a signed query parameter can, so a
- * download of this URL keeps the content-addressed object name rather than
- * the BIDS-shaped one. `bytes_url` (the data-plane route, which still 302s
- * through `buildRedirectUrl` for an annexed file) is the durable link that
- * keeps the BIDS filename; this one is for a client that wants to read the
- * object directly, forever, with no round trip through the Worker at all.
+ * the response's filename the way a signed query parameter can, so a download
+ * of this URL keeps the content-addressed object name rather than the BIDS
+ * filename.
  */
 export function buildAnnexPublicUrl(args: {
   datasetId: string;
@@ -361,8 +352,8 @@ export function contentTypeForBidsPath(bidsPath: string): string {
 // is the public data host and is always reachable, so the URL resolves from
 // anywhere. This also keeps the served manifest in lockstep with the build-time
 // raw S3 manifest, which hardcodes the same host (emit_manifest.py:bytes_url_for
-// on nemarDatasets/.github). Per-host fetchability is irrelevant: the presigned
-// `url` field is what dev/CLI flows fetch; bytes_url is the durable reference.
+// on nemarDatasets/.github). The served manifest emits this same stable route
+// as `url` under ADR 0095.
 // NOTE (epic #923): this lockstep is prod-only. buildBytesUrl now takes an
 // `origin` override; on staging it becomes data-test.nemar.org while
 // emit_manifest.py still emits data.nemar.org, so the two disagree for exemplars
@@ -372,9 +363,7 @@ const DATA_NEMAR_ORIGIN = "https://data.nemar.org";
 /**
  * Build the STABLE, host-invariant `bytes_url` for a manifest entry (#615).
  *
- * Unlike `url` (for annex files a presigned S3 GET that expires in ~1h),
- * `bytes_url` is durable — a consumer can persist it and re-fetch later from
- * anywhere:
+ * This durable contract can be persisted and re-fetched later from anywhere:
  * EVERY entry now resolves to the canonical per-file data-plane route,
  * `https://data.nemar.org/<id>/<version>/<bids_relpath>`: annex-backed files
  * 302 from there to bytes re-presigned on each request, and git-tracked files
@@ -773,8 +762,9 @@ export interface NemarExtensionBlock {
   pipeline_stage: PipelineStage | null;
   /**
    * Data completeness (#970, epic #967 Phase 3): 1 = every annex-keyed manifest
-   * entry verified present at its declared size, 0 = at least one missing/
-   * truncated (the #967 signature), null = not audited yet. Lives in the
+   * entry verified present at its declared size, whole or as a complete chunk set
+   * (#1565), 0 = at least one missing/truncated (the #967 signature), null = not
+   * audited yet. Lives in the
    * `nemar` extension namespace rather than the canonical `data_summary` block
    * because neuroschema's dataSummary.schema.json is `additionalProperties:
    * false` -- this is a NEMAR-specific integrity fact, not part of the

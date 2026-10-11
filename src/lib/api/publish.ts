@@ -88,7 +88,7 @@ export interface StepResult {
 
 /**
  * The 200 answer of `POST /datasets/:id/publish/request`. `request_notice` is the
- * Worker's copy of the neutral notice (ADR 0090, amendment 2026-10-07), for API
+ * Worker's copy of the neutral notice (ADR 0090, amendment "what an accepted request is told"), for API
  * clients; the CLI prints its own from the same shared definition, so it does not
  * read this field and an older Worker cannot make it print less.
  */

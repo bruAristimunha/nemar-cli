@@ -153,10 +153,10 @@ describe("nemar dataset publish request", () => {
   });
   const key = (id: string) => `POST /datasets/${id}/publish/request`;
   const flat = (text: string) => text.replace(/\s+/g, " ");
-  // The maintainer's wording of 2026-10-07, spelled out here on purpose: the
+  // The maintainer's wording of the notice, spelled out here on purpose: the
   // test must fail if the shared definition changes, so it cannot import it.
   const NOTICE = (id: string) =>
-    `Your request was received. NEMAR is checking publication eligibility. If every check passes, an administrator is notified to approve it. Run 'nemar dataset publish status ${id}' to see where it stands.`;
+    `Your request was received. NEMAR is checking publication eligibility. If every check passes, an administrator is notified to approve it. You will be emailed if a check needs your attention, and when an administrator decides. Run 'nemar dataset publish status ${id}' to see where it stands.`;
   const CHECKING = "NEMAR is checking publication eligibility";
 
   test("an accepted request is told, in neutral words, what happens next", async () => {
@@ -170,6 +170,7 @@ describe("nemar dataset publish request", () => {
           "  Your request was received.",
           "  NEMAR is checking publication eligibility.",
           "  If every check passes, an administrator is notified to approve it.",
+          "  You will be emailed if a check needs your attention, and when an administrator decides.",
           "  Run 'nemar dataset publish status nm000321' to see where it stands.",
           "",
         ].join("\n"),
@@ -186,7 +187,7 @@ describe("nemar dataset publish request", () => {
     }
   });
 
-  test("it is the same four lines whatever screen state the backend sent, and nothing follows it", async () => {
+  test("it is the same five lines whatever screen state the backend sent, and nothing follows it", async () => {
     // The screen runs after the request and its verdict is bound to a commit,
     // so the notice must not depend on what the screen holds. The block ABOVE
     // it is the backend's own words for the state (the date warning cannot be
@@ -230,7 +231,7 @@ describe("nemar dataset publish request", () => {
         expect(after, label).not.toMatch(
           /\b(clean|found|findings?|warning|acquisition|dates?|review)\b/i,
         );
-        expect(after.trim().split("\n"), label).toHaveLength(4);
+        expect(after.trim().split("\n"), label).toHaveLength(5);
       } finally {
         server.stop();
       }

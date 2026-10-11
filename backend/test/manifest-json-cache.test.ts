@@ -4,8 +4,9 @@
  * Unit-level, against the real (in-memory) Cache API implementations
  * `test/helpers/cache.ts` already provides for the manifest and git-file
  * caches, since `bun test` has no `caches.default` of its own. The
- * route-level behavior (the gate runs first, an excluded dataset is never
- * cached, a private flip is refused before the cache is touched) is covered
+ * route-level behavior (the gate runs first, a bucket-policy-excluded
+ * dataset uses the same stable URL document, and a private flip is refused
+ * before the cache is touched) is covered
  * in `data-route-manifest-stream.test.ts`'s "the manifest.json response
  * cache sits behind the visibility gate" describe block, which drives the
  * real `dataRoutes` app; this file pins the cache module's own contract in
@@ -34,7 +35,7 @@ function body(text: string): string {
 describe("manifestJsonCacheKey", () => {
   test("dataset- and version-scoped, never content-addressed", () => {
     const key = manifestJsonCacheKey(ORIGIN, "nm000132", "v1.1.1");
-    expect(key).toBe(`${ORIGIN}/__nemar-internal/manifest-json-cache/v1/nm000132/v1.1.1.json`);
+    expect(key).toBe(`${ORIGIN}/__nemar-internal/manifest-json-cache/v2/nm000132/v1.1.1.json`);
     // A bare version gets the `v` prefix folded in, like manifestCacheKey and
     // gitFileCacheKey.
     expect(manifestJsonCacheKey(ORIGIN, "nm000132", "1.1.1")).toBe(key);

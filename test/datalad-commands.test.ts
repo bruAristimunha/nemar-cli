@@ -366,12 +366,10 @@ describe("datalad commands - push errors", () => {
 
     const { stdout, exitCode } = await runCli(["dataset", "push", "--no-s3"], { cwd: repoDir });
     expect(exitCode).toBe(1);
-    // Git error about missing remote is printed via console.log fallback
-    expect(
-      stdout.includes("does not appear to be a git repository") ||
-        stdout.includes("push failed") ||
-        stdout.includes("Failed to push"),
-    ).toBe(true);
+    // The privacy preflight now refuses the push before Git can attempt a
+    // main-branch update when there is no verifiable fetch/push destination.
+    expect(stdout).toContain("Push stopped before the main branch was updated");
+    expect(stdout).toContain("remote fetch and push URLs could not be verified");
   });
 });
 

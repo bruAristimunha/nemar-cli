@@ -1,0 +1,18 @@
+-- Clear every stored password hash (ADR 0097).
+--
+-- NEMAR has no password sign-in any more: POST /auth/signup and POST
+-- /auth/retrieve-key were the only routes that wrote or read this column, and
+-- both are gone, with the bcrypt service behind them. A hash of a password
+-- nobody can use is credential material with no purpose, and it is the thing
+-- ADR 0096 had to stop admins reading out of `users`; clearing it is the end of
+-- that problem rather than a mitigation of it.
+--
+-- The column stays. Dropping it means rebuilding `users` and repointing every
+-- table that references it (migration 0026 shows what that costs), which is a
+-- far larger change than this one for no extra safety once the values are NULL.
+-- It stays NULLABLE and is still classified `secret` in USER_COLUMN_ROLES, so
+-- nothing that lists columns starts returning it.
+--
+-- This cannot be undone: a bcrypt hash cannot be rebuilt from anything left in
+-- the database. That is the intent.
+UPDATE users SET password_hash = NULL WHERE password_hash IS NOT NULL;

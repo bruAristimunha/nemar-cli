@@ -95,7 +95,6 @@ export const LIVE_TARGET_BLOCKED = liveTarget.blocked;
 // Test configuration
 export const TEST_CONFIG = {
   apiUrl: liveTarget.declaredApiUrl,
-  password: process.env.TEST_PASSWORD || "TestPassword123!",
   adminApiKey: process.env.TEST_ADMIN_API_KEY || "",
   userApiKey: process.env.TEST_USER_API_KEY || "",
   bypassToken: process.env.TEST_BYPASS_TOKEN || "",

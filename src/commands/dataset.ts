@@ -106,6 +106,7 @@ import {
 } from "../lib/facet-options.js";
 import {
   cloneDataset,
+  pushAnnexBranchToGitHub,
   pushBranch,
   pushToGitHub,
   saveDataset,
@@ -185,6 +186,13 @@ import {
 import { checkPrerequisitesForCommand } from "../lib/prerequisites.js";
 import { DownloadProgressTracker } from "../lib/progress.js";
 import { promptForProvenance } from "../lib/provenance.js";
+import {
+  ciPendingHeadline,
+  ciPendingHint,
+  ciUrlOf,
+  isCiPendingBlock,
+  isCiPendingReason,
+} from "../lib/publish-pending.js";
 import { renderSnippetLine, truncateTokenList } from "../lib/render/snippet.js";
 import { resolveSandboxCompletion } from "../lib/sandbox-status.js";
 import { bumpVersion, isValidStableVersion, parseVersion } from "../lib/semver.js";
@@ -201,6 +209,7 @@ import {
   readUploadProgress,
   writeUploadProgress,
 } from "../lib/upload-progress.js";
+import { runDataSteps } from "../lib/upload/data-steps.js";
 import { applyUploadDates, planUploadDates } from "../lib/upload/date-normalization.js";
 import {
   analyzeDataset,
@@ -208,13 +217,7 @@ import {
   collectProvenance,
   resolveLicenseStep,
 } from "../lib/upload/enrich.js";
-import {
-  deployCiStep,
-  printUploadSuccess,
-  pushMetadata,
-  saveDatasetStep,
-  writeNemarMetadata,
-} from "../lib/upload/finalize.js";
+import { deployCiStep, printUploadSuccess, pushMetadata } from "../lib/upload/finalize.js";
 import {
   ACKNOWLEDGE_FLAG,
   collectAcknowledgment,
@@ -234,11 +237,11 @@ import {
   verifyGhCli,
 } from "../lib/upload/preflight.js";
 import {
+  DEFAULT_UPLOAD_ANNEX_JOBS,
   acceptRepoInvitation,
   configureRemotes,
   createOrResumeDataset,
   initializeAnnexDataset,
-  uploadDataToS3,
 } from "../lib/upload/transfer.js";
 
 /**
@@ -550,7 +553,12 @@ export function createUploadCommand(): Command {
     .option("--skip-validation", "Skip BIDS validation (not recommended)")
     .option("--skip-orcid", "Skip co-author ORCID collection")
     .option("--dry-run", "Show what would be uploaded without doing it")
-    .option("-j, --jobs <number>", "Parallel upload streams (default: 4)", "4")
+    .option("-j, --jobs <number>", "Parallel S3 copy streams", "4")
+    .option(
+      "--annex-jobs <number>",
+      "Parallel local git-annex add workers",
+      String(DEFAULT_UPLOAD_ANNEX_JOBS),
+    )
     .option(YES_OPTION, YES_DESCRIPTION)
     .option("--restart", "Clear upload progress and re-upload all files")
     .option("--no", NO_DESCRIPTION) // Long form only; -n conflicts with --name
@@ -594,7 +602,7 @@ Process:
   1. Screens the files for identifiers on this machine, before anything is sent
   2. Validates BIDS format (unless --skip-validation)
   3. Creates GitHub repository for metadata
-  4. Uploads large files to S3 in parallel
+  4. Tracks files locally with git-annex, then copies them to S3 in parallel
   5. Enables PR-based versioning workflow
 
 Identifier preflight:
@@ -612,6 +620,9 @@ Identifier preflight:
   dataset again when you request publication.
 
 Note:
+  Local tracking workers and S3 copy streams are separate. --annex-jobs
+  controls git-annex add (default: 4); -j/--jobs controls S3 copies (default: 4).
+
   This command is for initial dataset creation only. To update an
   existing dataset, use 'nemar dataset commit' + 'nemar dataset push'
   (private) or 'nemar dataset update' (public).
@@ -620,10 +631,26 @@ Examples:
   $ ${invokedAs(command)} ./my-eeg-dataset
   $ ${invokedAs(command)} ./ds -n "My EEG Study" -d "64-channel EEG data"
   $ ${invokedAs(command)} ./ds --dry-run        # Preview without uploading
-  $ ${invokedAs(command)} ./ds -j 16            # More parallel streams
+  $ ${invokedAs(command)} ./ds -j 16            # More parallel S3 copy streams
+  $ ${invokedAs(command)} ./ds --annex-jobs 8   # More local git-annex add workers
   $ ${invokedAs(command)} ./ds --dataset-id nm099998   # Standing fixture (admin, staging)`,
     )
     .action(async (datasetPath, options) => {
+      const jobsValue = String(options.jobs);
+      const jobs = Number.parseInt(jobsValue, 10);
+      if (!/^\d+$/.test(jobsValue) || !Number.isSafeInteger(jobs) || jobs < 1) {
+        console.log(chalk.red(`Error: --jobs must be a positive integer (got "${options.jobs}").`));
+        process.exit(1);
+      }
+
+      const annexJobs = Number(options.annexJobs);
+      if (!Number.isSafeInteger(annexJobs) || annexJobs < 1) {
+        console.log(
+          chalk.red(`Error: --annex-jobs must be a positive integer (got "${options.annexJobs}").`),
+        );
+        process.exit(1);
+      }
+
       // Get config for GitHub username
       const config = getConfig();
 
@@ -803,34 +830,28 @@ Examples:
         process.exit(1);
       }
 
-      // Step 9: Upload data files to S3 via git-annex S3 special remote
-      const uploaded = await uploadDataToS3(
+      // Steps 9 to 11: copy the data to S3, write the NEMAR metadata, save
+      const dataSteps = await runDataSteps({
         absolutePath,
         options,
         dataFiles,
         filesToUpload,
         uploadProgress,
         datasetInfo,
-      );
-      if (uploaded.status === "fail") process.exit(1);
-      uploadProgress = uploaded.value;
-
-      // Step 10b: Ensure .nemar metadata is on disk and .bidsignore covers it
-      writeNemarMetadata(absolutePath, coAuthorEnrichment, uploadProgress);
-
-      // Step 11: Save dataset changes
-      if ((await saveDatasetStep(absolutePath, author, uploadProgress)).status === "fail") {
-        process.exit(1);
-      }
+        coAuthorEnrichment,
+        author,
+      });
+      if (dataSteps.status === "fail") process.exit(1);
+      uploadProgress = dataSteps.value;
 
       // Step 12: Push metadata to GitHub
       if ((await pushMetadata(absolutePath, uploadProgress)).status === "fail") process.exit(1);
 
       // Step 12b: Deploy BIDS validation CI
-      await deployCiStep(absolutePath, datasetInfo.dataset_id, uploadProgress);
+      const ciOutcome = await deployCiStep(absolutePath, datasetInfo.dataset_id, uploadProgress);
 
       // Step 13: Success!
-      printUploadSuccess(absolutePath, datasetInfo);
+      printUploadSuccess(absolutePath, datasetInfo, ciOutcome);
     });
 }
 
@@ -2918,7 +2939,9 @@ Examples:
 
       // Determine new version
       let newVersion: string;
-      if (options.version) {
+      // `!== undefined`, not truthiness: an empty --version= is a version the
+      // user gave and got wrong, not a flag they left out.
+      if (options.version !== undefined) {
         if (!isValidStableVersion(options.version)) {
           console.log(chalk.red(`Error: Invalid version: ${options.version}`));
           console.log("  Expected format: X.Y.Z (e.g., 2.0.0)");
@@ -3560,14 +3583,11 @@ Examples:
 
       // Also push git-annex branch if data files were uploaded
       if (dataFiles.length > 0) {
-        const annexPush = spawn({
-          cmd: ["git", "push", "origin", "git-annex"],
-          cwd: workDir,
-          stdout: "pipe",
-          stderr: "pipe",
-        });
-        if ((await annexPush.exited) !== 0) {
-          console.log(chalk.yellow("  Warning: Failed to push git-annex branch"));
+        const annexPush = await pushAnnexBranchToGitHub(workDir, "origin");
+        if (!annexPush.success) {
+          console.log(
+            chalk.yellow(`  Warning: Failed to push git-annex branch: ${annexPush.error}`),
+          );
         }
       }
       pushSpinner.succeed("Pushed branch");
@@ -4018,6 +4038,20 @@ datasetCommand.addCommand(accessCommand);
 
 const publishCommand = new Command("publish").description("Publication workflow management");
 
+/** The warning for an anonymous release the server did not echo back as anonymous. */
+function printAnonymousNotConfirmed(datasetId: string): void {
+  console.log(
+    chalk.yellow(
+      "\n  WARNING: you asked for an anonymous release, but the server did not confirm it.",
+    ),
+  );
+  console.log(
+    chalk.yellow(
+      `  Run 'nemar dataset publish status ${datasetId}' and check the Anonymous line before an admin approves it.`,
+    ),
+  );
+}
+
 publishCommand
   .command("request")
   .description("Request publication of a dataset")
@@ -4036,6 +4070,10 @@ Description:
   - Have S3 Object Lock enabled (prevents data deletion)
 
   You can only have one active publication request per dataset.
+
+  BIDS validation runs on GitHub after the upload. A request made before it has
+  completed is recorded, and NEMAR continues it once validation passes.
+  Check validation with: nemar dataset ci <dataset-id>
 
 Status Flow:
   requested → approving → published (or denied)
@@ -4076,17 +4114,9 @@ Examples:
       // request whose body never arrived would otherwise succeed with a
       // message indistinguishable from a correct one, and the depositor would
       // find out when their name appeared on the published record.
-      if (options.anonymous && result.anonymous !== true) {
-        console.log(
-          chalk.yellow(
-            "\n  WARNING: you asked for an anonymous release, but the server did not confirm it.",
-          ),
-        );
-        console.log(
-          chalk.yellow(
-            `  Run 'nemar dataset publish status ${datasetId}' and check the Anonymous line before an admin approves it.`,
-          ),
-        );
+      const anonymityUnconfirmed = options.anonymous === true && result.anonymous !== true;
+      if (anonymityUnconfirmed) {
+        printAnonymousNotConfirmed(datasetId);
       } else if (result.anonymous === true) {
         console.log(
           chalk.dim(
@@ -4102,7 +4132,7 @@ Examples:
         for (const line of identifierScreenLines(screen)) console.log(line);
       }
       // What happens next, in neutral words that name no finding, verdict or
-      // date warning (ADR 0090, amendment 2026-10-07): the screen runs after
+      // date warning (ADR 0090, amendment "what an accepted request is told"): the screen runs after
       // this request and its verdict is bound to a commit, so the outcome is
       // read from `publish status` or the mail, never guessed at here. Made
       // from the shared definition rather than read off the response, so every
@@ -4110,7 +4140,33 @@ Examples:
       // one threw above and prints its own text.
       console.log();
       for (const line of publicationRequestNotice(datasetId)) console.log(`  ${line}`);
+      // An anonymous release that was not confirmed would be published under
+      // the real name, so a script must not read this run as a success.
+      if (anonymityUnconfirmed) process.exit(1);
     } catch (error) {
+      if (isCiPendingBlock(error)) {
+        // Not an error: the request IS recorded, and the server re-checks it
+        // and continues once BIDS validation passes. Said in the info style and
+        // left to exit 0, so a script does not retry it and a depositor does
+        // not read it as a rejection. A validation FAILURE is a different
+        // reason and takes the error path below.
+        spinner.info(ciPendingHeadline(error.blockReason));
+        // The command to run again takes its `--anonymous` from what was
+        // typed, never from the server's echo, which may be missing.
+        for (const line of ciPendingHint(datasetId, options.anonymous === true)) {
+          console.log(line);
+        }
+        const ciUrl = ciUrlOf(error);
+        if (ciUrl) console.log(`  CI: ${ciUrl}`);
+        // What was recorded, not what was typed: the recorded request is the
+        // one an administrator later approves.
+        const recorded = (error.rawBody as { anonymous?: unknown } | undefined)?.anonymous;
+        if (options.anonymous && recorded !== true) {
+          printAnonymousNotConfirmed(datasetId);
+          process.exit(1);
+        }
+        return;
+      }
       if (error instanceof ApiError) {
         spinner.fail(error.message);
         console.log(chalk.dim(`  ${error.message}`));
@@ -4225,18 +4281,32 @@ Examples:
         console.log(`\n  ${chalk.red("Reason:")} ${result.denied_reason}`);
       }
 
+      // A request waiting on validation has had no screen yet, because the
+      // screen starts when validation passes and the request is released; the
+      // backend words that absence as "NOT RUN for this request", in red, which
+      // reads as a fault in a state that is only waiting.
+      const pendingReason =
+        result.status === "blocked" && isCiPendingReason(result.block_reason)
+          ? result.block_reason
+          : undefined;
       // Epic #1610 phase 4: the identifier screen, in the backend's words.
-      const screenLines = identifierScreenLines(result.identifier_screen);
+      const screenLines = pendingReason ? [] : identifierScreenLines(result.identifier_screen);
       if (screenLines.length > 0) {
         console.log();
         for (const line of screenLines) console.log(line);
       }
 
       // Blocked requests: surface WHY (e.g. BIDS validation pending/failed) plus
-      // the CI link and what to do next (#428). A pending/in-progress block now
-      // clears automatically once CI goes green (daily sweep), but the user can
-      // re-request to retry immediately.
-      if (result.status === "blocked") {
+      // the CI link and what to do next. A request that is blocked only because
+      // validation has not finished is a pending state, not a failure: it is
+      // said the way `publish request` says it (info, not red, no "re-request"
+      // from the server's message) and clears on its own once CI passes. Any
+      // other reason stays a red block.
+      if (pendingReason) {
+        console.log(`\n  ${chalk.cyan("ℹ")} ${ciPendingHeadline(pendingReason)}`);
+        for (const line of ciPendingHint(datasetId, result.anonymous === true)) console.log(line);
+        if (result.ci_url) console.log(`  ${chalk.dim("CI:")} ${result.ci_url}`);
+      } else if (result.status === "blocked") {
         if (result.message) {
           console.log(`\n  ${chalk.red("Blocked:")} ${result.message}`);
         } else if (result.block_reason) {
@@ -4255,9 +4325,10 @@ Examples:
         if (result.ci_url) {
           console.log(`  ${chalk.dim("CI:")} ${result.ci_url}`);
         }
+        const again = `nemar dataset publish request ${datasetId}${result.anonymous === true ? " --anonymous" : ""}`;
         console.log(
           chalk.dim(
-            `  This re-checks automatically once CI passes; or re-run 'nemar dataset publish request ${datasetId}' to retry now.`,
+            `  This re-checks automatically once CI passes; or re-run '${again}' to retry now.`,
           ),
         );
       }
@@ -5015,21 +5086,14 @@ Examples:
             // branch as it stood then; those new commits have to be pushed
             // separately or fresh clones won't know the S3 copies exist.
             const annexPushSpinner = ora("Pushing git-annex branch...").start();
-            const annexPush = spawn({
-              cmd: ["git", "push", "origin", "git-annex"],
-              cwd,
-              stdout: "pipe",
-              stderr: "pipe",
-            });
-            const annexPushStderr = await new Response(annexPush.stderr).text();
-            const annexPushExit = await annexPush.exited;
-            if (annexPushExit !== 0) {
+            const annexPush = await pushAnnexBranchToGitHub(cwd, "origin");
+            if (!annexPush.success) {
               annexPushSpinner.warn(
-                `Could not push git-annex branch: ${annexPushStderr.trim() || "unknown error"}`,
+                `Could not push git-annex branch: ${annexPush.error || "unknown error"}`,
               );
               console.log(
                 chalk.yellow(
-                  "  Run 'git push origin git-annex' manually so other clones can locate the new files.",
+                  "  The checked annex push was refused. Resolve the reported issue before retrying; do not push the branch manually.",
                 ),
               );
               s3PushFailed = true;

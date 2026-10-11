@@ -62,3 +62,4 @@
 - [Never proxy bulk bytes](never-proxy-bulk-bytes.md) — CF terms restrict large files via CDN; both planes redirect bulk and carry only metadata; the accounting you want already exists on the redirect path
 - [Repeated channel labels collapse stores](repeated-channel-labels-collapse-stores.md) — before biosigio 1.2.9 a repeated EDF label dropped a channel; only the file header can vouch for the count; never key channels by label
 - [Dataset workflow is byte-pinned](dataset-workflow-is-byte-pinned.md): editing onboard-openneuro.yml here fails unit-pure until nemarDatasets/.github carries the same bytes; ship as a pair or make the CLI fit
+- [curl --retry with -o /dev/null](curl-retry-with-devnull-fails-23.md) — exits 23 on a retried transfer and masks the status; loop in bash, and test the step with Bun.spawn (not spawnSync) against a Bun.serve stand-in

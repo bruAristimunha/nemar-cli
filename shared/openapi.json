@@ -1577,10 +1577,10 @@
                 "1",
                 "true"
               ],
-              "description": "Only datasets whose latest version has every manifest entry verified present in S3. \"1\" or \"true\" enable the filter."
+              "description": "Only datasets whose latest version has every manifest entry verified present in S3, whole or as a complete chunk set. \"1\" or \"true\" enable the filter."
             },
             "required": false,
-            "description": "Only datasets whose latest version has every manifest entry verified present in S3. \"1\" or \"true\" enable the filter.",
+            "description": "Only datasets whose latest version has every manifest entry verified present in S3, whole or as a complete chunk set. \"1\" or \"true\" enable the filter.",
             "name": "data_complete",
             "in": "query"
           },
@@ -2021,10 +2021,10 @@
                 "1",
                 "true"
               ],
-              "description": "Only datasets whose latest version has every manifest entry verified present in S3. \"1\" or \"true\" enable the filter."
+              "description": "Only datasets whose latest version has every manifest entry verified present in S3, whole or as a complete chunk set. \"1\" or \"true\" enable the filter."
             },
             "required": false,
-            "description": "Only datasets whose latest version has every manifest entry verified present in S3. \"1\" or \"true\" enable the filter.",
+            "description": "Only datasets whose latest version has every manifest entry verified present in S3, whole or as a complete chunk set. \"1\" or \"true\" enable the filter.",
             "name": "data_complete",
             "in": "query"
           },

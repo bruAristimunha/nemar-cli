@@ -402,7 +402,12 @@ export function seedSynthetic(h: Harness, id: string, o: SyntheticOptions = {}):
   if (tsv !== null) {
     if (o.annexTsv) {
       const bytes = new TextEncoder().encode(tsv);
-      files["participants.tsv"] = manifestEntry(bytes, false);
+      const entry = manifestEntry(bytes, false);
+      files["participants.tsv"] = entry;
+      // Annex files are reached through the data plane's object URL. Seed the
+      // plain representation so its HEAD can prove the manifest size before
+      // the test follows the redirect.
+      h.standin.put(`/${id}/objects/${String(entry.key)}`, bytes);
     } else raw("participants.tsv", tsv);
   }
   if (pjson !== null) raw("participants.json", pjson);

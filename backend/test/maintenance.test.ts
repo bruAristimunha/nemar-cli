@@ -23,7 +23,7 @@ function buildApp(): Hono<AppEnv> {
   app.post("/admin", (c) => c.json({ no_slash: true }));
   app.post("/webhooks/github", (c) => c.json({ received: true }));
   app.post("/auth/login", (c) => c.json({ logged_in: true }));
-  app.post("/auth/signup", (c) => c.json({ signed_up: true }));
+  app.post("/auth/resend-verification", (c) => c.json({ resent: true }));
   app.get("/", (c) => c.json({ name: "NEMAR API" }));
   return app;
 }
@@ -129,8 +129,8 @@ describe("maintenanceMode: read-only", () => {
     expect(res.status).toBe(200);
   });
 
-  test("POST /auth/signup -> 503 (signup stays frozen)", async () => {
-    const res = await hit(app, "read-only", "/auth/signup", "POST");
+  test("POST /auth/resend-verification -> 503 (only /auth/login is exempt)", async () => {
+    const res = await hit(app, "read-only", "/auth/resend-verification", "POST");
     expect(res.status).toBe(503);
   });
 

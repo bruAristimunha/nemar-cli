@@ -163,8 +163,9 @@ export interface Dataset {
       pre-manifest datasets). Older backends omit it. */
   total_files?: number | null;
   /** Data completeness of the latest version (#970): 1 = every annex-keyed
-      manifest entry verified present at its declared size, 0 = incomplete
-      (the #967 signature), null = not audited yet. Older backends omit it. */
+      manifest entry verified present at its declared size, whole or as a
+      complete chunk set (#1565), 0 = incomplete (the #967 signature), null =
+      not audited yet. Older backends omit it. */
   data_complete?: number | null;
   /** Actual bytes present in S3 (#970) -- distinct from file_size when
       data_complete=0. */

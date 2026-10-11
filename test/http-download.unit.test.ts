@@ -27,7 +27,10 @@ import {
   type S3ManifestStandin,
   startS3ManifestStandin,
 } from "../backend/test/helpers/s3-manifest-standin";
-import { dataPlaneManifestSchema } from "../shared/contract/data-plane";
+import {
+  PUBLISHED_FILE_MISSING_ERROR,
+  dataPlaneManifestSchema,
+} from "../shared/contract/data-plane";
 import { buildBidsFilterArgs, matchesBidsFilter } from "../src/lib/bids-filter";
 import {
   type DataPlaneManifestEntry,
@@ -302,6 +305,108 @@ describe("downloadEntries", () => {
     });
     expect(result.errors).toHaveLength(1);
     expect(result.hadInfrastructureFailure).toBe(false);
+  });
+
+  test("a file the manifest lists and storage lacks is reported, not a failed run (ADR 0005)", async () => {
+    // The data plane answers 502 with a named error for a listed file whose object is gone (a
+    // partial dataset served under ADR 0064). Retrying cannot help and exiting 1 would call a
+    // reportable gap a transport fault.
+    let hits = 0;
+    const lost = Bun.serve({
+      port: 0,
+      fetch: () => {
+        hits++;
+        return Response.json(
+          { error: PUBLISHED_FILE_MISSING_ERROR, dataset_id: "nm000001" },
+          { status: 502 },
+        );
+      },
+    });
+    try {
+      const result = await downloadEntries(
+        [{ path: "f.bin", size: 10, bytes_url: `http://localhost:${lost.port}/f` }],
+        join(workDir, "listed-missing"),
+        { attempts: 3 },
+      );
+      expect(hits).toBe(1);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0]).toContain("f.bin");
+      expect(result.hadInfrastructureFailure).toBe(false);
+    } finally {
+      lost.stop(true);
+    }
+  });
+
+  test("a 502 with a different JSON error is still a transport fault", async () => {
+    // The data plane's other 502s are JSON too ("Upstream content host unavailable"); only the
+    // one named error means the archive does not have the file.
+    let hits = 0;
+    const other = Bun.serve({
+      port: 0,
+      fetch: () => {
+        hits++;
+        return Response.json({ error: "Upstream content host unavailable" }, { status: 502 });
+      },
+    });
+    try {
+      const result = await downloadEntries(
+        [{ path: "f.bin", size: 10, bytes_url: `http://localhost:${other.port}/f` }],
+        join(workDir, "json-502"),
+        { attempts: 3 },
+      );
+      expect(hits).toBe(3);
+      expect(result.hadInfrastructureFailure).toBe(true);
+    } finally {
+      other.stop(true);
+    }
+  });
+
+  test("the named error without a JSON content type is not trusted", async () => {
+    // An intermediary's page is not the data plane's answer, whatever words it contains.
+    let hits = 0;
+    const page = Bun.serve({
+      port: 0,
+      fetch: () => {
+        hits++;
+        return new Response(JSON.stringify({ error: PUBLISHED_FILE_MISSING_ERROR }), {
+          status: 502,
+          headers: { "Content-Type": "text/html" },
+        });
+      },
+    });
+    try {
+      const result = await downloadEntries(
+        [{ path: "f.bin", size: 10, bytes_url: `http://localhost:${page.port}/f` }],
+        join(workDir, "html-502"),
+        { attempts: 3 },
+      );
+      expect(hits).toBe(3);
+      expect(result.hadInfrastructureFailure).toBe(true);
+    } finally {
+      page.stop(true);
+    }
+  });
+
+  test("any other 502 is still a transport fault: retried, and a failed run", async () => {
+    let hits = 0;
+    const bad = Bun.serve({
+      port: 0,
+      fetch: () => {
+        hits++;
+        return new Response("Bad gateway", { status: 502 });
+      },
+    });
+    try {
+      const result = await downloadEntries(
+        [{ path: "f.bin", size: 10, bytes_url: `http://localhost:${bad.port}/f` }],
+        join(workDir, "bad-gateway"),
+        { attempts: 3 },
+      );
+      expect(hits).toBe(3);
+      expect(result.hadInfrastructureFailure).toBe(true);
+    } finally {
+      bad.stop(true);
+    }
   });
 
   test("every error names the file it belongs to", async () => {

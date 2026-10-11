@@ -88,6 +88,30 @@ export function isPlaceholderAuthor(entry: string): boolean {
   return PLACEHOLDER_AUTHOR.test(entry.trim());
 }
 
+/** Does `EthicsApprovals` list at least one non-empty approval? */
+function listsEthicsApproval(desc: Record<string, unknown>): boolean {
+  return (
+    Array.isArray(desc.EthicsApprovals) &&
+    desc.EthicsApprovals.some((e) => typeof e === "string" && e.trim().length > 0)
+  );
+}
+
+/**
+ * Does this `dataset_description.json` text list an ethics approval itself?
+ * When it does, the README cannot change the ethics verdict and need not be
+ * read; a missing, unparseable or non-object description lists none.
+ */
+export function describesEthicsApproval(descriptionJson: string | null): boolean {
+  if (descriptionJson === null) return false;
+  try {
+    const parsed: unknown = JSON.parse(descriptionJson);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return false;
+    return listsEthicsApproval(parsed as Record<string, unknown>);
+  } catch {
+    return false;
+  }
+}
+
 /** Reasons are user-facing: each states the failure AND the fix. */
 export function evaluateSubmissionMinimums(
   descriptionJson: string | null,
@@ -147,11 +171,8 @@ export function evaluateSubmissionMinimums(
     );
   }
 
-  const ethicsApprovals = Array.isArray(desc.EthicsApprovals)
-    ? desc.EthicsApprovals.filter((e) => typeof e === "string" && e.trim().length > 0)
-    : [];
   const ethicsInReadme = readme !== null && ETHICS_IN_README.test(readme);
-  if (ethicsApprovals.length === 0 && !ethicsInReadme) {
+  if (!listsEthicsApproval(desc) && !ethicsInReadme) {
     reasons.push(
       "An ethics approval statement is required: fill the EthicsApprovals field of " +
         "dataset_description.json, or add an ethics/IRB statement to the README.",

@@ -800,15 +800,15 @@ export function parseManifest(body: unknown): ManifestEntry[] {
 }
 
 /**
- * Entries from a raw version manifest (`<id>/version/<tag>.json`). A `git:` key's bytes are
- * served by the data plane; its `bytes_url` may be missing or empty, and then the URL is
- * built the way the git-tree fallback builds it, one encoded segment at a time.
+ * Entries from a raw version manifest (`<id>/version/<tag>.json`). Every file is read through
+ * the stable data-plane route, whether its annex bytes are plain or chunked. Raw S3 is used to
+ * retrieve the manifest document itself, not as the file URL contract.
  */
 export function entriesFromVersionManifest(
   doc: unknown,
   id: string,
   version: string,
-  bases: { data: string; s3Base: string },
+  bases: { data: string },
 ): ManifestEntry[] {
   const files = isRecord(doc) ? doc.files : undefined;
   if (!isRecord(files)) throw new ReadFailure("manifest-shape");
@@ -816,15 +816,7 @@ export function entriesFromVersionManifest(
     if (!isRecord(f) || typeof f.key !== "string" || f.key === "") {
       throw new ReadFailure("manifest-shape");
     }
-    let url: string;
-    if (f.key.startsWith("git:")) {
-      url =
-        typeof f.bytes_url === "string" && f.bytes_url !== ""
-          ? f.bytes_url
-          : `${bases.data}/${id}/${version}/${encodePath(path)}`;
-    } else {
-      url = `${bases.s3Base}/${id}/objects/${encodePath(f.key)}`;
-    }
+    const url = `${bases.data}/${id}/${version}/${encodePath(path)}`;
     return { path, size: sizeOf(f.size), url };
   });
 }
@@ -892,7 +884,7 @@ export async function loadManifest(
     }
     return {
       ok: true,
-      entries: entriesFromVersionManifest(doc, id, version, ctx),
+      entries: entriesFromVersionManifest(doc, id, version, { data: ctx.data }),
       source: "s3-version-manifest",
     };
   } catch (error) {

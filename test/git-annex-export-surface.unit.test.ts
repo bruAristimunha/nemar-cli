@@ -34,7 +34,12 @@ import { readdirSync } from "node:fs";
 import { join } from "node:path";
 
 const MODULE_EXPORTS: Record<string, string[]> = {
-  "run-command": ["runCommand"],
+  "run-command": [
+    "INACTIVITY_WARNING_AFTER_MS",
+    "credentialValues",
+    "redactCredentials",
+    "runCommand",
+  ],
   prereq: [
     "checkAWSCredentials",
     "checkDownloadPrerequisites",
@@ -46,12 +51,20 @@ const MODULE_EXPORTS: Record<string, string[]> = {
   init: [
     "ADD_CHUNK_MAX_BYTES",
     "ADD_CHUNK_MAX_PATHS",
+    "ANNEX_CLONE_DESCRIPTION",
+    "ANNEX_DEPOSIT_DESCRIPTION",
+    "ANNEX_UPSTREAM_DESCRIPTION",
     "chunkAddTargets",
     "configureLargefiles",
     "ensureGitAnnexInitialized",
     "gitAnnexAdd",
     "initDataset",
+    "isDefaultAnnexDescription",
     "isGitAnnexDataset",
+    "parseAddFailures",
+    "parseAddOutput",
+    "replaceDefaultAnnexDescription",
+    "unstageTrackedPaths",
   ],
   policy: [
     "ANNEX_DATA_EXTENSIONS",
@@ -59,6 +72,9 @@ const MODULE_EXPORTS: Record<string, string[]> = {
     "ANNEX_SIZE_THRESHOLD_BYTES",
     "NEVER_ANNEX_GLOBS",
     "buildLargefilesExpression",
+    "describeAnnexSizeThreshold",
+    "isCaseVariantData",
+    "isCurrentLargefilesExpression",
     "isNeverAnnexedMetadata",
     "shouldAnnex",
   ],
@@ -87,18 +103,26 @@ const MODULE_EXPORTS: Record<string, string[]> = {
     "verifyGitHubAuth",
   ],
   "clone-push": [
+    "clearStaleAssumeUnchanged",
+    "clearStaleFlags",
     "cloneDataset",
     "commitRevert",
+    "compareRecordedStat",
     "createRevertBranch",
+    "describeChangedSinceTracked",
+    "describeStaleFlagFailure",
     "isNonFastForwardPush",
+    "pushAnnexBranchToGitHub",
     "pushBranch",
     "pushToGitHub",
     "saveDataset",
+    "setAssumeUnchanged",
   ],
   transfer: [
     "MAX_UNAVAILABLE_SAMPLE",
     "batchSetKeysAbsent",
     "batchSetKeysPresent",
+    "checkRemoteHolds",
     "classifyGetOutcome",
     "collectFileManifest",
     "copyPathsToAnnexRemote",
@@ -107,6 +131,7 @@ const MODULE_EXPORTS: Record<string, string[]> = {
     "dropFiles",
     "dropUnusedAnnexObjects",
     "extractCopyError",
+    "extractCopyJsonError",
     "extractWhereisKeyUrl",
     "getAnnexKeysForPaths",
     "getAnnexWhereisAll",
@@ -115,6 +140,8 @@ const MODULE_EXPORTS: Record<string, string[]> = {
     "getKeyHashDirs",
     "getRemoteUuid",
     "listAnnexedKeys",
+    "parseCopyJson",
+    "parseFsckJson",
     "setKeyPresent",
   ],
   "repo-state": [
@@ -161,7 +188,22 @@ const INTERNAL_WIRING = [
   "chunkAddTargets",
   "ADD_CHUNK_MAX_PATHS",
   "ADD_CHUNK_MAX_BYTES",
+  // Parses per-file errors from the list-form git-annex batch add.
+  "parseAddFailures",
+  // Parses success paths and per-file failures from the batch-add JSON stream.
+  "parseAddOutput",
   "isVersionCompatible",
+  // Moved from import-normalize.ts so the upload can share it without importing the
+  // import pipeline; consumed by sibling modules only.
+  "unstageTrackedPaths",
+  // Non-identifying annex repository descriptions (#1399).
+  "ANNEX_CLONE_DESCRIPTION",
+  "ANNEX_DEPOSIT_DESCRIPTION",
+  "ANNEX_UPSTREAM_DESCRIPTION",
+  "isDefaultAnnexDescription",
+  "replaceDefaultAnnexDescription",
+  // Annex-only guarded push used after S3 copy has advanced git-annex.
+  "pushAnnexBranchToGitHub",
   // policy.ts postdates the split (#1158). Its surface is consumed by sibling
   // git-annex modules and by import-openneuro, never by the CLI directly, so
   // none of it belongs to the pre-split monolith surface below.
@@ -170,6 +212,9 @@ const INTERNAL_WIRING = [
   "ANNEX_SIZE_THRESHOLD_BYTES",
   "NEVER_ANNEX_GLOBS",
   "buildLargefilesExpression",
+  "describeAnnexSizeThreshold",
+  "isCaseVariantData",
+  "isCurrentLargefilesExpression",
   "isNeverAnnexedMetadata",
   "shouldAnnex",
   // Also post-split (#1159): the path-scoped copy and the path->key map exist for
@@ -178,6 +223,27 @@ const INTERNAL_WIRING = [
   "copyPathsToAnnexRemote",
   "getAnnexKeysForPaths",
   "listAnnexedKeys",
+  // The upload S3 step's JSON copy accounting, its presence check for files with no
+  // local content, the credential redaction of what both print, and its save-step
+  // helper: unit tested, consumed by sibling modules only.
+  "parseCopyJson",
+  "extractCopyJsonError",
+  "checkRemoteHolds",
+  "parseFsckJson",
+  "setAssumeUnchanged",
+  // The credential redaction of what a subprocess prints, shared by the verbose log and
+  // the copy and presence-check errors: unit tested, consumed by sibling modules only.
+  "credentialValues",
+  "redactCredentials",
+  // The focused runCommand test pins the production inactivity threshold.
+  "INACTIVITY_WARNING_AFTER_MS",
+  // The stat guard, the stale-flag clear and the failure text of saveDataset's skip:
+  // unit tested, consumed by saveDataset itself and the tests.
+  "clearStaleAssumeUnchanged",
+  "clearStaleFlags",
+  "compareRecordedStat",
+  "describeChangedSinceTracked",
+  "describeStaleFlagFailure",
 ];
 
 /**

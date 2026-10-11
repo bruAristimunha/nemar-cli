@@ -337,7 +337,8 @@ interface RunOptions {
   allowBrowser?: boolean;
   pathPrefix?: string;
   debug?: boolean;
-  stdin?: "ignore" | "inherit";
+  /** A Blob is the whole of stdin, for the one prompt a test needs to answer. */
+  stdin?: "ignore" | "inherit" | Blob;
   /** Extra child env, applied last so it can override the defaults above. A value of
    *  `""` is passed through as present-and-empty (what the empty-`NEMAR_API_KEY` case
    *  needs); `undefined` DELETES the key, even if the parent had it. */
@@ -1990,24 +1991,84 @@ describe("nemar auth signup", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 17: deprecation sentences
+// 17: the password command is gone (ADR 0097)
 // ---------------------------------------------------------------------------
 
-describe("password-era commands print a deprecation sentence", () => {
-  test("retrieve-key prints it before the closed-stdin prompt dies", async () => {
-    const result = await run(["auth", "retrieve-key"], "http://127.0.0.1:1");
-    expect(result.out).toContain(
-      "Password sign-in is deprecated and will be removed in the next release; run `nemar auth login`.",
-    );
+describe("password sign-in is retired", () => {
+  test("retrieve-key says it is gone and names the command to run, instead of 'unknown command'", async () => {
+    // The mail sent when an account verified its email, and pages outside this
+    // repository, told people to run it. It must prompt for nothing.
+    // NEMAR_DEBUG turns the nudge into a log path, which would make the check below vacuous.
+    const result = await run(["auth", "retrieve-key"], "http://127.0.0.1:1", {
+      env: { NEMAR_DEBUG: undefined },
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.out).toContain("'nemar auth retrieve-key' no longer exists");
+    expect(result.out).toContain("nemar auth login");
+    expect(result.out).not.toMatch(/unknown command/i);
+    expect(result.out).not.toContain("Password:");
+    expect(result.out).not.toContain("Email address:");
+    // A command that was retired on purpose is not a crash to report.
+    expect(result.out).not.toContain("--debug");
   }, 15000);
 
-  test("regenerate-key prints it, plus the every-machine warning, before the prompt dies", async () => {
-    const result = await run(["auth", "regenerate-key"], "http://127.0.0.1:1");
-    expect(result.out).toContain(
-      "Password sign-in is deprecated and will be removed in the next release; run `nemar auth login`.",
+  test("retrieve-key ignores flags and arguments an old habit might add", async () => {
+    const result = await run(
+      ["auth", "retrieve-key", "--email", "a@b.co", "extra"],
+      "http://127.0.0.1:1",
     );
+    expect(result.exitCode).toBe(1);
+    expect(result.out).toContain("nemar auth login");
+  }, 15000);
+
+  test("auth --help does not list the retired command and names no password", async () => {
+    const result = await run(["auth", "--help"], "http://127.0.0.1:1");
+    expect(result.out).not.toContain("retrieve-key");
+    expect(result.out).not.toMatch(/password/i);
+  }, 15000);
+
+  test("regenerate-key still warns that it revokes every machine's key, without a deprecation line", async () => {
+    const result = await run(["auth", "regenerate-key"], "http://127.0.0.1:1");
+    expect(result.out).not.toContain("Password sign-in is deprecated");
     expect(result.out).toContain("EVERY machine");
     expect(result.out).toContain("nemar auth keys revoke");
+  }, 15000);
+
+  test("regenerate-key tells the person to paste the new key with -k, not to run a bare login", async () => {
+    // A bare `nemar auth login` starts the browser flow and ignores the key,
+    // so the regenerated key would be orphaned and another one minted.
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname === "/notices") return Response.json({ notices: [] });
+        if (url.pathname === "/auth/request-key-regeneration" && req.method === "POST") {
+          return Response.json({
+            message:
+              "If an active account exists with this email, a verification link will be sent",
+          });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      const result = await run(["auth", "regenerate-key"], `http://localhost:${server.port}`, {
+        stdin: new Blob(["ada@example.org\n"]),
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.out).toContain("nemar auth login -k <new-key>");
+    } finally {
+      server.stop(true);
+    }
+  }, 15000);
+
+  test("regenerate-key exits non-zero when the request fails", async () => {
+    // It is the only way to replace a lost key without a signed-in machine, so
+    // a failure has to reach a script and not only a person reading the output.
+    const result = await run(["auth", "regenerate-key"], "http://127.0.0.1:1", {
+      stdin: new Blob(["ada@example.org\n"]),
+    });
+    expect(result.exitCode).toBe(1);
   }, 15000);
 });
 

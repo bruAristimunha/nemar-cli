@@ -226,8 +226,22 @@ async function main(): Promise<void> {
     console.error("Could not read the resulting D1 catalog:\n", dump.output.trim());
     process.exit(1);
   }
-  const jsonStart = dump.output.indexOf("[");
-  const resultSets = JSON.parse(dump.output.slice(jsonStart)) as { results: unknown[] }[];
+  // The JSON array is the part between a line that is just `[` and the last line that is just
+  // `]`. `wrangler()` joins stdout and stderr, and wrangler prints a `[WARNING]` banner (with
+  // ANSI colour codes) around the array when, for example, a proxy variable is set; slicing from
+  // the first `[` or to the end of the text hands that banner to JSON.parse.
+  const jsonStart = dump.output.search(/^\[\s*$/m);
+  const jsonEnd = dump.output.search(/^\]\s*$(?![\s\S]*^\]\s*$)/m);
+  if (jsonStart < 0 || jsonEnd < jsonStart) {
+    console.error(
+      "Could not find the JSON catalog in wrangler's output:\n",
+      dump.output.slice(0, 2000),
+    );
+    process.exit(1);
+  }
+  const resultSets = JSON.parse(dump.output.slice(jsonStart, jsonEnd + 1)) as {
+    results: unknown[];
+  }[];
   if (resultSets.length !== tableNames.length + 1) {
     console.error(
       `Expected ${tableNames.length + 1} result sets from D1, got ${resultSets.length}.`,

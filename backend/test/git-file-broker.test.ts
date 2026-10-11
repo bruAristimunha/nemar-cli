@@ -726,7 +726,7 @@ describe("the route: the gate, then the bytes", () => {
     expect(res.headers.get("Retry-After")).toBe("30");
   });
 
-  test("a file that is genuinely gone is a 404", async () => {
+  test("a missing backing object contradicting a manifest entry is a 502, not a 404", async () => {
     const db = freshDb();
     seed(db, "nm000862", "public");
     reset({
@@ -738,7 +738,8 @@ describe("the route: the gate, then the bytes", () => {
 
     const res = await app().request(`/nm000862/${VERSION}/${PATH}`, {}, env(db));
 
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(502);
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
   });
 
   test("a private dataset 404s without a single upstream request", async () => {
@@ -1243,6 +1244,7 @@ describe("the route: the gate, then the bytes", () => {
       const SECOND_BODY = "nothing changed";
       const SECOND_BLOB_SHA = "f906b97310d39c554b0f699aea54901533f2076b";
       const ANNEX_PATH = "sub-01/eeg/data.set";
+      const ANNEX_OBJECT_PATH = "/nm000862/objects/SHA256E-s10--aaaa.set";
       const MISS_IP = "203.0.113.50";
       const secondRawPath = `/nemarDatasets/nm000862/${VERSION}/${PATH2}`;
 
@@ -1373,7 +1375,7 @@ describe("the route: the gate, then the bytes", () => {
         expect(await hitStillServed.text()).toBe(FILE_BODY);
       });
 
-      test("HEAD, an annexed file's redirect, and an ordinary 404 do not count against the miss budget", async () => {
+      test("HEAD, a verified plain-annex redirect, and an ordinary 404 do not count against the miss budget", async () => {
         const cache = new DrainingCache();
         install(cache);
         const db = freshDb();
@@ -1385,6 +1387,8 @@ describe("the route: the gate, then the bytes", () => {
               status: 200,
               headers: { "Content-Length": String(FILE_BODY.length) },
             }),
+          [ANNEX_OBJECT_PATH]: () =>
+            new Response(null, { status: 200, headers: { "Content-Length": "10" } }),
         });
         seedMissBudgetCount(cache, MISS_IP, __limits.DATA_MISS_MAX_REQUESTS - 1);
 

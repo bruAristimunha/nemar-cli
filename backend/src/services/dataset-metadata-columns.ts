@@ -151,8 +151,8 @@ export interface MetadataColumnInputs {
      *  distinct from `totals.bytes` (declared) so the two are never transposed
      *  at the call site. */
     bytesPresent: number;
-    /** Whether every annex-keyed manifest entry is present at its declared size
-     *  (`verifyDatasetVersionS3().complete`). */
+    /** Whether every annex-keyed manifest entry is present at its declared size,
+     *  whole or as a complete chunk set (`verifyDatasetVersionS3().complete`). */
     complete: boolean;
   };
 }

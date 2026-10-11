@@ -41,6 +41,11 @@ adds certainty for depositors, it does not replace the human gate.
   `bids_validation_*`): only a fixed dataset clears them, by re-request.
 - Already-published datasets are not gated retroactively; the gate runs only
   on publication requests.
+- A request recorded while BIDS validation was pending is released later by the
+  blocked-request sweep, which runs the same check before it releases the
+  request and re-blocks one that fails; a row whose files it cannot read waits
+  for the next run instead of failing open. See the amendment of 2026-10-07 in
+  [ADR 0086](0086-publication-requests-are-screened-for-identifiers-in-ci-and-the-admin-mail-waits-for-the-verdict.md).
 - The 25-character floor is enforced as a plain length check. This is the
   regex-style gate ADR 0014 rejected — deliberately re-decided for native
   first publication, where the remedy is a title edit, not a desk rejection.

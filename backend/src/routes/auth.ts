@@ -1,7 +1,10 @@
 /**
  * Authentication routes
  *
- * Handles user registration, email verification, and login.
+ * Handles email verification, API-key login and key regeneration. There is no
+ * password and no registration route here: an account is created by the
+ * ORCID browser flow (`auth-orcid.ts`) and a key is minted by the device flow
+ * (ADR 0047) or by `confirm-key-regeneration` below.
  */
 
 import { zValidator } from "@hono/zod-validator";
@@ -10,7 +13,6 @@ import { z } from "zod";
 import {
   ORCID_ID_PATTERN,
   type OrcidNameLookupStatus,
-  orcidIdSchema,
 } from "../../../shared/contract/publication.js";
 import { escapeHtml } from "../lib/escape";
 import { inactiveAccountBody, isActiveAccountStatus } from "../services/account-tier";
@@ -25,18 +27,8 @@ import {
 } from "../services/email";
 import { validateGitHubUsername } from "../services/github";
 import { getDatasetsToken } from "../services/github-auth";
-import {
-  emailFieldSchema,
-  findEmailHolder,
-  findGithubHolder,
-  findOrcidHolder,
-  identityRefusal,
-  isUniqueViolationOn,
-  normalizeGithubHandle,
-  normalizeOrcid,
-} from "../services/identity";
+import { emailFieldSchema } from "../services/identity";
 import { fetchOrcidName, orcidPubBase } from "../services/orcid-auth";
-import { hashPassword, validatePasswordStrength, verifyPassword } from "../services/password";
 import {
   generateApiKey,
   generateExpirationTimestamp,
@@ -46,6 +38,27 @@ import {
 import type { Bindings, Variables } from "../types/bindings";
 
 export const authRoutes = new Hono<{ Bindings: Bindings; Variables: Variables }>();
+
+/**
+ * The two routes that took a password, answered with a 410 that says where to go
+ * (ADR 0097).
+ *
+ * They are retired, not unrouted. An already-installed CLI still has the
+ * commands that call them, and an unrouted path answers 404 `Not Found`, which
+ * that CLI renders as "This NEMAR backend does not support this command yet":
+ * it blames the server and never names the command that works. The sentence is
+ * in `error` on purpose: the client prints `error` first for any code it does
+ * not know, and an older client knows none of this one.
+ *
+ * These handlers read nothing and write nothing: no body parse, no database,
+ * no password check. A request cannot create an account or a key here.
+ */
+export const PASSWORD_SIGN_IN_RETIRED_BODY = {
+  error: "Password sign-in was removed. Run `nemar auth login` to sign in with your browser.",
+  code: "password_sign_in_retired",
+} as const;
+authRoutes.post("/signup", (c) => c.json(PASSWORD_SIGN_IN_RETIRED_BODY, 410));
+authRoutes.post("/retrieve-key", (c) => c.json(PASSWORD_SIGN_IN_RETIRED_BODY, 410));
 
 /**
  * GET /auth/check-username - Check if username is available
@@ -134,17 +147,12 @@ authRoutes.get("/check-github", async (c) => {
 /**
  * GET /auth/orcid-name - Read the given/family name on a public ORCID record
  *
- * Pre-signup lookup, alongside check-username and check-github (#1255). ORCID
- * is required at signup and is the canonical source of the researcher name
- * that DOIs cite, but a record may hide its name. The CLI calls this right
- * after the ORCID prompt so it can ask for the name ONLY in that case,
- * instead of asking everyone for something we usually already know.
- *
- * A pre-flight GET rather than a flag on the signup response: signup is the
- * call that creates the account, so discovering "we need a name" from its
- * response would mean failing a submitted registration and re-driving the
- * prompts. This is idempotent, costs one public ORCID read, and mirrors the
- * two pre-signup checks that already exist.
+ * Written for the CLI's old signup form (#1255), alongside check-username and
+ * check-github: ORCID is the canonical source of the researcher name that DOIs
+ * cite, but a record may hide its name, so the form asked for one ONLY in that
+ * case. The form went with the password routes (ADR 0097) and nothing in this
+ * repository calls this route now; it stays because removing a public route is
+ * a separate decision. It is idempotent and costs one public ORCID read.
  *
  * The three outcomes are reported separately (`found` / `no_public_name` /
  * `lookup_failed`): the caller prompts for a name in the last two, but the
@@ -176,393 +184,6 @@ authRoutes.get("/orcid-name", async (c) => {
       given_name: null,
       family_name: null,
     });
-  }
-});
-
-// Signup request schema
-const signupSchema = z.object({
-  username: z
-    .string()
-    .min(3, "Username must be at least 3 characters")
-    .max(30, "Username must be at most 30 characters")
-    .regex(
-      /^[a-zA-Z0-9_-]+$/,
-      "Username can only contain letters, numbers, underscores, and hyphens",
-    ),
-  // Normalised BEFORE validation (ADR 0043) so the stored value can only ever
-  // be canonical: an address is trimmed and lowercased, and a GitHub handle
-  // loses a pasted leading "@" instead of failing the format check over it.
-  // `preprocess` rather than `.transform()` because the rules have to run
-  // before `.email()`/`.regex()`, not after them.
-  email: emailFieldSchema,
-  password: z.string().min(12, "Password must be at least 12 characters").max(128),
-  github_username: z.preprocess(
-    (v) => (typeof v === "string" ? normalizeGithubHandle(v) : v),
-    z
-      .string()
-      .min(1, "GitHub username is required")
-      .max(39, "GitHub username is too long")
-      .regex(
-        /^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$/,
-        "GitHub username must start and end with a letter or number, and can only contain letters, numbers, and hyphens",
-      ),
-  ),
-  description: z
-    .string()
-    .min(
-      20,
-      "Please provide a brief description of why you need NEMAR access (at least 20 characters)",
-    )
-    .max(500, "Description must be at most 500 characters"),
-  // ORCID is now required: it's the canonical source for the user's name (#835).
-  // Uppercased first so an iD typed with a lowercase `x` check digit is
-  // accepted and STORED canonically -- the partial unique index from migration
-  // 0077 compares `users.orcid` exactly, so a case variant would read as a
-  // different person's iD (ADR 0043).
-  orcid: z.preprocess((v) => (typeof v === "string" ? (normalizeOrcid(v) ?? v) : v), orcidIdSchema),
-  // Supplied only when the ORCID record hides its name (#1255): the server
-  // still reads ORCID first, so these are a fallback, never an override.
-  given_name: z.string().trim().min(1).max(100).optional(),
-  family_name: z.string().trim().min(1).max(100).optional(),
-  affiliation: z.string().max(200, "Affiliation must be at most 200 characters").optional(),
-  // city/country required for US export-control / sanctions screening (#835).
-  city: z.string().min(1, "City is required").max(120, "City must be at most 120 characters"),
-  country: z
-    .string()
-    .min(1, "Country is required")
-    .max(120, "Country must be at most 120 characters"),
-});
-
-/**
- * POST /auth/signup - Register a new user
- */
-authRoutes.post("/signup", zValidator("json", signupSchema), async (c) => {
-  const {
-    username,
-    email,
-    password,
-    github_username,
-    description,
-    orcid,
-    given_name: suppliedGivenName,
-    family_name: suppliedFamilyName,
-    affiliation,
-    city,
-    country,
-  } = c.req.valid("json");
-  const db = c.env.DB;
-
-  try {
-    // Validate password strength
-    const passwordCheck = validatePasswordStrength(password);
-    if (!passwordCheck.valid) {
-      return c.json(
-        {
-          error: "Password does not meet requirements",
-          details: passwordCheck.errors,
-        },
-        400,
-      );
-    }
-
-    // NOTE on `deleted_at`. The USERNAME check below deliberately does NOT
-    // filter `deleted_at IS NULL`: it mirrors a table-wide UNIQUE, so it must
-    // see tombstones too. Re-signup with a deleted user's old values is
-    // enabled by the tombstone MASKING (email -> deleted+<id>@deleted.invalid,
-    // username/github/orcid -> NULL), which frees them, NOT by excluding
-    // deleted rows here. See DELETE /admin/users/by-id/:id + migration 0037.
-    //
-    // The email, ORCID and GitHub checks go through services/identity.ts and
-    // are live-rows-only. For email and ORCID that is required: the
-    // constraints they mirror are 0077's PARTIAL indexes
-    // (`deleted_at IS NULL AND identity_conflict = 0`), so a live-only
-    // predicate is what matches the index the write will actually hit. For
-    // GitHub the predicate makes no difference either way -- the tombstone
-    // NULLs `github_username`, so no tombstone can hold a handle to collide
-    // with -- and it uses the same helper for symmetry, so all three
-    // identifiers are asked the same question in the same place.
-
-    // Check if username already exists
-    const existingUsername = await db
-      .prepare("SELECT id FROM users WHERE username = ?")
-      .bind(username)
-      .first();
-
-    if (existingUsername) {
-      return c.json({ error: "Username already taken" }, 409);
-    }
-
-    // Check if email already exists, case-insensitively (ADR 0043). The
-    // exact-case check this replaces let `Ada@Lab.org` and `ada@lab.org`
-    // become two accounts for one person; migration 0077's partial unique
-    // index now refuses that write outright, and this turns the refusal into
-    // a message that says what to do about it.
-    const existingEmail = await findEmailHolder(db, email);
-
-    if (existingEmail) {
-      return c.json({ error: "Email already registered", ...identityRefusal("email_in_use") }, 409);
-    }
-
-    // Check if the ORCID iD already backs an account (#1254). Nothing checked
-    // this before: `users.orcid` carried no constraint at all, and the only
-    // ORCID uniqueness in the system lived on `oauth_identities`, which a CLI
-    // signup never writes. So the CLI was a way to mint a second account for
-    // an iD that already had one. `findOrcidHolder` looks at both.
-    const existingOrcid = await findOrcidHolder(db, orcid);
-    if (existingOrcid) {
-      return c.json(
-        { error: "ORCID iD already registered", ...identityRefusal("orcid_in_use") },
-        409,
-      );
-    }
-
-    // Direct dup check on the raw input (case-insensitive). Common case:
-    // the username is already registered exactly as typed. Saves one GitHub
-    // API call and lets the request 409 even when the GitHub user happens
-    // not to resolve (e.g., user was renamed/deleted on GitHub after
-    // signing up here).
-    const directDupGithub = await findGithubHolder(db, github_username);
-    if (directDupGithub) {
-      return c.json(
-        {
-          error: "GitHub account already linked to another user",
-          ...identityRefusal("github_in_use"),
-        },
-        409,
-      );
-    }
-
-    // Validate GitHub username exists. This is also where we recover the
-    // canonical login (matters for case-variant dedup below).
-    const githubLookup = await validateGitHubUsername(
-      github_username,
-      await getDatasetsToken(c.env),
-    );
-    // #1052: a GitHub outage is not a verdict on the handle. Refusing a
-    // registration with "does not exist" when GitHub 500s sends someone to
-    // change a field that was right, and the change does not help.
-    if (githubLookup.status === "unavailable") {
-      console.error(`[signup] GitHub lookup unavailable: ${githubLookup.detail}`);
-      return c.json(
-        {
-          error: "GitHub unavailable",
-          message:
-            "GitHub could not be reached to verify your username; try again in a few minutes",
-        },
-        503,
-      );
-    }
-    if (githubLookup.status === "not_found") {
-      return c.json(
-        {
-          error: "GitHub user not found",
-          message: `The GitHub username '${github_username}' does not exist`,
-        },
-        400,
-      );
-    }
-    const githubUser = githubLookup.user;
-
-    // Re-check with the canonical login when GitHub normalized the case.
-    // Catches the "Octocat" stored vs "octocat" submitted shape.
-    if (githubUser.login.toLowerCase() !== github_username.toLowerCase()) {
-      const canonicalDup = await findGithubHolder(db, githubUser.login);
-      if (canonicalDup) {
-        return c.json(
-          {
-            error: "GitHub account already linked to another user",
-            ...identityRefusal("github_in_use"),
-          },
-          409,
-        );
-      }
-    }
-
-    // Hash password
-    const passwordHash = await hashPassword(password);
-
-    // Generate verification token
-    const verificationToken = generateVerificationToken();
-    const verificationExpires = generateExpirationTimestamp(24); // 24 hours
-
-    // ORCID is canonical for the name: pull given/family from the public
-    // record rather than asking the user to type it. The record wins whenever
-    // it has a name; the client-supplied pair is the fallback for a record
-    // that hides its name (or a transient lookup failure), which the CLI
-    // collects after GET /auth/orcid-name reports found: false.
-    //
-    // The name is what DOIs cite (#1255) and publishing is blocked without
-    // it, so landing an account with NULL names is a real cost -- but not one
-    // worth failing a registration over. The gap closes when the record is
-    // made public and `nemar admin backfill-names` (or the next ORCID link)
-    // reads it -- and, since ADR 0042, the owner can also just type it into
-    // Settings. That last route DOES apply here: signup records an ORCID iD
-    // but never sets `orcid_verified` (only the OAuth link flow proves the
-    // iD), and the name lock keys on the VERIFIED flag. So a CLI-signup
-    // account whose ORCID record hides its name can set one itself, and only
-    // an account that has actually linked ORCID is held to the record.
-    let givenName: string | null = null;
-    let familyName: string | null = null;
-    try {
-      const n = await fetchOrcidName(orcid, orcidPubBase(c.env));
-      givenName = n.given;
-      familyName = n.family;
-    } catch (nameErr) {
-      console.warn(`[signup] ORCID name fetch failed for ${orcid}`, nameErr);
-    }
-    // Both halves come from the same source: mixing a record given name with
-    // a typed family name would produce a name neither party stated. A
-    // partial from the record is kept rather than discarded when the client
-    // supplied nothing usable -- it is not citable on its own, but it is a
-    // head start for the backfill.
-    if ((!givenName || !familyName) && suppliedGivenName && suppliedFamilyName) {
-      givenName = suppliedGivenName;
-      familyName = suppliedFamilyName;
-    }
-
-    // Insert user
-    await db
-      .prepare(
-        `
-      INSERT INTO users (
-        username, email, password_hash, github_username, description,
-        verification_token, verification_expires_at, orcid,
-        given_name, family_name, affiliation, city, country
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `,
-      )
-      .bind(
-        username,
-        email,
-        passwordHash,
-        githubUser.login,
-        description,
-        verificationToken,
-        verificationExpires,
-        orcid,
-        givenName,
-        familyName,
-        affiliation || null,
-        city,
-        country,
-      )
-      .run();
-
-    // Send verification email
-    const verificationUrl = `${c.env.API_BASE_URL}/auth/verify?token=${verificationToken}`;
-
-    let emailSent = false;
-    try {
-      const { fromEmail, replyTo, isDev } = resolveEmailConfig(c.env);
-      await sendVerificationEmail(
-        email,
-        username,
-        verificationUrl,
-        c.env.RESEND_API_KEY,
-        fromEmail,
-        replyTo,
-        isDev,
-        c.env,
-      );
-      emailSent = true;
-    } catch (emailError) {
-      console.error("Failed to send verification email:", emailError);
-      // User created but email failed - they can use resend-verification
-    }
-
-    // Audit log failure should not block signup response
-    try {
-      await db
-        .prepare(
-          `INSERT INTO audit_log (action, resource_type, resource_id, details)
-           VALUES ('user_signup', 'user', ?, ?)`,
-        )
-        .bind(username, JSON.stringify({ email, github_username, description }))
-        .run();
-    } catch (auditError) {
-      console.error("Failed to write signup audit log for user:", username, auditError);
-    }
-
-    // Whether the account actually landed with a citable name (#1255 review
-    // item 4). The client's own pre-flight can say "found" and this insert's
-    // lookup can still fail transiently a moment later, and the account is
-    // created either way -- so the account-creating call is the one that has
-    // to report the truth, or the user learns about it at publish time.
-    const researcherName = givenName && familyName ? "recorded" : "missing";
-
-    return c.json(
-      {
-        message: "Registration successful",
-        email_sent: emailSent,
-        researcher_name: researcherName,
-        // ADR 0040 phase 2: verifying the email is the last step that gates
-        // the account itself, so these are the only steps a new signup owes.
-        // Admin approval is no longer one of them — it is the separate,
-        // later, upload-access decision, and telling someone to wait for it
-        // now stalls them in front of a key they could already fetch. The
-        // missing-name hint (#1255) rides along last: it is about how a DOI
-        // will cite this person, not about whether the account works.
-        next_steps: [
-          emailSent
-            ? "Check your email for a verification link"
-            : "Verification email failed to send. Use 'nemar auth resend-verification' to try again",
-          ...(emailSent ? ["Click the link to verify your email address"] : []),
-          "Run 'nemar auth retrieve-key' to get your API key",
-          "Run 'nemar auth login' to sign in with it",
-          ...(researcherName === "missing"
-            ? [
-                "No researcher name is on file; DOIs cannot cite you until your ORCID record shows your name publicly",
-              ]
-            : []),
-        ],
-      },
-      201,
-    );
-  } catch (error) {
-    console.error("Signup error:", error);
-
-    // Handle DB UNIQUE constraint violations as a safety net
-    // D1 errors may not be standard Error instances, so check multiple ways
-    const msg = error instanceof Error ? error.message : String(error);
-    if (msg.includes("UNIQUE constraint failed")) {
-      if (isUniqueViolationOn(error, "username")) {
-        return c.json({ error: "Username already taken" }, 409);
-      }
-      if (isUniqueViolationOn(error, "email")) {
-        return c.json(
-          { error: "Email already registered", ...identityRefusal("email_in_use") },
-          409,
-        );
-      }
-      // 0077's partial index reports the COLUMN, not the index name, so this
-      // catches a concurrent signup that claimed the iD between the check
-      // above and this insert.
-      if (isUniqueViolationOn(error, "orcid")) {
-        return c.json(
-          { error: "ORCID iD already registered", ...identityRefusal("orcid_in_use") },
-          409,
-        );
-      }
-      if (isUniqueViolationOn(error, "github_username")) {
-        return c.json(
-          {
-            error: "GitHub account already linked to another user",
-            ...identityRefusal("github_in_use"),
-          },
-          409,
-        );
-      }
-      console.error("Unhandled UNIQUE constraint column in signup:", msg);
-      return c.json({ error: "An account with these details already exists" }, 409);
-    }
-
-    return c.json(
-      {
-        error: "Signup failed",
-        message: error instanceof Error ? error.message : "Unknown error",
-      },
-      500,
-    );
   }
 });
 
@@ -624,7 +245,7 @@ authRoutes.get("/verify", async (c) => {
     ${
       user.status === "revoked"
         ? "<p>Contact a NEMAR administrator if you believe this is an error.</p>"
-        : "<p>Run <code style='background: #e5e7eb; padding: 2px 6px; border-radius: 4px;'>nemar auth retrieve-key</code> to get your API key, then <code style='background: #e5e7eb; padding: 2px 6px; border-radius: 4px;'>nemar auth login</code> to sign in with it.</p>"
+        : "<p>Run <code style='background: #e5e7eb; padding: 2px 6px; border-radius: 4px;'>nemar auth login</code> to sign in with your browser; it also creates your API key.</p>"
     }
   </div>
 
@@ -675,11 +296,11 @@ authRoutes.get("/verify", async (c) => {
     .run();
 
   // The account is now active (ADR 0040 phase 2), so this is the moment the
-  // API key becomes retrievable — and therefore the moment the mail that
-  // explains how to retrieve it belongs. It used to be sent at approval,
+  // API key becomes obtainable, and therefore the moment the mail that
+  // explains how to get it belongs. It used to be sent at approval,
   // which is no longer when the key becomes available. Best-effort: a mail
   // failure must not undo a verification that has already committed, and the
-  // user can still run `nemar auth retrieve-key` without ever seeing it.
+  // user can still run `nemar auth login` without ever seeing it.
   //
   // Whether it actually went is tracked, because the success page below is
   // the ONLY other place this user is told how to get their key. Promising
@@ -760,7 +381,7 @@ authRoutes.get("/verify", async (c) => {
       </div>
       <div style="display: flex; align-items: flex-start; margin-bottom: 15px;">
         <span style="background: #f59e0b; color: white; border-radius: 50%; width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; margin-right: 12px; flex-shrink: 0; font-size: 12px;">2</span>
-        <span><strong>Get your API key</strong> - Run <code>nemar auth retrieve-key</code>, then <code>nemar auth login</code></span>
+        <span><strong>Get your API key</strong> - Run <code>nemar auth login</code> and sign in with your browser</span>
       </div>
       <div style="display: flex; align-items: flex-start;">
         <span style="background: #e5e7eb; color: #6b7280; border-radius: 50%; width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; margin-right: 12px; flex-shrink: 0; font-size: 12px;">3</span>
@@ -772,8 +393,8 @@ authRoutes.get("/verify", async (c) => {
   <p style="color: #6b7280; font-size: 14px; margin-top: 30px;">
     You can close this page. Your account is active${
       keyEmailSent
-        ? "; we've emailed you the steps to retrieve your API key."
-        : " — run <code>nemar auth retrieve-key</code> to get your API key."
+        ? "; we've emailed you the steps to get your API key."
+        : "; run <code>nemar auth login</code> to get your API key."
     }
   </p>
 
@@ -933,132 +554,6 @@ authRoutes.post("/resend-verification", zValidator("json", resendSchema), async 
   );
 
   return c.json({ message: "Verification email sent" });
-});
-
-// ============================================================================
-// Retrieve API Key (verified or approved accounts, requires email + password)
-// ============================================================================
-
-const retrieveKeySchema = z.object({
-  email: emailFieldSchema,
-  password: z.string().min(1, "Password is required"),
-});
-
-/**
- * POST /auth/retrieve-key - Retrieve API key using email and password.
- *
- * Works from `verified` (ADR 0040 phase 2): the API key is base-tier, and
- * this route is where it is minted — nothing creates a token at approval, so
- * a legacy `verified` row with no token gets one here on first call, exactly
- * as an approved row always did. Returns the existing key's prefix (and a 409)
- * when one was already issued.
- */
-authRoutes.post("/retrieve-key", zValidator("json", retrieveKeySchema), async (c) => {
-  const { email, password } = c.req.valid("json");
-  const db = c.env.DB;
-
-  // Find user by email
-  const user = await db
-    .prepare(
-      "SELECT id, username, email, password_hash, status FROM users WHERE email = ? COLLATE NOCASE AND deleted_at IS NULL",
-    )
-    .bind(email)
-    .first<{
-      id: number;
-      username: string;
-      email: string;
-      password_hash: string;
-      status: string;
-    }>();
-
-  if (!user) {
-    // Intentionally vague to prevent email enumeration
-    return c.json({ error: "Invalid email or password" }, 401);
-  }
-
-  // Verify password
-  const passwordValid = await verifyPassword(password, user.password_hash);
-  if (!passwordValid) {
-    return c.json({ error: "Invalid email or password" }, 401);
-  }
-
-  // ADR 0040 phase 2: the key belongs to the base tier, so `verified` is
-  // enough. Admin approval is the upload decision and happens later, against
-  // an account that already holds a key.
-  if (!isActiveAccountStatus(user.status)) {
-    return c.json(inactiveAccountBody(user.status), 403);
-  }
-
-  // Check if user has an active (non-revoked, non-expired) token
-  const existingToken = await db
-    .prepare(
-      `SELECT id, api_key_prefix FROM tokens
-       WHERE user_id = ? AND revoked_at IS NULL
-       AND (expires_at IS NULL OR expires_at > datetime('now'))
-       ORDER BY created_at DESC LIMIT 1`,
-    )
-    .bind(user.id)
-    .first<{ id: number; api_key_prefix: string }>();
-
-  if (!existingToken) {
-    // No active token; generate a new one (the first retrieval after email
-    // verification, or a legacy `verified` row that predates ADR 0040)
-    const { apiKey, apiKeyPrefix } = generateApiKey();
-    const hashedKey = await hashApiKey(apiKey);
-
-    try {
-      await db
-        .prepare(
-          `INSERT INTO tokens (user_id, api_key_hash, api_key_prefix, name)
-           VALUES (?, ?, ?, 'Retrieved Token')`,
-        )
-        .bind(user.id, hashedKey, apiKeyPrefix)
-        .run();
-    } catch (tokenError) {
-      console.error("Failed to create token for user:", user.id, tokenError);
-      return c.json(
-        {
-          error: "Failed to generate API key",
-          message:
-            "Could not create your API key. Please try again. " +
-            "If the problem persists, contact an administrator.",
-        },
-        500,
-      );
-    }
-
-    // Audit log failure should not prevent key delivery
-    try {
-      await db
-        .prepare(
-          `INSERT INTO audit_log (user_id, action, resource_type, resource_id)
-           VALUES (?, 'key_retrieved', 'user', ?)`,
-        )
-        .bind(user.id, user.username)
-        .run();
-    } catch (auditError) {
-      console.error("Failed to write audit log for key retrieval, user:", user.id, auditError);
-    }
-
-    return c.json({
-      message: "API key generated successfully",
-      api_key: apiKey,
-      note: "Store this key securely. It will not be shown again.",
-    });
-  }
-
-  // User already has a token but we cannot show the actual key (only hash is stored).
-  // They need to use regenerate-key if they lost it.
-  return c.json(
-    {
-      error: "API key already issued",
-      details: { api_key_prefix: existingToken.api_key_prefix },
-      message:
-        "An API key has already been generated for your account. " +
-        "If you lost it, use 'nemar auth regenerate-key' to get a new one.",
-    },
-    409,
-  );
 });
 
 // ============================================================================
@@ -1262,7 +757,7 @@ authRoutes.get("/confirm-key-regeneration", async (c) => {
 
     <h2 style="color: #333; font-size: 18px; margin: 25px 0 15px 0;">Login with your new key</h2>
     <div style="background-color: #f4f4f5; padding: 12px; border-radius: 8px; font-family: monospace; font-size: 13px;">
-      nemar auth login
+      nemar auth login -k &lt;your-new-key&gt;
     </div>
   </div>
 

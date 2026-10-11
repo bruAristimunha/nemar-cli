@@ -14,9 +14,7 @@
  */
 
 import { createHash, randomBytes } from "crypto";
-import { hashSync } from "bcryptjs";
 
-const TEST_PASSWORD = "TestPassword123!";
 const TEST_USERS = [
   {
     username: "test-owner",
@@ -75,10 +73,6 @@ function generateApiKey(): { key: string; hash: string; prefix: string } {
   return { key, hash, prefix };
 }
 
-function generatePasswordHash(): string {
-  return hashSync(TEST_PASSWORD, 10);
-}
-
 async function main() {
   const isCleanup = process.argv.includes("--cleanup");
 
@@ -100,7 +94,6 @@ async function main() {
   console.log("=".repeat(60));
   console.log("\nRun these commands with: wrangler d1 execute nemar-db --remote\n");
 
-  const passwordHash = generatePasswordHash();
   const credentials: Record<string, string> = {};
 
   // Generate SQL for users
@@ -110,10 +103,10 @@ async function main() {
     const revokedAt = user.status === "revoked" ? ", datetime('now')" : ", NULL";
 
     console.log(
-      `INSERT INTO users (username, email, password_hash, github_username, status, role, email_verified, approved_at, revoked_at)`,
+      `INSERT INTO users (username, email, github_username, status, role, email_verified, approved_at, revoked_at)`,
     );
     console.log(
-      `VALUES ('${user.username}', '${user.email}', '${passwordHash}', '${user.github_username}', '${user.status}', '${user.role}', ${user.email_verified}${approvedAt}${revokedAt});`,
+      `VALUES ('${user.username}', '${user.email}', '${user.github_username}', '${user.status}', '${user.role}', ${user.email_verified}${approvedAt}${revokedAt});`,
     );
     console.log();
   }
@@ -137,7 +130,6 @@ async function main() {
   console.log("Test Credentials (save to test/.env.test)");
   console.log("=".repeat(60));
   console.log();
-  console.log(`TEST_PASSWORD=${TEST_PASSWORD}`);
   for (const [username, key] of Object.entries(credentials)) {
     const envVar = username.toUpperCase().replace(/-/g, "_") + "_API_KEY";
     console.log(`${envVar}=${key}`);

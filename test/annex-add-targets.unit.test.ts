@@ -7,7 +7,7 @@
  * limit while letting each completed chunk persist its annexed state.
  */
 
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import {
   chmodSync,
   existsSync,
@@ -30,7 +30,17 @@ import {
   initDataset,
 } from "../src/lib/git-annex/init";
 import { copyToAnnexRemote } from "../src/lib/git-annex/transfer";
-import { computeAddTargets, listAnnexedPaths, listTrackedPaths } from "../src/lib/upload/transfer";
+import {
+  computeAddTargets,
+  copyAnnexedToRemote,
+  listAnnexedPaths,
+  listAnnexedPathsNotAt,
+  listTrackedPaths,
+} from "../src/lib/upload/transfer";
+
+// Each test builds a repository and runs git-annex a few times; CI machines are slower
+// than the 5 s default allows.
+setDefaultTimeout(60_000);
 
 describe("chunkAddTargets", () => {
   test("empty list produces no chunks", () => {
@@ -367,8 +377,10 @@ describe("progress file outliving .git (#884 review blocker, real repos)", () =>
     const addTargets = computeAddTargets([], dataFiles, await listTrackedPaths(dir));
     expect(addTargets.map((f) => f.path)).toEqual(dataFiles.map((f) => f.path));
 
-    // Re-add + re-copy re-establishes the location log; the post-copy
-    // verification predicate finds nothing missing.
+    // Re-add + re-copy re-establishes the location log. The step under test is the
+    // production one (copy what the log lacks, then require every annexed file to be
+    // recorded at the remote), not a predicate retyped here: a copy of the check
+    // would keep passing after the check itself changed.
     expect(
       (
         await gitAnnexAdd(
@@ -378,12 +390,16 @@ describe("progress file outliving .git (#884 review blocker, real repos)", () =>
       ).success,
     ).toBe(true);
     await initDirectoryRemote(dir, "test-dir");
-    expect((await copyToAnnexRemote(dir, "test-dir", 1)).success).toBe(true);
-    const annexed = await listAnnexedPaths(dir);
-    const atRemote = await listAnnexedPaths(dir, "test-dir");
-    expect(annexed).toEqual(new Set(dataFiles.map((f) => f.path)));
-    const missing = addTargets.filter((f) => annexed.has(f.path) && !atRemote.has(f.path));
-    expect(missing).toEqual([]);
+    const outcome = await copyAnnexedToRemote({
+      absolutePath: dir,
+      remote: "test-dir",
+      addTargets,
+      dataFiles,
+      jobs: 1,
+    });
+    expect(outcome).toMatchObject({ status: "ok", total: 2, attempted: 2 });
+    expect(await listAnnexedPaths(dir)).toEqual(new Set(dataFiles.map((f) => f.path)));
+    expect(await listAnnexedPaths(dir, "test-dir")).toEqual(new Set(dataFiles.map((f) => f.path)));
   });
 
   test("annexed file never copied is flagged by the location-log verification", async () => {
@@ -412,10 +428,19 @@ describe("progress file outliving .git (#884 review blocker, real repos)", () =>
     );
     expect(copyOne.exitCode).toBe(0);
 
-    const annexed = await listAnnexedPaths(dir);
-    const atRemote = await listAnnexedPaths(dir, "test-dir");
-    const missing = dataFiles.filter((f) => annexed.has(f.path) && !atRemote.has(f.path));
-    expect(missing.map((f) => f.path)).toEqual(["sub-02/eeg/c.edf"]);
+    // The production check names exactly the annexed file the remote does not hold...
+    expect([...(await listAnnexedPathsNotAt(dir, "test-dir"))]).toEqual(["sub-02/eeg/c.edf"]);
+
+    // ...and the step that uses it copies that file rather than trusting the earlier run.
+    const outcome = await copyAnnexedToRemote({
+      absolutePath: dir,
+      remote: "test-dir",
+      addTargets: dataFiles,
+      dataFiles,
+      jobs: 1,
+    });
+    expect(outcome).toMatchObject({ status: "ok", total: 2, attempted: 1 });
+    expect(await listAnnexedPathsNotAt(dir, "test-dir")).toEqual(new Set());
   });
 
   test("listTrackedPaths surfaces git failure instead of returning an empty set", async () => {

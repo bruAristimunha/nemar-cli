@@ -444,6 +444,15 @@ describe("mtime change detection (#884 review: same-size rewrites)", () => {
     expect(getFilesNeedingUpload(progress, [rewritten, timedFiles[1]])).toEqual([]);
   });
 
+  test("markFileUploaded with a new size and no mtime drops the old mtime instead of keeping it", () => {
+    // Guards the refresh. The old mtime next to the new size describes a file that never
+    // existed, and it makes the next run report a change for the wrong reason.
+    const progress = initUploadProgress(testDir, "nm000123", timedFiles);
+    markFileUploaded(progress, timedFiles[0].path, { size: timedFiles[0].size + 1 });
+    expect(progress.files[timedFiles[0].path].size).toBe(timedFiles[0].size + 1);
+    expect(progress.files[timedFiles[0].path].mtimeMs).toBeUndefined();
+  });
+
   test("mtimeMs round-trips through disk and validates", () => {
     const progress = initUploadProgress(testDir, "nm000123", timedFiles);
     writeUploadProgress(testDir, progress);

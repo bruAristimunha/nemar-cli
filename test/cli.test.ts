@@ -578,8 +578,37 @@ describe("CLI Dataset Upload", () => {
     expect(stdout).toContain("--skip-validation");
     expect(stdout).toContain("--dry-run");
     expect(stdout).toContain("--jobs");
+    expect(stdout).toContain("--annex-jobs");
+    expect(stdout).toContain("local git-annex add workers");
+    expect(stdout).toContain("S3 copy streams");
     expect(stdout).toContain("--yes");
   });
+
+  test("nemar dataset upload rejects an invalid local annex worker count before authentication", async () => {
+    const { stdout, exitCode } = await runCli([
+      "dataset",
+      "upload",
+      "/tmp/test",
+      "--annex-jobs",
+      "0",
+    ]);
+
+    expect(exitCode).not.toBe(0);
+    expect(stdout).toContain("--annex-jobs must be a positive integer");
+  });
+
+  for (const invalidJobs of ["4workers", "0", "9007199254740992"]) {
+    test(`nemar dataset upload rejects invalid S3 copy worker count ${invalidJobs} before authentication`, async () => {
+      const ctx = createTestContext();
+      const { stdout, exitCode } = await runCli(
+        ["dataset", "upload", "/tmp/test", "--jobs", invalidJobs],
+        ctx,
+      );
+
+      expect(exitCode).not.toBe(0);
+      expect(stdout).toContain("--jobs must be a positive integer");
+    });
+  }
 
   test("nemar dataset upload requires authentication", async () => {
     const ctx = createTestContext();

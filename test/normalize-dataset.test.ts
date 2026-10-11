@@ -72,6 +72,10 @@ function chmodTreeWritable(dir: string): void {
   }
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
 async function run(args: string[], cwd: string): Promise<string> {
   const { stdout, stderr, exitCode } = await runCommand(args, { cwd });
   if (exitCode !== 0) {
@@ -393,6 +397,46 @@ describe("normalizeDatasetRepo", () => {
     expect(configured.trim()).toContain("include=*_motion.tsv");
   }, 180_000);
 
+  test("preserves a newer annex tracking ref observed while the push is running", async () => {
+    await addDirectoryRemote(clone, "stand-in");
+    const hook = join(origin, "hooks", "post-receive");
+    writeFileSync(
+      hook,
+      `#!/bin/sh
+set -eu
+remote=${shellQuote(origin)}
+clone=${shellQuote(clone)}
+while IFS=' ' read -r old new ref; do
+  [ "$ref" = "refs/heads/git-annex" ] || continue
+  tree=$(git --git-dir="$remote" rev-parse "$new^{tree}")
+  child=$(printf '%s\\n' 'concurrent annex advance' | GIT_AUTHOR_NAME='NEMAR Test' GIT_AUTHOR_EMAIL='test@nemar.test' GIT_COMMITTER_NAME='NEMAR Test' GIT_COMMITTER_EMAIL='test@nemar.test' git --git-dir="$remote" commit-tree "$tree" -p "$new")
+  git --git-dir="$remote" update-ref refs/heads/git-annex "$child" "$new"
+  env -u GIT_DIR -u GIT_WORK_TREE git -C "$clone" fetch --quiet --no-tags origin refs/heads/git-annex:refs/remotes/origin/git-annex
+done
+`,
+    );
+    chmodSync(hook, 0o755);
+
+    const result = await normalizeDatasetRepo(
+      {
+        datasetId: "on999999",
+        datasetPath: clone,
+        files: await findUnannexedData(clone),
+        bytes: 300_000,
+        attributeFiles: [".gitattributes"],
+        pendingKeys: [],
+      },
+      { push: true, remoteName: "stand-in" },
+    );
+    expect(result.pushed).toBe(true);
+
+    const remoteAnnex = await run(["git", "rev-parse", "refs/heads/git-annex"], origin);
+    const trackingAnnex = await run(["git", "rev-parse", "refs/remotes/origin/git-annex"], clone);
+    const localAnnex = await run(["git", "rev-parse", "refs/heads/git-annex"], clone);
+    expect(trackingAnnex.trim()).toBe(remoteAnnex.trim());
+    expect(trackingAnnex.trim()).not.toBe(localAnnex.trim());
+  }, 240_000);
+
   test("a second run over an already-normalized dataset pushes nothing", async () => {
     await addDirectoryRemote(clone, "stand-in");
     const first = await normalizeDatasetRepo(
@@ -408,11 +452,21 @@ describe("normalizeDatasetRepo", () => {
     );
     expect(first.pushed).toBe(true);
     const afterFirst = await run(["git", "rev-parse", "main", "git-annex"], clone);
+    const remoteAnnex = await run(
+      ["git", "ls-remote", "--heads", "origin", "refs/heads/git-annex"],
+      clone,
+    );
+    const trackingAnnex = await run(
+      ["git", "rev-parse", "--verify", "refs/remotes/origin/git-annex"],
+      clone,
+    );
+    expect(trackingAnnex.trim()).toBe(remoteAnnex.trim().split(/\s+/)[0]);
 
     // Idempotence is what makes a fleet run resumable: re-running over a dataset
     // that is already done must not move either branch. `git annex config --set`
     // to a value already configured writes no commit (measured on git-annex
-    // 10.20260901), so there is nothing for the second run to push.
+    // 10.20260901). The checked annex push also has to leave the tracking ref
+    // current, even on Git versions that do not map a raw URL back to its remote.
     const again = await normalizeDatasetRepo(
       {
         datasetId: "on999999",

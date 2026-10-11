@@ -14,9 +14,9 @@
  *     capability list (ADR 0066): the repository comes from the dataset row, the
  *     visibility gate runs before the token is used, and a blob is verified against
  *     the manifest's SHA;
- *   - an ANNEXED file answers 302 to an object URL, which is followed once, with a
- *     size cap, and the URL is never logged or reported (a presigned URL carries a
- *     credential identifier and a signature).
+ *   - a plain ANNEXED file answers 302 to its object URL, which is followed once;
+ *     a chunked file streams through the data plane under one eight-request budget
+ *     shared by both tables. The URL is never logged or reported.
  *
  * Nothing here decides eligibility. The caller has decided it from the D1 row; this
  * module adds the second, independent guard (the gathered metadata must say
@@ -30,12 +30,16 @@
 import type { NeurobagelInput } from "../../../shared/neurobagel/index.js";
 import { dataRoutes } from "../routes/data.js";
 import type { Bindings } from "../types/bindings.js";
+import { CHUNK_GETS_USED_HEADER, CHUNK_GET_BUDGET_HEADER } from "./chunked-delivery.js";
 import { resolveDataBaseOrigin } from "./environment.js";
 
 /** metadata.json carries the bids_index, so it grows with the subject count. */
 export const MAX_METADATA_BYTES = 16 * 1024 * 1024;
 /** participants.tsv and participants.json are small; anything larger is not a phenotype table. */
 export const MAX_TABLE_BYTES = 8 * 1024 * 1024;
+/** Hard cap shared by participants.tsv and participants.json for one gather. */
+export const MAX_GATHER_CHUNK_GETS = 8;
+export const GATHER_TABLE_COUNT = 2;
 
 const USER_AGENT = "nemar-neurobagel-writer/1";
 
@@ -74,7 +78,7 @@ export interface GatherDeps {
   /** Hands work to `waitUntil` (the data plane's cache writes). */
   waitUntil?: (work: Promise<unknown>) => void;
   /**
-   * Follows the one redirect an annexed file answers. It is the network boundary:
+   * Follows the redirect for a plain annexed file. It is the network boundary:
    * the default is the global `fetch`, and a test substitutes the object host.
    */
   followRedirect?: typeof fetch;
@@ -134,16 +138,27 @@ function decode(bytes: Uint8Array): string {
   return new TextDecoder("utf-8", { fatal: false, ignoreBOM: true }).decode(bytes);
 }
 
-function dataPlaneRequest(env: Bindings, path: string): Request {
+function dataPlaneRequest(env: Bindings, path: string, chunkGetBudget?: number): Request {
   return new Request(`${resolveDataBaseOrigin(env)}${path}`, {
     method: "GET",
-    headers: { Accept: "application/json", "User-Agent": USER_AGENT },
+    headers: {
+      Accept: "application/json",
+      "User-Agent": USER_AGENT,
+      ...(chunkGetBudget === undefined
+        ? {}
+        : { [CHUNK_GET_BUDGET_HEADER]: String(chunkGetBudget) }),
+    },
   });
 }
 
-async function callDataPlane(env: Bindings, path: string, deps: GatherDeps): Promise<Response> {
+async function callDataPlane(
+  env: Bindings,
+  path: string,
+  deps: GatherDeps,
+  chunkGetBudget?: number,
+): Promise<Response> {
   try {
-    const request = dataPlaneRequest(env, path);
+    const request = dataPlaneRequest(env, path, chunkGetBudget);
     if (deps.dataPlane) return await deps.dataPlane(request);
     return await dataRoutes.fetch(request, env, executionContext(deps));
   } catch (err) {
@@ -174,13 +189,13 @@ async function isAbsentFile(response: Response): Promise<boolean> {
  * Throws a {@link GatherRefusal} for anything that is not one of those two answers.
  */
 async function fetchTable(
-  env: Bindings,
   datasetId: string,
   version: string,
   name: "participants.tsv" | "participants.json",
   deps: GatherDeps,
+  requestDataPlane: (path: string) => Promise<Response>,
 ): Promise<string | null> {
-  const response = await callDataPlane(env, `/${datasetId}/${version}/${name}`, deps);
+  const response = await requestDataPlane(`/${datasetId}/${version}/${name}`);
   if (response.status === 404) {
     if (await isAbsentFile(response)) return null;
     throw new GatherRefusal(
@@ -303,8 +318,47 @@ export async function gatherNeurobagelInput(
     throw new GatherRefusal("metadata_degraded", "metadata.json carries no bids_index");
   }
 
-  const participantsTsv = await fetchTable(env, datasetId, latest, "participants.tsv", deps);
-  const participantsJson = await fetchTable(env, datasetId, latest, "participants.json", deps);
+  let remainingChunkGets = MAX_GATHER_CHUNK_GETS;
+  const requestTable = async (path: string): Promise<Response> => {
+    const response = await callDataPlane(env, path, deps, remainingChunkGets);
+    const rawUsed = response.headers.get(CHUNK_GETS_USED_HEADER);
+    if (rawUsed === null) {
+      if (response.ok || response.status === 302) {
+        await response.body?.cancel().catch(() => {});
+        throw new GatherRefusal("fetch_failed", "data plane omitted the chunk request count");
+      }
+      return response;
+    }
+    if (!/^(0|[1-9]\d*)$/.test(rawUsed)) {
+      await response.body?.cancel().catch(() => {});
+      throw new GatherRefusal("fetch_failed", "data plane returned an invalid chunk request count");
+    }
+    const used = Number(rawUsed);
+    if (!Number.isSafeInteger(used) || used > remainingChunkGets) {
+      await response.body?.cancel().catch(() => {});
+      throw new GatherRefusal(
+        "fetch_failed",
+        "data plane exceeded the gather chunk request budget",
+      );
+    }
+    remainingChunkGets -= used;
+    return response;
+  };
+
+  const participantsTsv = await fetchTable(
+    datasetId,
+    latest,
+    "participants.tsv",
+    deps,
+    requestTable,
+  );
+  const participantsJson = await fetchTable(
+    datasetId,
+    latest,
+    "participants.json",
+    deps,
+    requestTable,
+  );
 
   return {
     datasetId,

@@ -118,6 +118,31 @@ export function resolveCurrentVersion(row: {
 }
 
 /**
+ * SQL predicate for "this dataset has a version": a version DOI, or a
+ * `dataset_versions` row. It is two columns because a released ANONYMOUS
+ * deposit leaves `latest_version_doi` NULL on purpose (#1447) while still
+ * carrying the version row. "Has a version" is not "is published": an anonymous
+ * release has one and is unpublished.
+ *
+ * {@link resolveCurrentVersion} reads the same two sources but is stricter: a
+ * non-null DOI that `versionFromDoi` cannot parse, with no `dataset_versions`
+ * row, resolves to null while this predicate is still true. Such a row passes
+ * the WHERE clause and then hits the loop's `no_version` skip, so it still
+ * holds one of the LIMIT slots; the predicate keeps out only the rows that
+ * have neither source.
+ *
+ * Exported so every sweep that must skip a dataset with no version shares one
+ * definition instead of a hand-copied one: ARCHIVE_RETRY_SWEEP_QUERY and the
+ * availability-report sweep's candidacy both build from it. `table` is the name
+ * or alias the enclosing query gives `datasets`; it is interpolated into SQL,
+ * so it is typed to the two literals in use rather than accepted as a string.
+ */
+export function datasetHasVersionSql(table: "d" | "datasets"): string {
+  return `(${table}.latest_version_doi IS NOT NULL
+         OR EXISTS (SELECT 1 FROM dataset_versions dv WHERE dv.dataset_id = ${table}.dataset_id))`;
+}
+
+/**
  * Candidate query for the daily sweep. Exported so the test asserts the exact
  * WHERE logic against a real SQLite db. Binds `MAX_ARCHIVE_RETRIES`.
  *
@@ -126,9 +151,10 @@ export function resolveCurrentVersion(row: {
  * are under the cap, and whose last attempt is stale (>6h) or unknown -- the 6h
  * guard avoids re-dispatching an archive the webhook just retried.
  *
- * The version predicate stays in the WHERE clause rather than moving to the
- * loop's `!version` skip: `LIMIT 20` is the run's whole budget, and a row that
- * can never be dispatched must not consume one of the twenty slots.
+ * The version predicate ({@link datasetHasVersionSql}) stays in the WHERE
+ * clause rather than moving to the loop's `!version` skip: `LIMIT 20` is the
+ * run's whole budget, and a row with no version source at all must not consume
+ * one of the twenty slots.
  *
  * `file_size`/`total_files` (#1514) ride along so the loop can apply
  * `shouldSkipArchive` before dispatching: a dataset that failed once and has
@@ -141,8 +167,7 @@ export const ARCHIVE_RETRY_SWEEP_QUERY = `SELECT d.dataset_id, d.latest_version_
           ORDER BY created_at DESC LIMIT 1) AS recorded_version
    FROM datasets d
   WHERE d.archive_status = 'failed'
-    AND (d.latest_version_doi IS NOT NULL
-         OR EXISTS (SELECT 1 FROM dataset_versions dv WHERE dv.dataset_id = d.dataset_id))
+    AND ${datasetHasVersionSql("d")}
     AND d.archive_retry_count < ?
     AND (json_extract(d.sweep_stamps, '$.archive_checked_at') IS NULL
          OR json_extract(d.sweep_stamps, '$.archive_checked_at') < datetime('now', '-6 hours'))

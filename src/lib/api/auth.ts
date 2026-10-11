@@ -81,42 +81,6 @@ export async function checkOrcidName(orcid: string): Promise<OrcidNameResponse> 
   return request<OrcidNameResponse>(`/auth/orcid-name?orcid=${encodeURIComponent(orcid)}`);
 }
 
-export interface SignupRequest {
-  username: string;
-  email: string;
-  password: string;
-  github_username: string;
-  description: string;
-  /** Required (#835): canonical source for the user's name. */
-  orcid: string;
-  /** Only when the ORCID record hides its name (#1255); ORCID still wins. */
-  given_name?: string;
-  family_name?: string;
-  affiliation?: string;
-  /** Required for export-control screening (#835). */
-  city: string;
-  country: string;
-}
-
-export interface SignupResponse {
-  message: string;
-  email_sent: boolean;
-  /** Whether the created account has a citable researcher name (#1255). The
-   *  pre-flight lookup can disagree with this: only the insert knows. */
-  researcher_name?: "recorded" | "missing";
-  next_steps: string[];
-}
-
-/**
- * Register a new user account
- */
-export async function signup(data: SignupRequest): Promise<SignupResponse> {
-  return request<SignupResponse>("/auth/signup", {
-    method: "POST",
-    body: JSON.stringify(data),
-  });
-}
-
 export interface LoginRequest {
   api_key: string;
 }
@@ -159,18 +123,6 @@ export async function resendVerification(email: string): Promise<{ message: stri
   return request<{ message: string }>("/auth/resend-verification", {
     method: "POST",
     body: JSON.stringify({ email }),
-  });
-}
-
-export interface RetrieveKeyResponse {
-  message: string;
-  api_key: string;
-}
-
-export async function retrieveKey(email: string, password: string): Promise<RetrieveKeyResponse> {
-  return request<RetrieveKeyResponse>("/auth/retrieve-key", {
-    method: "POST",
-    body: JSON.stringify({ email, password }),
   });
 }
 

@@ -335,10 +335,10 @@ describe("archive-ready 'ready' UPDATE persists completeness", () => {
     expect(stamp.at).toBeNull();
 
     // The dataset must now actually be selected by the sweep's own predicate.
-    db.prepare("UPDATE datasets SET github_repo = ? WHERE dataset_id = ?").run(
-      "nemarDatasets/on004624",
-      "on004624",
-    );
+    // An archived dataset has a version, which the sweep requires.
+    db.prepare(
+      "UPDATE datasets SET github_repo = ?, latest_version_doi = ? WHERE dataset_id = ?",
+    ).run("nemarDatasets/on004624", "10.82901/nemar.on004624.v1.0.0", "on004624");
     const candidate = db.prepare(availabilityReportSweepCandidateQuery(false)).all(50) as Array<{
       dataset_id: string;
     }>;
@@ -349,10 +349,10 @@ describe("archive-ready 'ready' UPDATE persists completeness", () => {
     // The whole point of clearing the stamp is that the daily sweep picks the
     // row up and eventually puts it back. Exercise both halves against the
     // sweep's own exported SQL so this breaks if either side changes.
-    db.prepare("UPDATE datasets SET github_repo = ? WHERE dataset_id = ?").run(
-      "nemarDatasets/on004624",
-      "on004624",
-    );
+    // An archived dataset has a version, which the sweep requires.
+    db.prepare(
+      "UPDATE datasets SET github_repo = ?, latest_version_doi = ? WHERE dataset_id = ?",
+    ).run("nemarDatasets/on004624", "10.82901/nemar.on004624.v1.0.0", "on004624");
     // Already reported at some point in the past -> not a candidate.
     db.prepare(
       "UPDATE datasets SET sweep_stamps = json_set(COALESCE(sweep_stamps, '{}'), '$.availability_report_at', ?) WHERE dataset_id = ?",

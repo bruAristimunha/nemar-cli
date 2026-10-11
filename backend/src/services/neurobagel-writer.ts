@@ -60,7 +60,13 @@ import {
 } from "./neurobagel-curation.js";
 import { eligibleAmong, loadEligibleRow } from "./neurobagel-eligibility.js";
 import { inputFingerprint, rowFingerprint, sha256Hex } from "./neurobagel-fingerprint.js";
-import { type GatherDeps, GatherRefusal, gatherNeurobagelInput } from "./neurobagel-gather.js";
+import {
+  GATHER_TABLE_COUNT,
+  type GatherDeps,
+  GatherRefusal,
+  MAX_GATHER_CHUNK_GETS,
+  gatherNeurobagelInput,
+} from "./neurobagel-gather.js";
 import { type OpCounter, countOps, createOpCounter } from "./neurobagel-ops.js";
 import {
   LEDGER_ACTIONS,
@@ -93,7 +99,7 @@ import {
   serializeIndex,
   sha256OfBytes,
 } from "./neurobagel-store.js";
-import { headManifestObject } from "./s3.js";
+import { BOUNDED_LIST_MAX_PAGES, headManifestObject } from "./s3.js";
 
 // ----------------------------------------------------------------------------
 // Configuration
@@ -126,17 +132,17 @@ export const REMOVAL_LIMIT = 50;
  * invocation has 1000 subrequests in all, and the daily reconcile shares its tick with
  * every other job (ADR 0054), so a run takes well under half.
  *
- * What a dataset costs, measured by difference over runs of 1, 3 and 7 datasets (ADR 0084,
- * "What a run costs"): a REWRITTEN dataset about 22 operations (9 D1 statements, 4 R2
- * calls, the manifest HEAD and the allowance for the data plane's requests) and an
- * UNCHANGED one 3 (two D1 reads and the HEAD). What a run costs besides depends on the SIZE
+ * Before chunk serving, a REWRITTEN dataset measured about 22 operations (9 D1 statements,
+ * 4 R2 calls, the manifest HEAD and the data plane allowance); the current conservative
+ * gather allowance raises the measured cost by 16. An UNCHANGED dataset remains 3 operations
+ * (two D1 reads and the HEAD). What a run costs besides depends on the SIZE
  * OF THE STORE, because every listing is one call per page (see {@link closingReserve}).
  * A test fails if a dataset ever costs more than {@link DATASET_OPS_WORST}, so the numbers
  * here cannot go stale unnoticed.
  */
 export const OP_BUDGET = 400;
-/** The most one dataset may cost: its measured 22, with a margin for a ledger row and a retried index patch. */
-export const DATASET_OPS_WORST = 30;
+/** The most one dataset may cost: 38 under the bounded gather allowance, plus an 8-op margin. */
+export const DATASET_OPS_WORST = 46;
 /**
  * What the closing steps cost besides listing the store: the index read, the eligibility
  * check and the conditional write of two attempts, and the run record.
@@ -162,8 +168,19 @@ export function listingPages(objects: number): number {
 export function closingReserve(objects: number, leaving: number): number {
   return CLOSING_FIXED_OPS + 2 * listingPages(objects) + Math.min(leaving, REMOVAL_LIMIT);
 }
-/** What a gather is charged for the HTTP requests the data plane makes inside it (S3 manifest, the git broker's token and blobs, an annexed file's redirect). Measured: 3 in the test environment, more in production. */
-export const GATHER_HTTP_OPS = 8;
+/** Existing measured allowance for manifest, git broker and ordinary file requests. */
+export const GATHER_HTTP_BASE_OPS = 8;
+/** Two annexed tables can each need one HEAD and two bounded LIST pages. */
+export const GATHER_ANNEX_PROBE_OPS = GATHER_TABLE_COUNT * (1 + BOUNDED_LIST_MAX_PAGES);
+/** Margin for route and upstream variation beyond the explicit request bounds. */
+export const GATHER_HTTP_MARGIN = 2;
+/**
+ * Conservative per-gather HTTP allowance: the previous 8, plus both table probes,
+ * the shared chunk GET cap and a small margin. This keeps the writer's 400-op
+ * budget below the Worker subrequest ceiling when a gather sees chunked tables.
+ */
+export const GATHER_HTTP_OPS =
+  GATHER_HTTP_BASE_OPS + GATHER_ANNEX_PROBE_OPS + MAX_GATHER_CHUNK_GETS + GATHER_HTTP_MARGIN;
 
 /** The loader's per-artifact cap (deploy/neurobagel/README.md: NB_MAX_ARTIFACT_BYTES, 6 MiB). */
 export const MAX_ARTIFACT_BYTES = 6 * 1024 * 1024;

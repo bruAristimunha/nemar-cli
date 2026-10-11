@@ -7,7 +7,7 @@
  */
 
 import { HttpError } from "../retry";
-import { GITHUB_API, ORG_NAME } from "./shared";
+import { GITHUB_API, ORG_NAME, ghHeaders } from "./shared";
 import { githubFetchWithRetry } from "./transport";
 
 /** Identity used for all backend-initiated commits and tags on dataset repos. */
@@ -53,6 +53,10 @@ export function isContentsApiShaConflict(status: number, bodyText: string): bool
  *
  * Pass `branch` for a release branch or any other non-main ref; `""` is not a way
  * to ask for the repository default, because there is no reason to want one.
+ *
+ * **On a repository with no commits this CREATES `branch`, as an unrelated ROOT
+ * commit** (#1643). Nothing here refuses; only the availability report guards
+ * against it, by asking `branchExists` first.
  */
 export async function createOrUpdateFile(
   repo: string,
@@ -305,6 +309,8 @@ export async function getFileContent(
   filePath: string,
   pat: string,
   ref = "main",
+  /** Retry policy; the default is the background one. A caller in a batch passes {@link LOOKUP_ONCE}. */
+  options?: FetchPolicy,
 ): Promise<string | null> {
   // No retryOn404 here: 404 is a valid "file not present" signal returned as null.
   const response = await githubFetchWithRetry(
@@ -316,6 +322,7 @@ export async function getFileContent(
         "User-Agent": "NEMAR-API",
       },
     },
+    options,
   );
 
   if (response.status === 404) return null;
@@ -327,6 +334,10 @@ export async function getFileContent(
   }
 
   const data = await response.json<{ content: string; encoding: string }>();
+  // A zero-byte file comes back as base64 with `content: ""`. That is a file
+  // that exists and is empty, which is an answer; only a response with no
+  // content field at all is not one.
+  if (data.encoding === "base64" && data.content === "") return "";
   if (!data.content) {
     throw new Error(`No content field in GitHub response for ${filePath} in ${repo}`);
   }
@@ -341,6 +352,137 @@ export async function getFileContent(
   return data.content;
 }
 
+type FetchPolicy = NonNullable<Parameters<typeof githubFetchWithRetry>[2]>;
+
+/**
+ * How `branchExists` (and a sweep's file reads) talk to GitHub: the interactive
+ * kind and ONE attempt, so it never sleeps. The default (background) kind sleeps up to a minute before a
+ * call when the cached rate-limit bucket is nearly drained, and again between
+ * retries; asked once per row of a sweep, that stalls a 30-row pass for the
+ * better part of an hour (measured: about 60 s per row). Interactive turns a
+ * drained bucket into an immediate HttpError(503), and a single attempt turns a
+ * 5xx, 429 or secondary rate limit into the response itself, so every one of
+ * them becomes a per-row error that leaves the row unstamped for the next pass.
+ */
+export const LOOKUP_ONCE: FetchPolicy = { kind: "interactive", maxAttempts: 1 };
+
+/**
+ * GET the ref of `branch`: the one request `branchExists` and
+ * `getMainBranchSha` both make, so they cannot disagree about the URL.
+ *
+ * The branch is encoded per path segment so that `#`, `?` and `%` in a name
+ * cannot change the URL, while `/` stays a separator. GitHub accepts
+ * `release/1.0` and `release%2F1.0` alike in a ref path, so this is about not
+ * letting a branch name alter the request, not about making slash branches
+ * resolvable. (`getMainBranchSha` used to send the branch raw.)
+ *
+ * `options` is the retry policy, the one way the two requests differ; they also
+ * differ in what a 404 or an empty-repository 409 means (an answer for one, an
+ * error for the other), which is why neither is written in terms of the other.
+ */
+async function fetchBranchRef(
+  repo: string,
+  branch: string,
+  pat: string,
+  options: FetchPolicy,
+): Promise<Response> {
+  const ref = branch.split("/").map(encodeURIComponent).join("/");
+  return githubFetchWithRetry(
+    `${GITHUB_API()}/repos/${ORG_NAME}/${repo}/git/ref/heads/${ref}`,
+    { headers: ghHeaders(pat) },
+    options,
+  );
+}
+
+/** The `HttpError` for a GitHub response that is not an answer (`what`
+ *  completes "Failed to ..."). Pass `bodyText` when the body was already read. */
+async function githubHttpError(
+  response: Response,
+  what: string,
+  bodyText?: string,
+): Promise<HttpError> {
+  const error = bodyText ?? (await response.text().catch(() => "<failed to read body>"));
+  return new HttpError(
+    `Failed to ${what}: HTTP ${response.status}: ${error.slice(0, 300)}`,
+    response.status,
+    error.slice(0, 300),
+  );
+}
+
+/** The commit SHA in a 2xx ref response. A 2xx whose body is not a ref (a
+ *  proxy's HTML page, a captive portal) is an error, never an answer. */
+async function readRefSha(response: Response, branch: string): Promise<string> {
+  const refData = (await response.json().catch(() => null)) as {
+    object?: { sha?: string };
+  } | null;
+  const sha = refData?.object?.sha;
+  if (!sha) {
+    throw new Error(`Unexpected response format for ${branch} branch ref`);
+  }
+  return sha;
+}
+
+/**
+ * GitHub answers 404 for a ref that does not exist AND for a repository the
+ * token cannot see (lost installation access, the wrong installation, a PAT
+ * scope), so a 404 on the ref says nothing about the depositor's state until
+ * the repository itself is known to be visible. Resolves when it is; throws
+ * `HttpError(404)` when it is not.
+ */
+async function assertRepositoryVisible(repo: string, pat: string): Promise<void> {
+  const response = await githubFetchWithRetry(
+    `${GITHUB_API()}/repos/${ORG_NAME}/${repo}`,
+    { headers: ghHeaders(pat) },
+    LOOKUP_ONCE,
+  );
+  if (response.status === 404) {
+    await response.body?.cancel();
+    throw new HttpError(
+      `${ORG_NAME}/${repo}: repository not visible to NEMAR (GitHub answers 404 for the repository itself)`,
+      404,
+    );
+  }
+  if (!response.ok) {
+    throw await githubHttpError(response, `look up repository ${ORG_NAME}/${repo}`);
+  }
+  await response.body?.cancel();
+}
+
+/**
+ * Whether `branch` exists in the dataset repository.
+ *
+ * Two responses are answers, and everything else throws:
+ *   - 404 means "no such ref" ONLY if the repository is visible, so it is
+ *     followed by one probe of the repository itself; a repository that is not
+ *     visible throws `HttpError(404)` instead of reading as "no branch".
+ *   - 409 whose message says the repository is empty ("Git Repository is
+ *     empty.", observed from api.github.com for an empty repository on
+ *     2026-10-07; not in GitHub's reference) means "no". Any other 409 throws.
+ * A 2xx must carry a ref (`object.sha`); a 2xx that does not throws.
+ *
+ * The policy is {@link LOOKUP_ONCE}: interactive, a single attempt, never a
+ * sleep. A 404 is not retried as a propagation delay (that is
+ * `getMainBranchSha`'s question, not this one), and neither is a 5xx, a 429 or
+ * a secondary rate limit; each throws, and the caller decides what that costs.
+ */
+export async function branchExists(repo: string, branch: string, pat: string): Promise<boolean> {
+  const what = `look up ${branch} branch ref`;
+  const response = await fetchBranchRef(repo, branch, pat, LOOKUP_ONCE);
+  if (response.status === 404) {
+    await response.body?.cancel();
+    await assertRepositoryVisible(repo, pat);
+    return false;
+  }
+  if (response.status === 409) {
+    const body = await response.text().catch(() => "");
+    if (/empty/i.test(body)) return false;
+    throw await githubHttpError(response, what, body);
+  }
+  if (!response.ok) throw await githubHttpError(response, what);
+  await readRefSha(response, branch);
+  return true;
+}
+
 /**
  * Get the latest commit SHA on a branch.
  *
@@ -353,32 +495,9 @@ export async function getFileContent(
 export async function getMainBranchSha(repo: string, branch: string, pat: string): Promise<string> {
   // retryOn404: caller knows the branch exists (e.g., we just committed to it),
   // so 404 indicates GitHub hasn't propagated the ref yet.
-  const response = await githubFetchWithRetry(
-    `${GITHUB_API()}/repos/${ORG_NAME}/${repo}/git/ref/heads/${branch}`,
-    {
-      headers: {
-        Authorization: `Bearer ${pat}`,
-        Accept: "application/vnd.github.v3+json",
-        "User-Agent": "NEMAR-API",
-      },
-    },
-    { retryOn404: true },
-  );
-
-  if (!response.ok) {
-    const error = await response.text().catch(() => "<failed to read body>");
-    throw new HttpError(
-      `Failed to get ${branch} branch ref: HTTP ${response.status}: ${error.slice(0, 300)}`,
-      response.status,
-      error.slice(0, 300),
-    );
-  }
-
-  const refData = (await response.json()) as { object: { sha: string } };
-  if (!refData.object?.sha) {
-    throw new Error(`Unexpected response format for ${branch} branch ref`);
-  }
-  return refData.object.sha;
+  const response = await fetchBranchRef(repo, branch, pat, { retryOn404: true });
+  if (!response.ok) throw await githubHttpError(response, `get ${branch} branch ref`);
+  return readRefSha(response, branch);
 }
 
 /** Input to `commitFilesAsTree`. `content` must be UTF-8 text; binary is not supported. */

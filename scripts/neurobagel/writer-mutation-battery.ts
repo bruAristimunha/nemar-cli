@@ -979,7 +979,7 @@ export const MUTANTS: Mutant[] = [
     id: "B13-gather-http-allowance-zero",
     layer: "budget",
     file: WRITER,
-    find: "export const GATHER_HTTP_OPS = 8;",
+    find: "export const GATHER_HTTP_OPS =\n  GATHER_HTTP_BASE_OPS + GATHER_ANNEX_PROBE_OPS + MAX_GATHER_CHUNK_GETS + GATHER_HTTP_MARGIN;",
     replace: "export const GATHER_HTTP_OPS = 0;",
     note: "the data plane's HTTP requests are not charged",
     tests: [`${T}/neurobagel-writer.test.ts`],

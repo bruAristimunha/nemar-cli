@@ -62,6 +62,8 @@ per-directory JSON listing. It counts first and keeps nothing, so the refusal co
 any other lookup costs.
 (Amended 2026-09-28: see ADR 0074 for the per-branch bound, 38,000 unsigned / 30,000
 presigned.)
+(Amended 2026-10-09: ADR 0095 supersedes the per-branch bound; stable data-plane URLs make
+38,000 the common limit for every dataset.)
 
 ## Consequences
 
@@ -132,21 +134,23 @@ window can skip both the round trip and the scan. Bounded by an LRU with a 4 MiB
 directory entry, a digest) this mainly exists for, and under 4% of the 128 MB isolate budget
 nm000281's 43 MB manifest already pushes hard on, so a memo entry can never meaningfully
 compete with the memory bound #1502 exists to hold. A single answer larger than half the cap
-(`manifest.json`'s own `EntriesQuery`, near its 30,000-entry/~9 MB ceiling) is answered but
-never memoized, so one large listing cannot evict every small, hot entry.
+(`manifest.json`'s own `EntriesQuery`, near its current 38,000-entry ceiling under ADR 0095) is
+answered but never memoized, so one large listing cannot evict every small, hot entry.
 (Amended 2026-09-28: see ADR 0074 for the per-branch bound, 38,000 unsigned / 30,000
 presigned -- either is still answered but not memoized.)
+(Amended 2026-10-09: ADR 0095 supersedes the per-branch bound; the common 38,000-entry ceiling
+applies to every dataset, and the memoization rule is unchanged.)
 
 `Server-Timing`'s `manifest` stage now carries `desc="memo"`, `"fresh"` (window hit, still
 scanned), `"revalidated"` (a 304) or `"rewrite"` (a fresh 200), so the window's effect is
 visible from outside without a deploy that adds logging first -- the same reason the header
 exists at all (#1516).
 
-**`manifest.json`'s own response cache (ADR 0074) now rides this same window, instead of a
+**`manifest.json`'s own response cache (now governed by ADR 0095) rides this same window, instead of a
 second, independent conditional GET.** Its freshness check used to call `fetchManifestObject`
 directly (`manifestJsonCacheStillFresh`); every hit paid one conditional GET regardless of the
 window above. `manifestJsonHandler` now compares its cached document's ETag against the ETag
-the `EntryCountQuery` it already runs (to enforce the per-branch entry bound) came back with --
+the `EntryCountQuery` it already runs (to enforce the common entry bound) came back with --
 that query goes through `readManifest` like any other, so a hit confirmed within the window
 costs no S3 call at all, and one confirmed past the window costs exactly the single conditional
 GET the count query already pays to restamp its own copy. `manifestJsonCacheStillFresh` is gone.

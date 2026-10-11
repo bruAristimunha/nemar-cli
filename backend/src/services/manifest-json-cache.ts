@@ -11,13 +11,11 @@
  * signature computed at request time from the Worker's own credentials and
  * clock; two responses for the same manifest were never byte-identical, so
  * caching the built document would have meant serving one requester's
- * signature to everybody else. Once `url` is the plain public S3 URL for a
- * dataset the bucket policy does not exclude (`public-read-cache.ts`
- * decides which), the whole document is a pure function of the manifest's
- * own bytes: the same array for every requester until the manifest changes.
- * That is the property `git-file-cache.ts` (#1516) and the raw-manifest
- * cache (ADR 0072) already lean on for their own bytes; this is the same
- * argument one layer up, at the built response instead of the source.
+ * signature to everybody else. ADR 0095 makes every `url` the stable
+ * data-plane route, so the whole document is a pure function of the
+ * manifest's own bytes: the same array for every requester until the
+ * manifest changes. The route resolves plain or chunked storage only when
+ * the client fetches the file.
  *
  * WHY VALIDATED BY THE MANIFEST'S OWN ETAG, NEVER A CONTENT HASH OF THE
  * RESPONSE (ADR 0066's rule for every cache on this data plane). A stored
@@ -29,13 +27,10 @@
  * content-addressed key would need the new bytes in hand before it could
  * even be checked, defeating the point of skipping the scan.
  *
- * WHY AN EXCLUDED DATASET NEVER REACHES THIS CACHE. Its entries carry
- * presigned URLs, each good for one hour from the moment it was signed.
- * Caching that document would hand every later requester a signature timed
- * from whenever it was stored, which is precisely the staleness #1522
- * exists to remove. The caller (`routes/data.ts`) decides this before it
- * ever builds a cache key or calls into this module; nothing here inspects
- * the entries to guess which kind of document it was handed.
+ * VISIBILITY STILL GATES THE CACHE. The caller (`routes/data.ts`) checks the
+ * published dataset before it builds a cache key or calls into this module.
+ * The stable URLs are independent of bucket policy and storage layout, so
+ * every published dataset can use the same deterministic response cache.
  *
  * WHY THE STORED ENTRY'S OWN TTL IS SEVEN DAYS WHILE THE CLIENT IS TOLD
  * SOMETHING SHORTER. Identical reasoning to `git-file-cache.ts`'s
@@ -98,7 +93,9 @@ export interface ManifestJsonCacheHit {
  */
 export function manifestJsonCacheKey(origin: string, datasetId: string, version: string): string {
   const tag = toVersionTag(version);
-  return `${origin}/__nemar-internal/manifest-json-cache/v1/${encodeURIComponent(datasetId)}/${encodeURIComponent(tag)}.json`;
+  // v2 isolates the stable data-plane URL contract from v1 documents, which
+  // could contain direct or presigned S3 URLs and remain stored for seven days.
+  return `${origin}/__nemar-internal/manifest-json-cache/v2/${encodeURIComponent(datasetId)}/${encodeURIComponent(tag)}.json`;
 }
 
 /**

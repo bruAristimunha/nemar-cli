@@ -235,6 +235,15 @@ export interface Bindings {
   PRESCREEN_ENABLED?: string; // "true" enables the dispatch on publish request
   PRESCREEN_CALLBACK_SECRET?: string; // Workers secret; HMAC key for prescreen callback
 
+  // Dataset pull-request review (ADR 0092). When PR_REVIEW_ENABLED is "1", a pull request opened
+  // or updated against `main` of a dataset repository is reviewed by a model and the result is
+  // published as a check-run and a pull-request comment. Default (unset) keeps the webhook
+  // ignoring pull_request events, so a deploy never starts spending money or posting on
+  // pull requests by itself. The callback token reuses PRESCREEN_CALLBACK_SECRET under its own
+  // domain tag. Set on the PRODUCTION Worker only unless a staging test is deliberate: the dev
+  // Worker answers only for repositories it owns (see the ownership fence in the webhook).
+  PR_REVIEW_ENABLED?: string; // "1" enables the review
+
   // Import recovery (issue #754). onboard-openneuro.yml POSTs import state to
   // /webhooks/import-state (bearer NEMAR_WEBHOOK_TOKEN). On a terminal failure
   // an unambiguous orphan (private, no DOI, no versions, never completed) is

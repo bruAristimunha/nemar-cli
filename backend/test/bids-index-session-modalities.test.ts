@@ -66,7 +66,6 @@ import type { ManifestFile } from "../src/services/manifest";
 import { DigestQuery } from "../src/services/manifest-queries";
 import { scanManifestStream } from "../src/services/manifest-scan";
 import { resetManifestAnswerMemo } from "../src/services/manifest-source";
-import { __resetPublicReadCacheForTests } from "../src/services/public-read-cache";
 import {
   BIDS_INDEX_FIXTURES,
   BIDS_INDEX_PROVENANCE_FILE,
@@ -475,7 +474,6 @@ describe("GET /<id>/metadata.json, through the real route", () => {
     for (const fixture of BIDS_INDEX_FIXTURES) {
       // Per-isolate caches outlive a test file under one `bun test` process.
       resetManifestAnswerMemo();
-      __resetPublicReadCacheForTests();
       harness.s3.log.length = 0;
       bodies.set(fixture.id, await harness.metadataText(fixture.id));
       reads.set(
@@ -489,7 +487,6 @@ describe("GET /<id>/metadata.json, through the real route", () => {
   afterAll(() => harness.stop());
   beforeEach(() => {
     resetManifestAnswerMemo();
-    __resetPublicReadCacheForTests();
   });
 
   const bodyOf = (id: string) => bodies.get(id) as string;
@@ -549,7 +546,6 @@ describe("GET /<id>/metadata.json, through the real route", () => {
     };
     harness.serveManifest(id, "v1.1.1", JSON.stringify(crafted));
     resetManifestAnswerMemo();
-    __resetPublicReadCacheForTests();
     const body = await harness.metadataText(id);
     const node = (
       JSON.parse(body) as {

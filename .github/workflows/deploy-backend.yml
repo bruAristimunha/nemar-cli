@@ -55,7 +55,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.4.3
 
       - name: Setup Deno
         uses: denoland/setup-deno@v2
@@ -116,7 +116,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.4.3
 
       # Root install first (#958). backend/src imports ../../../../shared/contract,
       # so shared/*.ts joins the typecheck graph, and TypeScript resolves a module
@@ -250,7 +250,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.4.3
 
       # Root install first (#958). backend/src imports ../../../../shared/contract,
       # so shared/*.ts joins the typecheck graph, and TypeScript resolves a module

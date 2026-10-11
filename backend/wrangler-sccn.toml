@@ -553,6 +553,18 @@ AUTO_IMPORT_MIN_INTERVAL_MIN = "25"
 # run-prescreen on nemarDatasets/.github. Requires the PRESCREEN_CALLBACK_SECRET
 # Worker secret (set on dev). Prod stays unset (dark) until promoted.
 PRESCREEN_ENABLED = "true"
+# Dataset pull-request review (ADR 0092). On here, as the trial: the production Worker forwards
+# pull_request events for the datasets dev owns (xx09* and the fixture nm099998) to this Worker
+# (DEV_WEBHOOK_MIRROR_URL), which gates them, dispatches run-pr-review on nemarDatasets/.github
+# and publishes the NEMAR PR Review check. A dataset is reviewed only while it is public, named
+# and first-published, so an anonymous deposit such as nm099998, and production's private
+# nm099999, never are. It does nothing until the NEMAR App is subscribed to Pull request events
+# and that workflow is deployed; it needs PRESCREEN_CALLBACK_SECRET (set on dev). Production
+# leaves the variable unset (dark): add PR_REVIEW_ENABLED = "1" to [vars] to turn it on there.
+# The variable lives in this file and not in the dashboard because `wrangler deploy` replaces
+# the Worker's variables with the ones in this file (no keep_vars), so a dashboard-only value
+# is dropped by the next deploy.
+PR_REVIEW_ENABLED = "1"
 
 # Daily maintenance cron for dev/staging (epic #923 Phase 7). Offset an hour
 # from prod's "0 3" so the two environments never contend. "0 4 * * *" does not

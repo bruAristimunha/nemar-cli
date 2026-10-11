@@ -77,10 +77,11 @@ beforeEach(async () => {
 
 describe("GET /admin/users/:username", () => {
   test("carries the request stamp and the why text", async () => {
-    // The route selects `u.*`, so these arrive for free -- which is exactly why
-    // it is worth an assertion: nemarOrg/website#306 builds the admin review
-    // panel on that assumption, and a future narrowing of the SELECT to a named
-    // column list would drop them silently.
+    // The route selects an explicit list of every non-secret column
+    // (`ADMIN_USER_NON_SECRET_SELECT`, ADR 0096), and these two are on it. That
+    // is exactly why this is worth an assertion: nemarOrg/website#306 builds the
+    // admin review panel on them, and a column dropped from that list would lose
+    // them silently.
     seedUser("asked", {
       status: "verified",
       serviceAccess: 0,

@@ -4,18 +4,17 @@
  *
  * Scoped to the branches that never reach verifyDatasetVersionS3 -- same
  * constraint as data-integrity-sweep-route.test.ts and
- * imports-verify-route.test.ts: the S3 listing it does (listObjectPages)
- * hardcodes a live `*.s3.*.amazonaws.com` host with no local-test override,
- * so it cannot be exercised without live AWS credentials, and this repo's
- * no-mocks policy rules out faking the network call. The report-shape
- * assertions (missing[]/completeness for a resolved manifest, and the
- * minimal honest report when there is none) live in
- * availability-report.test.ts against the pure buildAvailabilityReport
- * builder instead; the actual createOrUpdateFile commit needs live GitHub
- * and is not covered by an automated test here, consistent with how the two
- * sibling files above scope themselves around the same live-network
- * constraint. This file covers what's left: the route's own dispatch (404
- * for an unknown dataset, before any S3/GitHub call; admin gating).
+ * imports-verify-route.test.ts: this file's env sets no S3_ENDPOINT_URL, so
+ * the S3 listing it does (listObjectPages) would go to a live
+ * `*.s3.*.amazonaws.com` host, and this repo's no-mocks policy rules out
+ * faking the network call. The report-shape assertions (missing[]/completeness
+ * for a resolved manifest, and the minimal honest report when there is none)
+ * live in availability-report.test.ts against the pure buildAvailabilityReport
+ * builder instead. The write path, including the createOrUpdateFile commit,
+ * is driven through this route and the sweep route against local GitHub and
+ * S3 stand-ins in availability-report-never-creates-main.test.ts. This file
+ * covers what's left: the route's own dispatch (404 for an unknown dataset,
+ * before any S3/GitHub call; admin gating).
  */
 
 import type { Database } from "bun:sqlite";

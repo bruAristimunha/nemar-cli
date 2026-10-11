@@ -62,6 +62,43 @@ export const publicationBlockReasonSchema = z.enum([
 export type PublicationBlockReason = z.infer<typeof publicationBlockReasonSchema>;
 
 /**
+ * The two block reasons that only say BIDS validation has not concluded (no run
+ * yet, or one going), as opposed to `bids_validation_failed`. A request blocked
+ * for either is waiting, not rejected: the sweep releases it when validation
+ * passes, and the CLI reports it as a state. Declared once here for the route,
+ * the sweep and the CLI.
+ */
+export const CI_PENDING_BLOCK_REASONS = [
+  "bids_validation_pending",
+  "bids_validation_in_progress",
+] as const satisfies readonly PublicationBlockReason[];
+
+export type CiPendingReason = (typeof CI_PENDING_BLOCK_REASONS)[number];
+
+/** Is this block reason one of the two that only say validation has not concluded? */
+export function isCiPendingReason(reason: unknown): reason is CiPendingReason {
+  return (
+    typeof reason === "string" && (CI_PENDING_BLOCK_REASONS as readonly string[]).includes(reason)
+  );
+}
+
+/**
+ * `error` code of the 503 a publication request gets when NEMAR could not check
+ * BIDS validation status at all (token, workflow deploy, GitHub outage), as
+ * opposed to checking and finding no run yet. It is not a block reason, so the
+ * vocabulary above is unchanged; the sentence is in `message`, and the CLI's
+ * client leads with it ({@link PUBLICATION_REFUSAL_ERROR_CODES}).
+ */
+export const CI_CHECK_UNAVAILABLE_CODE = "ci_check_unavailable";
+
+/**
+ * Codes a publication-request refusal carries in `error` with the human
+ * sentence in `message`, so the CLI's client prints the sentence and not the
+ * bare token.
+ */
+export const PUBLICATION_REFUSAL_ERROR_CODES: readonly string[] = [CI_CHECK_UNAVAILABLE_CODE];
+
+/**
  * The codes the identifier screen's refusals carry in `error` (epic #1610,
  * phase 4), with the human sentence in `message`. Declared here so the CLI's
  * client knows to lead with the sentence rather than print a bare token.

@@ -19,6 +19,7 @@ import { registerIdentifierSweepCallbackRoutes } from "../callbacks/identifier-s
 import { registerImportStateRoutes } from "../callbacks/import-state.js";
 import { registerLlmEnrichRoutes } from "../callbacks/llm-enrich.js";
 import { registerManifestCallbackRoutes } from "../callbacks/manifest.js";
+import { registerPrReviewRoutes } from "../callbacks/pr-review.js";
 import { registerPrescreenRoutes } from "../callbacks/prescreen.js";
 import { registerRecordsReadyRoutes } from "../callbacks/records-ready.js";
 import { registerVersionDoiRoutes } from "../callbacks/version-doi.js";
@@ -34,6 +35,7 @@ const webhooks = new Hono<{ Bindings: Bindings }>();
 registerVersionDoiRoutes(webhooks);
 registerManifestCallbackRoutes(webhooks);
 registerPrescreenRoutes(webhooks);
+registerPrReviewRoutes(webhooks);
 registerIdentifierScreenRoutes(webhooks);
 registerIdentifierSweepCallbackRoutes(webhooks);
 registerImportStateRoutes(webhooks);

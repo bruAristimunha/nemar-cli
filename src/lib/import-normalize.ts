@@ -26,7 +26,7 @@
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { chunkAddTargets, configureLargefiles, gitAnnexAdd } from "./git-annex/init.js";
+import { configureLargefiles, gitAnnexAdd, unstageTrackedPaths } from "./git-annex/init.js";
 import { buildLargefilesExpression } from "./git-annex/policy.js";
 import { runCommand } from "./git-annex/run-command.js";
 import type { S3Credentials } from "./git-annex/s3-remote.js";
@@ -130,10 +130,10 @@ export interface NormalizeDataResult {
   items: ImportManifestItem[];
   files: NormalizedFile[];
   /**
-   * Files git-annex reported `ok` for, which counts a key the remote already
-   * held as well as one transferred now -- both print `copy <path> ok`. Useful
-   * for the operator line, and NOT the evidence that the content arrived: that
-   * comes from asking git-annex which paths the remote holds afterwards.
+   * Files git-annex reported a successful copy record for, which counts a key the
+   * remote already held as well as one transferred now. Useful for the operator
+   * line, and NOT the evidence that the content arrived: that comes from asking
+   * git-annex which paths the remote holds afterwards.
    */
   copied: number;
   bytes: number;
@@ -321,32 +321,6 @@ export async function applyNemarAnnexPolicy(datasetPath: string): Promise<AnnexP
 }
 
 /**
- * Drop paths from the index while leaving them in the working tree, so git-annex
- * will look at them again.
- *
- * This is the step without which none of this works. `git annex add` only
- * considers files git sees as new or modified, so on a file that is committed as a
- * plain blob and unmodified it does nothing at all -- exit 0, no output, no change
- * -- and `--force-large` does not alter that: the flag decides which plane a
- * considered file goes to, not whether it is considered. Verified against
- * git-annex 10.20260901. Un-caching the path makes it new again, and the resulting
- * commit is a plain typechange on the same path.
- */
-async function unstageTrackedPaths(datasetPath: string, paths: string[]): Promise<void> {
-  for (const chunk of chunkAddTargets(paths)) {
-    const { exitCode, stderr } = await runCommand(
-      ["git", "rm", "--cached", "--quiet", "--", ...chunk],
-      { cwd: datasetPath },
-    );
-    if (exitCode !== 0) {
-      throw new Error(
-        `Failed to uncache ${chunk.length} path(s) from the git index: ${stderr.trim()}`,
-      );
-    }
-  }
-}
-
-/**
  * Move files the clone carries as plain git blobs into the annex and upload their
  * content to `remoteName`.
  *
@@ -449,10 +423,10 @@ export async function normalizeUnannexedData(args: {
 /**
  * The default upload: git-annex's own client, then the location log as proof.
  *
- * Exit 0 is not evidence on its own. `git annex copy --to` prints `copy <path> ok`
- * both for a transfer and for a key the remote already held, and says nothing at
- * all for a path it does not consider annexed -- so this asks the location log
- * which paths the remote now holds. A log read, no network.
+ * Exit 0 is not evidence on its own. `git annex copy --to` reports success both for
+ * a transfer and for a key the remote already held, and says nothing at all for a
+ * path it does not consider annexed -- so this asks the location log which paths
+ * the remote now holds. A log read, no network.
  *
  * That check is the second net behind `normalizeUnannexedData`'s key verification,
  * which is what makes the silent-skip case unreachable today. It does work on its

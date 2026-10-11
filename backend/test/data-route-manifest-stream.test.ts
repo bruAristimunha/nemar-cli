@@ -27,14 +27,9 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:tes
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Hono } from "hono";
-import {
-  MAX_MANIFEST_JSON_ENTRIES,
-  MAX_MANIFEST_JSON_ENTRIES_PRESIGNED,
-  dataRoutes,
-} from "../src/routes/data";
+import { MAX_MANIFEST_JSON_ENTRIES, dataRoutes } from "../src/routes/data";
 import { addPrivateDataset, buildPublicAccessPolicy } from "../src/services/bucket-policy";
 import {
-  buildAnnexPublicUrl,
   buildBytesUrl,
   contentTypeForBidsPath,
   diffRemovedSince,
@@ -52,7 +47,6 @@ import {
   manifestCacheKey,
   resetManifestAnswerMemo,
 } from "../src/services/manifest-source";
-import { __resetPublicReadCacheForTests } from "../src/services/public-read-cache";
 import type { Bindings, Variables } from "../src/types/bindings";
 import { DrainingCache, StalledCache } from "./helpers/cache";
 import { freshDb, realD1 } from "./helpers/d1";
@@ -92,9 +86,8 @@ const SMALL = "nm000132";
 const SMALL_OBJECT = `/${SMALL}/version/v1.1.1.json`;
 const LARGE_ID = "nm000281";
 const LARGE_OPTS = { subjects: 374, runsPerSession: 50, datasetId: LARGE_ID };
-// Sized strictly between the two per-branch bounds (30,000 presigned,
-// 38,000 unsigned): 88 subjects * 401 entries/subject + 5 root entries =
-// 35,293, per largeManifestEntryCount's formula.
+// Sized above the former presigned bound and below the shared 38,000 bound:
+// 88 subjects * 401 entries/subject + 5 root entries = 35,293.
 const MID_ID = "nm000283";
 const MID_OPTS = { subjects: 88, runsPerSession: 50, datasetId: MID_ID };
 
@@ -138,13 +131,9 @@ beforeEach(() => {
   s3.put(`/${SMALL}/version/v1.1.1.json`, CURRENT_TEXT);
   s3.put(`/${SMALL}/version/v1.0.0.json`, PRIOR_TEXT);
   s3.log.length = 0;
-  // The bucket-policy exclusion decision is cached per isolate for 60s
-  // (public-read-cache.ts); `bun test` runs the whole file in one process, so
-  // without this a policy set by one test would still answer a later test's
-  // request within that window. No policy set is the default: no dataset is
-  // excluded, matching a bucket with only the public-by-default statement.
+  // No bucket policy is required to construct a public manifest; this fixture
+  // remains available to assert that an exclusion does not change its URLs.
   s3.setBucketPolicy(null);
-  __resetPublicReadCacheForTests();
   // The per-isolate answer memo (#1494 amendment) is a module-level
   // singleton, and `bun test` at the repo root runs every test file in ONE
   // process (.memory/bun-test-shared-process-root-and-backend.md) -- without
@@ -227,7 +216,8 @@ describe("file and directory requests answer what the whole parse answered", () 
     expect(res.headers.get("ETag")).toBe(`"${file.checksum}"`);
     expect(res.headers.get("Last-Modified")).toBe(toHttpDate(CURRENT.created));
     expect(res.headers.get("Cache-Control")).toBe("public, max-age=300");
-    expect(res.headers.get("Content-Type")).toBeNull();
+    expect(res.headers.get("Content-Type")).toBe(contentTypeForBidsPath(ANNEX));
+    expect(res.headers.get("Accept-Ranges")).toBe("bytes");
   });
 
   test("HEAD on a git-tracked file adds the inert content type", async () => {
@@ -244,19 +234,6 @@ describe("file and directory requests answer what the whole parse answered", () 
     const missing = await get(`/${SMALL}/v1.1.1/${REMOVED_FILE}`, { method: "HEAD" });
     expect(missing.status).toBe(404);
     expect(missing.headers.get("Cache-Control")).toBe("public, max-age=60");
-  });
-
-  test("GET on an annexed file redirects with the manifest's headers", async () => {
-    if (!ANNEX) throw new Error("fixture has no annexed file");
-    const res = await get(`/${SMALL}/v1.1.1/${ANNEX}`, { redirect: "manual" });
-    expect(res.status).toBe(302);
-    const file = CURRENT.files[ANNEX];
-    expect(res.headers.get("Location")).toStartWith(
-      `https://nemar.s3.us-east-2.amazonaws.com/${SMALL}/objects/${file.key}?`,
-    );
-    expect(res.headers.get("ETag")).toBe(`"${file.checksum}"`);
-    expect(res.headers.get("Last-Modified")).toBe(toHttpDate(CURRENT.created));
-    expect(res.headers.get("Content-Length")).toBeNull();
   });
 
   for (const dir of ["", "sub-001", "sub-001/eeg", "stimuli", "code"]) {
@@ -366,7 +343,7 @@ describe("file and directory requests answer what the whole parse answered", () 
 });
 
 describe("manifest.json", () => {
-  test("below the bound, every entry in Object.entries order, public or brokered", async () => {
+  test("below the bound, every entry uses its stable data-plane URL", async () => {
     const res = await get(`/${SMALL}/v1.1.1/manifest.json`);
     expect(res.status).toBe(200);
     expect(res.headers.get("Cache-Control")).toBe("public, max-age=300");
@@ -392,29 +369,7 @@ describe("manifest.json", () => {
           origin: "https://data.nemar.org",
         }),
       );
-      if (file.key.startsWith("git:")) {
-        expect(e.url).toBe(e.bytes_url);
-      } else {
-        // The plain public S3 URL (#1522): same object path a presigned URL
-        // would use, no query string at all. env() below points S3 at the
-        // local stand-in via S3_ENDPOINT_URL, so the comparison does too --
-        // production leaves endpointUrl unset and gets the real AWS host.
-        expect(e.url).toBe(
-          buildAnnexPublicUrl({
-            datasetId: SMALL,
-            file,
-            s3Options: {
-              bucket: "nemar",
-              region: "us-east-2",
-              accessKeyId: "x",
-              secretAccessKey: "y",
-              endpointUrl: s3.url,
-            },
-          }),
-        );
-        expect(e.url).not.toContain("?");
-        expect(e.url).toStartWith(`${s3.url}/${SMALL}/objects/`);
-      }
+      expect(e.url).toBe(e.bytes_url);
     }
   });
 
@@ -422,10 +377,12 @@ describe("manifest.json", () => {
     const res = await get(`/${SMALL}/v1.1.1/manifest.json`);
     const entries = (await res.json()) as Record<string, unknown>[];
     expect(entries.length).toBeGreaterThan(0);
-    const annex = entries.find((e) => !(e.url === undefined) && e.url !== e.bytes_url);
-    const git = entries.find((e) => e.url === e.bytes_url);
+    const annex = entries.find((e) => !CURRENT.files[e.path]?.key.startsWith("git:"));
+    const git = entries.find((e) => CURRENT.files[e.path]?.key.startsWith("git:"));
     expect(annex).toBeDefined();
     expect(git).toBeDefined();
+    expect(annex?.url).toBe(annex?.bytes_url);
+    expect(git?.url).toBe(git?.bytes_url);
     // Object.keys reflects INSERTION order, which is what JSON.stringify
     // serializes -- this is the same order external consumers (the eegdash
     // viewer, third-party downloaders, nemar-py) see on the wire. Neither
@@ -435,53 +392,14 @@ describe("manifest.json", () => {
     expect(Object.keys(git as Record<string, unknown>)).toEqual(expectedOrder);
   });
 
-  test("a dataset the bucket policy excludes from public read keeps presigned URLs", async () => {
+  test("a dataset excluded by bucket policy still emits stable data-plane URLs", async () => {
     s3.setBucketPolicy(addPrivateDataset(buildPublicAccessPolicy("nemar", []), "nemar", SMALL));
-    __resetPublicReadCacheForTests();
     const res = await get(`/${SMALL}/v1.1.1/manifest.json`);
     expect(res.status).toBe(200);
-    // Unchanged from before #1522: the response still tracks a signature
-    // lifetime, so the short client cache stays.
-    expect(res.headers.get("Cache-Control")).toBe("public, max-age=60");
+    expect(res.headers.get("Cache-Control")).toBe("public, max-age=300");
     const entries = (await res.json()) as { url: string | null; bytes_url: string }[];
-    const annexEntry = entries.find((e) => e.url !== e.bytes_url);
-    expect(annexEntry).toBeDefined();
-    expect(annexEntry?.url).toStartWith(
-      `https://nemar.s3.us-east-2.amazonaws.com/${SMALL}/objects/`,
-    );
-    expect(annexEntry?.url).toContain("X-Amz-Signature=");
-  });
-
-  test("the unsigned url actually serves the object, GET and Range", async () => {
-    const annexPath = Object.keys(CURRENT.files).find(
-      (p) => !CURRENT.files[p].key.startsWith("git:"),
-    );
-    if (!annexPath) throw new Error("fixture has no annexed file");
-    const file = CURRENT.files[annexPath];
-    const bytes = new TextEncoder().encode("nemar-1522-object-bytes");
-    s3.put(`/${SMALL}/objects/${file.key}`, bytes);
-
-    const url = buildAnnexPublicUrl({
-      datasetId: SMALL,
-      file,
-      s3Options: {
-        bucket: "nemar",
-        region: "us-east-2",
-        accessKeyId: "x",
-        secretAccessKey: "y",
-        endpointUrl: s3.url,
-      },
-    });
-    expect(url).not.toContain("?");
-
-    const full = await fetch(url);
-    expect(full.status).toBe(200);
-    expect(new Uint8Array(await full.arrayBuffer())).toEqual(bytes);
-
-    const ranged = await fetch(url, { headers: { Range: "bytes=0-4" } });
-    expect(ranged.status).toBe(206);
-    expect(ranged.headers.get("Content-Range")).toBe(`bytes 0-4/${bytes.length}`);
-    expect(new Uint8Array(await ranged.arrayBuffer())).toEqual(bytes.slice(0, 5));
+    expect(entries.length).toBeGreaterThan(0);
+    expect(entries.every((entry) => entry.url === entry.bytes_url)).toBe(true);
   });
 
   test(
@@ -506,31 +424,24 @@ describe("manifest.json", () => {
   );
 
   test(
-    "the per-branch bound: presigned refuses at 30,000, unsigned serves up to 38,000",
+    "one 38,000-entry bound applies regardless of bucket policy",
     async () => {
       const midCount = largeManifestEntryCount(MID_OPTS);
-      expect(midCount).toBeGreaterThan(MAX_MANIFEST_JSON_ENTRIES_PRESIGNED);
       expect(midCount).toBeLessThan(MAX_MANIFEST_JSON_ENTRIES);
       seed(MID_ID, "public", [["1.0.0", "2026-09-01 00:00:00"]]);
 
-      // Excluded (presigned) branch: the SAME manifest, refused at the
-      // unraised 30,000 bound -- it never got cheaper, so it never moved.
+      // Bucket policy does not affect URL construction or the manifest bound.
       s3.setBucketPolicy(addPrivateDataset(buildPublicAccessPolicy("nemar", []), "nemar", MID_ID));
-      __resetPublicReadCacheForTests();
       const presigned = await get(`/${MID_ID}/v1.0.0/manifest.json`);
-      expect(presigned.status).toBe(413);
-      const presignedBody = (await presigned.json()) as Record<string, unknown>;
-      expect(presignedBody.limit).toBe(MAX_MANIFEST_JSON_ENTRIES_PRESIGNED);
-      expect(String(presignedBody.error)).toContain(`${MAX_MANIFEST_JSON_ENTRIES_PRESIGNED} files`);
+      expect(presigned.status).toBe(200);
+      const entries = (await presigned.json()) as { url: string | null; bytes_url: string }[];
+      expect(entries.length).toBe(midCount);
+      expect(entries.every((entry) => entry.url === entry.bytes_url)).toBe(true);
 
-      // Not excluded (unsigned) branch: same manifest, same dataset, served
-      // under the raised 38,000 bound.
       s3.setBucketPolicy(null);
-      __resetPublicReadCacheForTests();
       const unsigned = await get(`/${MID_ID}/v1.0.0/manifest.json`);
       expect(unsigned.status).toBe(200);
-      const entries = (await unsigned.json()) as unknown[];
-      expect(entries.length).toBe(midCount);
+      expect(await unsigned.text()).toBe(JSON.stringify(entries));
     },
     LARGE_MANIFEST_TEST_TIMEOUT_MS,
   );
@@ -660,23 +571,24 @@ describe("the manifest.json response cache sits behind the visibility gate", () 
     expect(readsOf(SMALL)).toEqual([]);
   });
 
-  test("an excluded dataset's document is never written to this cache", async () => {
+  test("a bucket-policy-excluded dataset's stable URL document is cached", async () => {
     s3.setBucketPolicy(addPrivateDataset(buildPublicAccessPolicy("nemar", []), "nemar", SMALL));
-    __resetPublicReadCacheForTests();
     const res = await get(`/${SMALL}/v1.1.1/manifest.json`);
     expect(res.status).toBe(200);
     const key = manifestJsonCacheKey("https://data.nemar.org", SMALL, "v1.1.1");
-    expect(cache.store.has(key)).toBe(false);
+    expect(cache.store.has(key)).toBe(true);
+    expect(res.headers.get("Cache-Control")).toBe("public, max-age=300");
+    const entries = (await res.json()) as { url: string | null; bytes_url: string }[];
+    expect(entries.every((entry) => entry.url === entry.bytes_url)).toBe(true);
   });
 
-  test("warmed unsigned, then excluded: the next manifest.json is presigned, not the cached unsigned document (review)", async () => {
+  test("changing bucket policy leaves the cached stable URL contract unchanged", async () => {
     const annexPath = Object.keys(CURRENT.files).find(
       (p) => !CURRENT.files[p].key.startsWith("git:"),
     );
     if (!annexPath) throw new Error("fixture has no annexed file");
 
-    // Not excluded yet (no bucket policy set): warm the response cache with
-    // the UNSIGNED document (#1522).
+    // Warm the deterministic response cache.
     const first = await get(`/${SMALL}/v1.1.1/manifest.json`);
     expect(first.status).toBe(200);
     const key = manifestJsonCacheKey("https://data.nemar.org", SMALL, "v1.1.1");
@@ -685,26 +597,21 @@ describe("the manifest.json response cache sits behind the visibility gate", () 
       JSON.parse(await first.text()) as { path: string; url: string | null }[]
     ).find((e) => e.path === annexPath);
     expect(firstAnnex?.url).not.toBeNull();
-    // Unsigned: a plain object URL, no query string.
-    expect(firstAnnex?.url).not.toContain("?");
+    expect(firstAnnex?.url).toBe(firstAnnex?.bytes_url);
 
-    // The bucket policy now excludes this dataset from public read, through
-    // the real path (`isDatasetExcludedFromPublicRead`'s own bucket-policy
-    // read), not the `__seedPublicReadCacheForTests` seam.
+    // The bucket policy now excludes the dataset from public read.
     s3.setBucketPolicy(addPrivateDataset(buildPublicAccessPolicy("nemar", []), "nemar", SMALL));
-    __resetPublicReadCacheForTests();
 
-    // `manifestJsonHandler` never even asks this cache once `excluded` is
-    // true (`const cache = excluded ? null : edgeCache()`), so the document
-    // just warmed above must not leak through as a stale unsigned answer.
+    // The policy does not change stable route URLs or their 300-second cache.
     const second = await get(`/${SMALL}/v1.1.1/manifest.json`);
     expect(second.status).toBe(200);
     const secondAnnex = (
       JSON.parse(await second.text()) as { path: string; url: string | null }[]
     ).find((e) => e.path === annexPath);
     expect(secondAnnex?.url).not.toBeNull();
-    expect(secondAnnex?.url).toContain("?");
-    expect(secondAnnex?.url).not.toBe(firstAnnex?.url);
+    expect(secondAnnex?.url).toBe(secondAnnex?.bytes_url);
+    expect(secondAnnex?.url).toBe(firstAnnex?.url);
+    expect(second.headers.get("Cache-Control")).toBe("public, max-age=300");
   });
 });
 
@@ -828,8 +735,8 @@ describe("the large manifest: answers, and memory that does not follow it", () =
   );
 
   const paths = [...largeManifestPaths(LARGE_OPTS)];
-  // An annexed recording deep in the manifest, so a GET is a presigned
-  // redirect (a git-tracked file would need a GitHub stand-in as well).
+  // An annexed recording deep in the manifest. HEAD remains metadata-only;
+  // GET storage acceptance needs an isolated non-synthetic S3 sample.
   const deep = paths.slice(123_457).find((p) => p.endsWith(".bdf")) as string;
 
   test(
@@ -867,7 +774,6 @@ describe("the large manifest: answers, and memory that does not follow it", () =
       expect(bytes).toBeGreaterThan(55_000_000);
       for (const run of [
         () => get(`/${LARGE_ID}/v1.0.3/${deep}`, { method: "HEAD" }),
-        () => get(`/${LARGE_ID}/v1.0.3/${deep}`, { redirect: "manual" }),
         () => get(`/${LARGE_ID}/v1.0.3/sub-200/ses-01/emg/`, HTML_ACCEPT),
         () => get(`/${LARGE_ID}/metadata.json`),
         () => get(`/${LARGE_ID}/v1.0.3/manifest.json`),

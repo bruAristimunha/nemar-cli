@@ -18,7 +18,12 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { resetTestDataset } from "./api/admin.js";
 import { requestUploadCredentials } from "./api/data.js";
-import { cloneDataset, pushToGitHub, saveDataset } from "./git-annex/clone-push.js";
+import {
+  cloneDataset,
+  pushAnnexBranchToGitHub,
+  pushToGitHub,
+  saveDataset,
+} from "./git-annex/clone-push.js";
 import { configureGitHubRemote } from "./git-annex/github.js";
 import { configureLargefiles, gitAnnexAdd, initDataset } from "./git-annex/init.js";
 import { runCommand } from "./git-annex/run-command.js";
@@ -321,12 +326,9 @@ export async function runE2ETest(options: {
         const pushResult = await pushToGitHub(cloneDir, "origin", branchName);
         assertOk(pushResult, "pushToGitHub (update branch)");
 
-        const { exitCode: annexPushCode, stderr: annexPushErr } = await runCommand(
-          ["git", "push", "origin", "git-annex"],
-          { cwd: cloneDir },
-        );
-        if (annexPushCode !== 0) {
-          throw new Error(`Failed to push git-annex branch: ${annexPushErr.trim()}`);
+        const annexPush = await pushAnnexBranchToGitHub(cloneDir, "origin");
+        if (!annexPush.success) {
+          throw new Error(`Failed to push git-annex branch: ${annexPush.error}`);
         }
 
         log(ctx, `Update pushed to branch: ${branchName}`);

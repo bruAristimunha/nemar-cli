@@ -10,7 +10,7 @@
  * precisely a TS re-implementation quietly disagreeing with the real thing.
  */
 
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import {
   chmodSync,
   mkdirSync,
@@ -27,6 +27,8 @@ import { configureLargefiles, gitAnnexAdd, initDataset } from "../src/lib/git-an
 import {
   ANNEX_SIZE_THRESHOLD_BYTES,
   buildLargefilesExpression,
+  describeAnnexSizeThreshold,
+  isCurrentLargefilesExpression,
   isNeverAnnexedMetadata,
   shouldAnnex,
 } from "../src/lib/git-annex/policy";
@@ -92,6 +94,10 @@ const FIXTURES: Array<{ path: string; size: number; why: string }> = [
   // The .github workflows that must never become symlinks (ADR 0015).
   { path: ".github/workflows/bids-validate.yml", size: 4_000, why: "CI workflow must stay in git" },
 ];
+
+// Each test builds a repository and runs git-annex a few times; CI machines are slower
+// than the 5 s default allows.
+setDefaultTimeout(60_000);
 
 let repoDir: string;
 /** path -> true when git-annex itself put the file in the annex. */
@@ -255,5 +261,95 @@ describe("annex policy: the shell copy cannot drift", () => {
     const match = script.match(/^ANNEX_LARGEFILES="(.*)"$/m);
     expect(match, "ANNEX_LARGEFILES not found in scripts/nemar-restore-dataset.sh").not.toBeNull();
     expect((match as RegExpMatchArray)[1]).toBe(buildLargefilesExpression());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The size threshold, byte for byte (ADR 0031, amendment of 2026-10-07)
+// ---------------------------------------------------------------------------
+
+/**
+ * Every spelling of the threshold that a repository can carry is checked against
+ * real git-annex at the bytes around the boundary. The expected outcome is written
+ * as a literal (more than 100,000 bytes annexes), never derived from the constant:
+ * git-annex reads `kb` as SI, so `largerthan=100kb` is 100,000 bytes. An expectation
+ * computed from the constant could not disagree with a wrong constant.
+ */
+const BOUNDARY_SIZES = [99_999, 100_000, 100_001, 102_399, 102_400, 102_401] as const;
+
+/**
+ * The expression every `nm` dataset was configured with before the threshold was
+ * rendered in exact bytes, verbatim. Hard-coded so that it stays the old spelling
+ * whatever `buildLargefilesExpression` becomes.
+ */
+const LEGACY_EXPRESSION =
+  "(include=*.edf or include=*.bdf or include=*.set or include=*.fif or include=*.vhdr or include=*.eeg or include=*.cnt or include=*.fdt or include=*_motion.tsv or largerthan=100kb) and (exclude=*.tsv or include=*_motion.tsv) and exclude=*.json and exclude=*.md and exclude=*.txt and exclude=*.yml and exclude=*.yaml and exclude=README* and exclude=LICENSE* and exclude=CHANGES* and exclude=.bidsignore and exclude=.gitignore";
+
+const boundaryRepos: string[] = [];
+
+/** Add one `.dat` per boundary size under `expression` and return what git-annex annexed. */
+async function annexedAtBoundary(expression: string | undefined): Promise<Set<string>> {
+  const dir = mkdtempSync(join(tmpdir(), "nemar-annex-boundary-"));
+  boundaryRepos.push(dir);
+  const init = await initDataset(dir);
+  if (!init.success) throw new Error(`initDataset failed: ${init.error}`);
+  const configured = await configureLargefiles(dir, expression);
+  if (!configured.success) throw new Error(`configureLargefiles failed: ${configured.error}`);
+  const paths = BOUNDARY_SIZES.map((size) => `size-${size}.dat`);
+  for (const [i, size] of BOUNDARY_SIZES.entries()) {
+    writeFileSync(join(dir, paths[i]), "x".repeat(size));
+  }
+  const added = await gitAnnexAdd(dir, paths);
+  if (!added.success) throw new Error(`gitAnnexAdd failed: ${added.error}`);
+  const found = await runCommand(["git", "annex", "find", "--include", "*"], { cwd: dir });
+  if (found.exitCode !== 0) throw new Error(`git annex find failed: ${found.stderr}`);
+  return new Set(found.stdout.split("\n").filter(Boolean));
+}
+
+afterAll(() => {
+  for (const dir of boundaryRepos) {
+    chmodTreeWritable(dir);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+describe("annex policy: the size threshold is 100,000 bytes", () => {
+  test("the expression states the threshold in exact bytes, with no unit to misread", () => {
+    const expression = buildLargefilesExpression();
+    expect(expression).toContain("or largerthan=100000) and");
+    expect(expression).not.toMatch(/largerthan=\S*kb/i);
+    expect(ANNEX_SIZE_THRESHOLD_BYTES).toBe(100_000);
+    expect(describeAnnexSizeThreshold()).toBe("100,000 bytes");
+  });
+
+  for (const [name, expression] of [
+    ["the expression NEMAR configures today", undefined],
+    ["the largerthan=100kb expression every earlier dataset carries", LEGACY_EXPRESSION],
+  ] as const) {
+    test(`real git-annex annexes more than 100,000 bytes and nothing less: ${name}`, async () => {
+      const annexed = await annexedAtBoundary(expression);
+      for (const size of BOUNDARY_SIZES) {
+        expect(annexed.has(`size-${size}.dat`), `${size} bytes`).toBe(size > 100_000);
+      }
+    });
+
+    test(`shouldAnnex agrees with real git-annex at every boundary size: ${name}`, async () => {
+      const annexed = await annexedAtBoundary(expression);
+      for (const size of BOUNDARY_SIZES) {
+        expect(shouldAnnex(`size-${size}.dat`, size), `${size} bytes`).toBe(
+          annexed.has(`size-${size}.dat`),
+        );
+      }
+    });
+  }
+
+  test("the legacy spelling counts as NEMAR's policy and a different threshold does not", () => {
+    // Datasets configured before the amendment carry `100kb`; the fleet sweep must not
+    // read them as drifted. Both are the same rule, as the boundary tests above show.
+    expect(isCurrentLargefilesExpression(buildLargefilesExpression())).toBe(true);
+    expect(isCurrentLargefilesExpression(LEGACY_EXPRESSION)).toBe(true);
+    expect(isCurrentLargefilesExpression(LEGACY_EXPRESSION.replace("100kb", "1mb"))).toBe(false);
+    expect(isCurrentLargefilesExpression(LEGACY_EXPRESSION.replace("100kb", "100kib"))).toBe(false);
+    expect(isCurrentLargefilesExpression("largerthan=100kb")).toBe(false);
   });
 });

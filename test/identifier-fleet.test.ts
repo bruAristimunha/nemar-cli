@@ -1475,8 +1475,8 @@ describe("a manifest too large for the data plane (413) falls back, never retrie
     const v = w.versionOf(ID);
     w.raw(`/data/${ID}/${v}/${encodePath(B)}`, { bytes: CLEAN });
     w.raw(`/data/${ID}/${v}/${encodePath(edfPath(2))}`, { bytes: CLEAN });
-    w.raw("/s3/custom/given.edf", { bytes: CLEAN });
-    w.raw(`/s3/${ID}/objects/MD5E-s256--aa11.edf`, { bytes: CLEAN });
+    w.raw(`/data/${ID}/${v}/${encodePath(edfPath(3))}`, { bytes: CLEAN });
+    w.raw(`/data/${ID}/${v}/${encodePath(edfPath(4))}`, { bytes: CLEAN });
     const record = await scanDataset(w.ctx(), ID, v);
     expect(record.manifest_source).toBe("s3-version-manifest");
     expect(record.status).toBe("clean");
@@ -1484,9 +1484,10 @@ describe("a manifest too large for the data plane (413) falls back, never retrie
     // Built per segment like the tree fallback: the space and `#` are encoded, the slashes are not.
     expect(w.hits(`/data/${ID}/${v}/sub-01/eeg/sub%2001%23a_eeg.edf`)).toBe(1);
     expect(w.hits(`/data/${ID}/${v}/${encodePath(edfPath(2))}`)).toBe(1);
-    // A non-empty bytes_url is used as given, and the data plane path is not tried.
-    expect(w.hits("/s3/custom/given.edf")).toBe(1);
-    expect(w.hits(`/data/${ID}/${v}/${encodePath(edfPath(3))}`)).toBe(0);
+    // A legacy bytes_url is ignored: the stable data-plane route is always used.
+    expect(w.hits("/s3/custom/given.edf")).toBe(0);
+    expect(w.hits(`/data/${ID}/${v}/${encodePath(edfPath(3))}`)).toBe(1);
+    expect(w.hits(`/data/${ID}/${v}/${encodePath(edfPath(4))}`)).toBe(1);
     expect(w.hits(w.manifestPath(ID))).toBe(1);
   });
 
@@ -2340,7 +2341,7 @@ describe("the aws fallback runs the real aws CLI against an S3 stand-in", () => 
     async () => {
       const w = newWorld();
       w.add(ID, {}, { manifestStatus: 413, versionManifest: doc });
-      w.raw(`/s3/${ID}/objects/MD5E-s256--aa11.edf`, { bytes: CLEAN });
+      w.raw(`/data/${ID}/v1.0.0/${encodePath(EDF)}`, { bytes: CLEAN });
       const ctx = w.ctx({ readVersionManifest: undefined, awsEnv: awsEnv(w) });
       const record = await scanDataset(ctx, ID, w.versionOf(ID));
       expect(record.manifest_source).toBe("s3-version-manifest");

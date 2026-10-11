@@ -32,7 +32,7 @@ export const COMMON_COMMANDS: Readonly<Record<string, readonly string[]>> = {
   // two commands a consumer types (search, download) kept adjacent.
   dataset: ["search", "download", "upload", "validate", "status", "list"],
 
-  // Day-to-day operator work: the user queue, the publication queue, DOIs,
+  // Day-to-day operator work: the user queue, the publication queue, the pull-request queue, DOIs,
   // and the two destructive-but-routine dataset actions. Everything under
   // `import*`, every `*-sweep`, every `backfill-*`, and the fleet/exemplar/
   // zarr/s3/repo groups are deliberately absent -- they are run from cron or
@@ -42,6 +42,7 @@ export const COMMON_COMMANDS: Readonly<Record<string, readonly string[]>> = {
     "approve",
     "revoke",
     "publish",
+    "pr-reviews",
     "doi",
     "make-public",
     "delete-dataset",

@@ -185,6 +185,40 @@ describe("scanDatasetKeyRegistration", () => {
     expect(state.missingContent).toEqual([]);
   }, 240_000);
 
+  test("registers a key the bucket holds only as complete chunks (ADR 0063, #1565)", async () => {
+    // A special remote configured with chunk=<size> stores <fields>-S<size>-C<n>--<name>
+    // and never the plain key. The presence test reads a complete chunk set as held,
+    // so this sweep now records such a key in the location log; an incomplete one
+    // stays missing content. Real keys from a real annex, with the listing built the
+    // way a chunked remote lays it out.
+    const path = await cloneForScan("scan-chunked");
+    const { annexed } = await scanDatasetKeyRegistration("on999999", path, async () => new Map());
+    const [chunkedKey, ...plainKeys] = annexed;
+    const size = annexKeyDeclaredSize(chunkedKey) as number;
+    const chunkSize = 1000;
+    const count = Math.ceil(size / chunkSize);
+    expect(count).toBeGreaterThan(2);
+    const chunkObjects = new Map<string, number>(
+      Array.from({ length: count }, (_, i): [string, number] => [
+        chunkedKey.replace("--", `-S${chunkSize}-C${i + 1}--`),
+        i + 1 < count ? chunkSize : size - chunkSize * (count - 1),
+      ]),
+    );
+
+    const whole = new Map([...sizedObjects(plainKeys), ...chunkObjects]);
+    const held = await scanDatasetKeyRegistration("on999999", path, async () => whole);
+    expect(held.inBucket).toContain(chunkedKey);
+    expect(held.toRegister).toContain(chunkedKey);
+    expect(held.missingContent).toEqual([]);
+
+    const lastChunk = [...chunkObjects.keys()][count - 1];
+    const short = new Map(whole);
+    short.delete(lastChunk);
+    const incomplete = await scanDatasetKeyRegistration("on999999", path, async () => short);
+    expect(incomplete.toRegister).not.toContain(chunkedKey);
+    expect(incomplete.missingContent).toEqual([chunkedKey]);
+  }, 240_000);
+
   test("separates content the bucket does not hold from a lost registration", async () => {
     // The #1396 shape. An empty bucket is not "every registration was lost", and
     // the two need opposite responses: one is repaired here, the other needs the

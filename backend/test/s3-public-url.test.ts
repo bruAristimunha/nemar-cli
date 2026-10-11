@@ -1,7 +1,7 @@
 /**
- * `buildPublicObjectUrl` (#1522): the plain, query-string-free public S3 URL
- * `manifest.json` now emits for an annexed entry the bucket policy does not
- * exclude from public read.
+ * `buildPublicObjectUrl` (#1522): a low-level direct-S3 URL helper retained
+ * for operational callers and path-compatibility checks. The manifest
+ * contract uses stable data-plane URLs under ADR 0095.
  *
  * Two claims this pins, each checked for real rather than by inspection:
  *  - it builds the key's PATH the same way `generatePresignedGetUrl` does,

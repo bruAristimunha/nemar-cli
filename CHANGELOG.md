@@ -13,6 +13,185 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
+## 0.10.16 - 2026-10-10
+
+Epic #1671 (upload and integrity fixes) reaches `main` together with the automated review of
+dataset pull requests and the admin command that works through it, publication requests that
+wait for the BIDS check, chunked annex objects that are counted and served, admin account
+search and edit, and the end of password sign-in. The automated review ships dark in
+production and is on in the dev Worker for a trial; the steps that turn it on are listed under
+Deploy coupling.
+
+### Added
+
+- **A pull request to a dataset is reviewed automatically, and the result is a green or red
+  check (#1682, ADR 0092).** Once the NEMAR GitHub App is subscribed to Pull request events it
+  delivers them to the Worker, which gates them (per-commit dedupe, the contributor tally, rate caps) and dispatches one
+  central workflow, `run-pr-review.yml` in `nemarDatasets/.github`. Claude Haiku 5.5 at high
+  effort, with no tools, answers three questions: is anything lost, does the revision advance
+  the dataset, is the dataset materially better. The Worker derives the verdict from the report
+  and from git facts and never reads it from the model; anything that is not a clear pass is
+  `action_required`, never green. A contributor with more than 5 rejected pull requests and more
+  than 10 percent of their decided ones is paused. Only pull requests whose base is `main` are
+  reviewed, forks included, and nothing from a pull request is executed. **Off in production
+  until its flag is exactly `1`; on in the dev Worker, which reviews only the datasets dev owns.**
+- **`nemar admin pr-reviews` lists, explains and approves dataset pull requests (ADR 0093).**
+  `list` (the default) joins one GitHub search of open pull requests to the stored reviews,
+  `show <dataset> <pr>` explains one, `approve` makes the approval with the administrator's own
+  GitHub login (no Worker code path approves), and `next` walks the queue one pull request at a
+  time. `standing` shows a contributor's record; `allow`, `block` and `clear` set or remove an
+  override of the tally. It works with the review switched off: a pull request with no review is
+  `not_reviewed`.
+- **`nemar admin pr-reviews start` reviews the pull requests that were already open (ADR 0092
+  amendment).** The Worker reviews on events, and a pull request that was open before the review
+  was switched on produced none. `start <dataset> <pr>` and `start --all` (with `--dry-run` and
+  `--yes`) ask for one: the Worker reads the pull request from GitHub itself and runs it through
+  the same gate, so the flag, the pause and the platform's daily pool still apply, while the
+  per-contributor allowances do not hold back a review an administrator asked for by name. It
+  also starts again a commit whose review was declined, ended in an error, never reported, or
+  was handed to GitHub and not heard from for 30 minutes. A restart that follows an attempt
+  which cost a model call counts as a second call against the pool. The redelivery of a failed
+  dispatch goes through the same gate.
+- **`nemar admin users` finds an account by any field and edits a closed set of fields (ADR 0096).**
+  Search matches every word in any text field, ranks an exact hit first and offers close
+  matches when nothing matches; `show` and `edit` work by account id, so web accounts without a
+  username are reachable. Credentials are never searched or returned. Any administrator edits
+  names, affiliation, city and country; changing who can act as the account is for owners only.
+- **A publication request made while BIDS validation is still running is reported as waiting,
+  not as an error (#1646, ADR 0086 amendment).** The route still records the request as blocked;
+  `nemar dataset publish request` now shows it in the info style and exits 0, `publish status` shows it the same way, and a daily sweep releases
+  the request when CI passes (or re-blocks it if a submission minimum fails). When the
+  readiness check itself cannot run the route answers 503 `ci_check_unavailable`. The CLI says
+  whether the requester is emailed, and `nemar dataset upload` names the CI and publish steps
+  in its closing output.
+- **Chunked git-annex objects are counted as present and served (#1565, #1695, ADR 0064
+  amendment and ADR 0095).** A key stored as `-S<chunksize>-C<n>` chunks counts toward
+  `data_complete` once its chunk set is complete (`shared/annex-key.ts`, one definition for
+  the Worker and the CLI). Every `manifest.json` entry now points at its stable data-plane
+  route, which checks the published dataset and version before touching S3, redirects only
+  after a plain-object HEAD confirms the size, and streams a complete chunk set with bounded
+  memory and single byte-range support. The manifest cache key moved to v2 so no stored
+  manifest keeps a direct S3 URL.
+- **Uploads survive long copies and large trees (epic #1671, #1642, #1455, ADR 0094 and the
+  ADR 0031 amendment).** S3 credentials are renewed during a long server-side copy and the copy
+  is verified; annex workers are bounded and validated; resumed uploads are batched by size;
+  annex adds are fed paths in NUL-separated batches; the CLI warns when tracking or saving has
+  been idle; recorded upload checks are bound to annex keys and to the S3 target. On a large
+  tree (1 GiB of annexed data or more) the save skips re-reading files whose size and mtime
+  still match the upload plan and puts the skip back on any failure or signal. The annex size
+  threshold is 100,000 bytes, as git-annex reads `100kb`, and the CLI's selection is
+  authoritative for upper-case data extensions.
+- **`nemar` rejects an option an ancestor command would swallow (#1493).** `nemar dataset
+  release <id> --version 2.0.0` used to print the CLI version and exit 0, so a scripted release
+  did nothing. The pre-pass joins the value to the flag, and rejects a shadowed flag with no
+  value or typed before its command.
+
+### Changed
+
+- **Password sign-in is removed (ADR 0097, migrations 0093 and 0094).** `POST /auth/signup` and
+  `POST /auth/retrieve-key` answer 410 `password_sign_in_retired` and say to run `nemar auth
+  login`; `nemar auth retrieve-key` stays as a hidden stub that exits 1; `bcryptjs` and
+  `services/password.ts` are deleted. Every stored `password_hash` is set to NULL (not
+  reversible; Time Travel keeps copies for up to 30 days, and exports and the hourly backup until
+  they are deleted) and a trigger refuses the
+  retired route's insert shape. API keys, `POST /auth/login`, `regenerate-key`, the device flow
+  and the web code flow are unchanged.
+- **`git init` falls back for a git older than 2.28.** `git init -b main` is tried first; on
+  its usage-error status the CLI runs a plain `git init` and points an unborn `HEAD` at
+  `main`.
+- **Bun is pinned to 1.4.3 in every workflow and in `packageManager` (#1703).**
+
+### Fixed
+
+- **The availability report never creates `main`.** On a dataset that was created but had not
+  pushed yet, the sweep's write created `main` as an unrelated root commit and the next upload
+  failed after 12 attempts. The write now refuses with 409 when `main` is missing, and the sweep
+  only considers datasets that have a version.
+- **A git-annex repository no longer records the uploader's login, node and path
+  (#1683).** `git annex init` is given a fixed description, and an upload replaces a default one
+  left by an older CLI before anything is pushed. The old value stays in the history of an
+  already-pushed `git-annex` branch (the back-catalogue is #1399).
+- **An imported dataset's first push no longer stops on the source's own repository names.** The
+  privacy gate added with #1683 refused any clone whose `uuid.log` held a `user@host:/path`
+  description, and OpenNeuro's own repositories carry them (all of 20 older datasets checked, for
+  example `root@93184394ac19:/datalad/ds000001`), so `nemar admin import prepare` stopped at the push. Before
+  anything of the `git-annex` branch is published, another repository's description is replaced with
+  `upstream` and the history is pruned again; this machine's own description is still refused, and the
+  message now names the way out.
+- **`--verbose` no longer prints a GitHub token.** The credential helper written for a push or a
+  fleet clone, and the token `gh` returns for `nemar admin pr-reviews` and the fleet annex policy, could
+  reach stderr, which people paste into issues. Only `nemar sandbox` turns that log on today.
+- **`nemar dataset download` reports a file the manifest lists and storage lacks as absent.** The data
+  plane answers 502 for it; the downloader retried three times and exited 1, where ADR 0005 treats a
+  file the archive does not have as a reportable gap. Any other 502 is still a transport fault.
+- **A retired command, or a refused `regenerate-key`, no longer asks for a bug report.**
+- **A blocked-publication sweep that throws is an error in the audit tally**, not a run with nothing to
+  do.
+- **`bun run migrations:d1-check`** reads wrangler's catalog around the warning banner it prints when a
+  proxy variable is set.
+
+### Migrations
+
+- `0092_pr_reviews.sql`: the review table, the contributor-override table and their CHECKs.
+- `0093_clear_password_hashes.sql`: sets every stored password hash to NULL. Not reversible.
+- `0094_guard_retired_password_signup.sql`: refuses the retired signup insert and clears any
+  hash written between the two migrations.
+- `0095_pr_review_attempts.sql`: adds `pr_reviews.attempts` (1 for every existing row), so the
+  platform's daily pool counts model calls rather than rows. `bun run migrations:d1-check`
+  passes.
+
+### Deploy coupling
+
+- Migrations run before the Worker deploys. The previous Worker serves the old signup route
+  for a moment after 0093; 0094 closes that window.
+- The CLI calls routes the old Worker does not have (`/admin/users/by-id/:id` and
+  `/admin/pr-reviews`), so the Worker must be live before the package is installed.
+- **Re-audit chunked datasets after the deploy:** `nemar admin data-integrity-sweep --reaudit`.
+  A stored `data_complete = 0` stays 0 until something re-verifies the dataset (ADR 0064).
+- **Trying the automated review** takes three steps outside this release: subscribe the NEMAR
+  App to Pull request events (Pull requests: write); have the four `ANTHROPIC_*` organization
+  variables on `nemarDatasets`; deploy `run-pr-review.yml` to `nemarDatasets/.github` (a change
+  there reaches every dataset repository at once, ADR 0020) and wire its parity test with
+  `NEMAR_PR_REVIEW_WORKFLOW_LIVE`. The flag is already on in the dev Worker's config, and the
+  production Worker forwards events for the datasets dev owns (the `xx09*` datasets and the
+  fixture `nm099998`) to it, so a throwaway pull request to a published `xx0999NN` exemplar runs
+  the whole chain while production stays dark (`nm099998` is an anonymous deposit and `nm099999`
+  is private and production's, so neither is ever reviewed). **Turning it on for real datasets**
+  is adding the flag to the production block of `backend/wrangler-sccn.toml`, which ships in a
+  later release, after that trial has passed. A pull request that is open at that moment
+  produces no event; `nemar admin pr-reviews start --all` reviews those.
+- Pages on `docs.nemar.org` that name `nemar auth retrieve-key` need the same edit as the CLI
+  messages (ADR 0097): `cli/getting-started/authentication`, `cli/getting-started/quickstart`,
+  `platform/api` and the help capture in `cli/commands/auth`. That repository is private.
+- The hourly D1 backup (ADR 0004) keeps the password hashes in its git history. Clearing them in
+  the database does not touch it; rewriting that history is a separate decision (ADR 0097).
+- Do not run `nemar admin fleet key-registration --apply` on a chunked dataset until `git annex get`
+  of a chunked key is shown to work (ADR 0064 and 0095).
+
+### Known limitations
+
+- The live model call, the workload identity exchange and a real run of `run-pr-review.yml`
+  have not run on GitHub; everything around them is tested against real git, real SQLite and
+  stand-ins for the two HTTP services.
+- The `NEMAR PR Review` check is not required by any ruleset. Making it required waits until
+  the false-fail rate is known.
+- Manually redelivering an older commit's event makes it the latest and the newer commit's
+  claim is refused; both end as "push again" (ADR 0092, accepted risk).
+- Part of #1455 is addressed here and the issue stays open: acceptance against a real upload
+  (files over 1 GiB, authenticated S3, a final save on NFS) and the persistence of the idle
+  warnings are not settled. The S3 credential renewal and the multi-batch copy have no automated
+  test against a real bucket (the loopback test was removed); run one real upload to a dev dataset
+  before relying on them.
+- Chunked files are served by the Worker from a stream, and workerd may drop the hand-set
+  `Content-Length`; the chunk listing is bounded to 512 objects per backend and size. Read a chunked
+  sample from staging before announcing it (ADR 0095, known limits).
+- A recorded publication request whose latest BIDS run ends `cancelled`, `timed_out` or `skipped`
+  stays waiting until another run starts, while the CLI says it continues automatically (ADR 0086).
+- `nemar dataset update` does not clear stale assume-unchanged flags left by a save killed with
+  SIGKILL; `nemar dataset commit` does (ADR 0094).
+- Owner edits of an account's email and GitHub handle (ADR 0096, still proposed) do not end the old
+  holder's keys and sessions, and the handle is not checked against GitHub.
+
 ## 0.10.15 - 2026-10-07
 
 Epic #1610: identifier screening and an in-place scrub of published datasets. A third party

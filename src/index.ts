@@ -32,6 +32,11 @@ import { doctorCommand } from "./commands/doctor.js";
 import { sandboxCommand } from "./commands/sandbox.js";
 import { IS_DEV_BUILD } from "./lib/api/client.js";
 import { MaintenanceError, errorDetail } from "./lib/api/errors.js";
+import {
+  MisplacedShadowedOptionError,
+  MissingShadowedValueError,
+  bindShadowedOptionValues,
+} from "./lib/argv-shadowing.js";
 import { runComplete } from "./lib/completion/run.js";
 import { NO_DESCRIPTION, NO_OPTION, YES_DESCRIPTION, YES_OPTION } from "./lib/confirm.js";
 import {
@@ -354,7 +359,23 @@ async function main() {
     process.on("exit", () => printUpdateBanner(pendingUpdate));
   }
 
-  await program.parseAsync();
+  // `nemar dataset release <id> --version X.Y.Z` must reach `release`, not
+  // the root --version (#1493); see lib/argv-shadowing.ts.
+  let argv: string[];
+  try {
+    argv = bindShadowedOptionValues(program, rawArgs);
+  } catch (err) {
+    if (err instanceof MissingShadowedValueError || err instanceof MisplacedShadowedOptionError) {
+      // A mistyped option, reported as Commander reports one. error() exits;
+      // routing through it runs the exitOverride whose markUsageExit() skips
+      // the bug-report nudge, since a wrong flag is not a bug.
+      err.command.error(err.message, { code: err.code });
+    }
+    // Anything else is a defect in the pre-pass itself, not in the user's
+    // arguments: say so, instead of letting it read as a command failure.
+    throw new Error(`argv pre-pass failed: ${errorDetail(err)}`, { cause: err });
+  }
+  await program.parseAsync(argv, { from: "user" });
 }
 
 main().catch((err) => {

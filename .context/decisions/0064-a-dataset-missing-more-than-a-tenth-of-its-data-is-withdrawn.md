@@ -208,3 +208,51 @@ data nobody can supply, which is what withdrawal is for.
 
 A key on the purge list is not missing: it is excluded from both the numerator and the denominator of the availability ratio ([ADR 0085](0085-a-privacy-correction-scrubs-every-version-in-place.md)).
 **Not built in Phase 2 of #1610:** there is no purge list yet, and the availability count does not read one ([ADR 0085](0085-a-privacy-correction-scrubs-every-version-in-place.md), "Build status").
+
+## Amendment 2026-10-07 (#1565): a chunked key is present when its chunk set is complete
+
+The test "an object at its declared size" now also holds for a key whose complete chunk set is in the bucket.
+A git-annex special remote configured with `chunk=1GiB` stores `<fields>-S<chunksize>-C<n>--<name>` objects and never the plain key, so every chunked file used to count as missing.
+`isKeyPresentAtDeclaredSize` (`shared/annex-key.ts`, one definition for the Worker and the CLI) answers present when the plain object exists at its declared size.
+It also answers present when the plain object is ABSENT and some chunking of the key is complete.
+A complete chunking is chunks C1..Cn, with n the size divided by the chunk size, rounded up.
+Every chunk is exactly the chunk size except the last, which holds whatever is left (a full chunk when the size divides evenly).
+An empty file is a single empty chunk.
+A plain object that exists at the wrong size stays missing even beside a complete chunk set.
+The data plane serves the plain key, and a short plain object is served as a 200 with truncated bytes, silently, where an absent key fails loudly.
+
+**What changes in the arithmetic.**
+This ADR's numerator is the keys with NO object at their declared size, the missing count.
+Only that count shrinks: a chunked key with a complete chunk set is no longer in it.
+The denominator is the distinct annexed keys the tree names, never reads S3, and is unchanged, so no stored denominator moves and nothing needs a backfill.
+The Worker stores no ratio.
+Its `data_complete` is `missingKeys.length === 0`, and the 90% rule is evaluated only by the CLI, in `dataAvailability` at the import publish gate.
+A stored `data_complete = 0` stays 0 until something re-verifies the dataset: `nemar admin data-integrity-sweep --reaudit`, `POST /admin/imports/:id/verify`, a reindex, or the import retry engine when it reaches the row.
+Nothing in this repository schedules the sweep, so the re-audit is a deploy step for the release that carries this change.
+
+**Present now means recoverable, not servable.**
+A complete chunk set can be reassembled by the Zarr converter (`scripts/zarr/generate_zarr.py`).
+Whether `git annex get` can fetch a chunk-only key has not been verified.
+The data plane and `manifest.json` still emit the plain-key URL (`<id>/objects/<key>`) for a chunked key, and no such object exists.
+For a reader that URL does not resolve (403 or 404): an anonymous GET of an absent key on `s3://nemar` answers 403, because anonymous ListBucket is denied.
+That half of #1565 is not fixed, and the issue stays open.
+
+**Update 2026-10-10.** The serving half landed afterwards (#1695, [ADR 0095](0095-manifest-urls-are-stable-data-plane-routes.md)): a `manifest.json` entry's `url` is now its stable `bytes_url`, and that route streams a complete chunk set, so a chunked file is servable from the data plane.
+Two things stay open. `git annex get` of a chunk-only key is still unverified, and the data plane has not served real chunk bytes yet (ADR 0095 leaves that acceptance open). The paragraphs above and below describe the state before that change, and where they say the data plane cannot serve a chunked key or that the issue stays open, ADR 0095 is the later word.
+
+**Consequence for the withdrawal rule.**
+A chunked key with a complete chunk set is available for this ADR's threshold, so the rule never fires on account of such a key, however many of them the data plane cannot yet serve.
+A chunked key with a missing, short or oversized chunk is still missing and still counts against the dataset.
+The promise above that a listed dataset "advertises nothing it cannot deliver" is not met for a chunked file until #1565 closes.
+`data_complete = 1` is a public filter (the catalog filter, the MCP `data_complete` argument and the API), and it now means every data key is in the bucket, whole or as a complete chunk set.
+It does not mean every data key is servable.
+Whether it should be offered as a public claim before the data plane serves chunked keys is the owner's decision and is not made here.
+
+**Side effects of the same presence test.**
+`nemar admin fleet key-registration --apply` uses it, so it will now record chunk-only keys in the location log as held by NEMAR's remote.
+`nemar dataset status` prints its Data line only when `data_complete` is 0, and `nemar dataset list` leaves the column blank, so neither says anything about a chunk-only dataset until #1565 closes.
+The import-failure surfaces (the publish gate in `import-openneuro.ts` and the issue accrual in `import-issue-accrual.ts`) keep their wording: imports copy plain keys server-side, so what they report is about plain keys.
+
+**`nm000276`.**
+Issue #1565 lists only C1..C94 of `s100969566208` at 1 GiB, which is 95 chunks, so that listing is incomplete without C95 at the remainder size, 37,834,752 bytes.
+The dataset's `data_complete` would flip to 1 only if the listing also holds C95, and the same holds for every other chunked file it names.

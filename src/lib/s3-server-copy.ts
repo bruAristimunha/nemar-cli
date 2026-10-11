@@ -19,7 +19,11 @@
 import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { annexKeyDeclaredSize, isKeyPresentAtDeclaredSize } from "../../shared/annex-key.js";
 import { runCommand } from "./git-annex/run-command.js";
+
+// Re-exported from shared/annex-key.ts so existing importers keep their path.
+export { annexKeyDeclaredSize, isKeyPresentAtDeclaredSize };
 
 /** A parsed S3 location. `region` is undefined when the URL didn't encode one. */
 export interface S3Ref {
@@ -36,37 +40,6 @@ export interface CopyItem {
   source: S3Ref | null;
   httpUrl: string | null;
   destUri: string;
-}
-
-/**
- * Declared size (bytes) encoded in a git-annex key, e.g.
- * `SHA256E-s10565888--abc123.edf` -> 10565888. Works for any backend that
- * encodes size this way (SHA256E, MD5E, SHA1E, ...). Returns null for
- * non-annex keys (`git:<sha>`, in-tree git blobs) or anything that doesn't
- * match the pattern, so callers can tell "no declared size" apart from "0
- * bytes claimed" -- load-bearing for the copy-integrity checks below, which
- * must not silently accept an empty object as correct.
- */
-export function annexKeyDeclaredSize(key: string): number | null {
-  const match = key.match(/-s(\d+)--/);
-  return match ? Number.parseInt(match[1], 10) : null;
-}
-
-/**
- * True when `key` is present in `existing` (a key -> byte-size map from
- * {@link listExistingObjects}) at its correct size. An annex key's declared
- * size must match exactly -- a 0-byte or truncated object counts as absent
- * even though the key exists (the #967 bug: a failed curl fallback used to
- * leave a valid-looking 0-byte PUT behind). A non-annex `git:` key has no
- * declared size, so presence alone is sufficient (its bytes live in GitHub,
- * not S3).
- */
-export function isKeyPresentAtDeclaredSize(key: string, existing: Map<string, number>): boolean {
-  const actual = existing.get(key);
-  if (actual === undefined) return false;
-  const declared = annexKeyDeclaredSize(key);
-  if (declared === null) return true;
-  return actual === declared;
 }
 
 /**

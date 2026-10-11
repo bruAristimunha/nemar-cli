@@ -46,8 +46,9 @@ function seedDataset(db: Database, datasetId: string): void {
     "INSERT OR IGNORE INTO users (id, username, email, github_username, status) VALUES (1, 'alice', 'alice@nemar.org', 'alice', 'approved')",
   ).run();
   db.prepare(
-    "INSERT INTO datasets (dataset_id, owner_user_id, name, visibility, is_sandbox, github_repo) VALUES (?, 1, ?, 'public', 0, ?)",
-  ).run(datasetId, datasetId, `nemarDatasets/${datasetId}`);
+    // A version DOI: the sweep only considers datasets that have a version.
+    "INSERT INTO datasets (dataset_id, owner_user_id, name, visibility, is_sandbox, github_repo, latest_version_doi) VALUES (?, 1, ?, 'public', 0, ?, ?)",
+  ).run(datasetId, datasetId, `nemarDatasets/${datasetId}`, `10.82901/nemar.${datasetId}.v1.0.0`);
 }
 
 function readStamp(db: Database, datasetId: string): string | null {

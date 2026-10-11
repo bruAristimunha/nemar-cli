@@ -11,18 +11,20 @@
  */
 
 import type { Bindings } from "../types/bindings.js";
+import { datasetHasVersionSql } from "./archive-retry.js";
 import { isNonProductionEnv } from "./environment.js";
 import { exemplarOrFragment } from "./exemplar.js";
 import { getDatasetsToken } from "./github-auth.js";
-import { createOrUpdateFile } from "./github/contents.js";
+import { branchExists, createOrUpdateFile } from "./github/contents.js";
 import {
   type DatasetVersionIntegrityResult,
   type ExpectedManifestFile,
   parseManifestFiles,
   verifyDatasetVersionS3,
+  versionReadS3Options,
 } from "./import-integrity.js";
 import { errorMessage } from "./repo-metadata.js";
-import { type PresignedUrlOptions, getManifest } from "./s3.js";
+import { getManifest } from "./s3.js";
 
 /** One manifest PATH whose declared annex key is not present in S3 at its
  *  declared size. Entries are built by walking manifest PATHS (not annex
@@ -142,20 +144,88 @@ export function buildAvailabilityReport(args: BuildAvailabilityReportArgs): Avai
   };
 }
 
+/** The branch the report is committed to, and the one whose existence is
+ *  checked first. One constant, so the guard and the write cannot name
+ *  different branches. */
+const REPORT_BRANCH = "main";
+
 /**
- * Thrown by {@link writeAvailabilityReport} for caller-recoverable failures
- * (missing dataset row, no/invalid GitHub repo, auth failure) so the admin
- * route can map them to a specific HTTP status instead of a generic 500.
+ * Thrown by {@link writeAvailabilityReport} for failures the admin route maps
+ * to a specific HTTP status instead of a generic 500:
+ *   - 404: no such dataset row;
+ *   - 400: no GitHub repository, or a malformed `github_repo`;
+ *   - 409: the repository has no `main` branch (empty, or never pushed), so the
+ *     report is refused rather than creating `main` as a root commit (#1643);
+ *   - 500: a failure that is not the dataset's own state, wrapped with its
+ *     `cause`: GitHub auth, or a branch lookup that failed or could not be
+ *     trusted (including a repository not visible to NEMAR).
  * Mirrors DatasetReindexError (services/dataset-reindex.ts).
  */
 export class AvailabilityReportError extends Error {
   constructor(
     message: string,
-    public readonly statusCode: 400 | 404 | 500,
+    public readonly statusCode: 400 | 404 | 409 | 500,
+    options?: { cause?: unknown },
   ) {
-    super(message);
+    super(message, options);
     this.name = "AvailabilityReportError";
   }
+}
+
+/**
+ * Where the report is committed, or the reason it must not be. Runs before any
+ * S3 work on the write path: it is a handful of cheap checks, and the S3 pass
+ * is the most expensive thing a sweep row does.
+ */
+async function resolveReportTarget(
+  env: Bindings,
+  githubRepo: string | null,
+  datasetId: string,
+): Promise<{ repoName: string; pat: string }> {
+  if (!githubRepo) {
+    throw new AvailabilityReportError(`Dataset has no GitHub repository: ${datasetId}`, 400);
+  }
+  const repoName = githubRepo.split("/")[1];
+  if (!repoName) {
+    throw new AvailabilityReportError(`Invalid github_repo format: ${githubRepo}`, 400);
+  }
+  let pat: string;
+  try {
+    pat = await getDatasetsToken(env);
+  } catch (err) {
+    throw new AvailabilityReportError(`Failed to resolve GitHub auth: ${errorMessage(err)}`, 500, {
+      cause: err,
+    });
+  }
+  // Never create `main` (#1643). On a repository nothing has been pushed to
+  // yet (a dataset created but still uploading) the Contents API PUT makes
+  // `main` an unrelated ROOT commit. The depositor's first push is then
+  // rejected as non-fast-forward, and the git-annex adjusted branch cannot be
+  // auto-rebased onto the unrelated root; the upload only recovered through a
+  // manual merge.
+  //
+  // `branchExists` answers false only for a branch that is absent from a
+  // repository NEMAR can see, so the 409 below can say exactly that. Every
+  // other outcome (a repository not visible to NEMAR, a rate limit, a 5xx, a
+  // body that is not a ref) throws, and is reported as a 500 because it is not
+  // a fact about the dataset.
+  let hasReportBranch: boolean;
+  try {
+    hasReportBranch = await branchExists(repoName, REPORT_BRANCH, pat);
+  } catch (err) {
+    throw new AvailabilityReportError(
+      `Could not check for ${REPORT_BRANCH} in ${githubRepo}: ${errorMessage(err)}. Nothing was written`,
+      500,
+      { cause: err },
+    );
+  }
+  if (!hasReportBranch) {
+    throw new AvailabilityReportError(
+      `${githubRepo} has no ${REPORT_BRANCH} branch (empty repository, or ${REPORT_BRANCH} was never pushed). Nothing was written; the availability report never creates ${REPORT_BRANCH}`,
+      409,
+    );
+  }
+  return { repoName, pat };
 }
 
 export interface WriteAvailabilityReportOptions {
@@ -172,9 +242,14 @@ export interface WriteAvailabilityReportOptions {
  * `createOrUpdateFile` enrichment uses for `.nemar/metadata.json`).
  *
  * Throws {@link AvailabilityReportError} for the dataset-not-found case (and,
- * on the write path only, a missing/invalid github_repo or a GitHub auth
- * failure) so callers can map them to specific HTTP statuses; a dry-run never
- * needs a repo at all, so those checks are skipped when `dryRun` is true.
+ * on the write path only, a missing/invalid github_repo, a GitHub auth
+ * failure, or a repository with no `main` branch) so callers can map them to
+ * specific HTTP statuses; a dry-run never needs a repo at all, so those checks
+ * are skipped when `dryRun` is true.
+ *
+ * On the write path the GitHub checks run BEFORE the S3 work. Verifying a
+ * dataset is a paginated LIST plus a manifest walk, the dominant cost of a
+ * sweep row, so a row the write is going to refuse anyway must not pay it.
  */
 export async function writeAvailabilityReport(
   env: Bindings,
@@ -191,6 +266,11 @@ export async function writeAvailabilityReport(
     throw new AvailabilityReportError(`Dataset not found: ${datasetId}`, 404);
   }
 
+  // Write path only: resolve the target and refuse BEFORE the S3 work below.
+  const target = opts?.dryRun
+    ? null
+    : await resolveReportTarget(env, dataset.github_repo, datasetId);
+
   // import_jobs carries OpenNeuro provenance for imported (on*) datasets
   // only; a native NEMAR submission has no row here, so `source` stays null.
   const importJob = await db
@@ -206,13 +286,7 @@ export async function writeAvailabilityReport(
   // comparison result, not the parsed files map itself.
   let manifest: Record<string, ExpectedManifestFile> | null = null;
   if (integrity.version) {
-    const s3Options: PresignedUrlOptions = {
-      bucket: env.S3_BUCKET,
-      region: env.AWS_REGION,
-      accessKeyId: env.AWS_ACCESS_KEY_ID,
-      secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
-    };
-    const manifestJson = await getManifest(s3Options, datasetId, integrity.version);
+    const manifestJson = await getManifest(versionReadS3Options(env), datasetId, integrity.version);
     if (manifestJson) {
       manifest = parseManifestFiles(manifestJson);
     }
@@ -229,27 +303,14 @@ export async function writeAvailabilityReport(
     blocklistReason: importJob?.blocklist_reason ?? null,
   });
 
-  if (!opts?.dryRun) {
-    if (!dataset.github_repo) {
-      throw new AvailabilityReportError(`Dataset has no GitHub repository: ${datasetId}`, 400);
-    }
-    const repoName = dataset.github_repo.split("/")[1];
-    if (!repoName) {
-      throw new AvailabilityReportError(`Invalid github_repo format: ${dataset.github_repo}`, 400);
-    }
-    let pat: string;
-    try {
-      pat = await getDatasetsToken(env);
-    } catch (err) {
-      throw new AvailabilityReportError(`Failed to resolve GitHub auth: ${errorMessage(err)}`, 500);
-    }
+  if (target) {
     await createOrUpdateFile(
-      repoName,
+      target.repoName,
       ".nemar/availability-report.json",
       JSON.stringify(report, null, 2),
       "Update NEMAR availability report",
-      pat,
-      "main",
+      target.pat,
+      REPORT_BRANCH,
     );
   }
 
@@ -270,15 +331,30 @@ export async function writeAvailabilityReport(
 // `availabilityReportSweepWhere` builder rather than two copies of the WHERE
 // clause that could drift apart.
 
-/** Base candidacy predicate: every managed dataset (github_repo IS NOT NULL;
- *  catalog ds* rows have none), not sandbox, not yet stamped. The curated
- *  exemplar fleet (`is_exemplar = 1`) is inserted `is_sandbox = 1` but is
- *  permanent, not churning (AGENTS.md's dataset ID bands, "never" cleaned),
- *  so `exemplarOrFragment()` carves it back into candidacy (issue #1168),
- *  matching the visibility predicates in dataset-search.ts / catalog.ts. */
+/** Base candidacy predicate: a dataset with a GitHub repository
+ *  (`github_repo IS NOT NULL`; catalog `ds*` rows have none), not sandbox, with
+ *  a version, and not yet stamped. The curated exemplar fleet
+ *  (`is_exemplar = 1`) is inserted `is_sandbox = 1` but is permanent, not
+ *  churning (AGENTS.md's dataset ID bands, "never" cleaned), so
+ *  `exemplarOrFragment()` carves it back into candidacy (issue #1168), matching
+ *  the visibility predicates in dataset-search.ts / catalog.ts.
+ *
+ *  A dataset with no version yet (no version DOI, no dataset_versions row) is
+ *  not a candidate: its report has nothing to compare against, and its
+ *  repository may still be empty mid-upload. A never-versioned row would hold
+ *  one of the LIMIT slots on every pass (ORDER BY dataset_id), as it would in
+ *  ARCHIVE_RETRY_SWEEP_QUERY. This predicate removes only that case.
+ *
+ *  KNOWN LIMITATION (tracked as a follow-up to #1643): a row the write REFUSES
+ *  (the repository has no `main`, or is not visible to NEMAR) stays a candidate
+ *  and unstamped, so it is retried on every pass and holds a LIMIT slot, and
+ *  because candidates are ordered by dataset_id it starves the valid rows behind
+ *  it. The version rule is `datasetHasVersionSql`, which that query also builds
+ *  from. */
 const AVAILABILITY_REPORT_SWEEP_BASE_WHERE = `github_repo IS NOT NULL
      AND (is_sandbox = 0 OR is_sandbox IS NULL OR ${exemplarOrFragment("")})
-     AND json_extract(sweep_stamps, '$.availability_report_at') IS NULL`;
+     AND json_extract(sweep_stamps, '$.availability_report_at') IS NULL
+     AND ${datasetHasVersionSql("datasets")}`;
 
 /** Appended to the base predicate when `?missing-only=1` narrows candidacy to
  *  datasets already known incomplete (data_complete = 0, migration 0059). */
@@ -322,24 +398,41 @@ export function availabilityReportSweepRemainingQuery(missingOnly: boolean): str
  *
  *  This one is not read-only: each candidate does a GitHub commit
  *  (createOrUpdateFile = a GET-sha + PUT pair on raw fetch, with NO rate-limit
- *  retry) on the shared GITHUB_ADMIN_PAT that also drives repo creation,
- *  publication and DOI work. It was 10 for that reason, citing the
- *  bulk-approval-rate-limit precedent.
+ *  retry, after the one-attempt branchExists ref lookup) on the shared
+ *  GITHUB_ADMIN_PAT that also drives repo creation, publication and DOI work.
+ *  It was 10 for that reason, citing the bulk-approval-rate-limit precedent.
  *
  *  30 is still comfortable because the loop is sequential and each iteration is
  *  dominated by an S3 LIST plus a manifest walk (verifyDatasetVersionS3), not by
- *  the two GitHub calls. 30 candidates is 60 content-generating requests spread
- *  across the seconds-per-dataset those S3 passes take, so it does not resemble
- *  the tight burst the precedent hit. If that ever changes -- a fast path that
- *  skips the S3 verify, or parallelising the loop -- this number has to come
- *  back down, because the pacing is incidental to the work, not enforced. */
+ *  the three GitHub calls. 30 candidates is 90 GitHub requests, 30 of them
+ *  writes, spread across the seconds-per-dataset those S3 passes take, so it
+ *  does not resemble the tight burst the precedent hit. A refused row skips the
+ *  S3 pass and costs one ref lookup (two on a 404, with the repository probe),
+ *  so a pass made of refused rows is a quick burst of reads, never of writes.
+ *  If the pacing ever changes -- a fast path that skips the S3 verify, or
+ *  parallelising the loop -- this number has to come back down, because the
+ *  pacing is incidental to the work, not enforced. */
 export const AVAILABILITY_REPORT_SWEEP_MAX = 30;
+
+/** One candidate the pass could not complete. */
+export interface AvailabilityReportSweepError {
+  dataset_id: string;
+  error: string;
+  /** The HTTP status the single-dataset route answers for this failure, so a
+   *  refusal reads differently from a fault without parsing `error`: 409 =
+   *  refused because the repository has no `main`; 400/404 = the dataset's own
+   *  configuration; 500 = anything else (S3, GitHub or auth failure, a
+   *  repository not visible to NEMAR, the stamp write). */
+  status: number;
+}
 
 export interface AvailabilityReportSweepResult {
   processed: number;
   written: number;
-  errors: { dataset_id: string; error: string }[];
-  /** Candidates still unstamped after this run; null if the count query failed. */
+  errors: AvailabilityReportSweepError[];
+  /** Candidates still unstamped after this run, refused and failed rows
+   *  included (see AVAILABILITY_REPORT_SWEEP_BASE_WHERE); 0 means nothing is left
+   *  to try. Null if the count query failed. */
   remaining: number | null;
 }
 
@@ -372,14 +465,18 @@ export async function runAvailabilityReportSweep(
   const candidates = rows.results ?? [];
 
   let written = 0;
-  const errors: { dataset_id: string; error: string }[] = [];
+  const errors: AvailabilityReportSweepError[] = [];
   for (const { dataset_id } of candidates) {
     try {
       await writeAvailabilityReport(env, dataset_id);
       await env.DB.prepare(AVAILABILITY_REPORT_STAMP_SQL).bind(dataset_id).run();
       written++;
     } catch (err) {
-      errors.push({ dataset_id, error: errorMessage(err) });
+      errors.push({
+        dataset_id,
+        error: errorMessage(err),
+        status: err instanceof AvailabilityReportError ? err.statusCode : 500,
+      });
     }
   }
 

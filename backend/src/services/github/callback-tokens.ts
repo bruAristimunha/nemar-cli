@@ -280,3 +280,66 @@ export async function verifyIdentifierSweepCallbackToken(
   const expected = await signIdentifierSweepCallbackToken(payload, secret);
   return timingSafeEqual(token, expected);
 }
+
+// ============================================================================
+// PR-review callback HMAC tokens (ADR 0092)
+// ============================================================================
+//
+// The pull-request review workflow claims its review at /webhooks/pr-review-claim and posts its
+// report to /webhooks/pr-review-result with one token. Signed with the same secret as the pre-screen and identifier-screen tokens
+// (PRESCREEN_CALLBACK_SECRET, one fewer secret to provision on two Workers) and
+// DOMAIN-SEPARATED the same way: the message begins with a tag line no other kind's message can
+// begin with, so a token minted for any other callback cannot answer for a review, and a review
+// token cannot answer for them.
+//
+// The token binds the dataset, the review row and the attempt's nonce. Single-use is enforced by
+// the row (`state` and `nonce`, cleared when a result is stored), not by the HMAC.
+
+/** The first line of every PR-review message. Never shared with another token kind. */
+export const PR_REVIEW_TOKEN_DOMAIN = "pr-review";
+
+export interface PrReviewCallbackPayload {
+  datasetId: string;
+  reviewId: number;
+  nonce: string;
+}
+
+/** Canonical, domain-tagged payload encoding, pinned so signer and verifier agree. */
+function encodePrReviewCallbackPayload(payload: PrReviewCallbackPayload): string {
+  return `${PR_REVIEW_TOKEN_DOMAIN}\n${payload.datasetId}\n${payload.reviewId}\n${payload.nonce}`;
+}
+
+/** Sign a PR-review callback payload with HMAC-SHA256 (hex digest). */
+export async function signPrReviewCallbackToken(
+  payload: PrReviewCallbackPayload,
+  secret: string,
+): Promise<string> {
+  if (!secret) {
+    throw new Error("signPrReviewCallbackToken: secret is required");
+  }
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    encoder.encode(encodePrReviewCallbackPayload(payload)),
+  );
+  return toHex(signature);
+}
+
+/** Verify a PR-review callback token (constant-time). */
+export async function verifyPrReviewCallbackToken(
+  token: string,
+  payload: PrReviewCallbackPayload,
+  secret: string,
+): Promise<boolean> {
+  if (!token || !secret) return false;
+  const expected = await signPrReviewCallbackToken(payload, secret);
+  return timingSafeEqual(token, expected);
+}

@@ -1028,9 +1028,10 @@ export function registerDatasetLifecycleRoutes(admin: AdminRouter): void {
 
   /**
    * POST /admin/datasets/availability-report-sweep?limit=N[&missing-only=1] —
-   * one-time backfill that generates + commits `.nemar/availability-report.json`
-   * (services/availability-report.ts, epic #999 phase 1 #1000) across every
-   * managed dataset, stamping availability_report_at (migration 0061).
+   * backfill that generates + commits `.nemar/availability-report.json`
+   * (services/availability-report.ts, epic #999 phase 1 #1000) for every
+   * non-sandbox dataset (plus the exemplar fleet) that has a version and no
+   * report yet, stamping availability_report_at (migration 0061).
    * Mirrors hed-sweep's shape (candidate/stamp/remaining) exactly. Candidate/
    * remaining SQL is built from availabilityReportSweepCandidateQuery /
    * availabilityReportSweepRemainingQuery (services/availability-report.ts) so
@@ -1049,17 +1050,22 @@ export function registerDatasetLifecycleRoutes(admin: AdminRouter): void {
    *
    * Bounded per invocation by AVAILABILITY_REPORT_SWEEP_MAX (30, matching the
    * read-only sweeps; see the rationale on that constant). Each candidate here
-   * still does a GitHub commit (createOrUpdateFile, 2 API calls) unlike
-   * hed-sweep/data-integrity-sweep, and a burst of write calls can trip
-   * GitHub's secondary rate limit (the same failure mode the
-   * bulk-approval-rate-limit precedent hit); what keeps 30 safe is that the
-   * loop is sequential and each iteration is dominated by an S3 LIST plus a
-   * manifest walk, so the writes are naturally spread. No in-Worker
-   * sleep between writes (that would eat into the Worker's request duration
-   * budget) -- createOrUpdateFile itself has no 403 backoff either (its retry
-   * loop only covers a stale-SHA conflict, not rate limiting), so a
+   * still does a GitHub commit unlike hed-sweep/data-integrity-sweep: a ref
+   * lookup (branchExists), then createOrUpdateFile's GET sha and PUT, so three
+   * API calls (a refused row costs one, or two when the ref lookup 404s and
+   * the repository is probed). A burst of write calls can trip GitHub's
+   * secondary rate limit (the same failure mode the bulk-approval-rate-limit
+   * precedent hit); what keeps 30 safe is that the loop is sequential and each
+   * iteration is dominated by an S3 LIST plus a manifest walk, so the writes
+   * are naturally spread. No in-Worker sleep between writes (that would eat
+   * into the Worker's request duration budget), and none inside the calls
+   * either: branchExists makes one interactive attempt and createOrUpdateFile
+   * has no 403 backoff (its retry loop only covers a stale-SHA conflict), so a
    * rate-limited candidate just throws, lands in `errors`, and stays
-   * unstamped. The pacing strategy is entirely external to this handler: the
+   * unstamped. A candidate the write REFUSES (the repository has no `main`, or
+   * is not visible to NEMAR) also lands in `errors`, with its `status`; see
+   * AVAILABILITY_REPORT_SWEEP_BASE_WHERE for what that costs. The pacing
+   * strategy is entirely external to this handler: the
    * small per-batch cap plus the CLI's inter-batch sleep between calls, and
    * an unstamped candidate is simply retried on the next sweep invocation
    * once GitHub's limit window has passed. Run repeatedly until `remaining`
@@ -1251,6 +1257,11 @@ export function registerDatasetLifecycleRoutes(admin: AdminRouter): void {
       return c.json(dryRun ? report : { written: true, report });
     } catch (err) {
       if (err instanceof AvailabilityReportError) {
+        // A 4xx names the dataset's own state; a 5xx is a fault (GitHub auth,
+        // a branch lookup that failed) and would otherwise leave no server log.
+        if (err.statusCode >= 500) {
+          console.error(`[availability-report] Failed for ${datasetId}:`, err);
+        }
         return c.json({ error: err.message }, err.statusCode);
       }
       console.error(`[availability-report] Failed for ${datasetId}:`, err);

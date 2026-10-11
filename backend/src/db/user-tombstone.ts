@@ -8,7 +8,8 @@
 //      email prefs are nulled; email_verified and orcid_verified are zeroed.
 //   2. Re-signup freedom — nulling username/github and rewriting email FREES
 //      those UNIQUE values so the original owner can sign up again later. (The
-//      signup de-dup checks intentionally still see tombstoned rows.)
+//      values are freed by this mask, not by ignoring deleted rows in the
+//      checks.)
 //   3. Access erasure — the upload grant and the request behind it are cleared,
 //      the same four columns POST /admin/revoke clears (ADR 0040/0042), so a
 //      tombstoned row cannot sit at status='revoked' still holding the grant.

@@ -20,6 +20,16 @@
 import { z } from "zod";
 
 /**
+ * The `error` of the 502 the data plane answers when a file the manifest names is not in
+ * storage: an annex object absent from the bucket, or a git blob GitHub does not have
+ * (`manifestObjectMissing`, ADR 0095). It is a different answer from the 404 for a path the
+ * manifest never listed, so a gather can tell a missing optional table from lost content. A
+ * downloader reads it by ADR 0005's rule that missing content is reported and never blocks the
+ * delivery (not a failed run), and reads any other 502 as a transport fault to retry.
+ */
+export const PUBLISHED_FILE_MISSING_ERROR = "Published file is missing from storage";
+
+/**
  * One file in a published version.
  *
  * `checksum_algorithm` is `"git"` for a file tracked in plain git and an annex
@@ -43,14 +53,11 @@ export const dataPlaneManifestEntrySchema = z
     /** Durable, storable contract URL for the bytes. Always present (#615). */
     bytes_url: z.string().min(1),
     /**
-     * Immediately-fetchable URL. For an annex-backed file this is usually the
-     * plain, never-expiring public S3 URL (nemarOrg/nemar-cli#1522); a
-     * dataset the bucket policy excludes from public read still gets a
-     * presigned S3 GET that expires in about an hour. For a git-tracked file
-     * it is the same durable data-plane URL as `bytes_url`, because the
-     * Worker serves those bytes itself rather than handing out a third-party
-     * link (#1403). Prefer `bytes_url` for anything you store: it is durable
-     * either way, and does not require knowing which case applies.
+     * Stable data-plane URL for fetching the file. It equals `bytes_url` for
+     * git-tracked, plain annex and chunked annex files, regardless of bucket
+     * public-read policy (ADR 0095). The route checks visibility before it
+     * resolves storage and serves the bytes. Keep `bytes_url` as the explicit
+     * durable download contract for clients that already consume it.
      */
     url: z.string().nullish(),
     /**

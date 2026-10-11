@@ -609,3 +609,54 @@ export async function triggerApprovePublication(
     throw new DispatchRejectedError(response.status, await response.text());
   }
 }
+
+/**
+ * The fields the central pull-request review workflow needs, and nothing it could use to choose a
+ * target. The workflow re-reads the pull request from GitHub with its own token: it is given the
+ * review's coordinates, not the pull request's text, and it maps `environment` to an API origin
+ * from a fixed table of its own, so a payload can never steer the callback to a host it chose.
+ */
+export interface PrReviewDispatch {
+  datasetId: string;
+  prNumber: number;
+  headSha: string;
+  reviewId: number;
+  callbackToken: string;
+  environment: ApprovalDispatchEnvironment;
+}
+
+/**
+ * Trigger the pull-request review via `repository_dispatch[run-pr-review]` on
+ * `nemarDatasets/.github` (ADR 0092). Throws with the status only: GitHub's body is not ours to
+ * forward, and the caller logs this message.
+ */
+export async function triggerPrReviewRun(
+  d: PrReviewDispatch,
+  pat: string,
+  timeoutMs?: number,
+): Promise<void> {
+  const response = await fetch(`${GITHUB_API()}/repos/${CENTRAL_WORKFLOW_REPO}/dispatches`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${pat}`,
+      Accept: "application/vnd.github.v3+json",
+      "User-Agent": "NEMAR-API",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      event_type: "run-pr-review",
+      client_payload: {
+        dataset_id: d.datasetId,
+        pr_number: d.prNumber,
+        head_sha: d.headSha,
+        review_id: d.reviewId,
+        callback_token: d.callbackToken,
+        environment: d.environment,
+      },
+    }),
+    ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
+  });
+  if (!response.ok) {
+    throw new Error(`PR review dispatch rejected: HTTP ${response.status}`);
+  }
+}

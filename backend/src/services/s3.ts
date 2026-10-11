@@ -168,11 +168,10 @@ export async function generatePresignedGetUrl(
 /**
  * Build the plain, query-string-free public URL for an S3 object (#1522).
  *
- * Used by `manifest.json` for a dataset the bucket policy has NOT carved out
- * of `PublicReadExceptPrivate` (`services/public-read-cache.ts` decides
- * which): the object is already anonymously readable, so a signature buys
- * nothing but an expiry the manifest then has to track. An excluded dataset
- * keeps calling {@link generatePresignedGetUrl} instead.
+ * This is a low-level URL helper; `manifest.json` now emits stable data-plane
+ * routes for every dataset (ADR 0095). Direct S3 URLs remain useful to
+ * operational code and regression checks that specifically need to verify
+ * S3 path encoding or public-object behavior.
  *
  * SAME ENCODING AS THE PRESIGNER, ON PURPOSE. `generatePresignedGetUrl`
  * builds its pre-signature URL the same way: a bare string-concatenated key,
@@ -475,6 +474,113 @@ export async function listObjectSizes(
     mergeObjectSizesPage(xml, prefix, sizes);
   }
   return sizes;
+}
+
+export interface BoundedS3ObjectList {
+  /** Full object keys, with their exact S3-reported sizes. */
+  sizes: Map<string, number>;
+  /** False when the page or object budget prevented a complete listing. */
+  complete: boolean;
+}
+
+const BOUNDED_LIST_PAGE_SIZE = 256;
+export const BOUNDED_LIST_MAX_PAGES = 2;
+const BOUNDED_LIST_MAX_OBJECTS = BOUNDED_LIST_PAGE_SIZE * BOUNDED_LIST_MAX_PAGES;
+
+/**
+ * List a bounded prefix without ever treating a capped or malformed result as
+ * complete. Used by the file data plane to discover annex chunks: a normal
+ * complete 95-chunk upload fits comfortably in this two-page budget, while an
+ * unusually large or noisy prefix fails closed instead of consuming unbounded
+ * Worker subrequests or memory.
+ */
+export async function listObjectSizesBounded(
+  options: PresignedUrlOptions,
+  prefix: string,
+): Promise<BoundedS3ObjectList> {
+  const { bucket, region, endpointUrl } = options;
+  const aws = createS3Client(options);
+  const origin = (endpointUrl ?? `https://${bucket}.s3.${region}.amazonaws.com`).replace(
+    /\/+$/,
+    "",
+  );
+  const sizes = new Map<string, number>();
+  let continuationToken: string | undefined;
+
+  for (let page = 0; page < BOUNDED_LIST_MAX_PAGES; page++) {
+    const params = new URLSearchParams({
+      "list-type": "2",
+      "encoding-type": "url",
+      "max-keys": String(BOUNDED_LIST_PAGE_SIZE),
+      prefix,
+      ...(continuationToken ? { "continuation-token": continuationToken } : {}),
+    });
+    const signed = await aws.sign(`${origin}/?${params.toString()}`, { method: "GET" });
+    const response = await fetch(signed);
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      throw new Error(`Failed to list chunk objects: HTTP ${response.status}`);
+    }
+
+    const xml = await response.text();
+    if (!xml.includes("<ListBucketResult")) {
+      throw new Error("Unexpected S3 chunk-list response");
+    }
+    for (const match of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) {
+      const keyMatch = match[1]?.match(/<Key>([\s\S]*?)<\/Key>/);
+      const sizeMatch = match[1]?.match(/<Size>(\d+)<\/Size>/);
+      if (!keyMatch?.[1] || !sizeMatch?.[1]) {
+        throw new Error("Malformed S3 chunk-list entry");
+      }
+      let key: string;
+      try {
+        key = decodeURIComponent(unescapeXml(keyMatch[1]));
+      } catch {
+        throw new Error("Malformed encoded key in S3 chunk-list entry");
+      }
+      const size = Number(sizeMatch[1]);
+      if (!Number.isSafeInteger(size) || size < 0) {
+        throw new Error("Malformed size in S3 chunk-list entry");
+      }
+      if (!key.startsWith(prefix)) continue;
+      if (sizes.has(key)) throw new Error("Duplicate key in S3 chunk-list response");
+      sizes.set(key, size);
+      if (sizes.size > BOUNDED_LIST_MAX_OBJECTS) return { sizes, complete: false };
+    }
+
+    const truncated = /<IsTruncated>\s*true\s*<\/IsTruncated>/.test(xml);
+    if (!truncated) return { sizes, complete: true };
+    const token = xml.match(/<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/)?.[1];
+    if (!token) throw new Error("Truncated S3 chunk listing has no continuation token");
+    continuationToken = unescapeXml(token);
+  }
+
+  return { sizes, complete: false };
+}
+
+/**
+ * Authenticated object request used by the data plane after its visibility,
+ * version and manifest-path gates. `Range` is sent to S3 for chunk slices;
+ * callers construct it only from parsed, bounded byte offsets.
+ */
+export async function fetchS3Object(
+  options: PresignedUrlOptions,
+  key: string,
+  request: { method: "GET" | "HEAD"; range?: string },
+): Promise<Response> {
+  assertValidS3Key(key);
+  const { bucket, region, endpointUrl } = options;
+  const origin = (endpointUrl ?? `https://${bucket}.s3.${region}.amazonaws.com`).replace(
+    /\/+$/,
+    "",
+  );
+  const encodedKey = key.split("/").map(encodeURIComponent).join("/");
+  const headers = request.range ? { Range: request.range } : undefined;
+  const signed = await createS3Client(options).sign(`${origin}/${encodedKey}`, {
+    method: request.method,
+    headers,
+  });
+  return fetch(signed);
 }
 
 // ---------------------------------------------------------------------------

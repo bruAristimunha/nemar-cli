@@ -50,7 +50,9 @@ async function testGitHubSsh(): Promise<{ works: boolean; error?: string }> {
  */
 export async function getGitHubToken(): Promise<{ token: string | null; error?: string }> {
   try {
-    const { stdout, exitCode, stderr } = await runCommand(["gh", "auth", "token"]);
+    const { stdout, exitCode, stderr } = await runCommand(["gh", "auth", "token"], {
+      sensitiveOutput: true,
+    });
 
     if (exitCode !== 0) {
       console.warn("gh CLI returned non-zero exit code:", exitCode);
@@ -298,7 +300,7 @@ export async function configureGitHubRemote(
         "credential.https://github.com.helper",
         `!printf 'username=x-access-token\\npassword=${token}'`,
       ],
-      { cwd: path },
+      { cwd: path, redact: [token] },
     );
   }
   // Local: Try HTTPS via gh CLI token first (preferred), then SSH as fallback
@@ -317,7 +319,7 @@ export async function configureGitHubRemote(
           "credential.https://github.com.helper",
           `!printf 'username=x-access-token\\npassword=${ghTokenResult.token}'`,
         ],
-        { cwd: path },
+        { cwd: path, redact: [ghTokenResult.token] },
       );
     } else {
       // HTTPS not available, try SSH as last resort

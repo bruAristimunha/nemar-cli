@@ -26,6 +26,7 @@
     "src/**/*",
     "shared/**/*",
     "scripts/neurobagel/**/*.ts",
+    "scripts/ci/pr-review*.ts",
     "scripts/identifier-fleet-lib.ts",
     "scripts/identifier-fleet-scan.ts",
     "scripts/identifier-screen-ci-lib.ts",

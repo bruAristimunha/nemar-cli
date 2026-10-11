@@ -112,6 +112,12 @@ const SWEEP_WIRING: Record<
   // absent from DEV_CRON_ALLOWLIST; the raw sweep stays unguarded for the admin route.
   runNeurobagelVerificationSweep: "cron-wrapped",
   runNeurobagelVerificationSweepCron: "prod-only",
+  // ADR 0092: the pull-request review watchdog. Its deadline is 30 minutes, so it rides
+  // the 30-minute tick; it writes check-runs and comments to the shared nemarDatasets org,
+  // so it is production-only there and absent from DEV_CRON_ALLOWLIST. It also refuses
+  // outside production on its own. It deliberately ignores PR_REVIEW_ENABLED, so switching the
+  // review off does not strand the checks of reviews already in flight.
+  sweepStalePrReviews: "tick-prod-only",
   sweepBlockedBidsValidationRequests: "all-envs",
   // Epic #1610 phase 4: the identifier-screen watchdog. Its deadline is 50
   // minutes, so it rides the 30-minute tick; it mails admins, so it is

@@ -1,6 +1,7 @@
 {
   "name": "nemar-api",
-  "version": "0.10.15",
+  "packageManager": "bun@1.4.3",
+  "version": "0.10.16-dev8",
   "private": true,
   "scripts": {
     "dev": "wrangler dev -c wrangler-sccn.toml --env dev",
@@ -15,7 +16,6 @@
     "@hono/zod-validator": "^0.4.0",
     "@modelcontextprotocol/server": "2.0.0",
     "aws4fetch": "^1.0.20",
-    "bcryptjs": "^3.0.3",
     "fast-png": "8.0.0",
     "fzstd": "0.1.1",
     "hono": "^4.11.4",

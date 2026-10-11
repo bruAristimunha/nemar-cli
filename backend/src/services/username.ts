@@ -18,14 +18,13 @@
  */
 
 /**
- * The username rule, matching CLI signup (`signupSchema` in routes/auth.ts and
- * `GET /auth/check-username`) exactly: 3-30 characters of letters, digits,
- * underscore or hyphen.
+ * The username rule, matching `GET /auth/check-username` exactly (and the CLI
+ * signup form's schema, which has since been removed, ADR 0097): 3-30
+ * characters of letters, digits, underscore or hyphen.
  *
  * Spelled out here as bounds plus a character-class regex rather than one
- * combined pattern so `validateUsernameFormat` can say WHICH rule was broken;
- * the signup path gets that from zod's per-rule messages and this path had
- * nowhere else to get it.
+ * combined pattern so `validateUsernameFormat` can say WHICH rule was broken,
+ * which a single regex cannot.
  */
 export const USERNAME_MIN_LENGTH = 3;
 export const USERNAME_MAX_LENGTH = 30;

@@ -12,10 +12,12 @@
  *
  * Deliberately scoped to an EMPTY (or non-candidate) datasets table so every
  * test here exercises parsing/validation/response shape with ZERO S3 calls --
- * verifyDatasetVersionS3 does real, uncontrolled network I/O
- * (listObjectPages hardcodes a live `*.s3.*.amazonaws.com` host with no
- * local-test seam, the same structural constraint Phase 1/2 hit), so it is
- * only exercised once a real candidate reaches the batch loop. No mocks: the
+ * this file's env sets no S3_ENDPOINT_URL, so verifyDatasetVersionS3 would
+ * reach a live `*.s3.*.amazonaws.com` host once a real candidate reaches the
+ * batch loop. (The override is honored outside production, by listObjectPages
+ * since #1514 and by verifyDatasetVersionS3 since #1643; see
+ * availability-report-never-creates-main.test.ts for a route driven that way.
+ * This file does not use it.) No mocks: the
  * `recordingD1` wrapper below still forwards every call to real SQLite --
  * it only additionally records the bound LIMIT parameter so the clamp test
  * can observe it without needing >30 real candidates (which would reach the

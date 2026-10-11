@@ -80,7 +80,7 @@ S3_BASE_URL="https://nemar.s3.${S3_REGION}.amazonaws.com"
 # and fails if the two drift apart -- shell cannot import the TS, so the test is
 # the only thing holding them together. Regenerate with:
 #   bun -e 'import {buildLargefilesExpression} from "./src/lib/git-annex/policy.ts"; console.log(buildLargefilesExpression())'
-ANNEX_LARGEFILES="(include=*.edf or include=*.bdf or include=*.set or include=*.fif or include=*.vhdr or include=*.eeg or include=*.cnt or include=*.fdt or include=*_motion.tsv or largerthan=100kb) and (exclude=*.tsv or include=*_motion.tsv) and exclude=*.json and exclude=*.md and exclude=*.txt and exclude=*.yml and exclude=*.yaml and exclude=README* and exclude=LICENSE* and exclude=CHANGES* and exclude=.bidsignore and exclude=.gitignore"
+ANNEX_LARGEFILES="(include=*.edf or include=*.bdf or include=*.set or include=*.fif or include=*.vhdr or include=*.eeg or include=*.cnt or include=*.fdt or include=*_motion.tsv or largerthan=100000) and (exclude=*.tsv or include=*_motion.tsv) and exclude=*.json and exclude=*.md and exclude=*.txt and exclude=*.yml and exclude=*.yaml and exclude=README* and exclude=LICENSE* and exclude=CHANGES* and exclude=.bidsignore and exclude=.gitignore"
 
 # Colors for output
 RED='\033[0;31m'

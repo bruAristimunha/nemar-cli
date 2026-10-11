@@ -7,6 +7,14 @@
  */
 
 import {
+  type AdminUserEditBody,
+  type AdminUserEditResponse,
+  type AdminUserDetail as AdminUserFullDetail,
+  type AdminUserShowResponse,
+  adminUserEditResponseSchema,
+  adminUserShowResponseSchema,
+} from "../../../shared/contract/admin-user.js";
+import {
   type AccountKind,
   type AdminUserListItem,
   type AdminUsersListResponse,
@@ -28,6 +36,14 @@ import type {
   NeurobagelStatus,
   NeurobagelVerifyResult,
 } from "../../../shared/contract/neurobagel-admin.js";
+import type {
+  ClearOverrideResponse,
+  ContributorStanding,
+  PrReviewDetail,
+  QueueResponse,
+  SetOverrideResponse,
+  StartReviewResponse,
+} from "../../../shared/contract/pr-review-admin.js";
 import type { BackfillNameOutcome } from "../../../shared/contract/publication.js";
 import type { NeurobagelWeekly } from "../../../shared/contract/weekly-attention.js";
 import { request } from "./client.js";
@@ -72,14 +88,59 @@ export async function listUsers(
   awaitingApproval?: boolean,
   // What the account IS (epic #1272 phase 4, #1284; ADR 0048).
   kind?: AccountKind,
+  extra: {
+    /** Words to find in ANY text field of an account (ADR 0096). Every word
+     *  must match somewhere. Each matching row then carries `matched_in`. */
+    search?: string;
+    /** Include tombstoned accounts, which the listing hides by default. */
+    includeDeleted?: boolean;
+  } = {},
 ): Promise<UsersListResponse> {
   const params = new URLSearchParams();
   if (status) params.set("status", status);
   if (role) params.set("role", role);
   if (awaitingApproval) params.set("awaiting_approval", "1");
   if (kind) params.set("kind", kind);
+  // `!== undefined`, not truthiness: an empty search must reach the backend and
+  // be refused there, never be dropped here and answered with every account.
+  if (extra.search !== undefined) params.set("q", extra.search);
+  if (extra.includeDeleted) params.set("include_deleted", "true");
   const query = params.toString() ? `?${params.toString()}` : "";
   return request(`/admin/users${query}`, {}, true, adminUsersListResponseSchema);
+}
+
+export type { AdminUserFullDetail, AdminUserEditBody, AdminUserEditResponse };
+
+/**
+ * One account's full non-secret details, by numeric id (ADR 0096). By id and
+ * not username because a web/ORCID account has no username.
+ */
+export async function getAdminUserById(
+  id: number,
+  includeDeleted = false,
+): Promise<AdminUserShowResponse> {
+  return request(
+    `/admin/users/by-id/${id}${includeDeleted ? "?include_deleted=true" : ""}`,
+    {},
+    true,
+    adminUserShowResponseSchema,
+  );
+}
+
+/**
+ * Edit an account (ADR 0096). Descriptive fields: any admin. username, email
+ * and github_username: owner only, and never one's own account.
+ */
+export async function editAdminUser(
+  id: number,
+  fields: AdminUserEditBody,
+): Promise<AdminUserEditResponse> {
+  return request(
+    `/admin/users/by-id/${id}`,
+    { method: "PATCH", body: JSON.stringify(fields) },
+    true,
+    adminUserEditResponseSchema,
+  );
 }
 
 export interface ApproveResponse {
@@ -207,10 +268,11 @@ export async function setAccountKind(
 
 /** The fields `nemar admin doctor kinds` reads off `GET
  *  /admin/users/:username` (epic #1272 phase 4, #1284 review; ADR 0048).
- *  The route selects `u.*` plus two computed columns, so this is
- *  deliberately narrow rather than a full mirror of the row -- everything
- *  else is untyped here on purpose (`.passthrough()`-shaped, no contract
- *  schema exists for this endpoint yet). */
+ *  The route selects every NON-SECRET column (`ADMIN_USER_NON_SECRET_SELECT`;
+ *  credentials are never returned, ADR 0096) plus two computed columns, so
+ *  this is deliberately narrow rather than a full mirror of the row --
+ *  everything else is untyped here on purpose (`.passthrough()`-shaped).
+ *  `getAdminUserById` is the validated, fully typed read of one account. */
 export interface AdminUserDetail {
   username: string | null;
   account_kind?: AccountKind;
@@ -1039,7 +1101,8 @@ export async function signalDefaultsSweepReset(): Promise<SignalDefaultsSweepRes
  *  `POST /admin/datasets/data-integrity-sweep`). */
 export interface DataIntegritySweepBatchResponse {
   processed: number;
-  /** Verified complete (every annex-keyed manifest entry present at declared size). */
+  /** Verified complete (every annex-keyed manifest entry present at declared size,
+   *  whole or as a complete chunk set). */
   complete: number;
   /** Verified incomplete this batch -- the #967 signature. */
   incomplete: number;
@@ -1155,9 +1218,21 @@ export interface AvailabilityReportSweepBatchResponse {
   processed: number;
   /** Successfully generated + committed this batch. */
   written: number;
-  errors: { dataset_id: string; error: string }[];
-  /** Datasets still unswept (no `$.availability_report_at` in sweep_stamps); 0 when done. */
+  errors: AvailabilityReportSweepError[];
+  /** Candidates still unstamped (no `$.availability_report_at` in sweep_stamps),
+   *  including rows this batch refused or failed; 0 means nothing is left to try. */
   remaining: number | null;
+}
+
+/** One candidate a batch could not complete. */
+export interface AvailabilityReportSweepError {
+  dataset_id: string;
+  error: string;
+  /** The status the single-dataset route answers for this failure: 409 = refused
+   *  because the repository has no `main`; 400/404 = the dataset's own
+   *  configuration; 500 = anything else (S3, GitHub or auth failure, a
+   *  repository not visible to NEMAR). */
+  status: number;
 }
 
 /** Response of `?reset=1`: count of stamped rows cleared back to unswept. */
@@ -2129,6 +2204,102 @@ export async function anonymitySweepReset(): Promise<{ reset: number }> {
   return request<{ reset: number }>(
     "/admin/datasets/anonymity-sweep?reset=1",
     { method: "POST", headers: { "Content-Type": "application/json" } },
+    true,
+  );
+}
+
+// ============================================================================
+// Dataset pull-request review queue (ADR 0093, following ADR 0092)
+// ============================================================================
+
+export type {
+  ClearOverrideResponse,
+  ContributorStanding,
+  PrReviewDetail,
+  QueueEntry,
+  QueueResponse,
+  QueueVerdict,
+  SetOverrideResponse,
+  StartReviewResponse,
+} from "../../../shared/contract/pr-review-admin.js";
+
+/** Every open pull request to `main` in `nemarDatasets`, with the automated review of its current commit. */
+export async function listPrReviews(filters: {
+  verdicts?: string[];
+  dataset?: string;
+  author?: string;
+  needsMe?: boolean;
+}): Promise<QueueResponse> {
+  const params = new URLSearchParams();
+  if (filters.verdicts && filters.verdicts.length > 0) {
+    params.set("verdict", filters.verdicts.join(","));
+  }
+  if (filters.dataset) params.set("dataset", filters.dataset);
+  if (filters.author) params.set("author", filters.author);
+  if (filters.needsMe) params.set("needs_me", "1");
+  const query = params.toString() ? `?${params.toString()}` : "";
+  return request<QueueResponse>(`/admin/pr-reviews${query}`, { method: "GET" }, true);
+}
+
+/**
+ * One pull request: its stored review and history, what GitHub says now, and its author's standing.
+ * Pass `head` (a full commit id) to ask what the review concluded about THAT commit, which is how
+ * `approve` avoids relying on a head the Worker read a moment earlier or later.
+ */
+export async function getPrReview(
+  datasetId: string,
+  prNumber: number,
+  head?: string,
+): Promise<PrReviewDetail> {
+  const query = head ? `?head=${encodeURIComponent(head)}` : "";
+  return request<PrReviewDetail>(
+    `/admin/pr-reviews/${encodeURIComponent(datasetId)}/${prNumber}${query}`,
+    { method: "GET" },
+    true,
+  );
+}
+
+/**
+ * Review a pull request that is already open, or start again a commit whose review ended without a
+ * verdict. The Worker reads the pull request from GitHub itself; only the dataset and the number are
+ * sent. The answer is the review gate's own fixed word (`dispatched`, `duplicate`, ...).
+ */
+export async function startPrReview(
+  datasetId: string,
+  prNumber: number,
+): Promise<StartReviewResponse> {
+  return request<StartReviewResponse>(
+    `/admin/pr-reviews/${encodeURIComponent(datasetId)}/${prNumber}/start`,
+    { method: "POST" },
+    true,
+  );
+}
+
+export async function getPrReviewAuthor(login: string): Promise<ContributorStanding> {
+  return request<ContributorStanding>(
+    `/admin/pr-review-authors/${encodeURIComponent(login)}`,
+    { method: "GET" },
+    true,
+  );
+}
+
+/** Allow or block a contributor; the tally no longer decides the pause until it is cleared (rate limits still apply). */
+export async function setPrReviewAuthor(
+  login: string,
+  mode: "allow" | "block",
+  reason?: string,
+): Promise<SetOverrideResponse> {
+  return request<SetOverrideResponse>(
+    `/admin/pr-review-authors/${encodeURIComponent(login)}`,
+    { method: "PUT", body: JSON.stringify(reason ? { mode, reason } : { mode }) },
+    true,
+  );
+}
+
+export async function clearPrReviewAuthor(login: string): Promise<ClearOverrideResponse> {
+  return request<ClearOverrideResponse>(
+    `/admin/pr-review-authors/${encodeURIComponent(login)}`,
+    { method: "DELETE" },
     true,
   );
 }

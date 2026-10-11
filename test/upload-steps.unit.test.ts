@@ -278,8 +278,18 @@ describe("showUploadPlan", () => {
   test("without --dry-run returns ok with the (null) existing config", () => {
     const dir = scratchDir("nemar-plan-ok-");
     const manifest = { files: [], dataFiles: 0, metadataFiles: 0, totalSize: 0 };
-    const result = showUploadPlan(dir, "Test DS", manifest, { jobs: "4" });
+    const lines: string[] = [];
+    const log = console.log;
+    console.log = (...args: unknown[]) => lines.push(args.join(" "));
+    let result: ReturnType<typeof showUploadPlan>;
+    try {
+      result = showUploadPlan(dir, "Test DS", manifest, { jobs: "12", annexJobs: "8" });
+    } finally {
+      console.log = log;
+    }
     expect(result.status).toBe("ok");
+    expect(lines.join("\n")).toContain("Local git-annex add workers: 8");
+    expect(lines.join("\n")).toContain("Parallel S3 copy streams: 12");
     if (result.status === "ok") {
       expect(result.value.existingConfig).toBeNull();
     }

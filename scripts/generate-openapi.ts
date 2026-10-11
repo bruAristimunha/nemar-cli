@@ -163,7 +163,7 @@ const LEGACY_FILTER_PARAMS = {
     .enum(["1", "true"])
     .optional()
     .describe(
-      'Only datasets whose latest version has every manifest entry verified present in S3. "1" or "true" enable the filter.',
+      'Only datasets whose latest version has every manifest entry verified present in S3, whole or as a complete chunk set. "1" or "true" enable the filter.',
     ),
   recent: z.number().int().optional().describe("Only datasets created within the last N days."),
   license: z

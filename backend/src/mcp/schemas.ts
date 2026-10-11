@@ -123,7 +123,10 @@ export const searchDatasetsInputSchema4 = z4
     data_complete: z4
       .boolean()
       .optional()
-      .describe("Filter to datasets verified to hold all of their declared content."),
+      .describe(
+        "Filter to datasets verified to hold all of their declared content, each file stored " +
+          "whole or as a complete chunk set.",
+      ),
     recent: z4
       .number()
       .int()

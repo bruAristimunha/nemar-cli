@@ -161,3 +161,63 @@ Nothing in this ADR's gate changed; the importer is one more client of it.
 The 2026-10-04 policy above stands: an acquisition date alone is clear, and nothing in the gate changed.
 [ADR 0090](0090-acquisition-dates-finer-than-year-and-month-are-warned-about-never-gated-or-rewritten.md) records the maintainer's choice of policy B and adds a fixed warning, produced by `describeScreen` from the report's counts whenever a date kind is counted.
 The admin email, the status views and the requester's blocked-request mail therefore carry it; the report contract gained no field.
+
+## Amendment 2026-10-07 (#1646): a CI-pending refusal is a state the CLI reports, not an error
+
+A request made before the dataset's BIDS validation has concluded is refused with `bids_validation_pending` or `bids_validation_in_progress`, and that refusal is recorded: the request row is `blocked`, and the blocked-request sweep (`sweepBlockedBidsValidationRequests`) re-reads the latest run and unblocks it when CI passes.
+Unblocking starts the identifier screen exactly as a re-request would, so the request carries on by itself.
+The sweep runs today from the daily scheduled cleanup (03:00 UTC in production, per `backend/wrangler-sccn.toml`), so a recorded request can wait up to a day, and a run takes at most 50 rows and releases at most 10 requests, the rest waiting for the next run.
+The cadence is the server's to change and is not part of this decision, which is why the CLI promises no time.
+(The half-hourly sweep earlier in this ADR is another one: it covers screens that did not report.)
+
+Both places that decide a request put it through the submission minimums of ADR 0026 and, for an anonymous request, the blind check of ADR 0065, with one function (`checkSubmissionGate`): the request route does so even when CI is the only thing blocking (a missing minimum then replaces the pending reason and is answered at once as `min_requirements_failed` with its reasons), and the sweep does so before it releases a request, because the depositor may have edited the data since.
+A request that fails is re-blocked as `min_requirements_failed` and stops being a sweep candidate until the depositor requests again.
+OpenNeuro imports and exemplars keep their exemption, except that an anonymous request is always checked.
+The request route reads a README only when `EthicsApprovals` lists no approval, and one it cannot read counts as one with no statement; it never takes the Name and Authors rules with it.
+A description it cannot read blocks an anonymous release and lets a native submission go on to the admin review (ADR 0026).
+
+The sweep is a daily batch and reads more carefully.
+Its reads never sleep or retry, and share a budget of 100 per run (the tally reports `gateReads` and `deferred`); a file it cannot read, native or anonymous, or a run that spends the budget, leaves the row untouched for the next run and counts it as an error or as deferred, and a verdict is never given from a partial look.
+Every write it makes is conditional on the row being as it read it (status, anonymous flag, block reason and `updated_at`), so a request made again in the meantime, possibly anonymously, is never released or relabelled on a verdict reached for the old row; a write that finds the row changed is counted as skipped.
+A row it looked at and left as it was moves to the back of the queue, so enough of them cannot fill every run and starve the ones behind.
+
+The refusal means "recorded, waiting".
+Printed as a failure with exit 1, it sent depositors into retry loops of their own.
+That holds only when GitHub answered.
+When the readiness check itself cannot run (no credential, a failed workflow deploy, an outage) the request is still recorded, but the route answers 503 `ci_check_unavailable` with no block reason instead of the pending 422, because the cause can be one the sweep does not cure: it reads the run list with the same credential and recovers when GitHub does, but it does not deploy the workflow, so a request recorded after a failed deploy waits for a run that nothing starts, and nothing promises that the request carries on.
+The row is written with the pending reason, so `nemar dataset publish status` still shows it as waiting on validation; telling the two apart would take a stored marker, and is left as a follow-up.
+The block-reason vocabulary is shared with the website and is not extended for it.
+
+The maintainer decided that `nemar dataset publish request` reports a CI-pending refusal in the info style and exits 0, and that `nemar dataset publish status` shows a request in that state the same way.
+A failed validation (`bids_validation_failed`), a missing minimum, a missing owner name, a request already open and every other refusal keep their text and exit 1.
+An identifier finding is never a refusal of this command: the request is accepted, the screen runs after it, and a finding blocks the request later, which `nemar dataset publish status` and the requester's mail report.
+The CLI does not wait, retry or poll: the server already records the request and owns the transition, and every re-request repeats the GitHub readiness check and rewrites the row, so a client-side loop (an earlier `--wait` re-requested every minute for up to 24 hours) is rejected.
+The depositor checks validation with `nemar dataset ci <id>` and requests again if they would rather not wait for the sweep, and the upload's success output names both commands.
+A re-request restates the anonymous flag, so the command printed for an anonymous depositor carries `--anonymous`, and a request that asked for anonymity and was not recorded as anonymous exits 1.
+If validation fails, the sweep relabels the request `bids_validation_failed` and mails nobody; if a submission minimum fails when the sweep goes to release it, it re-blocks the request as `min_requirements_failed` and mails nobody either.
+The text says where to look.
+
+The pending state is `isCiPendingBlock` in `src/lib/publish-pending.ts`, guarded through the real CLI by `test/publish-pending-cli.test.ts` and `test/publish-status-pending-cli.test.ts`.
+
+## Known gaps at release (review of 2026-10-10)
+
+None blocks the release. Each is a place where the words promise a little more than the code does.
+
+- **The request route and the sweep classify the latest run differently.** The route blocks on no runs,
+  `failure` and an unfinished run, and lets every other conclusion through. The sweep releases only on
+  `success` and keeps a recorded request blocked on `cancelled`, `timed_out` and `skipped`, "a later run
+  decides" (its header says so). The shim run is about five seconds with a two-minute timeout, so the case
+  is rare, but a request recorded as waiting whose latest run ends that way stays waiting until a push to
+  the dataset starts another run, while the CLI says it continues automatically. A re-request passes.
+  One shared classifier is the fix; the sweep's tally has no figure for requests that stay blocked, so
+  these show as `errors=0`.
+- **The 503 `ci_check_unavailable` cure is not the sweep's.** When the cause is a workflow that was never
+  deployed, the sweep reads the run list, gets a 404 and counts an error each day; it does not deploy the
+  workflow. The depositor's `publish status` still says the request continues automatically.
+- **The notice promises mail that is sent once.** "You will be emailed if a check needs your attention"
+  holds for the identifier-screen block mail, whose send failure is logged and dropped without a lease or a
+  retry (the administrator mail has both).
+- **A request released and then lost before the screen starts** (the Worker is killed between the sweep's
+  release and `startScreenAndNotify`) is `requested` with no screen status, and no sweep looks for that.
+- **An older installed CLI prints the bare word `ci_check_unavailable`** for the 503, because only this
+  release's client leads with `message`.

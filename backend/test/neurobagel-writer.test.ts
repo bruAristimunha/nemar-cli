@@ -1248,7 +1248,7 @@ describe("failures never replace a good artifact with a worse one", () => {
     const bad = await run({ only: ["nm000674"] });
     console.error = quiet.error;
     console.warn = quiet.warn;
-    expect(bad.results[0]?.outcome).toBe("refused");
+    expect(bad.results[0]).toMatchObject({ outcome: "refused", code: "fetch_failed" });
     expect(await storeKeys(h.bucket)).not.toContain("nm000674.jsonld");
   });
 
@@ -1983,7 +1983,7 @@ describe("a run counts what it spends and stops with headroom to finish", () => 
   test("a run that stopped on its budget has left the reserve unspent: loop + reserved fits the budget", async () => {
     // Whatever the budget, the examination ends with the closing steps' share still there:
     // that is what the margin for one more dataset (its worst case) and the reserve buy.
-    expect(DATASET_OPS_WORST).toBe(30);
+    expect(DATASET_OPS_WORST).toBe(46);
     for (const budget of [120, 160, 200, 250, 330]) {
       await h.reset();
       for (const id of ids(30)) seedSynthetic(h, id);
@@ -2029,16 +2029,16 @@ describe("a run counts what it spends and stops with headroom to finish", () => 
   });
 
   test("the HTTP count is the writer's own HEAD plus the data plane's allowance, and the allowance covers what was really sent", async () => {
-    // The pins: a HEAD a dataset (1) and the allowance (8) for a gather. They are the
+    // The pins: a HEAD per dataset (1) and the bounded allowance (24) for a gather. They are the
     // writer's own numbers, so a change is a decision to make here and in the ADR.
-    expect(GATHER_HTTP_OPS).toBe(8);
+    expect(GATHER_HTTP_OPS).toBe(24);
     for (const id of ids(3)) seedSynthetic(h, id);
     const before = h.standin.log.length;
     const first = await run();
     const sent = h.standin.log.length - before;
     expect(outcomes(first).every((o) => o.endsWith(":written"))).toBe(true);
-    // 3 rewritten datasets: 9 each.
-    expect(first.ops.http).toBe(3 * (1 + 8));
+    // 3 rewritten datasets: one manifest HEAD plus the 24-request gather allowance each.
+    expect(first.ops.http).toBe(3 * (1 + 24));
     // What the stand-in saw (the HEAD, the manifest, the two tables) is inside that.
     expect(sent).toBeGreaterThan(3);
     expect(sent).toBeLessThanOrEqual(first.ops.http);

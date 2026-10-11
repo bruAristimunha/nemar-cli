@@ -1,6 +1,6 @@
 # ADR 0074: manifest.json emits unsigned public URLs, presigned only for a bucket-policy exclusion
 
-**Status:** accepted
+**Status:** superseded by ADR-0095
 **Date:** 2026-09-28
 **Owner:** Seyed Yahya Shirazi
 

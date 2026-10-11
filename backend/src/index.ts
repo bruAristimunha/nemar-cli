@@ -88,6 +88,7 @@ import {
   verificationLogLine,
 } from "./services/neurobagel-verify";
 import { getActiveNotices } from "./services/notices";
+import { sweepStalePrReviews } from "./services/pr-review";
 import { sweepBlockedBidsValidationRequests } from "./services/publication-sweep";
 import { runRecordingStatsSweepCron } from "./services/recording-stats-sweep";
 import { runSignalDefaultsSweepCron } from "./services/signal-defaults-sweep";
@@ -192,8 +193,8 @@ api.route("/neurobagel", neurobagelRoutes);
 // Mount route handlers
 api.route("/auth", authRoutes);
 // Web-dashboard auth (#569). Mounted at the same /auth prefix as the
-// CLI flow; no path overlap with authRoutes (existing /signup, /login,
-// /verify, etc. vs new /code/request, /code/verify, /logout, /me).
+// API-key routes; no path overlap with authRoutes (/login, /verify, etc.
+// vs new /code/request, /code/verify, /logout, /me).
 api.route("/auth", authWebRoutes);
 // ORCID SSO (#832). Same /auth prefix; new paths under /auth/orcid/*.
 api.route("/auth", authOrcidRoutes);
@@ -823,11 +824,22 @@ async function scheduledCleanup(env: Bindings): Promise<void> {
   //    and rewrite their status. Narrowed rather than skipped: staging needs
   //    this sweep, since an exemplar published while BIDS validation is still
   //    running lands in 'blocked' and would otherwise stay stuck.
-  let blockedSweep = { scanned: 0, unblocked: 0, reblocked: 0, errors: 0 };
+  let blockedSweep = {
+    scanned: 0,
+    unblocked: 0,
+    reblocked: 0,
+    errors: 0,
+    deferred: 0,
+    skipped: 0,
+    gateReads: 0,
+  };
   try {
     blockedSweep = await sweepBlockedBidsValidationRequests(env);
   } catch (err) {
     console.error("Scheduled cleanup: blocked publication-request sweep failed:", err);
+    // The tally below is written to the audit log. Left at its zeros it would read as a sweep
+    // that ran and found nothing to do (ADR 0054), which is the opposite of what happened.
+    blockedSweep = { ...blockedSweep, errors: 1 };
   }
 
   // Log summary to audit_log. `deleted`/`failed` cover only sandbox (xx)
@@ -853,7 +865,7 @@ async function scheduledCleanup(env: Bindings): Promise<void> {
     console.error("Scheduled cleanup: failed to write audit log:", err);
   }
   console.log(
-    `Scheduled cleanup: ${deleted} deleted, ${failed} failed; staleness warned=${staleness.warned} adminNotified=${staleness.adminNotified} reset=${staleness.reset}; importsSwept=${importsSwept}; blockedSweep unblocked=${blockedSweep.unblocked} reblocked=${blockedSweep.reblocked} errors=${blockedSweep.errors}`,
+    `Scheduled cleanup: ${deleted} deleted, ${failed} failed; staleness warned=${staleness.warned} adminNotified=${staleness.adminNotified} reset=${staleness.reset}; importsSwept=${importsSwept}; blockedSweep unblocked=${blockedSweep.unblocked} reblocked=${blockedSweep.reblocked} errors=${blockedSweep.errors} deferred=${blockedSweep.deferred} skipped=${blockedSweep.skipped}`,
   );
 }
 
@@ -896,6 +908,30 @@ export default {
             .catch((err) =>
               console.error(
                 "[identifier-screen-sweep] sweep failed:",
+                err instanceof Error ? (err.stack ?? err.message) : err,
+              ),
+            ),
+        );
+        // ADR 0092: the pull-request review watchdog. A review handed to GitHub that never
+        // reports is marked unreported and its check turned to "needs a person", because a
+        // dispatch is answered 204 whether or not a workflow listens and the check would
+        // otherwise stay "in progress" for good. It also republishes a stored result whose
+        // check never reached GitHub. PRODUCTION-ONLY, by AGENTS.md's default for a new cron
+        // job: it writes check-runs and comments to the shared nemarDatasets org, which the dev
+        // worker would also reach. It does NOT read PR_REVIEW_ENABLED: switching the review off must not
+        // strand the checks of reviews already in flight.
+        ctx.waitUntil(
+          sweepStalePrReviews(env)
+            .then((r) => {
+              if (r.timedOut + r.republished + r.abandoned + r.errors > 0) {
+                console.log(
+                  `[pr-review-sweep] timedOut=${r.timedOut} republished=${r.republished} abandoned=${r.abandoned} errors=${r.errors}`,
+                );
+              }
+            })
+            .catch((err) =>
+              console.error(
+                "[pr-review-sweep] sweep failed:",
                 err instanceof Error ? (err.stack ?? err.message) : err,
               ),
             ),
@@ -991,8 +1027,9 @@ export default {
 
     // Safe outside prod: scheduledCleanup self-narrows to the dev sandbox band
     // and, outside production, runs ONLY its sandbox-delete, stuck-manifest
-    // logging and audit-log sections. Its staleness-email, import-recovery and
-    // blocked-publication-sweep sections are production-only (guards inside).
+    // logging and audit-log sections, plus the blocked-publication sweep narrowed to the dev
+    // range and the fixtures dev owns. Its staleness-email and import-recovery sections are
+    // production-only (guards inside).
     ctx.waitUntil(scheduledCleanup(env));
     // #646 Phase 4: drain stale vectors (embedding_dirty=1) — the backstop for
     // changes that don't go through the inline enrich/reindex re-embed.
@@ -1175,12 +1212,13 @@ export default {
       // runAvailabilityReportSweepCron instead. Kept inside this block too,
       // belt and braces, exactly like archiveRetrySweep's own internal guard.
       //
-      // Self-limiting rather than exhaustive: capped at 10 GitHub commits per
-      // run (AVAILABILITY_REPORT_SWEEP_MAX) because a burst of writes trips
-      // GitHub's secondary rate limit on the shared PAT. It drains ~10/day and
-      // stamps only on success, so failures are retried on the next pass. A
-      // large backlog is meant to be cleared with `nemar admin
-      // availability-report --all`, not by waiting on this.
+      // Self-limiting rather than exhaustive: capped at
+      // AVAILABILITY_REPORT_SWEEP_MAX (30) GitHub commits per run because a
+      // burst of writes trips GitHub's secondary rate limit on the shared PAT.
+      // It drains up to 30/day and stamps only on success, so failures are
+      // retried on the next pass (see AVAILABILITY_REPORT_SWEEP_BASE_WHERE for
+      // rows the write refuses). A large backlog is meant to be cleared with
+      // `nemar admin availability-report --all`, not by waiting on this.
       ctx.waitUntil(
         runAvailabilityReportSweepCron(env)
           .then((r) => {

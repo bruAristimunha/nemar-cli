@@ -657,8 +657,9 @@ export function dateNormalizationLine(count: number): string {
 
 /**
  * What a person is told when a publication request has been ACCEPTED, one sentence per line (ADR
- * 0090, amendment 2026-10-07). The terminal and the route's `request_notice` both come from here,
- * and nothing else in the repository spells these sentences.
+ * 0090, amendment "what an accepted request is told"). The terminal and the route's
+ * `request_notice` both come from here, and no other source file spells these sentences (a test
+ * enforces it).
  *
  * It is neutral on purpose and takes no screen as input: the identifier screen runs after the
  * request is made and its verdict is bound to a commit, so a finding, a verdict, a count or the
@@ -666,12 +667,18 @@ export function dateNormalizationLine(count: number): string {
  * it. The requester learns the outcome from `nemar dataset publish status` or from the mail, which
  * is where the date warning is shown too. The only variable part is the dataset id, which the
  * caller has just had accepted. A request refused up front gets its own refusal text and no notice.
+ *
+ * The mail sentence names only the mails the requester really gets: one when the identifier screen
+ * blocks the request (`sendIdentifierScreenBlockedEmail`), one on approval and one on denial. A
+ * clean screen mails the administrators and not the requester, so no line says the requester is
+ * told when the checks complete.
  */
 export function publicationRequestNotice(datasetId: string): string[] {
   return [
     "Your request was received.",
     "NEMAR is checking publication eligibility.",
     "If every check passes, an administrator is notified to approve it.",
+    "You will be emailed if a check needs your attention, and when an administrator decides.",
     `Run 'nemar dataset publish status ${datasetId}' to see where it stands.`,
   ];
 }

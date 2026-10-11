@@ -116,7 +116,9 @@ const ACCEPTED = {
 
 describe("nemar dataset publish request --anonymous", () => {
   test("sends anonymous: true in the request body", async () => {
-    const server = startCaptureServer(ACCEPTED);
+    // Answered with the confirmation a real backend sends. Without it the
+    // release is unconfirmed, which exits 1 (see the tests below).
+    const server = startCaptureServer({ ...ACCEPTED, anonymous: true });
     try {
       const result = await runCli(
         ["dataset", "publish", "request", "nm000104", "--anonymous"],
@@ -159,6 +161,7 @@ describe("nemar dataset publish request --anonymous", () => {
         ["dataset", "publish", "request", "nm000104", "--anonymous"],
         server.url,
       );
+      expect(result.exitCode).toBe(0);
       expect(result.stdout).toContain("Your identity will be withheld");
       expect(result.stdout).not.toContain("did not confirm");
     } finally {
@@ -178,6 +181,9 @@ describe("nemar dataset publish request --anonymous", () => {
       );
       expect(result.stdout).toContain("did not confirm");
       expect(result.stdout).not.toContain("Your identity will be withheld");
+      // A script must not go on as if the release were blind: it would be
+      // published under the real name.
+      expect(result.exitCode).toBe(1);
     } finally {
       server.stop();
     }
@@ -193,6 +199,7 @@ describe("nemar dataset publish request --anonymous", () => {
         server.url,
       );
       expect(result.stdout).toContain("did not confirm");
+      expect(result.exitCode).toBe(1);
     } finally {
       server.stop();
     }

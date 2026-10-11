@@ -40,6 +40,7 @@
 import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import chalk from "chalk";
+import { PUBLISHED_FILE_MISSING_ERROR } from "../../shared/contract/data-plane.js";
 
 /** Upper bound on in-flight requests, and what `-j`/`--jobs` is clamped to. */
 export const MAX_CONCURRENCY = 16;
@@ -104,6 +105,22 @@ function isInfrastructureFailure(status: number | null): boolean {
 /** Statuses worth trying again: throttling and transient server faults. */
 function isRetryableStatus(status: number): boolean {
   return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+/** The data plane's own answer is a few dozen bytes; anything larger is somebody else's page. */
+const MAX_MISSING_BODY_BYTES = 4096;
+
+/** True for the data plane's "published file is missing from storage" answer (a small JSON body). */
+async function namesAMissingPublishedFile(response: Response): Promise<boolean> {
+  if (!(response.headers.get("content-type") ?? "").includes("json")) return false;
+  const length = Number(response.headers.get("content-length") ?? 0);
+  if (length > MAX_MISSING_BODY_BYTES) return false;
+  try {
+    const body = (await response.json()) as { error?: unknown } | null;
+    return body?.error === PUBLISHED_FILE_MISSING_ERROR;
+  } catch {
+    return false;
+  }
 }
 
 interface FetchOutcome {
@@ -176,6 +193,15 @@ async function fetchOne(
     if (!response.ok) {
       message = `${file.path}: HTTP ${response.status}`;
       infrastructure = isInfrastructureFailure(response.status);
+      if (response.status === 502 && (await namesAMissingPublishedFile(response))) {
+        // The manifest lists the file and storage does not have it (a partial dataset, ADR
+        // 0064). ADR 0005 says missing content is reported and never blocks the delivery, so
+        // this is reportable, not retried, and not a failed run. Any other 502 stays a
+        // transport fault.
+        message = `${file.path}: HTTP 502 (listed in the manifest, missing from storage)`;
+        infrastructure = false;
+        break;
+      }
       if (isRetryableStatus(response.status) && attempt < attempts) {
         await backoff();
         continue;

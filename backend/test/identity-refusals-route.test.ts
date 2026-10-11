@@ -3,13 +3,14 @@
  *
  * One person, one account: an ORCID iD, an email address (case-insensitively)
  * or a GitHub handle backs at most one live account. Migration 0077 enforces
- * it in the database; these tests drive the four APPLICATION entry points that
+ * it in the database; these tests drive the APPLICATION entry points that
  * have to refuse before the database has to, plus the unlink that stops an
- * account claiming an iD it can no longer prove.
+ * account claiming an iD it can no longer prove. (There were four until
+ * `POST /auth/signup` went with the password, ADR 0097.)
  *
  * Real engine throughout: bun:sqlite behind realD1 with every migration
- * applied, real Hono dispatch via `app.request()`, real zod validation, real
- * bcrypt at signup, real session issuance via `issueSession()`, real HMAC code
+ * applied, real Hono dispatch via `app.request()`, real zod validation,
+ * real session issuance via `issueSession()`, real HMAC code
  * hashing via the production `hashAuthCode`, and real pending-cookie signing
  * via `signPending`. The two external boundaries -- ORCID's public record API
  * and GitHub's /users/:login -- are a local `Bun.serve()` reached through the
@@ -29,7 +30,6 @@ import { authRoutes } from "../src/routes/auth";
 import { authOrcidRoutes } from "../src/routes/auth-orcid";
 import { authWebRoutes } from "../src/routes/auth-web";
 import { PENDING_COOKIE_NAME, encodeState, signPending } from "../src/services/orcid-auth";
-import { hashPassword } from "../src/services/password";
 import { issueSession } from "../src/services/web-session";
 import type { Bindings, Variables } from "../src/types/bindings";
 import { freshDb, realD1 } from "./helpers/d1";
@@ -48,19 +48,6 @@ let db: Database;
 let app: Hono<{ Bindings: Bindings; Variables: Variables }>;
 /** Serves ORCID personal-details, ORCID /oauth/token, and GitHub /users/:login. */
 let external: Server;
-/**
- * GitHub `/users/:login` hits since the last reset.
- *
- * This is what makes the signup PRE-CHECKS falsifiable at all. Migration
- * 0077's partial unique indexes would reject a duplicate email or iD at the
- * INSERT anyway, and signup's catch turns that into the same 409 body -- so a
- * status-and-body assertion alone passes whether or not the pre-check exists.
- * The pre-checks run BEFORE `validateGitHubUsername`, so the observable
- * difference is that a refused signup spends no GitHub API call. That is also
- * why they are ordered that way: a duplicate must not cost a rate-limited
- * request against a shared token.
- */
-let githubCalls = 0;
 let externalBase: string;
 /** Which iD the local ORCID token endpoint hands back for the next callback. */
 let tokenOrcid = OTHER_ORCID;
@@ -80,7 +67,6 @@ beforeAll(() => {
       }
       const gh = url.pathname.match(/^\/users\/(.+)$/);
       if (gh) {
-        githubCalls += 1;
         return Response.json({ login: gh[1], id: 4242 });
       }
       return new Response("not found", { status: 404 });
@@ -114,7 +100,6 @@ function env(): Bindings {
 beforeEach(() => {
   db = freshDb();
   tokenOrcid = OTHER_ORCID;
-  githubCalls = 0;
   app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
   app.route("/auth", authRoutes);
   app.route("/auth", authOrcidRoutes);
@@ -180,163 +165,44 @@ async function sessionCookie(userId: number): Promise<string> {
 }
 
 // --------------------------------------------------------------------------
-// CLI signup
+// Legacy mixed-case rows
+//
+// `POST /auth/signup` (the CLI's password registration) is gone (ADR 0097), and
+// with it the "CLI signup refuses a duplicate identity" and "normalises what it
+// stores" suites. What they pinned is covered as follows. Refusing a held iD,
+// address or handle: ORCID finalize, ORCID link and the profile and
+// email-change routes below, and the schema (migration 0077). The typed-input
+// rules (a lowercase check digit, an orcid.org URL, a garbage-prefixed paste, a
+// pasted @handle) and the live-only holder lookups: identity-normalizers.unit
+// .test.ts, which has no HTTP route to go through any more.
 // --------------------------------------------------------------------------
 
-function signup(body: Record<string, unknown> = {}): Promise<Response> {
-  return app.request(
-    "/auth/signup",
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        username: "newuser",
-        email: "newuser@example.org",
-        password: "Correct-Horse-Battery-9",
-        github_username: "newuser",
-        description: "I would like to deposit EEG datasets collected in our lab.",
-        orcid: OTHER_ORCID,
-        city: "San Diego",
-        country: "USA",
-        ...body,
-      }),
-    },
-    env(),
-  );
-}
-
-describe("CLI signup refuses a duplicate identity", () => {
-  test("a case-variant of a live address is refused with the Settings message", async () => {
-    seedUser("Ada@Lab.org");
-    const res = await signup({ email: "ADA@lab.ORG" });
-    expect(res.status).toBe(409);
-    const body = (await res.json()) as { error: string; code: string; message: string };
-    expect(body.code).toBe("email_in_use");
-    // The `error` string is unchanged (the CLI prints it and pins it), and the
-    // actionable sentence rides alongside in `message`.
-    expect(body.error).toBe("Email already registered");
-    expect(body.message).toContain("nemar.org/settings");
-    expect(db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM users").get()?.n).toBe(2);
-    // Refused by the pre-check, not by the index at INSERT time: no GitHub
-    // call was spent. Without this the assertions above pass either way.
-    expect(githubCalls).toBe(0);
-  });
-
-  test("an iD held only through users.orcid is refused (the 42/43 hole)", async () => {
-    // No oauth_identities row: exactly the shape a CLI signup could never see
-    // before #1254, because nothing checked users.orcid at all.
-    seedUser("holder@example.org", { orcid: HELD_ORCID });
-    const res = await signup({ orcid: HELD_ORCID });
-    expect(res.status).toBe(409);
-    const body = (await res.json()) as { error: string; code: string; message: string };
-    expect(body.code).toBe("orcid_in_use");
-    expect(body.message).toContain("nemar.org/settings");
-    expect(githubCalls).toBe(0);
-  });
-
-  test("an iD held only through oauth_identities is refused too", async () => {
-    // The mirror image: users.orcid is NULL and the identity row carries it.
-    const id = seedUser("linked@example.org");
-    db.run(
-      "INSERT INTO oauth_identities (user_id, provider, provider_subject) VALUES (?, 'orcid', ?)",
-      [id, HELD_ORCID],
-    );
-    const res = await signup({ orcid: HELD_ORCID });
-    expect(res.status).toBe(409);
-    expect(((await res.json()) as { code: string }).code).toBe("orcid_in_use");
-    expect(githubCalls).toBe(0);
-  });
-
-  test("a case-variant GitHub handle is refused", async () => {
-    seedUser("gh@example.org", { github: "Octocat" });
-    const res = await signup({ github_username: "octocat" });
-    expect(res.status).toBe(409);
-    const body = (await res.json()) as { error: string; code: string };
-    expect(body.code).toBe("github_in_use");
-    expect(body.error).toBe("GitHub account already linked to another user");
-  });
-
-  test("a tombstoned row does not block re-signup with its freed address", async () => {
-    // The tombstone MASKS the address rather than holding it, so the live-only
-    // predicate the email check now uses must not resurrect it as a collision.
-    seedUser("deleted+7@deleted.invalid", { deleted: true });
-    const res = await signup({ email: "newuser@example.org" });
-    expect(res.status).toBe(201);
-  });
-
-  test("an iD held by a TOMBSTONED row does not block a new signup", async () => {
-    seedUser("deleted+8@deleted.invalid", { orcid: HELD_ORCID, deleted: true });
-    const res = await signup({ orcid: HELD_ORCID });
-    expect(res.status).toBe(201);
-  });
-});
-
-describe("CLI signup normalises what it stores", () => {
-  test("a mixed-case address is stored lowercase", async () => {
-    const res = await signup({ email: "Ada.Lovelace@Example.ORG" });
-    expect(res.status).toBe(201);
-    expect(userByEmail("ada.lovelace@example.org")).toBeTruthy();
-  });
-
-  test("a pasted @handle is accepted and stored without the @", async () => {
-    // Before #1254 the regex rejected the leading "@" outright, so a pasted
-    // handle failed validation rather than being cleaned up.
-    const res = await signup({ github_username: "@octocat" });
-    expect(res.status).toBe(201);
-    expect(userByEmail("newuser@example.org")?.github_username).toBe("octocat");
-  });
-
-  test("a lowercase check digit is accepted and stored uppercase", async () => {
-    const res = await signup({ orcid: X_ORCID.toLowerCase() });
-    expect(res.status).toBe(201);
-    expect(userByEmail("newuser@example.org")?.orcid).toBe(X_ORCID);
-  });
-
-  test("a full ORCID URI is reduced to the bare iD", async () => {
-    const res = await signup({ orcid: `https://orcid.org/${OTHER_ORCID}` });
-    expect(res.status).toBe(201);
-    expect(userByEmail("newuser@example.org")?.orcid).toBe(OTHER_ORCID);
-  });
-
-  test("a garbage-prefixed iD is rejected, not silently 'normalised'", async () => {
-    // `normalizeOrcid` anchors BOTH ends. Anchoring only the tail -- which it
-    // did until the #1254 review -- turns `garbage0000-...-0097` into a valid
-    // iD and stores it as if the user had typed one, so a fat-fingered paste
-    // silently claims somebody else's identifier.
-    const res = await signup({ orcid: `garbage${OTHER_ORCID}` });
-    expect(res.status).toBe(400);
-    expect(userByEmail("newuser@example.org")).toBeNull();
-  });
-});
-
 describe("an address is found whatever case it was stored or typed in", () => {
-  // The regression this pins: signup started lowercasing the stored address,
-  // while `retrieve-key` / `resend-verification` / `request-key-regeneration`
-  // still looked it up exact-case. Someone who signed up as
-  // `John.Smith@gmail.com` and typed it that way got "Invalid email or
-  // password" -- a dead end with no way to tell it from a wrong password.
+  // The regression this pins: addresses came to be stored lowercase, while
+  // `resend-verification` / `request-key-regeneration` still looked them up
+  // exact-case. Someone who registered as `John.Smith@gmail.com` and typed it
+  // that way got nothing back: a dead end with no way to tell it from a wrong
+  // address.
   const MIXED = "John.Smith@Example.ORG";
   const OTHER_CASE = "JOHN.smith@example.org";
-  const PASSWORD = "Correct-Horse-Battery-9";
 
   /**
    * A LEGACY row: stored with its address exactly as typed, the way every row
    * created before #1254 was.
    *
-   * This is what makes the NOCASE lookups load-bearing, and it is why these
-   * tests do NOT go through signup. Normalising the REQUEST is not enough on
-   * its own: once the request is lowercased, an exact-case lookup still
-   * matches every row this phase creates, because those are lowercased too.
-   * It is the ~600 rows already in the catalog that an exact-case lookup
+   * This is what makes the NOCASE lookups load-bearing. Normalising the REQUEST
+   * is not enough on its own: once the request is lowercased, an exact-case
+   * lookup still matches every row created since, because those are lowercased
+   * too. It is the ~600 rows already in the catalog that an exact-case lookup
    * cannot find.
    */
-  async function seedLegacy(): Promise<void> {
+  function seedLegacy(): void {
     db.run(
-      `INSERT INTO users (username, email, password_hash, github_username, status,
+      `INSERT INTO users (username, email, github_username, status,
                           signup_source, email_verified, orcid, orcid_verified,
                           verification_token)
-       VALUES ('legacy', ?, ?, 'legacy-gh', 'verified', 'cli', 1, ?, 0, 'seed-token')`,
-      [MIXED, await hashPassword(PASSWORD), OTHER_ORCID],
+       VALUES ('legacy', ?, 'legacy-gh', 'verified', 'cli', 1, ?, 0, 'seed-token')`,
+      [MIXED, OTHER_ORCID],
     );
   }
 
@@ -372,50 +238,8 @@ describe("an address is found whatever case it was stored or typed in", () => {
       .catch(() => undefined);
   }
 
-  test("signup stores a mixed-case address lowercased", async () => {
-    const res = await signup({
-      email: MIXED,
-      username: "jsmith",
-      github_username: "jsmith",
-    });
-    expect(res.status).toBe(201);
-    expect(userByEmail("john.smith@example.org")).toBeTruthy();
-  });
-
-  test("retrieve-key finds a legacy mixed-case row typed in another case", async () => {
-    await seedLegacy();
-    const res = await app.request(
-      "/auth/retrieve-key",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: OTHER_CASE, password: PASSWORD }),
-      },
-      env(),
-    );
-    // 200 (key minted) or 409 (key already issued) both mean the row was
-    // found. 401 is the bug: "Invalid email or password" for a correct
-    // password, with no way for the user to tell which half was wrong.
-    expect([200, 409]).toContain(res.status);
-  });
-
-  test("a wrong password on a found legacy row is still refused", async () => {
-    // The guard against a lookup so loose that it stops proving anything.
-    await seedLegacy();
-    const res = await app.request(
-      "/auth/retrieve-key",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: OTHER_CASE, password: "not-the-password" }),
-      },
-      env(),
-    );
-    expect(res.status).toBe(401);
-  });
-
   test("resend-verification finds a legacy row typed in another case", async () => {
-    await seedLegacy();
+    seedLegacy();
     db.run("UPDATE users SET status = 'pending' WHERE email = ?", [MIXED]);
     await post("/auth/resend-verification");
     expect(storedToken()).not.toBe("seed-token");
@@ -423,14 +247,14 @@ describe("an address is found whatever case it was stored or typed in", () => {
   });
 
   test("key regeneration finds a legacy row typed in another case", async () => {
-    await seedLegacy();
+    seedLegacy();
     await post("/auth/request-key-regeneration");
     expect(storedToken()).not.toBe("seed-token");
   });
 
   test("an address matching NO account rotates nothing", async () => {
     // The guard against a rotation assertion that would pass on any input.
-    await seedLegacy();
+    seedLegacy();
     db.run("UPDATE users SET status = 'pending' WHERE email = ?", [MIXED]);
     await post("/auth/resend-verification", "nobody@example.org");
     expect(storedToken()).toBe("seed-token");
@@ -501,11 +325,30 @@ describe("ORCID finalize refuses a duplicate identity", () => {
     expect(body.message).toContain("nemar.org/settings");
   });
 
+  test("a soft-deleted row holding the iD does not block a new account", async () => {
+    // The tombstone is not a holder: a person who deleted their account can
+    // come back. The live-only predicate is what allows it, and without this
+    // case nothing at the route level would notice it going.
+    seedUser("deleted+8@deleted.invalid", { orcid: HELD_ORCID, deleted: true });
+    const res = await finalize(HELD_ORCID);
+    expect(res.status).toBe(200);
+  });
+
+  test("a soft-deleted row holding the same address does not block it either", async () => {
+    // The legacy shape: a tombstone that kept the real address. The unique
+    // index is partial (live rows only), so the write is legal and the
+    // pre-check must agree with it.
+    seedUser("BrandNew@Example.ORG", { deleted: true });
+    const res = await finalize(X_ORCID, { email: "brandnew@example.org" });
+    expect(res.status).toBe(200);
+  });
+
   test("a clean signup lands, with the address trimmed and lowercased", async () => {
     // The iD is already canonical here and cannot be otherwise: `verifyPending`
     // rejects a token whose iD is not in canonical form, so finalize's own
     // `normalizeOrcid` is a belt-and-braces guarantee about what gets STORED,
-    // not a repair for user input. The typed-iD path is covered on signup.
+    // not a repair for user input. The typed-iD rules are pinned in
+    // identity-normalizers.unit.test.ts.
     //
     // The address is the interesting half: `"  Brand.New@Example.ORG "` used to
     // 400, because the schema ran `.email()` before its own trim.
@@ -734,16 +577,16 @@ describe("ORCID unlink releases the iD", () => {
 
   test("the released iD is then free for another account to claim", async () => {
     // The point of clearing it, stated as behaviour rather than as a column
-    // value: before #1254 this signup would have been refused forever by an
-    // account that no longer had the link.
+    // value: before #1254 a new account claiming this iD would have been
+    // refused forever by an account that no longer had the link.
     const id = seedUser("me@example.org", { orcid: HELD_ORCID, identityBacked: true });
     await app.request(
       "/auth/orcid/unlink",
       { method: "POST", headers: { Origin: ORIGIN, Cookie: await sessionCookie(id) } },
       env(),
     );
-    const res = await signup({ orcid: HELD_ORCID });
-    expect(res.status).toBe(201);
+    const res = await finalize(HELD_ORCID);
+    expect(res.status).toBe(200);
   });
 });
 

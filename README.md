@@ -126,7 +126,8 @@ sequenceDiagram
     participant Admin as Admin
 
     U->>CLI: nemar auth signup
-    CLI->>API: POST /auth/signup
+    CLI->>API: Start browser sign-in (device flow, ADR 0047)
+    U->>API: Sign in with ORCID in the browser
     API-->>U: Verification email
     U->>API: Click verification link
     API->>Admin: Notification: new user pending

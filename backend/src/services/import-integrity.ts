@@ -10,43 +10,19 @@
  *   - the retry engine's "verify current state first" step before deciding
  *     whether to blocklist or re-dispatch an incomplete/failed/quarantined row.
  *
- * `annexKeyDeclaredSize`/`isKeyPresentAtDeclaredSize` below are a Workers-side
- * port of the identically-named Phase 1 helpers in `src/lib/s3-server-copy.ts`
- * (CLI code; not importable into a Workers bundle -- it pulls in node:fs at
- * module scope via git-annex/run-command.js). Keep the regex and null-vs-0
- * semantics in sync if either changes.
+ * `annexKeyDeclaredSize`/`isKeyPresentAtDeclaredSize` are re-exported from
+ * `shared/annex-key.ts` so existing importers keep their path. That module owns
+ * the chunked-key rule: content stored as `-S<size>-C<n>` chunk objects counts as
+ * present when a chunking is complete (#1565, ADR 0064 amendment 2026-10-07).
  */
 
+import { annexKeyDeclaredSize, isKeyPresentAtDeclaredSize } from "../../../shared/annex-key.js";
 import type { Bindings } from "../types/bindings.js";
 import { resolveCurrentVersion } from "./archive-retry.js";
+import { testS3EndpointOverride } from "./environment.js";
 import { type PresignedUrlOptions, getManifest, listObjectSizes } from "./s3.js";
 
-/**
- * Declared size (bytes) encoded in a git-annex key, e.g.
- * `SHA256E-s10565888--abc123.edf` -> 10565888. Returns null for a `git:`-keyed
- * (non-annex) manifest entry or anything that doesn't match the pattern, so
- * callers can tell "no declared size" apart from "0 bytes claimed".
- */
-export function annexKeyDeclaredSize(key: string): number | null {
-  const match = key.match(/-s(\d+)--/);
-  return match ? Number.parseInt(match[1], 10) : null;
-}
-
-/**
- * True when `key` is present in `existing` (a key -> byte-size map from
- * {@link import("./s3.js").listObjectSizes}) at its correct size. An annex
- * key's declared size must match exactly -- a 0-byte or truncated object
- * counts as absent even though the key exists (the #967 bug). A key with no
- * declared size (shouldn't reach here; git:-keyed entries are filtered out
- * before this is called) is treated as present-if-listed.
- */
-export function isKeyPresentAtDeclaredSize(key: string, existing: Map<string, number>): boolean {
-  const actual = existing.get(key);
-  if (actual === undefined) return false;
-  const declared = annexKeyDeclaredSize(key);
-  if (declared === null) return true;
-  return actual === declared;
-}
+export { annexKeyDeclaredSize, isKeyPresentAtDeclaredSize };
 
 /** The subset of VersionManifest (services/manifest.ts) this check needs. */
 export interface ExpectedManifestFile {
@@ -250,6 +226,36 @@ export function computeVersionIntegrity(
   };
 }
 
+/** The bindings {@link versionReadS3Options} reads. */
+type VersionReadS3Env = Pick<
+  Bindings,
+  | "S3_BUCKET"
+  | "AWS_REGION"
+  | "AWS_ACCESS_KEY_ID"
+  | "AWS_SECRET_ACCESS_KEY"
+  | "S3_ENDPOINT_URL"
+  | "ENVIRONMENT"
+>;
+
+/**
+ * The S3 options for every read that decides whether a dataset version is
+ * complete: this module's LIST and manifest read, and the availability report's
+ * own manifest read. One builder, so they cannot disagree about the origin.
+ *
+ * A test points those reads at a local server through S3_ENDPOINT_URL, which is
+ * honored outside production only ({@link testS3EndpointOverride}): the verdict
+ * they produce feeds data_complete and the withdrawal rule (ADR 0064).
+ */
+export function versionReadS3Options(env: VersionReadS3Env): PresignedUrlOptions {
+  return {
+    bucket: env.S3_BUCKET,
+    region: env.AWS_REGION,
+    accessKeyId: env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
+    endpointUrl: testS3EndpointOverride(env),
+  };
+}
+
 /**
  * I/O wrapper: resolve a dataset's version manifest (a specific `version`, or
  * the latest published one when omitted) and the live `<id>/objects/`
@@ -261,19 +267,11 @@ export function computeVersionIntegrity(
  * than trust a zero.
  */
 export async function verifyDatasetVersionS3(
-  env: Pick<
-    Bindings,
-    "DB" | "S3_BUCKET" | "AWS_REGION" | "AWS_ACCESS_KEY_ID" | "AWS_SECRET_ACCESS_KEY"
-  >,
+  env: Pick<Bindings, "DB"> & VersionReadS3Env,
   datasetId: string,
   version?: string,
 ): Promise<DatasetVersionIntegrityResult> {
-  const options: PresignedUrlOptions = {
-    bucket: env.S3_BUCKET,
-    region: env.AWS_REGION,
-    accessKeyId: env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
-  };
+  const options = versionReadS3Options(env);
 
   let resolvedVersion = version ?? null;
   if (!resolvedVersion) {

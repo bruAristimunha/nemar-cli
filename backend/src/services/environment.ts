@@ -18,6 +18,20 @@ export function isNonProductionEnv(env: Pick<Bindings, "ENVIRONMENT">): boolean 
   return NON_PRODUCTION.has((env.ENVIRONMENT ?? "").trim().toLowerCase());
 }
 
+/**
+ * The S3 origin override (`S3_ENDPOINT_URL`), or `undefined` in anything but a
+ * recognized non-production environment. It exists so a test can point S3 reads
+ * at a local server; it is fenced because the reads it redirects decide
+ * `data_complete` and, through it, the withdrawal rule (ADR 0064), so a stray
+ * value in production must not be able to redirect them. Fail-closed: an
+ * unknown or unset ENVIRONMENT counts as production.
+ */
+export function testS3EndpointOverride(
+  env: Pick<Bindings, "ENVIRONMENT" | "S3_ENDPOINT_URL">,
+): string | undefined {
+  return isNonProductionEnv(env) ? env.S3_ENDPOINT_URL : undefined;
+}
+
 /** Prod defaults for the two env-resolved origins below. Duplicated as literals
  *  in datacite-constants.ts (landing) and data-router.ts (bytes) so those files
  *  stay usable without an env; keep the three in sync. */

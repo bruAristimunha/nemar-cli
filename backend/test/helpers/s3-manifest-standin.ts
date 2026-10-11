@@ -178,7 +178,11 @@ export function startS3ManifestStandin(): S3ManifestStandin {
         });
       }
       entry.status = 200;
-      const headers = { ETag: obj.etag, "Content-Type": "application/json" };
+      const headers = {
+        ETag: obj.etag,
+        "Content-Length": String(obj.body.length),
+        "Content-Type": "application/json",
+      };
       if (req.method === "HEAD") return new Response(null, { status: 200, headers });
       if (obj.breakAfter !== undefined) {
         const cut = obj.body.slice(0, obj.breakAfter);
