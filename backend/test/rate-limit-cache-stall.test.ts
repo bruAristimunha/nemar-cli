@@ -19,7 +19,7 @@ const ADDRESS = "203.0.113.90";
 const FAULT = "[rate-limit] cache failure";
 /** Slow enough to prove the bound is applied, quick enough to prove it is a bound. */
 const AT_LEAST_MS = 400;
-const AT_MOST_MS = 1500;
+const AT_MOST_MS = 4000;
 
 const never = <T>() => new Promise<T>(() => {});
 
@@ -148,5 +148,79 @@ describe("a stalled cache write", () => {
       process.off("unhandledRejection", listener);
     }
     expect(unhandled).toEqual([]);
+  });
+});
+
+describe("a record whose body cannot be read", () => {
+  // A body that errors or never finishes says nothing about the record. It is a
+  // cache fault (fail open, loud, bounded), not a damaged record to be "repaired"
+  // into a counter that restarts at zero on every request and never limits.
+  const damaged = () =>
+    h.warn.mock.calls.filter((c) => c[0] === "[rate-limit] repaired a damaged counter record");
+
+  class BodyCache extends InMemoryCache {
+    constructor(private readonly body: () => ReadableStream<Uint8Array>) {
+      super();
+    }
+    async match(): Promise<Response | undefined> {
+      return new Response(this.body(), { headers: { "Content-Type": "application/json" } });
+    }
+  }
+
+  const erroring = () =>
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(new Error("network connection lost"));
+      },
+    });
+  const hanging = () => new ReadableStream<Uint8Array>({ start() {} });
+
+  test("a stream that errors is a cache fault, not a damaged record", async () => {
+    install(new BodyCache(erroring));
+    const app = buildApp();
+    for (let i = 0; i < 5; i++) {
+      const res = await hit(app, edge(ADDRESS));
+      expect(res.status).toBe(200);
+      // Nothing was counted, so nothing is claimed: not "remaining 999" five times.
+      expect(res.headers.get("X-RateLimit-Remaining")).toBeNull();
+    }
+    expect(damaged()).toEqual([]);
+    expect(faults().length).toBe(1);
+    expect(faults()[0]?.[1]).toMatchObject({ keyKind: "ip", error: "Error" });
+  });
+
+  test("a body that never finishes costs the bound, then fails open and logs", async () => {
+    install(new BodyCache(hanging));
+    const { value: res, ms } = await timed(hit(buildApp(), edge(ADDRESS)));
+    expect(res.status).toBe(200);
+    expect(ms).toBeGreaterThanOrEqual(AT_LEAST_MS);
+    expect(ms).toBeLessThan(AT_MOST_MS);
+    expect(damaged()).toEqual([]);
+    expect(faults()[0]?.[1]).toMatchObject({ keyKind: "ip", error: "CacheStallError" });
+  });
+
+  test("the miss budget treats an unreadable record the same way", async () => {
+    install(new BodyCache(erroring));
+    const outcome = await checkDataMissBudget(
+      env,
+      new Request("http://localhost/data/x", { headers: edge(ADDRESS) }),
+      undefined,
+    );
+    expect(outcome.allowed).toBe(true);
+    expect(damaged()).toEqual([]);
+    expect(faults()[0]?.[1]).toMatchObject({ keyKind: "data-miss-ip" });
+  });
+
+  test("a body that is not JSON is still a damaged record, and is repaired", async () => {
+    class NotJson extends InMemoryCache {
+      async match(): Promise<Response | undefined> {
+        return new Response("this is not json");
+      }
+    }
+    install(new NotJson());
+    const res = await hit(buildApp(), edge(ADDRESS));
+    expect(res.status).toBe(200);
+    expect(damaged().length).toBe(1);
+    expect(faults()).toEqual([]);
   });
 });

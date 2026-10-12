@@ -390,8 +390,13 @@ async function readCounterRecord(
   if (!cached) return freshWindow(now);
   let data: unknown;
   try {
-    data = await cached.json();
-  } catch {
+    data = await boundedWait(cached.json(), "read");
+  } catch (err) {
+    // Only a body that is not JSON is a damaged record. A body that cannot be read
+    // at all (a stream that errors, one that never finishes) says nothing about
+    // the record: it is a cache fault, and goes to the fail-open, loud path rather
+    // than being "repaired" into a reset counter that never limits.
+    if (!(err instanceof SyntaxError)) throw err;
     data = null;
   }
   const state = __readCounter(data, now);
@@ -1262,7 +1267,9 @@ export async function rateLimiter(
     }
     const defer = dataPlaneDefer();
     if (defer) {
-      defer(write.catch((err: unknown) => logCacheFault(keyKind, path, err)));
+      // Bounded and logged like every other wait: a put that never settles would
+      // otherwise leave no line and no count.
+      defer(boundedWait(write, "put").catch((err: unknown) => logCacheFault(keyKind, path, err)));
       return;
     }
     // No execution context -- a route test driving the app directly, per
@@ -1513,7 +1520,11 @@ async function consumeKeyedBudget(
 
     const write = cache.put(cacheKey, counterRecord({ ...state, count: state.count + 1 }, now));
     if (waitUntil) {
-      waitUntil(write.catch((err: unknown) => logCacheFault(bucket.kind, undefined, err)));
+      waitUntil(
+        boundedWait(write, "put").catch((err: unknown) =>
+          logCacheFault(bucket.kind, undefined, err),
+        ),
+      );
     } else {
       try {
         await boundedWait(write, "put");
