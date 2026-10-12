@@ -344,6 +344,25 @@ function refusal(
   };
 }
 
+/**
+ * Set headers on the response a handler produced. A handler that returns its own
+ * `Response` replaces the one the context was building, and the headers of a
+ * `Response` from `fetch()` or `Response.redirect()` are immutable, so when the
+ * first write is refused the response is rebuilt from itself, which makes them
+ * writable, and written again.
+ */
+function stampHeaders(c: RateLimitContext, headers: Record<string, string>): void {
+  const apply = (res: Response) => {
+    for (const [name, value] of Object.entries(headers)) res.headers.set(name, value);
+  };
+  try {
+    apply(c.res);
+  } catch {
+    c.res = new Response(c.res.body, c.res);
+    apply(c.res);
+  }
+}
+
 // A legitimate full-dataset download over the data plane (`nemar-py
 // --jobs 16`, `rclone sync`) fires thousands of small per-file requests
 // against this ONE ip-keyed bucket, and #1516 (the brokered-file edge cache)
@@ -1080,8 +1099,8 @@ export async function rateLimiter(
   // limiter 429d. The CF-edge layer still enforces its own per-IP
   // ceilings, so the floor isn't absent.
   if (keyKind === "token" && (await isPrivilegedToken(c.env, bucketKeyValue))) {
-    c.header("X-RateLimit-Bucket", "admin-bypass");
     await next();
+    stampHeaders(c, { "X-RateLimit-Bucket": "admin-bypass" });
     return;
   }
 
@@ -1127,6 +1146,11 @@ export async function rateLimiter(
     ]);
   }
 
+  // The headers this request's answer will carry, decided here and applied after
+  // the handler ran: a handler that builds its own `Response` replaces anything
+  // set on the context before it, so setting them first would lose them.
+  let stamp: Record<string, string> | undefined;
+
   try {
     const cache = caches.default;
 
@@ -1159,25 +1183,21 @@ export async function rateLimiter(
       }
       const observed = { ...state, count: count + 1, warned };
       await writeCount(cache.put(cacheKey, counterRecord(observed, now)));
-      await next();
-      return;
-    }
-
-    if (count >= maxRequests) {
+    } else if (count >= maxRequests) {
       const refused = refusal(keyKind, maxRequests, state, now, caller.source);
       return c.json(refused.body, 429, refused.headers);
+    } else {
+      // Increment the counter. The record keeps the window's original end and
+      // expires with it; a refused request above writes nothing.
+      const newCount = count + 1;
+      await writeCount(cache.put(cacheKey, counterRecord({ ...state, count: newCount }, now)));
+      stamp = {
+        "X-RateLimit-Limit": maxRequests.toString(),
+        "X-RateLimit-Remaining": (maxRequests - newCount).toString(),
+        "X-RateLimit-Bucket": keyKind,
+        "X-RateLimit-Caller": caller.source,
+      };
     }
-
-    // Increment the counter. The record keeps the window's original end and
-    // expires with it; a refused request above writes nothing.
-    const newCount = count + 1;
-    await writeCount(cache.put(cacheKey, counterRecord({ ...state, count: newCount }, now)));
-
-    // Add rate limit headers to response
-    c.header("X-RateLimit-Limit", maxRequests.toString());
-    c.header("X-RateLimit-Remaining", (maxRequests - newCount).toString());
-    c.header("X-RateLimit-Bucket", keyKind);
-    c.header("X-RateLimit-Caller", caller.source);
   } catch (error) {
     // Fail open so a cache outage doesn't block all traffic, but emit a
     // structured log (once per window per bucket kind per isolate, see
@@ -1187,6 +1207,7 @@ export async function rateLimiter(
   }
 
   await next();
+  if (stamp) stampHeaders(c, stamp);
 }
 
 /**
