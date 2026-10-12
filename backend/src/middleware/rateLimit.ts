@@ -26,6 +26,15 @@
  *     bucket's 60s window and trips it on the 11th, about 50 seconds in,
  *     so it rides the generic bucket plus its own per-row floor instead.
  *     See the `AUTH_PATHS` comment for the detail.
+ *   - Who an address names depends on how the request arrived (#1709, ADR
+ *     0098). Cloudflare sets `CF-Connecting-IP` on everything from the public
+ *     network, and that value alone keys the buckets above. A request through
+ *     a service binding (the website's Worker) has none, so the visitor the
+ *     caller forwarded in `X-Forwarded-For` is counted instead, in `site-ip`
+ *     (and in `site:`-prefixed keys of the strict, data and Neurobagel
+ *     buckets), and a request with neither is counted in one shared bucket.
+ *     `X-Forwarded-For` never chooses the bucket of a request that carries
+ *     `CF-Connecting-IP`.
  */
 
 import type { Context, Next } from "hono";
@@ -46,6 +55,48 @@ const WINDOW_SIZE = 60; // seconds
 // adding Cache-Control to the three dataset GET endpoints (which is the
 // real architectural fix; this cap raise is defense-in-depth).
 const MAX_REQUESTS = 500;
+// The website's own bucket, per forwarded visitor (#1709, ADR 0098). The website
+// reaches this Worker through a service binding, which carries no
+// `CF-Connecting-IP`, and forwards the visitor's address in `X-Forwarded-For`;
+// such a request is counted here, keyed by that address, instead of in `ip`.
+// The pool problem MAX_REQUESTS describes does not arise: each key is one
+// visitor, not every visitor behind a handful of Cloudflare egress addresses.
+//
+// Sized to the heaviest page the website renders. A search page makes one search
+// call and up to ten `GET /datasets/:id` hydrations, eleven calls in all, so 2000
+// covers about 180 such page views in a window, three a second from one address:
+// more than a person produces, and the rate at which a crawler is a load problem
+// for the website itself rather than for this API. The goal for this traffic,
+// robots included, is that the data gets found, so the number is generous; the
+// bucket stays a floor against a runaway loop, not a quota.
+//
+// NEVER BELOW MAX_REQUESTS. A visitor who reaches the API through the website must
+// not be treated more strictly than a caller who reaches it directly, and a test
+// pins the relation so raising one cap cannot silently invert it.
+//
+// Counted the way every bucket in this file is counted: each allowed request
+// refreshes the counter's expiry, so a cap is a budget between two quiet gaps of
+// a window, not a rate per minute. That is a property of the counter, not of this
+// bucket, and ADR 0098 records it as a separate matter.
+const SITE_IP_MAX_REQUESTS = 2000;
+// A request with neither `CF-Connecting-IP` nor a usable `X-Forwarded-For`. The
+// public network cannot produce one (Cloudflare always sets the first), so it is a
+// caller inside the account that did not say who it acts for: today only the
+// website, if its forwarding broke. It used to get a fresh random bucket per
+// request, which is no bucket at all and silently turned the limiter off for the
+// strict buckets too. Now every such request shares ONE bucket per kind, so the
+// failure is bounded and visible (`X-RateLimit-Bucket: site-unattributed`, and a
+// log line once per window) rather than silent.
+//
+// The shared bucket is the whole site's traffic at once, so its cap is far above
+// any one visitor's: 20,000 is about 333 requests a second, some fifty times the
+// six or so a second that the 2026-10-11 production sample implies for the whole
+// website (a 40 percent refusal rate at a cap of 500), and still bounds a loop. The
+// strict, data and Neurobagel buckets keep their own caps for unattributed
+// callers, so a broken forward on a sign-in route throttles at the strict cap,
+// the same behavior the route had behind the shared egress pool (#1354), instead
+// of removing the floor.
+const SITE_UNATTRIBUTED_MAX_REQUESTS = 20_000;
 // Authenticated bucket. Originally sized for the heaviest single admin
 // orchestration: `nemar admin publish approve` on a 6500-object dataset
 // makes ~65 sequential CLI→Worker HTTP calls (one batch per ~100-object
@@ -367,7 +418,10 @@ export function __readBearerTokenFromHeader(authHeader: string | undefined): str
  *  - `neurobagel-ip` for the Neurobagel artifact store's read route
  *    (`/neurobagel/*`). 1,200/60s, IP-keyed, checked before the bearer branch for
  *    the reasons at NEUROBAGEL_PATH_RE.
- *  - `ip` for everything else (the unauthenticated cap).
+ *  - `ip` for everything else (the unauthenticated cap), or, for a caller
+ *    without `CF-Connecting-IP`, `site-ip` (the visitor it forwarded) or
+ *    `site-unattributed` (nobody named). The `ip` argument is the caller key
+ *    from {@link __readCallerIdentity} and `source` is its source.
  *
  * Admin endpoints used to be entirely exempt; that gave an admin
  * running a malformed loop unbounded access to the worker. Keeping the
@@ -375,10 +429,132 @@ export function __readBearerTokenFromHeader(authHeader: string | undefined): str
  * floor without the floor being absent.
  */
 export interface __BucketSelection {
-  keyKind: "auth-ip" | "ip" | "token" | "data-ip" | "neurobagel-ip";
-  /** Pre-hash key material: the IP, or the raw bearer token. */
+  keyKind:
+    | "auth-ip"
+    | "ip"
+    | "site-ip"
+    | "site-unattributed"
+    | "token"
+    | "data-ip"
+    | "neurobagel-ip";
+  /** Pre-hash key material: the caller key (see {@link __CallerIdentity}), or the raw bearer token. */
   rawKey: string;
   maxRequests: number;
+}
+
+/**
+ * How a request came to carry (or not carry) an address (#1709, ADR 0098).
+ *
+ *  - `edge`: it has `CF-Connecting-IP`. Cloudflare sets that header on every
+ *    request that arrives from the public network and a client cannot omit or
+ *    replace it, so it is the caller's address and `X-Forwarded-For` is never
+ *    looked at. This is the only source a public caller can have.
+ *  - `site`: no `CF-Connecting-IP`, and `X-Forwarded-For` starts with a valid IP
+ *    literal. A request through a service binding does not arrive from the
+ *    public network, so it carries no `CF-Connecting-IP` unless its caller sets
+ *    one; the Cloudflare account is the trust boundary (ADR 0078), and the
+ *    caller names the visitor it acts for. The caller must SET the header from
+ *    its own `CF-Connecting-IP`, never pass a visitor's header through.
+ *  - `unattributed`: neither. Not reachable from the public network.
+ */
+export type __CallerSource = "edge" | "site" | "unattributed";
+
+/** A caller's source and its bucket key. The key is the address itself for an
+ *  `edge` caller, `site:<address>` for a `site` caller, and a fixed word for an
+ *  `unattributed` one. The prefix puts every site key in a keyspace of its own,
+ *  so it cannot collide with a real address (no IP literal starts with `s`,
+ *  which is not a hex digit), and the fixed word cannot be an address either. */
+export interface __CallerIdentity {
+  source: __CallerSource;
+  key: string;
+}
+
+const SITE_KEY_PREFIX = "site:";
+const UNATTRIBUTED_KEY = "unattributed";
+/** A longer `X-Forwarded-For` is not read at all: a forwarding hop sets one address. */
+const MAX_FORWARDED_HEADER_LENGTH = 512;
+/** The longest textual IP literal: eight groups, or an IPv4-mapped form, is 45 characters. */
+const MAX_IP_LITERAL_LENGTH = 45;
+/** Dotted-quad with each octet 0 to 255 and no leading zero, which some parsers read as octal. */
+const IPV4_LITERAL_RE =
+  /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
+
+/**
+ * An IP literal in canonical form, or null. IPv4 is matched strictly; IPv6 is
+ * validated and compressed by the URL parser, so `2001:DB8:0:0::1` and
+ * `2001:db8::1` are one key. Anything else (a host name, a port, brackets, a
+ * zone id, an over-long string, `unknown`) is null.
+ */
+function canonicalIpLiteral(candidate: string): string | null {
+  if (candidate.length === 0 || candidate.length > MAX_IP_LITERAL_LENGTH) return null;
+  if (IPV4_LITERAL_RE.test(candidate)) return candidate;
+  if (!candidate.includes(":") || !/^[0-9a-fA-F:.]+$/.test(candidate)) return null;
+  try {
+    return new URL(`http://[${candidate}]/`).hostname.slice(1, -1);
+  } catch {
+    return null;
+  }
+}
+
+/** The first entry of an `X-Forwarded-For` value as a canonical IP literal, or null. */
+export function __firstForwardedIp(header: string | null | undefined): string | null {
+  if (!header || header.length > MAX_FORWARDED_HEADER_LENGTH) return null;
+  const comma = header.indexOf(",");
+  return canonicalIpLiteral((comma < 0 ? header : header.slice(0, comma)).trim());
+}
+
+/**
+ * The trust rule, in one place. `CF-Connecting-IP` wins whenever it is present
+ * and `X-Forwarded-For` is then ignored; the forwarded address is read only when
+ * it is absent.
+ */
+export function __readCallerIdentity(
+  cfConnectingIp: string | null | undefined,
+  xForwardedFor: string | null | undefined,
+): __CallerIdentity {
+  if (cfConnectingIp) return { source: "edge", key: cfConnectingIp };
+  const visitor = __firstForwardedIp(xForwardedFor);
+  if (visitor) return { source: "site", key: `${SITE_KEY_PREFIX}${visitor}` };
+  return { source: "unattributed", key: UNATTRIBUTED_KEY };
+}
+
+/** The identity of a request. Shared by the middleware and the per-route budgets. */
+function callerIdentityOf(headers: { get(name: string): string | null }): __CallerIdentity {
+  return __readCallerIdentity(headers.get("CF-Connecting-IP"), headers.get("X-Forwarded-For"));
+}
+
+const identityLoggedAt = new Map<string, number>();
+
+/**
+ * One log line per isolate per window for each caller source that is not the
+ * ordinary one. It is the way to see, with `wrangler tail`, that the website's
+ * calls arrive as `site` (the property ADR 0098 rests on and cannot prove
+ * before production), and to be told when a caller stops forwarding a visitor.
+ * Never per request, and never the address.
+ */
+function logIdentityOnce(source: "site" | "unattributed", path: string): void {
+  const now = Date.now();
+  const last = identityLoggedAt.get(source);
+  if (last !== undefined && now - last < WINDOW_SIZE * 1000) return;
+  identityLoggedAt.set(source, now);
+  if (source === "site") {
+    console.log(
+      "[rate-limit] counting a request without CF-Connecting-IP by its forwarded visitor",
+      {
+        path,
+      },
+    );
+  } else {
+    console.warn(
+      "[rate-limit] request with neither CF-Connecting-IP nor a valid X-Forwarded-For; counted in the shared unattributed bucket",
+      { path },
+    );
+  }
+}
+
+/** Test-only: let a test see the next identity log line again. */
+export function __resetIdentityLogForTests(): void {
+  identityLoggedAt.clear();
 }
 
 /**
@@ -411,6 +587,7 @@ export function __selectBucket(
   rawPath: string,
   authHeader: string | undefined,
   ip: string,
+  source: __CallerSource = "edge",
 ): __BucketSelection {
   const path = __normalizeMountPath(rawPath);
   if (AUTH_PATHS.some((p) => path === p || path.startsWith(`${p}/`) || path.startsWith(`${p}?`))) {
@@ -430,6 +607,21 @@ export function __selectBucket(
   const bearer = __readBearerTokenFromHeader(authHeader);
   if (bearer) {
     return { keyKind: "token", rawKey: bearer, maxRequests: TOKEN_MAX_REQUESTS_AUTHED };
+  }
+  // The anonymous bucket, by how the caller was identified (#1709, ADR 0098).
+  // `ip` here is the caller key, so a `site` or `unattributed` caller never
+  // shares a counter with a real address. The strict, data and Neurobagel
+  // buckets above keep their own caps for every source; only this one, whose
+  // cap exists to be generous to the website, differs.
+  if (source === "site") {
+    return { keyKind: "site-ip", rawKey: ip, maxRequests: SITE_IP_MAX_REQUESTS };
+  }
+  if (source === "unattributed") {
+    return {
+      keyKind: "site-unattributed",
+      rawKey: ip,
+      maxRequests: SITE_UNATTRIBUTED_MAX_REQUESTS,
+    };
   }
   return { keyKind: "ip", rawKey: ip, maxRequests: MAX_REQUESTS };
 }
@@ -567,10 +759,15 @@ export async function rateLimiter(
   }
 
   const path = c.req.path;
-  // Fall back to a random UUID instead of the shared "unknown" sentinel
-  // so headerless requests each get their own bucket rather than pooling.
-  const ip =
-    c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For") || crypto.randomUUID();
+  // Who this request's address names. `CF-Connecting-IP` decides whenever it is
+  // present and `X-Forwarded-For` is then never read, so a client cannot choose
+  // its bucket; see `__CallerSource`. A request with neither used to get a random
+  // UUID, a fresh bucket each time, which is no limit at all; it now shares one.
+  const caller = __readCallerIdentity(
+    c.req.header("CF-Connecting-IP"),
+    c.req.header("X-Forwarded-For"),
+  );
+  if (caller.source !== "edge") logIdentityOnce(caller.source, path);
 
   // `c.executionCtx.waitUntil`, or undefined outside a real Worker
   // invocation -- Hono throws on the getter then, the same fallback
@@ -592,7 +789,8 @@ export async function rateLimiter(
   const { keyKind, rawKey, maxRequests } = __selectBucket(
     path,
     options.anonymousSurface ? undefined : c.req.header("Authorization"),
-    ip,
+    caller.key,
+    caller.source,
   );
 
   // Token buckets hash the raw bearer; the auth middleware later
@@ -829,14 +1027,17 @@ export async function checkDataMissBudget(
   request: Request,
   waitUntil: ((work: Promise<unknown>) => void) | undefined,
 ): Promise<DataMissBudgetOutcome> {
-  const ip =
-    request.headers.get("CF-Connecting-IP") ||
-    request.headers.get("X-Forwarded-For") ||
-    crypto.randomUUID();
+  // The same identity the middleware uses, so a visitor forwarded by the website
+  // is charged to their own miss budget and an unattributed caller to one shared
+  // budget, not to a fresh random one.
   return consumeKeyedBudget(
     env,
     request,
-    { kind: DATA_MISS_BUCKET_KIND, key: ip, maxRequests: DATA_MISS_MAX_REQUESTS },
+    {
+      kind: DATA_MISS_BUCKET_KIND,
+      key: callerIdentityOf(request.headers).key,
+      maxRequests: DATA_MISS_MAX_REQUESTS,
+    },
     waitUntil,
   );
 }
@@ -980,6 +1181,8 @@ export const __limits = {
   AUTH_MAX_REQUESTS,
   TOKEN_MAX_REQUESTS_AUTHED,
   MAX_REQUESTS,
+  SITE_IP_MAX_REQUESTS,
+  SITE_UNATTRIBUTED_MAX_REQUESTS,
   DATA_MAX_REQUESTS,
   DATA_MISS_MAX_REQUESTS,
   NEUROBAGEL_MAX_REQUESTS,
