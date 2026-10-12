@@ -176,7 +176,9 @@ describe("a token the database says is an admin", () => {
       ["has no flag", { other: true }, "no-boolean"],
     ];
     const reports = () =>
-      h.warn.mock.calls.filter((c) => c[0] === "[rate-limit] replaced a damaged admin-flag record");
+      h.warn.mock.calls.filter(
+        (c) => c[0] === "[rate-limit] found a damaged admin-flag record, reading the database",
+      );
 
     for (const [what, damaged, kind] of cases) {
       test(`a record that ${what} is read again from the database, replaced, and reported as ${kind}`, async () => {
@@ -197,6 +199,25 @@ describe("a token the database says is an admin", () => {
         expect(lookups()).toEqual([]);
       });
     }
+
+    test("is reported as found, not as replaced, when the database then fails and nothing is replaced", async () => {
+      const hash = await hashApiKey(ADMIN_KEY);
+      await h.seedAdminFlag(hash, { admin: "yes" });
+      const broken = { ...env, DB: undefined } as unknown as Bindings;
+      const res = await hit(
+        buildApp(),
+        { ...edge("203.0.113.15"), ...bearer(ADMIN_KEY) },
+        "/admin/users",
+        broken,
+      );
+      // The database failed, so the token is not an admin and the record is as it was.
+      expect(res.headers.get("X-RateLimit-Bucket")).toBe("token");
+      expect(await h.storedAdminFlag(hash)).toEqual({ admin: "yes" });
+      expect(lookups()[0]?.[1]).toMatchObject({ phase: "lookup" });
+      // The line did not claim a replacement that did not happen.
+      expect(reports().length).toBe(1);
+      expect(String(reports()[0]?.[0])).not.toContain("replaced");
+    });
 
     test("is reported once per window and kind of damage, not per request", async () => {
       const hash = await hashApiKey(ADMIN_KEY);

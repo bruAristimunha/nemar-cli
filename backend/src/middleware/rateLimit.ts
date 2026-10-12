@@ -1230,10 +1230,13 @@ async function isPrivilegedToken(env: Bindings, hashedApiKey: string): Promise<b
       // A record that is not a usable flag is read again from the database and
       // replaced below, rather than holding the token to "not an admin" until it
       // expires, and reported like a damaged counter record: the self-heal is
-      // right, a silent one would hide whatever is writing bad records.
+      // right, a silent one would hide whatever is writing bad records. The line
+      // says only what has happened by now, that the record was found damaged and
+      // the database is being read: the database or the write may still fail, and
+      // then nothing was replaced.
       const damage = known.damage;
       logOncePerWindow(`admin-flag-damaged:${damage}`, (suppressed, sinceMs) => {
-        console.warn("[rate-limit] replaced a damaged admin-flag record", {
+        console.warn("[rate-limit] found a damaged admin-flag record, reading the database", {
           keyKind: "admin-flag",
           damage,
           suppressed,
