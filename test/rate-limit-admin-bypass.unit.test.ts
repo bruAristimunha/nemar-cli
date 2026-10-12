@@ -46,18 +46,18 @@ describe("__selectBucket", () => {
     expect(r.rawKey).toBe(VALID_TOKEN);
   });
 
-  test("unauthenticated non-auth endpoints fall back to the ip bucket at 500/60s", () => {
+  test("unauthenticated non-auth endpoints fall back to the ip bucket at 1000/60s", () => {
     const r = __selectBucket("/datasets", undefined, "1.2.3.4");
     expect(r.keyKind).toBe("ip");
-    // Tracks MAX_REQUESTS in rateLimit.ts (bumped 100 → 500 in #639).
-    expect(r.maxRequests).toBe(500);
+    // Tracks MAX_REQUESTS in rateLimit.ts (bumped 100 → 500 in #639, 500 → 1000 in #1709).
+    expect(r.maxRequests).toBe(1000);
     expect(r.rawKey).toBe("1.2.3.4");
   });
 
   test("syntactically-bad bearer falls through to ip bucket (no false escalation)", () => {
     const r = __selectBucket("/admin/datasets", "Bearer short", "1.2.3.4");
     expect(r.keyKind).toBe("ip");
-    expect(r.maxRequests).toBe(500);
+    expect(r.maxRequests).toBe(1000);
   });
 
   test("public data-plane paths get the generous data-ip bucket, IP-keyed", () => {
@@ -87,7 +87,7 @@ describe("__selectBucket", () => {
     // Anchored regex must not let /datasets/* leak into the generous bucket.
     const anon = __selectBucket("/datasets", undefined, "1.2.3.4");
     expect(anon.keyKind).toBe("ip");
-    expect(anon.maxRequests).toBe(500);
+    expect(anon.maxRequests).toBe(1000);
     const authed = __selectBucket("/datasets/nm000132", `Bearer ${VALID_TOKEN}`, "1.2.3.4");
     expect(authed.keyKind).toBe("token");
   });

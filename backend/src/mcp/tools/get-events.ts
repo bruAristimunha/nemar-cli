@@ -226,8 +226,8 @@ export const MAX_STORE_FANOUT_ENTRIES = 2000;
  * materialize 5.4 M row objects, run 5.4 M zod parses, and only then apply
  * `limit`/`offset`. That cannot fit in a 128 MB isolate, and the failure
  * RE-AMPLIFIES: the isolate dies before `waitUntil` runs, so nothing is cached,
- * so the next attempt repeats the whole read. At the anonymous 500/60s IP
- * bucket that is tens of GB/min of S3 egress from one IP with zero cache
+ * so the next attempt repeats the whole read. At the anonymous per-IP bucket
+ * (500 per 60 s when this was measured) that is tens of GB/min of S3 egress from one IP with zero cache
  * progress.
  *
  * A file over either bound is not read whole, but it is not refused outright

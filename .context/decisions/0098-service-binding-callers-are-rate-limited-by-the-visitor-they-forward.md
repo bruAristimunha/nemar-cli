@@ -109,6 +109,11 @@ The Cloudflare account is the trust boundary, as in ADR 0078, and no secret head
   ADR 0078 left dataset facts out until a caller settles them, and the HTTP path already settles them.
 - **Raising the anonymous cap as the fix.**
   Rejected as the fix: the cap is a floor against runaway loops, and decision 7 shows a raise only moves along the same curve.
+  The same pull request does raise `MAX_REQUESTS` from 500 to 1000, as a separate commit that can be dropped without touching anything above,
+  as defense in depth for the callers that still reach the API as one client (a Pages preview, local development, a failed binding assumption, shared CI runners).
+  It stops at 1000 because `TOKEN_MAX_REQUESTS_AUTHED` is 1000 and a token holder must not be limited more strictly than an anonymous caller;
+  going higher means raising the token cap in a decision of its own.
+  `/mcp` shares this bucket, so its ceiling doubles with it.
 - **Leaving a request with no address unlimited, as it is today.**
   Rejected: it silently turns the limiter off, for the strict paths too, and would do so for everyone if a zone setting stripped `CF-Connecting-IP`.
 - **Forwarding the visitor as `X-Real-IP` over the public network.**

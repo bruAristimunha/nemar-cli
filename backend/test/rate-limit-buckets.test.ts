@@ -186,7 +186,9 @@ describe("__selectBucket", () => {
     expect(sel.keyKind).toBe("token");
     expect(sel.rawKey).toBe(VALID_TOKEN);
     expect(sel.maxRequests).toBe(__limits.TOKEN_MAX_REQUESTS_AUTHED);
-    expect(sel.maxRequests).toBeGreaterThan(__limits.MAX_REQUESTS);
+    // Never stricter than an anonymous caller. Equal since #1709 raised the
+    // anonymous cap to the token cap; see the comment on MAX_REQUESTS.
+    expect(sel.maxRequests).toBeGreaterThanOrEqual(__limits.MAX_REQUESTS);
   });
 
   test("unauthenticated requests bucket on IP with legacy cap", () => {
@@ -223,7 +225,7 @@ describe("__selectBucket", () => {
     expect(anonymous.keyKind).toBe("ip");
     expect(anonymous.rawKey).toBe("10.0.0.3");
     expect(anonymous.maxRequests).toBe(__limits.MAX_REQUESTS);
-    expect(anonymous.maxRequests).toBeLessThan(__limits.TOKEN_MAX_REQUESTS_AUTHED);
+    expect(anonymous.maxRequests).toBeLessThanOrEqual(__limits.TOKEN_MAX_REQUESTS_AUTHED);
   });
 
   test("admin paths use the token bucket (not exempt)", () => {
@@ -349,6 +351,33 @@ describe("the MCP sub-app really passes anonymousSurface (epic #1065)", () => {
     }
     expect(remaining[1]).toBe(remaining[0] - 1);
     expect(remaining[2]).toBe(remaining[0] - 2);
+  });
+});
+
+describe("the anonymous cap (#1709)", () => {
+  test("is 1000, and no stricter for a token holder or for the website's visitors", () => {
+    // Pinned so a change to the number is a decision. It may not exceed the token
+    // cap without raising that one (a holder must not be limited more strictly
+    // than someone with no token), and the website's per-visitor bucket may not
+    // fall below it.
+    expect(__limits.MAX_REQUESTS).toBe(1000);
+    expect(__limits.MAX_REQUESTS).toBeLessThanOrEqual(__limits.TOKEN_MAX_REQUESTS_AUTHED);
+    expect(__limits.MAX_REQUESTS).toBeLessThanOrEqual(__limits.SITE_IP_MAX_REQUESTS);
+  });
+
+  test("the 1000th request from one address passes and the 1001st is refused", async () => {
+    const { app, env } = buildApp(PROD_ENV);
+    const headers = { "CF-Connecting-IP": "10.99.0.8" };
+    let last: Response | undefined;
+    for (let i = 0; i < 1000; i++) {
+      last = await hit(app, env, "/datasets", headers);
+      expect(last.status).toBe(200);
+    }
+    expect(last?.headers.get("X-RateLimit-Remaining")).toBe("0");
+    const over = await hit(app, env, "/datasets", headers);
+    expect(over.status).toBe(429);
+    expect(over.headers.get("X-RateLimit-Limit")).toBe("1000");
+    expect(over.headers.get("Retry-After")).toBe(String(__limits.WINDOW_SIZE));
   });
 });
 

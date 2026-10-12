@@ -54,7 +54,41 @@ const WINDOW_SIZE = 60; // seconds
 // primary control against abuse. Bumped 100 → 500 in #639 along with
 // adding Cache-Control to the three dataset GET endpoints (which is the
 // real architectural fix; this cap raise is defense-in-depth).
-const MAX_REQUESTS = 500;
+//
+// Bumped again 500 → 1000 in #1709 (ADR 0098), as a change of its own so it can be
+// reverted without touching the site-ip work below. The website's ordinary traffic
+// no longer rides this bucket (it is counted per visitor in `site-ip`); this is
+// defense in depth for the callers that still reach the API as one client: the
+// website when it cannot use its binding (a Pages preview, local development, or
+// if a binding call turns out to carry an address after all), the docs gate's
+// Pages Function, and shared CI runners.
+//
+// What a counted request costs: one Worker invocation and, for the catalog reads
+// that dominate, two or three D1 reads (a page of rows and its count; a search adds
+// an index lookup). The Cache-Control those routes send lets a client that honors
+// it skip the call; it does not make the Worker skip the work for one that does
+// not. At 1000 per window the ceiling for one address is about 17 requests a
+// second, 1.4 million a day, per data center.
+//
+// What the number does and does not protect against. It bounds a runaway loop from
+// one address. It does not bound a crawl spread over many addresses (each has its
+// own bucket, each data center its own counter), or the cost of any single call.
+// `/mcp` shares this bucket, and
+// its tools read from S3 per call; those reads are bounded by their own byte limits
+// (#1498), not by this number, so a higher cap raises how many one address may
+// start. No Cloudflare rule in front of the Worker is documented in this
+// repository, so read this as the only floor.
+//
+// Why 1000 and not more. A token holder must never be limited more strictly than an
+// anonymous caller: the bearer is the only difference between them, and a holder
+// could stop sending it. `TOKEN_MAX_REQUESTS_AUTHED` is 1000, so this cannot go
+// above it without raising that one too, which is a separate decision; a test pins
+// the relation. And no number cures the website's refusals on its own, because
+// each allowed request refreshes the counter's expiry: a pool that never goes quiet
+// for 60 seconds is refused for about a minute after every `cap / rate` seconds.
+// At six requests a second that is about 42 percent refused at 500 and about 26 at 1000;
+// ADR 0098 gives the measurements and leaves the counter for a decision of its own.
+const MAX_REQUESTS = 1000;
 // The website's own bucket, per forwarded visitor (#1709, ADR 0098). The website
 // reaches this Worker through a service binding, which carries no
 // `CF-Connecting-IP`, and forwards the visitor's address in `X-Forwarded-For`;
