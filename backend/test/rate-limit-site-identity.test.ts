@@ -65,6 +65,15 @@ describe("__firstForwardedIp", () => {
     // Only the first entry counts, however many follow.
     ["203.0.113.7, 10.0.0.1, 10.0.0.2", "203.0.113.7"],
     ["203.0.113.7,10.0.0.1", "203.0.113.7"],
+    // Only `::ffff:` followed by exactly two groups is the mapped range. Its neighbors
+    // keep their own keys, so no visitor whose address merely ends in `::ffff:x:y`
+    // is read as an IPv4 one.
+    ["2001:db8::ffff:1:2", "2001:db8::ffff:1:2"],
+    ["2001:db9::ffff:1:2", "2001:db9::ffff:1:2"],
+    ["::ffff:1:2:3", "::ffff:1:2:3"],
+    ["1::ffff:1:2", "1::ffff:1:2"],
+    ["ffff::ffff:1:2", "ffff::ffff:1:2"],
+    ["::abcd:102:304", "::abcd:102:304"],
     // The longest legitimate literal is 45 characters, and is accepted (as the IPv4 it wraps).
     ["0000:0000:0000:0000:0000:ffff:255.255.255.255", "255.255.255.255"],
   ])("%j reads as %j", (header, expected) => {
@@ -81,6 +90,13 @@ describe("__firstForwardedIp", () => {
     ["example.com"],
     ["203.0.113"],
     ["203.0.113.256"],
+    // An octet above 255 is refused in every position, including 256 to 259.
+    ["256.1.1.1"],
+    ["1.256.1.1"],
+    ["1.1.256.1"],
+    ["259.0.0.1"],
+    ["1.1.1.259"],
+    ["1.1.300.1"],
     // A leading zero is refused whatever the octet (some parsers read it as octal).
     ["203.0.113.07"],
     ["203.0.113.007"],
@@ -298,6 +314,13 @@ describe("the caps", () => {
   test("the website's caps are the numbers the owner chose", () => {
     expect(__limits.SITE_IP_MAX_REQUESTS).toBe(2000);
     expect(__limits.SITE_UNATTRIBUTED_MAX_REQUESTS).toBe(20_000);
+  });
+
+  test("the Neurobagel and miss-budget caps are the numbers they were sized to", () => {
+    // The tables elsewhere read their numbers from `__limits`, so they could not see
+    // one of these change.
+    expect(__limits.NEUROBAGEL_MAX_REQUESTS).toBe(1200);
+    expect(__limits.DATA_MISS_MAX_REQUESTS).toBe(10_000);
   });
 
   test("a visitor through the website is never treated more strictly than a public caller", () => {
@@ -842,5 +865,42 @@ describe("checkDataMissBudget uses the same identity", () => {
     expect((await ask({})).allowed).toBe(false);
     expect((await ask({ "X-Forwarded-For": "junk" })).allowed).toBe(false);
     expect((await ask(viaBinding(A))).allowed).toBe(true);
+  });
+});
+
+describe("the token bucket is keyed by the bearer, whoever forwarded it", () => {
+  const A_KEY = `a${"x".repeat(47)}`;
+  const B_KEY = `b${"x".repeat(47)}`;
+
+  test("selection keys the bucket on the bearer for a site and an unattributed caller", () => {
+    const site = __selectBucket("/admin/users", `Bearer ${A_KEY}`, "site:203.0.113.7", "site");
+    expect(site).toMatchObject({ keyKind: "token", rawKey: A_KEY });
+    const none = __selectBucket("/admin/users", `Bearer ${A_KEY}`, "unattributed", "unattributed");
+    expect(none).toMatchObject({ keyKind: "token", rawKey: A_KEY });
+  });
+
+  test("one bearer from two visitors is one count; two bearers from one visitor are two", async () => {
+    const app = buildApp();
+    const as = (key: string, visitor: string) => ({
+      ...viaBinding(visitor),
+      Authorization: `Bearer ${key}`,
+    });
+    const first = await hit(app, as(A_KEY, "203.0.113.120"), "/admin/users");
+    const second = await hit(app, as(A_KEY, "203.0.113.121"), "/admin/users");
+    const other = await hit(app, as(B_KEY, "203.0.113.120"), "/admin/users");
+    const cap = __limits.TOKEN_MAX_REQUESTS_AUTHED;
+    expect(first.headers.get("X-RateLimit-Remaining")).toBe(String(cap - 1));
+    expect(second.headers.get("X-RateLimit-Remaining")).toBe(String(cap - 2));
+    expect(other.headers.get("X-RateLimit-Remaining")).toBe(String(cap - 1));
+  });
+});
+
+describe("two visitors whose addresses differ only in the prefix are two buckets", () => {
+  test("end to end", async () => {
+    const app = buildApp();
+    const a = await hit(app, viaBinding("2001:db8::ffff:1:2"));
+    const b = await hit(app, viaBinding("2001:db9::ffff:1:2"));
+    expect(a.headers.get("X-RateLimit-Remaining")).toBe(String(CAP - 1));
+    expect(b.headers.get("X-RateLimit-Remaining")).toBe(String(CAP - 1));
   });
 });

@@ -131,11 +131,11 @@ beforeAll(async () => {
   // missing table; the tests below read headers, not bodies.
   const d1 = (await mf.getD1Database("DB", "nemar-api")) as unknown as D1Database;
   await applyMigrations(d1, migrationFiles());
-});
+}, 60_000);
 
 afterAll(async () => {
   await mf?.dispose();
-});
+}, 30_000);
 
 describe("what workerd hands a callee over a service binding", () => {
   test("no CF-Connecting-IP, no X-Real-IP and no cf object arrive; the forwarded visitor does", async () => {

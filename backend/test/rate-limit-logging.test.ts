@@ -9,7 +9,11 @@
  */
 
 import { describe, expect, spyOn, test } from "bun:test";
-import { __limits, checkDataMissBudget } from "../src/middleware/rateLimit";
+import {
+  __limits,
+  checkDataMissBudget,
+  checkPrivateGrantBudget,
+} from "../src/middleware/rateLimit";
 import type { Bindings } from "../src/types/bindings";
 import { InMemoryCache } from "./helpers/cache";
 import {
@@ -318,5 +322,102 @@ describe("a fault line says where the work failed", () => {
     await hit(app, edge(ADDRESS));
     expect(faults()[0]?.[1]).toMatchObject({ suppressed: 0, sinceMs: 0 });
     expect(faults()[1]?.[1]).toMatchObject({ suppressed: 1, sinceMs: 60_250 });
+  });
+});
+
+describe("the once-per-window machinery", () => {
+  const failing = () => {
+    install(new PutFailingCache());
+    return buildApp();
+  };
+
+  test("a line that has come back is still once per window, not once per call", async () => {
+    const app = failing();
+    await hit(app, edge(ADDRESS));
+    h.clock = T0 + __limits.WINDOW_SIZE * 1000;
+    await hit(app, edge(ADDRESS));
+    expect(faults().length).toBe(2);
+    for (const offset of [1, 1000, 30_000, __limits.WINDOW_SIZE * 1000 - 1]) {
+      h.clock = T0 + __limits.WINDOW_SIZE * 1000 + offset;
+      await hit(app, edge(ADDRESS));
+    }
+    expect(faults().length).toBe(2);
+    h.clock = T0 + 2 * __limits.WINDOW_SIZE * 1000;
+    await hit(app, edge(ADDRESS));
+    expect(faults().length).toBe(3);
+    expect(faults()[2]?.[1]).toMatchObject({ suppressed: 4 });
+  });
+
+  test("a fault line names the route", async () => {
+    await hit(failing(), edge(ADDRESS), "/auth/login");
+    expect(faults()[0]?.[1]).toMatchObject({ keyKind: "auth-ip", route: "/auth/login" });
+  });
+
+  test("a site caller and an unattributed one on the SAME bucket each get their line", async () => {
+    const app = buildApp();
+    await hit(app, viaBinding("203.0.113.151"), "/auth/login");
+    await hit(app, {}, "/auth/login");
+    expect(h.log.mock.calls.length).toBe(1);
+    expect(h.warn.mock.calls.filter((c) => String(c[0]).startsWith("[rate-limit]")).length).toBe(1);
+    expect(h.warn.mock.calls[0]?.[1]).toMatchObject({ keyKind: "auth-ip", reason: "absent" });
+  });
+
+  test("the two lines an operator greps for read exactly as the ADR says", async () => {
+    const app = buildApp();
+    await hit(app, viaBinding("203.0.113.152"));
+    await hit(app, {});
+    expect(h.log.mock.calls[0]?.[0]).toBe(
+      "[rate-limit] counting a request without CF-Connecting-IP by its forwarded visitor",
+    );
+    expect(h.warn.mock.calls[0]?.[0]).toBe(
+      "[rate-limit] request with neither CF-Connecting-IP nor a usable X-Forwarded-For; counted in a shared bucket",
+    );
+  });
+
+  describe("a repair is logged once per bucket kind AND kind of damage", () => {
+    const repaired = () =>
+      h.warn.mock.calls
+        .filter((c) => c[0] === "[rate-limit] repaired a damaged counter record")
+        .map((c) => c[1]);
+
+    test("two kinds of damage on one bucket kind are two lines", async () => {
+      const app = buildApp();
+      await h.seed("ip:203.0.113.153", "not json", 3600);
+      await h.seed("ip:203.0.113.154", { count: "lots", windowEnd: T0 + 30_000 }, 3600);
+      await hit(app, edge("203.0.113.153"));
+      await hit(app, edge("203.0.113.154"));
+      expect(repaired()).toEqual([
+        { keyKind: "ip", damage: "unparseable", suppressed: 0, sinceMs: 0 },
+        { keyKind: "ip", damage: "bad-count", suppressed: 0, sinceMs: 0 },
+      ]);
+    });
+
+    test("one kind of damage on two bucket kinds is two lines", async () => {
+      const app = buildApp();
+      await h.seed("ip:203.0.113.155", "not json", 3600);
+      await h.seed("auth-ip:203.0.113.156", "not json", 3600);
+      await hit(app, edge("203.0.113.155"));
+      await hit(app, edge("203.0.113.156"), "/auth/login");
+      expect(repaired().map((r) => (r as { keyKind: string }).keyKind)).toEqual(["ip", "auth-ip"]);
+    });
+
+    test("the budgets name their own kind", async () => {
+      const env = { ENVIRONMENT: "production" } as Pick<
+        Bindings,
+        "ENVIRONMENT" | "TEST_BYPASS_TOKEN"
+      >;
+      await h.seed(`data-miss-ip:${ADDRESS}`, "not json", 3600);
+      await h.seed("private-grant-account:user-5", "not json", 3600);
+      await checkDataMissBudget(
+        env,
+        new Request("http://localhost/data/x", { headers: edge(ADDRESS) }),
+        undefined,
+      );
+      await checkPrivateGrantBudget(env, new Request("http://localhost/x"), 5, undefined);
+      expect(repaired().map((r) => (r as { keyKind: string }).keyKind)).toEqual([
+        "data-miss-ip",
+        "private-grant-account",
+      ]);
+    });
   });
 });

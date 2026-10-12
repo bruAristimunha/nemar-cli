@@ -443,7 +443,9 @@ describe("concurrent requests", () => {
   // requests in flight together can each read the same count and each write the same
   // next one: the cap can be overrun by the concurrency, never by more than that.
   // What must hold is that every request is answered and the record stays whole.
-  test("eleven at once on the strict bucket are all answered and leave a well-formed record", async () => {
+  // The cap can be overrun by the concurrency (the documented race), so this pins
+  // only that every request is answered and the record stays whole, not a count.
+  test("eleven at once on the strict bucket are all answered and leave a well-formed record, whatever the count", async () => {
     const app = buildApp();
     const headers = viaBinding("203.0.113.63");
     const answers = await Promise.all(
@@ -819,5 +821,64 @@ describe("observe-only counting follows the same window", () => {
     expect((await h.stored("ip:203.0.113.51"))?.count).toBe(1);
     expect(res.headers.get("X-RateLimit-Bucket")).toBeNull();
     expect(res.headers.get("X-RateLimit-Remaining")).toBeNull();
+  });
+});
+
+describe("a refusal writes nothing (ADR 0099 decision 1)", () => {
+  class CountingCache extends InMemoryCache {
+    puts = 0;
+    async put(request: RequestInfo | URL, response: Response): Promise<void> {
+      this.puts++;
+      return super.put(request, response);
+    }
+  }
+
+  test("twenty refusals make no cache write, and the record is unchanged", async () => {
+    const cache = new CountingCache();
+    (globalThis as { caches?: unknown }).caches = { default: cache };
+    const key = new Request("https://rate-limit.internal/rl:ip:203.0.113.108");
+    await cache.put(
+      key,
+      new Response(JSON.stringify({ count: ANON_CAP, warned: false, windowEnd: T0 + 30_000 }), {
+        headers: { "Content-Type": "application/json", "Cache-Control": "max-age=30" },
+      }),
+    );
+    cache.puts = 0;
+    const app = buildApp();
+    for (let i = 0; i < 20; i++) {
+      expect((await hit(app, edge("203.0.113.108"))).status).toBe(429);
+    }
+    expect(cache.puts).toBe(0);
+    expect(((await (await cache.match(key))?.json()) as { count: number }).count).toBe(ANON_CAP);
+  });
+});
+
+describe("an entry can outlive its window by under a second, and the limiter's own check ends it", () => {
+  // The cache keeps whole seconds: a window ending at T0 + 60 000 whose last write was
+  // at T0 + 10 500 is stored for 50 s and lives to T0 + 60 500. Between the two the
+  // entry is still there, so only the limiter's own `end <= now` starts a new window.
+  test.each([60_000, 60_200, 60_499])("a request at T0 + %d starts a fresh window", async (at) => {
+    h.clock = T0 + 10_500;
+    await h.seed(
+      "ip:203.0.113.109",
+      { count: ANON_CAP, warned: false, windowEnd: T0 + 60_000 },
+      50,
+    );
+    h.clock = T0 + at;
+    expect(await h.stored("ip:203.0.113.109")).toBeDefined();
+    const res = await hit(buildApp(), edge("203.0.113.109"));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-RateLimit-Remaining")).toBe(String(ANON_CAP - 1));
+  });
+
+  test("and one a moment earlier is still refused", async () => {
+    h.clock = T0 + 10_500;
+    await h.seed(
+      "ip:203.0.113.110",
+      { count: ANON_CAP, warned: false, windowEnd: T0 + 60_000 },
+      50,
+    );
+    h.clock = T0 + 59_999;
+    expect((await hit(buildApp(), edge("203.0.113.110"))).status).toBe(429);
   });
 });

@@ -109,9 +109,11 @@ describe("a stalled cache write", () => {
       expect(ms).toBeLessThan(AT_MOST_MS);
       expect(faults().length).toBe(1);
       expect(faults()[0]?.[1]).toMatchObject({ keyKind: kind, error: "CacheStallError" });
-      // The data plane's write is not waited on (in a Worker it is handed to
-      // `waitUntil`), so its answer states a count whether or not the write lands;
-      // every other bucket waits and says nothing it did not count.
+      // These requests carry no execution context, so the data plane's write falls
+      // back to a bounded wait and its answer states the count whether or not the
+      // write lands; with a real `waitUntil` the write is handed over instead (see
+      // rate-limit-deferred.test.ts). Every other bucket waits and says nothing it
+      // did not count.
       expect(res.headers.get("X-RateLimit-Bucket")).toBe(kind === "data-ip" ? kind : null);
     },
   );

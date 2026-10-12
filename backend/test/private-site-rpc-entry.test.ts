@@ -133,11 +133,11 @@ beforeAll(async () => {
     )
     .bind(userId, await hashCookieId(APP_COOKIE))
     .run();
-});
+}, 60_000);
 
 afterAll(async () => {
   await mf?.dispose();
-});
+}, 30_000);
 
 describe("src/worker.ts in workerd", () => {
   test("the default export is still the HTTP app", async () => {

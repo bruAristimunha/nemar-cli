@@ -56,6 +56,12 @@ function collector() {
 
 const faults = () => h.error.mock.calls.filter((c) => c[0] === FAULT);
 
+/** The count a bucket holds in a cache this file installed itself. */
+async function countIn(cache: InMemoryCache, key: string): Promise<unknown> {
+  const res = await cache.match(new Request(`https://rate-limit.internal/rl:${key}`));
+  return res ? ((await res.json()) as { count?: unknown }).count : undefined;
+}
+
 async function viaCounter(cache: InMemoryCache) {
   install(cache);
   const ctx = collector();
@@ -131,5 +137,42 @@ describe("a deferred write that never settles", () => {
     expect(ms).toBeLessThan(AT_MOST_MS);
     expect(faults().length).toBe(1);
     expect(faults()[0]?.[1]).toMatchObject({ keyKind: kind, error: "CacheStallError" });
+  });
+});
+
+describe("a write handed to waitUntil is handed over, counted, and never waited on", () => {
+  test("the data plane's counter hands over exactly one write per request", async () => {
+    const cache = new InMemoryCache();
+    const { res, ctx } = await viaCounter(cache);
+    expect(res.status).toBe(200);
+    expect(ctx.work.length).toBe(1);
+    await ctx.settled();
+    expect(await countIn(cache, `data-ip:${ADDRESS}`)).toBe(1);
+  });
+
+  test("a write that never settles does not delay the response", async () => {
+    const started = performance.now();
+    const { res, ctx } = await viaCounter(new PutStalledCache());
+    expect(res.status).toBe(200);
+    expect(performance.now() - started).toBeLessThan(250);
+    expect(ctx.work.length).toBe(1);
+  });
+
+  test("the miss budget hands over one write, which lands", async () => {
+    const cache = new InMemoryCache();
+    const { outcome, ctx } = await viaMissBudget(cache);
+    expect(outcome.allowed).toBe(true);
+    expect(ctx.work.length).toBe(1);
+    await ctx.settled();
+    expect(await countIn(cache, `data-miss-ip:${ADDRESS}`)).toBe(1);
+  });
+
+  test("the private-grant budget hands over one write, which lands", async () => {
+    const cache = new InMemoryCache();
+    const { outcome, ctx } = await viaPrivateGrant(cache);
+    expect(outcome.allowed).toBe(true);
+    expect(ctx.work.length).toBe(1);
+    await ctx.settled();
+    expect(await countIn(cache, "private-grant-account:user-77")).toBe(1);
   });
 });
