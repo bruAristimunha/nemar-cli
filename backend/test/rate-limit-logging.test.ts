@@ -462,6 +462,11 @@ describe("a fault line says where the work failed", () => {
     // A record whose `count` throws when the limiter looks at it: the body arrived and
     // parsed, and what fails is the limiter's own interpretation of it.
     class HostileRecord extends InMemoryCache {
+      puts = 0;
+      async put(request: RequestInfo | URL, response: Response): Promise<void> {
+        this.puts++;
+        return super.put(request, response);
+      }
       async match(): Promise<Response | undefined> {
         const response = new Response("{}");
         response.json = async () =>
@@ -477,12 +482,16 @@ describe("a fault line says where the work failed", () => {
       h.error.mock.calls.filter((c) => c[0] === "[rate-limit] limiter fault");
 
     test("on the request path", async () => {
-      install(new HostileRecord());
+      const cache = new HostileRecord();
+      install(cache);
       const res = await hit(buildApp(), edge(ADDRESS));
       expect(res.status).toBe(200);
       expect(limiterFaults().length).toBe(1);
       expect(limiterFaults()[0]?.[1]).toMatchObject({ phase: "decide", error: "RangeError" });
       expect(faults()).toEqual([]);
+      // It failed open: nothing was counted, so nothing was written and nothing announced.
+      expect(cache.puts).toBe(0);
+      expect([...res.headers.keys()].filter((name) => name.startsWith("x-ratelimit"))).toEqual([]);
     });
 
     test("on the keyed-budget path", async () => {
@@ -490,13 +499,16 @@ describe("a fault line says where the work failed", () => {
         Bindings,
         "ENVIRONMENT" | "TEST_BYPASS_TOKEN"
       >;
-      install(new HostileRecord());
+      const cache = new HostileRecord();
+      install(cache);
       const outcome = await checkDataMissBudget(
         env,
         new Request("http://localhost/data/x", { headers: edge(ADDRESS) }),
         undefined,
       );
       expect(outcome.allowed).toBe(true);
+      // Failed open: no count was written.
+      expect(cache.puts).toBe(0);
       expect(limiterFaults().length).toBe(1);
       expect(limiterFaults()[0]?.[1]).toMatchObject({
         keyKind: "data-miss-ip",
