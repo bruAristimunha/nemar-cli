@@ -179,7 +179,12 @@ decide" cannot be expressed with either.
 2. Set the four `ANTHROPIC_*` organization variables on `nemarDatasets`, and check the federation
    rule accepts only `repo:nemarDatasets/.github:ref:refs/heads/main` for this workflow.
 3. Deploy `run-pr-review.yml`, then add it to the `unit-pure` sparse checkout with
-   `NEMAR_PR_REVIEW_WORKFLOW_LIVE` so the parity test stops skipping.
+   `NEMAR_PR_REVIEW_WORKFLOW_LIVE` so the parity test stops skipping. **Done (2026-10-12):** the
+   workflow is on `nemarDatasets/.github` `main` (commit `fe7f821a`), byte-identical to the
+   authoring copy, and `unit-pure` checks it out beside `onboard-openneuro.yml` and sets
+   `NEMAR_PR_REVIEW_WORKFLOW_LIVE`. The parity test now runs on every pull request, a missing
+   deployed copy fails it, and a change to either copy that is not deployed to the other turns
+   `unit-pure` red.
 4. Release this change to production. The flag is already on in `[env.dev.vars]` of
    `backend/wrangler-sccn.toml` (the soak target) and absent from `[vars]`, so production is dark. Once
    the soak below has passed, add `PR_REVIEW_ENABLED = "1"` to `[vars]`; that is a change to the file, so

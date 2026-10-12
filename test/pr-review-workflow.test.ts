@@ -5,10 +5,10 @@
  * The workflow is authored in this repository and deployed by copying it whole into
  * `nemarDatasets/.github` (the same arrangement and the same drift risk as the onboarding
  * workflow, see `test/dataset-workflow-parity.test.ts`). The parity check at the bottom compares
- * the two byte for byte when a deployed copy is available, and SKIPS VISIBLY otherwise: until the
- * file is deployed there is nothing to compare, and a required CI job must not fail on a file that
- * cannot exist yet. Once it is deployed, add the file to the `unit-pure` job's sparse checkout and
- * set NEMAR_PR_REVIEW_WORKFLOW_LIVE there, which turns a missing copy into a failure.
+ * the two byte for byte. The `unit-pure` job checks out the deployed copy and sets
+ * NEMAR_PR_REVIEW_WORKFLOW_LIVE to it, which turns a missing copy into a failure. Without the
+ * variable (a developer machine) it looks for a sibling checkout of `nemarDatasets/.github` and
+ * SKIPS VISIBLY when there is none, so the check is enforced in CI and optional locally.
  */
 
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";

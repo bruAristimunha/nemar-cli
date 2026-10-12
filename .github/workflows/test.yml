@@ -824,22 +824,27 @@ jobs:
           sparse-checkout-cone-mode: false
           ref: staging
 
-      # The deployed copy of onboard-openneuro.yml, for the same reason and with the
-      # same shape (#1309). That workflow is authored in this repo beside the CLI it
-      # invokes, then deployed by copying it whole into nemarDatasets/.github -- and
-      # the two had already drifted by one merged PR before anyone noticed, because
-      # nothing compared them. `main`, not a pre-release branch: that repo has no
-      # release train, so what is on main is what runs.
+      # The deployed copies of onboard-openneuro.yml and run-pr-review.yml, for the
+      # same reason and with the same shape (#1309). Both are authored in this repo
+      # beside the code they invoke, then deployed by copying them whole into
+      # nemarDatasets/.github -- and the first pair had already drifted by one merged
+      # PR before anyone noticed, because nothing compared them. `main`, not a
+      # pre-release branch: that repo has no release train, so what is on main is
+      # what runs.
       #
-      # nemarDatasets/.github is PUBLIC, so no token is needed. Sparse, non-cone, one
-      # file. It lands in dataset-workflows-live/ at the repo root, which the
-      # unit-pure file glob does not reach, so it cannot be mistaken for a test file.
-      - name: Check out the deployed dataset workflow
+      # nemarDatasets/.github is PUBLIC, so no token is needed. Sparse, non-cone, two
+      # files (non-cone mode takes file paths, one per line). They land in
+      # dataset-workflows-live/ at the repo root, which the unit-pure file glob does
+      # not reach, so they cannot be mistaken for test files. A workflow added to
+      # this list needs its own NEMAR_*_LIVE variable in the test step below.
+      - name: Check out the deployed dataset workflows
         uses: actions/checkout@v4
         with:
           repository: nemarDatasets/.github
           path: dataset-workflows-live
-          sparse-checkout: .github/workflows/onboard-openneuro.yml
+          sparse-checkout: |
+            .github/workflows/onboard-openneuro.yml
+            .github/workflows/run-pr-review.yml
           sparse-checkout-cone-mode: false
           ref: main
 
@@ -896,6 +901,7 @@ jobs:
           # broken checkout step cannot silently disable the check.
           NEMAR_WEBSITE_ACCOUNT_COPY: website-copy/src/lib/account-copy.ts
           NEMAR_DATASET_WORKFLOW_LIVE: dataset-workflows-live/.github/workflows/onboard-openneuro.yml
+          NEMAR_PR_REVIEW_WORKFLOW_LIVE: dataset-workflows-live/.github/workflows/run-pr-review.yml
           # Empty on a fork, where the checkout above is skipped, so the guard
           # skips VISIBLY instead of failing on a checkout that could never have
           # worked. On any run from this repository it is set, and a missing

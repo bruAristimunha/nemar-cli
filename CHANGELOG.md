@@ -15,6 +15,17 @@ earlier releases are described only by their generated notes.
 
 ## Unreleased
 
+### Changed
+
+- **The parity test for `run-pr-review.yml` now runs in CI against the deployed copy (ADR 0092).**
+  The workflow reached `nemarDatasets/.github` `main` on 2026-10-12 (commit `fe7f821a`), so the
+  `unit-pure` job's sparse checkout of that repository lists it beside `onboard-openneuro.yml` and
+  sets `NEMAR_PR_REVIEW_WORKFLOW_LIVE` to it. Until now the test skipped in CI, because there was
+  nothing to compare. With the variable set, a missing deployed copy fails the test, and so does a
+  deployed copy that differs from `.github/dataset-workflows/run-pr-review.yml` by a single byte.
+  A change to either copy now has to be deployed to the other in the same step, as it already
+  had to be for the onboarding workflow. Step 3 of ADR 0092's "Before it is switched on" is done.
+
 ### Fixed
 
 - **The weekly summary.json drift check can file its issue.** The job has no checkout, so `gh`
