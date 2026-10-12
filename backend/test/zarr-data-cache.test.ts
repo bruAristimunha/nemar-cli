@@ -43,7 +43,7 @@ import type { Database } from "bun:sqlite";
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import type { Server } from "bun";
 import { Hono } from "hono";
-import { __limits } from "../src/middleware/rateLimit";
+import { __limits, __resetRateLimitLogsForTests } from "../src/middleware/rateLimit";
 import {
   type CacheLike,
   FULL_OBJECT_CACHE_MAX_BYTES,
@@ -1966,6 +1966,9 @@ describe("rate limiter exemption for redirect candidates (#1181 phase 6 / issue 
   });
 
   test("N+1 redirects crossing the cap produce exactly one console.warn, never one per request", async () => {
+    // The warning is also limited to one per window per bucket kind for the whole
+    // isolate, so start from a state in which no earlier test has spoken.
+    __resetRateLimitLogsForTests();
     const ip = "203.0.113.14";
     const key = `https://rate-limit.internal/rl:data-ip:${ip}`;
     // Seed one below the cap so the SECOND request below is the one that

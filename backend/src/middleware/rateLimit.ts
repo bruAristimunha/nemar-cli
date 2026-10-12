@@ -443,11 +443,25 @@ function refusal(
   };
 }
 
-/** One line per window per bucket kind for the refusals, so `wrangler tail` can
- *  show that a bucket is refusing and how often. Never an address. */
-function logRefusal(keyKind: string, maxRequests: number, retryAfter: number): void {
-  logOncePerWindow(`refusal:${keyKind}`, (suppressed) => {
-    console.warn("[rate-limit] refusing", { keyKind, maxRequests, retryAfter, suppressed });
+/** One line per window per caller source and bucket kind for the refusals, so
+ *  `wrangler tail` can show that a bucket is refusing, how often, and for whom.
+ *  Keyed by the source as well as the bucket, so ordinary brute-force noise from
+ *  public callers on a strict bucket cannot take the one slot and hide the site
+ *  being refused on it. Never an address. */
+function logRefusal(
+  keyKind: string,
+  maxRequests: number,
+  retryAfter: number,
+  caller: __CallerSource | undefined,
+): void {
+  logOncePerWindow(`refusal:${caller ?? "account"}:${keyKind}`, (suppressed) => {
+    console.warn("[rate-limit] refusing", {
+      keyKind,
+      ...(caller === undefined ? {} : { caller }),
+      maxRequests,
+      retryAfter,
+      suppressed,
+    });
   });
 }
 
@@ -1268,7 +1282,10 @@ export async function rateLimiter(
     caller.key,
     caller.source,
   );
-  logIdentityOnce(caller, keyKind, maxRequests, path);
+  // Only where the address chose the bucket. A token bucket is keyed by the token,
+  // so a line about "counted by its forwarded visitor" or "in a shared bucket"
+  // would be false of it.
+  if (keyKind !== "token") logIdentityOnce(caller, keyKind, maxRequests, path);
 
   // Token buckets hash the raw bearer; the auth middleware later
   // re-hashes the same value to look the user up in D1. IP buckets use
@@ -1364,10 +1381,15 @@ export async function rateLimiter(
         // Same helper web-session.ts uses for privacy-preserving IP storage, so
         // every IP hash in the codebase is produced by one named function.
         const ipHash = await hashIp(rawKey);
-        console.warn("[rate-limit] observe-only bucket would have tripped", {
-          ipHash,
-          path,
-          count: count + 1,
+        // Once per window per bucket kind as well as once per address: a flood
+        // from many addresses must not be a line each.
+        logOncePerWindow(`observe:${keyKind}`, (suppressed) => {
+          console.warn("[rate-limit] observe-only bucket would have tripped", {
+            ipHash,
+            path,
+            count: count + 1,
+            suppressed,
+          });
         });
         warned = true;
       }
@@ -1375,7 +1397,7 @@ export async function rateLimiter(
       await writeCount(cache.put(cacheKey, counterRecord(observed, now)));
     } else if (count >= maxRequests) {
       const refused = refusal(keyKind, maxRequests, state, now, caller.source);
-      logRefusal(keyKind, maxRequests, refused.body.retry_after as number);
+      logRefusal(keyKind, maxRequests, refused.body.retry_after as number, caller.source);
       return c.json(refused.body, 429, refused.headers);
     } else {
       // Increment the counter. The record keeps the window's original end and
@@ -1559,7 +1581,12 @@ async function consumeKeyedBudget(
 
     if (state.count >= bucket.maxRequests) {
       const refused = refusal(bucket.kind, bucket.maxRequests, state, now, bucket.caller);
-      logRefusal(bucket.kind, bucket.maxRequests, refused.body.retry_after as number);
+      logRefusal(
+        bucket.kind,
+        bucket.maxRequests,
+        refused.body.retry_after as number,
+        bucket.caller,
+      );
       return {
         allowed: false,
         response: new Response(JSON.stringify(refused.body), {

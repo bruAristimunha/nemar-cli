@@ -153,6 +153,7 @@ describe("refusals are logged once per window per bucket kind", () => {
     expect(refusals().length).toBe(1);
     expect(refusals()[0]?.[1]).toEqual({
       keyKind: "ip",
+      caller: "edge",
       maxRequests: __limits.MAX_REQUESTS,
       retryAfter: 30,
       suppressed: 0,
@@ -168,6 +169,30 @@ describe("refusals are logged once per window per bucket kind", () => {
     await hit(app, edge("203.0.113.80"));
     expect(refusals().length).toBe(2);
     expect(refusals()[1]?.[1]).toMatchObject({ suppressed: 49, retryAfter: 60 });
+  });
+
+  test("a different caller on the same bucket has a line of its own, so noise cannot hide a site outage", async () => {
+    const app = buildApp();
+    const full = { count: __limits.AUTH_MAX_REQUESTS, warned: false, windowEnd: T0 + 60_000 };
+    await h.seed("auth-ip:203.0.113.90", full);
+    await h.seed("auth-ip:site:203.0.113.91", full);
+    await h.seed("auth-ip:unattributed", full);
+    // Ordinary public brute-force noise first...
+    for (let i = 0; i < 5; i++) await hit(app, edge("203.0.113.90"), "/auth/login");
+    // ...and then the website being refused on the same bucket.
+    await hit(app, viaBinding("203.0.113.91"), "/auth/login");
+    await hit(app, {}, "/auth/login");
+    expect(refusals().map((c) => c[1])).toEqual([
+      { keyKind: "auth-ip", caller: "edge", maxRequests: 10, retryAfter: 60, suppressed: 0 },
+      { keyKind: "auth-ip", caller: "site", maxRequests: 10, retryAfter: 60, suppressed: 0 },
+      {
+        keyKind: "auth-ip",
+        caller: "unattributed",
+        maxRequests: 10,
+        retryAfter: 60,
+        suppressed: 0,
+      },
+    ]);
   });
 
   test("each bucket kind has its own line, and none holds an address", async () => {

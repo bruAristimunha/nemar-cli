@@ -636,6 +636,19 @@ describe("the identity log", () => {
     expect(lines()).toEqual([]);
   });
 
+  test("a bearer chooses the token bucket, so no line claims the address did", async () => {
+    // The key is the token, not the visitor and not the shared bucket.
+    const app = buildApp();
+    const token = { Authorization: `Bearer ${"t".repeat(48)}` };
+    await hit(app, { ...viaBinding(A), ...token }, "/admin/users");
+    await hit(app, { ...token }, "/admin/users");
+    expect(lines().filter((c) => String(c[0]).includes("CF-Connecting-IP"))).toEqual([]);
+    // The answers still say how the caller was identified.
+    const site = await hit(app, { ...viaBinding(B), ...token }, "/admin/users");
+    expect(site.headers.get("X-RateLimit-Bucket")).toBe("token");
+    expect(site.headers.get("X-RateLimit-Caller")).toBe("site");
+  });
+
   test("a site caller is logged once per window per bucket, with the bucket and its cap", async () => {
     const app = buildApp();
     await hit(app, viaBinding(A));

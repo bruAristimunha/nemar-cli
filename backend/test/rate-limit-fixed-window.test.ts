@@ -766,4 +766,30 @@ describe("observe-only counting follows the same window", () => {
     expect((await h.stored("ip:203.0.113.50"))?.count).toBe(1);
     expect((await h.stored("ip:203.0.113.50"))?.warned).toBe(false);
   });
+
+  test("a flood from many addresses is one line per window, not one per address", async () => {
+    const app = buildApp({ observeOnly: true });
+    for (let i = 1; i <= 8; i++) {
+      await h.seed(`ip:203.0.113.${100 + i}`, {
+        count: ANON_CAP,
+        warned: false,
+        windowEnd: T0 + 30_000,
+      });
+      await hit(app, edge(`203.0.113.${100 + i}`));
+    }
+    const tripped = h.warn.mock.calls.filter((c) =>
+      String(c[0]).includes("observe-only bucket would have tripped"),
+    );
+    expect(tripped.length).toBe(1);
+    // Each address was still counted, and still marked as warned about.
+    expect((await h.stored("ip:203.0.113.108"))?.warned).toBe(true);
+  });
+
+  test("a counted request carries no X-RateLimit headers: it is counted, not announced", async () => {
+    const res = await hit(buildApp({ observeOnly: true }), edge("203.0.113.51"));
+    expect(res.status).toBe(200);
+    expect((await h.stored("ip:203.0.113.51"))?.count).toBe(1);
+    expect(res.headers.get("X-RateLimit-Bucket")).toBeNull();
+    expect(res.headers.get("X-RateLimit-Remaining")).toBeNull();
+  });
 });
