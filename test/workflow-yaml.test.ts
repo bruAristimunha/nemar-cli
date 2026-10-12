@@ -4,6 +4,9 @@
  * Validates that all CI workflow templates in deployWorkflows() produce
  * syntactically valid YAML. This prevents regressions like #285 where
  * unescaped \n in JS template literals broke the deployed YAML.
+ *
+ * It also checks how the repository's own test workflow routes changes to jobs. That every
+ * workflow gives its `gh` calls a repository is checked in `workflow-gh-calls.test.ts`.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -289,6 +292,27 @@ describe("the repo's own test workflow routes changes to jobs", () => {
     for (const job of ["lint", "unit-pure", "integration-dev"]) {
       expect(workflow.jobs[job]?.if ?? "").toContain("outputs.shared == 'true'");
     }
+  });
+
+  test("workflow files have a filter, and gate lint and unit-pure alike", () => {
+    // test/workflow-gh-calls.test.ts polices every workflow, but a pull request that edits
+    // only a workflow matches no other filter and would run no job. `unit-pure` is the job
+    // that runs the test, so it must be wired. `lint` is wired too, but that is convention
+    // (the two `if:` conditions stay identical), not a requirement: a job skipped by its
+    // `if:` reports Success and does not block a required check.
+    expect(filterNames()).toContain("workflows");
+    for (const job of ["lint", "unit-pure"]) {
+      expect(workflow.jobs[job]?.if ?? "", job).toContain("outputs.workflows == 'true'");
+    }
+    const filtersText = (workflow.jobs.changes.steps as { with?: { filters?: string } }[]).find(
+      (s) => s.with?.filters,
+    )?.with?.filters;
+    // Parsed, not searched: the globs must sit under the `workflows:` key, not merely appear
+    // somewhere in the block (under another filter, or in a comment).
+    const filters = parse(filtersText ?? "") as Record<string, string[]>;
+    expect(filters.workflows).toEqual(
+      expect.arrayContaining([".github/workflows/**", ".github/dataset-workflows/**"]),
+    );
   });
 
   test("the source trees the jobs build all have a filter", () => {

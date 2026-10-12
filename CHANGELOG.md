@@ -13,6 +13,34 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
+## Unreleased
+
+### Fixed
+
+- **The weekly summary.json drift check can file its issue.** The job has no checkout, so `gh`
+  had no repository to act on. Of the 20 scheduled runs on record (the first on 2026-06-01), 19
+  failed in the step that opens the issue and 1 in the step that reports a broken coverage
+  endpoint, so no drift issue was ever filed and the one outage it should have reported went
+  unreported. The job now names its repository. The label step creates the `drift` label if it
+  is missing and no longer hides its errors; a failure there is visible in the log but does not
+  stop the job, because a label that really is missing still fails the step that files the
+  issue. Each existing-issue lookup is retried three times, five seconds apart, and still fails
+  the step after the third failure instead of reading an error as "no issue", which would have
+  filed a duplicate every Monday. A lookup also keeps only an issue whose title starts with its
+  own prefix, so the probe-broken and report-broken issues are no longer taken for the drift
+  issue. The first run after the fix files the first drift issue; the report on 2026-10-12
+  listed 96 of 1303 versions with no `summary.json`. **This takes effect when it reaches
+  `main`:** scheduled workflows run from the default branch, and this change targets `dev`.
+- **The nightly dev-suite issue no longer files a duplicate when its lookup fails.** The same
+  `|| true` pattern read a failed lookup as "no open issue", and the label step hid a real
+  failure behind "already exists". The lookup is now retried three times and fails the step if
+  it still fails; the label step warns in the log instead of going silent.
+- **A test fails on a workflow `gh` call that has no repository, and CI runs it on a workflow-only
+  pull request.** `test/workflow-gh-calls.test.ts` checks every workflow the repository ships, `.yml`
+  or `.yaml`, and the per-dataset templates for a `gh` call with no checkout, `GH_REPO` or
+  `--repo`, a swallowed issue lookup, a lookup in a step that does not stop on error, and a
+  swallowed label create. A pull request that edited only a workflow used to run no job at all.
+
 ## 0.10.16 - 2026-10-11
 
 Epic #1671 (upload and integrity fixes) reaches `main` together with the automated review of
