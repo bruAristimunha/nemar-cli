@@ -460,6 +460,36 @@ describe("a fault line says where the work failed", () => {
   });
 });
 
+describe("the identity lines", () => {
+  const siteLines = () =>
+    h.log.mock.calls.filter((c) => String(c[0]).includes("counting a request without"));
+  const unattributedLines = () =>
+    h.warn.mock.calls.filter((c) => String(c[0]).includes("request with neither"));
+
+  test("the healthy site line is one per window, however many calls the website makes", async () => {
+    const app = buildApp();
+    for (let i = 0; i < 1100; i++) {
+      h.clock = T0 + i;
+      await hit(app, viaBinding(ADDRESS));
+    }
+    expect(siteLines().length).toBe(1);
+    // The window ends: the next line reports what the first window swallowed.
+    h.clock = T0 + __limits.WINDOW_SIZE * 1000;
+    await hit(app, viaBinding(ADDRESS));
+    expect(siteLines().length).toBe(2);
+    expect(siteLines()[1]?.[1]).toMatchObject({ suppressed: 1099 });
+  });
+
+  test("a caller that names nobody is a symptom and keeps its milestones", async () => {
+    const app = buildApp();
+    for (let i = 0; i < 1100; i++) {
+      h.clock = T0 + i;
+      await hit(app, {});
+    }
+    expect(unattributedLines().length).toBe(4);
+  });
+});
+
 describe("the once-per-window machinery", () => {
   const failing = () => {
     install(new PutFailingCache());

@@ -188,8 +188,16 @@ const LOG_MILESTONES: ReadonlySet<number> = new Set([10, 100, 1000]);
  * flood, a handful of lines per kind per minute is the line worth reading, and a
  * line per request buries it. The key space is bounded by the kinds, sources and
  * reasons below.
+ *
+ * `options.milestones: false` turns the repeats off, for a line that is healthy
+ * and informational rather than a symptom: a count of what it swallowed would be
+ * noise, and at steady traffic the repeats would add a few lines a minute.
  */
-function logOncePerWindow(key: string, emit: (suppressed: number, sinceMs: number) => void): void {
+function logOncePerWindow(
+  key: string,
+  emit: (suppressed: number, sinceMs: number) => void,
+  options: { milestones?: boolean } = {},
+): void {
   const now = Date.now();
   const slot = logSlots.get(key);
   // A clock that went backwards ends the quiet period as well: otherwise a slot
@@ -197,7 +205,7 @@ function logOncePerWindow(key: string, emit: (suppressed: number, sinceMs: numbe
   if (slot && now >= slot.windowAt && now - slot.windowAt < WINDOW_MS) {
     slot.inWindow++;
     slot.sinceLine++;
-    if (LOG_MILESTONES.has(slot.inWindow)) {
+    if (options.milestones !== false && LOG_MILESTONES.has(slot.inWindow)) {
       // `sinceLine` has just counted this call, which is speaking and so is not swallowed.
       const suppressed = slot.sinceLine - 1;
       const sinceMs = Math.max(0, now - slot.lastAt);
@@ -1068,6 +1076,10 @@ function logIdentityOnce(
         );
       }
     },
+    // The `site` line is the healthy case, the evidence that the website's calls
+    // arrive as expected, and it would otherwise repeat on the 11th, 101st and 1001st
+    // call at the website's rate. An unattributed line is a symptom and keeps them.
+    { milestones: caller.source !== "site" },
   );
 }
 
