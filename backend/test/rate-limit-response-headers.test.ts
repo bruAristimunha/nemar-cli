@@ -149,3 +149,29 @@ describe("when the limiter is bypassed", () => {
     expect(res.headers.get("X-RateLimit-Bucket")).toBeNull();
   });
 });
+
+describe("what a browser may read of the answer", () => {
+  test("the rate limit's headers are exposed to cross-origin callers on nemar.org hosts", async () => {
+    const { default: worker } = await import("../src/index");
+    const res = await worker.fetch(
+      new Request("https://api.nemar.org/health", { headers: { Origin: "https://nemar.org" } }),
+      { ...PROD_ENV, ENVIRONMENT: "development" } as typeof PROD_ENV,
+      { waitUntil() {}, passThroughOnException() {} } as unknown as ExecutionContext,
+    );
+    expect(res.status).toBe(200);
+    const exposed = (res.headers.get("Access-Control-Expose-Headers") ?? "")
+      .split(",")
+      .map((name) => name.trim().toLowerCase());
+    for (const name of [
+      "x-request-id",
+      "retry-after",
+      "x-ratelimit-limit",
+      "x-ratelimit-remaining",
+      "x-ratelimit-reset",
+      "x-ratelimit-bucket",
+      "x-ratelimit-caller",
+    ]) {
+      expect(exposed).toContain(name);
+    }
+  });
+});
