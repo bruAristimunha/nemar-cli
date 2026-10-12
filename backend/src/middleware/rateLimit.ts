@@ -124,7 +124,8 @@ const SITE_IP_MAX_REQUESTS = 2000;
 // not a fresh random one each, which would be no bucket at all and would switch the
 // limiter off for the strict buckets too. So the failure is bounded and visible:
 // `X-RateLimit-Caller: unattributed` on every answer, and a log line per bucket
-// per window that says why the forward was unusable.
+// per window (again on the 11th, 101st and 1001st call) that says why the forward
+// was unusable.
 //
 // The shared bucket is the whole site's traffic at once, so its cap is far above
 // any one visitor's: 20,000 is about 333 requests a second, some fifty times the
@@ -464,7 +465,7 @@ async function readRecordBody(cached: Response | undefined): Promise<unknown> {
  * Turn a stored body (see {@link readRecordBody}) into the bucket's state. A record
  * that will not parse or will not make sense is repaired, not trusted and not failed
  * open on, and the repair is logged once per window per bucket kind and kind of
- * damage: the self-heal is right, a silent one would hide whatever is writing bad
+ * damage, and again on the 11th, 101st and 1001st call: the self-heal is right, a silent one would hide whatever is writing bad
  * records. A fault in here is the limiter's own (phase `decide`), not the cache's.
  */
 function interpretRecord(body: unknown, now: number, keyKind: string): __CounterState {
@@ -514,8 +515,9 @@ function refusal(
   };
 }
 
-/** One line per window per caller source and bucket kind for the refusals, so
- *  `wrangler tail` can show that a bucket is refusing, how often, and for whom.
+/** One line per window per caller source and bucket kind for the refusals (and
+ *  again on the 11th, 101st and 1001st call), so `wrangler tail` can show that a
+ *  bucket is refusing, how often, and for whom.
  *  Keyed by the source as well as the bucket, so ordinary brute-force noise from
  *  public callers on a strict bucket cannot take the one slot and hide the site
  *  being refused on it. Never an address. */
@@ -1047,7 +1049,8 @@ function callerIdentityOf(request: Request): __CallerIdentity {
 
 /**
  * One line per isolate per window for each (caller source, bucket kind) that is
- * not an ordinary public request. It is the way to see, with `wrangler tail`,
+ * not an ordinary public request, and, for an unattributed caller, again on the 11th,
+ * 101st and 1001st call. It is the way to see, with `wrangler tail`,
  * that the website's calls arrive as `site` (the property ADR 0098 rests on and
  * cannot prove before production), and to be told when a caller stops forwarding
  * a visitor, on whichever bucket that happens. An unattributed line says why,
@@ -1294,10 +1297,13 @@ export interface RateLimiterOptions {
    * visible, and a later PROXIED request from that IP correctly 429s once
    * the shared bucket is exhausted, observed traffic included.
    *
-   * Logs exactly ONE `console.warn` per window, the first time the count
-   * reaches the point enforcement would have blocked -- never per request,
-   * which would be the same noise this option replaces (an unconditional
-   * per-request log the zarr sub-app used to emit for every exempted hit).
+   * Warns once per address per window (the record's `warned` flag), the first
+   * time the count reaches the point enforcement would have blocked, and the
+   * warning is one line per window per bucket kind however many addresses reach
+   * it, again only on the 11th, 101st and 1001st call (`logOncePerWindow`) --
+   * never per request, which would be the same noise this option replaces (an
+   * unconditional per-request log the zarr sub-app used to emit for every exempted
+   * hit).
    */
   observeOnly?: boolean;
 
@@ -1496,8 +1502,8 @@ export async function rateLimiter(
         // Same helper web-session.ts uses for privacy-preserving IP storage, so
         // every IP hash in the codebase is produced by one named function.
         const ipHash = await hashIp(rawKey);
-        // Once per window per bucket kind as well as once per address: a flood
-        // from many addresses must not be a line each.
+        // Once per window per bucket kind (and again at the milestones) as well as
+        // once per address: a flood from many addresses must not be a line each.
         logOncePerWindow(`observe:${keyKind}`, (suppressed, sinceMs) => {
           console.warn("[rate-limit] observe-only bucket would have tripped", {
             ipHash,
@@ -1532,8 +1538,9 @@ export async function rateLimiter(
     }
   } catch (error) {
     // Fail open so a cache outage doesn't block all traffic, but emit a
-    // structured log (once per window per bucket kind per isolate, see
-    // `logCacheFault`) so Workers tail / log tooling surfaces the issue.
+    // structured log (once per window per bucket kind, phase and error class per
+    // isolate, and again at the milestones, see `logCacheFault`) so Workers tail /
+    // log tooling surfaces the issue.
     // TODO(#478): replace with Sentry captureException once DSN is wired.
     logCacheFault(keyKind, path, error, phase);
   }
@@ -1743,7 +1750,7 @@ async function consumeKeyedBudget(
   } catch (error) {
     // Fail open, the same policy `rateLimiter` itself follows on a cache
     // outage: a broken Cache API must not block traffic. Logged the same way,
-    // once per window per bucket kind.
+    // once per window per bucket kind, phase and error class.
     logCacheFault(bucket.kind, undefined, error, phase);
     return { allowed: true };
   }

@@ -60,6 +60,7 @@ The Cloudflare account is the trust boundary, as in ADR 0078, and no secret head
    Pooling rather than leaving it unlimited makes a broken forward visible and bounded.
    Every answer carries `X-RateLimit-Caller: edge | site | unattributed`, the admin-bypass answer included, which says so on every bucket, including the strict, data and Neurobagel buckets whose `X-RateLimit-Bucket` keeps the same name for every source.
    The limiter logs an identity line for each combination of caller source, bucket and reason, once per isolate per window, naming the bucket and its cap.
+   A warning for an unattributed caller repeats on the 11th, 101st and 1001st call in the window, like every limiter log below; the `site` line, which is the healthy case, does not, so it is one line a window per bucket at any rate.
    It writes none for a token bucket: that bucket is keyed by the bearer and not by the address, so a line about a forwarded visitor or a shared bucket would be false of it.
    An unattributed line also says why (`absent`, `too-long`, `first-entry-not-an-ip` with a coarse shape, or `unspecified-or-loopback`) and the header's length, never its value.
    Pooling also means a sign-in route keeps a floor instead of silently losing it.
@@ -118,14 +119,14 @@ The Cloudflare account is the trust boundary, as in ADR 0078, and no secret head
   it is the only detector for "put resolves but nothing persists" and for a binding call that carries a `CF-Connecting-IP` after all.
   Then tail the production API Worker while a few website pages load:
   `bunx cfman wrangler --account sccn tail nemar-api --search "[rate-limit]"`.
-  A line `counting a request without CF-Connecting-IP by its forwarded visitor` (once per isolate per window for each source, bucket and reason, and never for a token bucket) means the hypothesis about the missing header holds.
+  A line `counting a request without CF-Connecting-IP by its forwarded visitor` (once per isolate per window for each source, bucket and reason, with no repeats, and never for a token bucket) means the hypothesis about the missing header holds.
   A warning `request with neither` means the website is not forwarding a usable visitor, and says why;
   its responses carry `X-RateLimit-Caller: unattributed`.
   No such line, with the website working, means a binding call carries a `CF-Connecting-IP` after all:
   its requests are in `ip`, nothing has regressed and nothing has improved, and this ADR needs an amendment.
 - **What an absent header means, and what it does not.**
   The `X-RateLimit-*` headers are set on the finished response, so a handler that builds its own `Response` keeps them.
-  An answer without them was not announced as counted: the development Worker, a bypass, a cache fault (which is logged, once per window per bucket kind), or an observe-only count.
+  An answer without them was not announced as counted: the development Worker, a bypass, a cache fault (which is logged, once per window per bucket kind and again at the milestones described below), or an observe-only count.
   That last is the zarr redirect path, which counts a request against the shared bucket and never announces it, so "no headers" does not mean "not counted" there.
   They are not proof of a count either: the data plane hands its write to `waitUntil`, so its answer states a count whether or not the write lands, and a failing `put` there leaves `X-RateLimit-Remaining` unchanged while the line is logged.
   The falling `X-RateLimit-Remaining` above is the evidence; the header's presence alone is not.
