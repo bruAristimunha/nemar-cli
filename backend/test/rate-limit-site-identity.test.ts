@@ -674,13 +674,13 @@ describe("the identity log", () => {
 
   test("an unattributed caller is warned about on EVERY bucket it reaches, with the reason", async () => {
     const app = buildApp();
+    // The same reason, repeated, is one line per bucket however many requests carry it.
     await hit(app, {});
-    await hit(app, { "X-Forwarded-For": "unknown" });
+    await hit(app, {});
     await hit(app, {}, "/auth/login");
-    await hit(app, { "X-Forwarded-For": "a".repeat(600) }, "/auth/login");
+    await hit(app, {}, "/auth/login");
     await hit(app, {}, "/data/nm000108/v1.0.0/x");
     const warnings = h.warn.mock.calls.filter((c) => String(c[0]).startsWith("[rate-limit]"));
-    // Three buckets, one line each, however many requests reached them.
     expect(warnings.map((c) => (c[1] as { keyKind: string }).keyKind).sort()).toEqual([
       "auth-ip",
       "data-ip",
@@ -712,6 +712,19 @@ describe("the identity log", () => {
       shape: "other",
     });
     expect(JSON.stringify(h.warn.mock.calls)).not.toContain(secret);
+  });
+
+  test("a different reason on the same bucket is a different line, so one cannot hide another", async () => {
+    const app = buildApp();
+    await hit(app, {});
+    await hit(app, {});
+    await hit(app, { "X-Forwarded-For": "unknown" });
+    await hit(app, { "X-Forwarded-For": "unknown" });
+    await hit(app, { "X-Forwarded-For": "0.0.0.0" });
+    const reasons = h.warn.mock.calls
+      .filter((c) => String(c[0]).startsWith("[rate-limit]"))
+      .map((c) => (c[1] as { reason: string }).reason);
+    expect(reasons).toEqual(["absent", "first-entry-not-an-ip", "unspecified-or-loopback"]);
   });
 
   test("each kind of unreadable header is told apart in the one line it gets", async () => {

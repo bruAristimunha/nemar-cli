@@ -45,6 +45,7 @@
  */
 
 import type { Context, Next } from "hono";
+import { isInternalRequest } from "../lib/internal-request";
 import { ACTIVE_ACCOUNT_STATUS_SQL_LIST } from "../services/account-tier";
 import { hashApiKey } from "../services/token";
 import { hashIp } from "../services/web-session";
@@ -777,8 +778,14 @@ export interface __BucketSelection {
  *    caller names the visitor it acts for. The caller must SET the header from
  *    its own `CF-Connecting-IP`, never pass a visitor's header through.
  *  - `unattributed`: neither. Not reachable from the public network.
+ *  - `internal`: a request this Worker built for itself and handed to one of its
+ *    own sub-apps (an MCP tool reading `index.json` through the zarr gateway, the
+ *    Neurobagel gatherer reading the data plane). It is marked by object identity
+ *    (`lib/internal-request.ts`), which nothing a client sends can claim, and the
+ *    limiter does not count it: the request that caused it was counted where it
+ *    arrived. It is never a bucket and never a warning.
  */
-export type __CallerSource = "edge" | "site" | "unattributed";
+export type __CallerSource = "edge" | "site" | "unattributed" | "internal";
 
 /** A caller's source and its bucket key. The key is the address itself for an
  *  `edge` caller, `site:<address>` for a `site` caller, and a fixed word for an
@@ -918,9 +925,15 @@ export function __readCallerIdentity(
   return { source: "unattributed", key: UNATTRIBUTED_KEY, detail };
 }
 
+const INTERNAL_CALLER: __CallerIdentity = { source: "internal", key: "internal" };
+
 /** The identity of a request. Shared by the middleware and the per-route budgets. */
-function callerIdentityOf(headers: { get(name: string): string | null }): __CallerIdentity {
-  return __readCallerIdentity(headers.get("CF-Connecting-IP"), headers.get("X-Forwarded-For"));
+function callerIdentityOf(request: Request): __CallerIdentity {
+  if (isInternalRequest(request)) return INTERNAL_CALLER;
+  return __readCallerIdentity(
+    request.headers.get("CF-Connecting-IP"),
+    request.headers.get("X-Forwarded-For"),
+  );
 }
 
 /**
@@ -938,20 +951,23 @@ function logIdentityOnce(
   maxRequests: number,
   path: string,
 ): void {
-  if (caller.source === "edge") return;
-  logOncePerWindow(`identity:${caller.source}:${keyKind}`, (suppressed) => {
-    if (caller.source === "site") {
-      console.log(
-        "[rate-limit] counting a request without CF-Connecting-IP by its forwarded visitor",
-        { keyKind, maxRequests, path, suppressed },
-      );
-    } else {
-      console.warn(
-        "[rate-limit] request with neither CF-Connecting-IP nor a usable X-Forwarded-For; counted in a shared bucket",
-        { keyKind, maxRequests, path, suppressed, ...caller.detail },
-      );
-    }
-  });
+  if (caller.source === "edge" || caller.source === "internal") return;
+  logOncePerWindow(
+    `identity:${caller.source}:${keyKind}:${caller.detail?.reason ?? ""}`,
+    (suppressed) => {
+      if (caller.source === "site") {
+        console.log(
+          "[rate-limit] counting a request without CF-Connecting-IP by its forwarded visitor",
+          { keyKind, maxRequests, path, suppressed },
+        );
+      } else {
+        console.warn(
+          "[rate-limit] request with neither CF-Connecting-IP nor a usable X-Forwarded-For; counted in a shared bucket",
+          { keyKind, maxRequests, path, suppressed, ...caller.detail },
+        );
+      }
+    },
+  );
 }
 
 /**
@@ -1156,6 +1172,14 @@ export async function rateLimiter(
   // Check for test bypass header (for CI/CD and integration tests)
   const testBypassToken = c.req.header("X-Test-Bypass");
   if (testBypassToken && c.env.TEST_BYPASS_TOKEN && testBypassToken === c.env.TEST_BYPASS_TOKEN) {
+    await next();
+    return;
+  }
+
+  // A request this Worker built for itself is not a caller: see `__CallerSource`.
+  // It used to be bucketed by a random UUID, which is to say not at all, and the
+  // pooled bucket that now catches a caller with no address must not catch it.
+  if (isInternalRequest(c.req.raw)) {
     await next();
     return;
   }
@@ -1392,7 +1416,8 @@ export async function checkDataMissBudget(
   // The same identity the middleware uses, so a visitor forwarded by the website
   // is charged to their own miss budget and an unattributed caller to one shared
   // budget, not to a fresh random one.
-  const caller = callerIdentityOf(request.headers);
+  const caller = callerIdentityOf(request);
+  if (caller.source === "internal") return { allowed: true };
   return consumeKeyedBudget(
     env,
     request,

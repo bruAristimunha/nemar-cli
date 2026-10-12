@@ -61,6 +61,11 @@ The Cloudflare account is the trust boundary, as in ADR 0078, and no secret head
    The limiter logs one line per window per isolate for each bucket an unattributed or site caller reaches, naming the bucket and its cap.
    An unattributed line also says why (`absent`, `too-long`, `first-entry-not-an-ip` with a coarse shape, or `unspecified-or-loopback`) and the header's length, never its value.
    Pooling also means a sign-in route keeps a floor instead of silently losing it.
+   The Worker's own calls are not callers and are not pooled.
+   An MCP tool reading a dataset's `index.json` through the zarr gateway, and the Neurobagel gatherer reading the data plane, hand a bare `Request` to a sub-app in process, with neither header.
+   They are marked by object identity (`lib/internal-request.ts`), which nothing a client sends can claim and a copy of the request does not inherit,
+   and the limiter lets them through uncounted and unlogged: the request that caused them was counted where it arrived.
+   Without the mark they would share the pooled data-plane bucket and miss budget with any real caller that failed to say who it is, warn on a healthy system, and be refused whenever a public flood filled that pool.
    If a zone setting stripped `CF-Connecting-IP` from public traffic, that traffic would be pooled rather than switch the limiter off, but only if the setting stripped `X-Forwarded-For` as well:
    one that removed only `CF-Connecting-IP` would let a public client's own `X-Forwarded-For` choose its bucket, which is decision 1 failing.
    Nothing in this repository can see such a setting, so it is listed here as a thing to check if the zone's header handling ever changes.
