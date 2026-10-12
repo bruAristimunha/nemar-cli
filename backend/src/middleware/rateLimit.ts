@@ -230,6 +230,29 @@ function errorName(error: unknown): string {
   return error instanceof Error ? error.name : typeof error;
 }
 
+/** The error classes a fault log key tells apart; any other name is `other`, so the
+ *  key space has a hard ceiling whatever name a runtime gives an error. */
+const FAULT_CLASSES: ReadonlySet<string> = new Set([
+  "Error",
+  "TypeError",
+  "RangeError",
+  "SyntaxError",
+  "ReferenceError",
+  "EvalError",
+  "URIError",
+  "AbortError",
+  "TimeoutError",
+  "CacheStallError",
+]);
+
+/** The part of a fault log key that is the error: its class when it is one we tell
+ *  apart, `other` otherwise. A transient stall must not hide a persistent bug of
+ *  another class in the same phase for the rest of the window. */
+function faultClass(error: unknown): string {
+  const name = errorName(error);
+  return FAULT_CLASSES.has(name) ? name : "other";
+}
+
 /** The Cache API did not answer within the bound. Reported like any cache fault. */
 class CacheStallError extends Error {
   constructor(what: string) {
@@ -263,7 +286,8 @@ type FaultPhase = "match" | "read" | "decide" | "put";
 
 /**
  * Log a fault in the enforcement path (which fails open) once per window per
- * bucket kind and phase. One fault is one outage for every request of that kind, and a
+ * bucket kind, phase and error class, and again on the 11th, 101st and 1001st
+ * call. One fault is one outage for every request of that kind, and a
  * request-volume-scaled flood of `console.error` lines is exactly the noise that
  * makes the line worth reading harder to find. Per kind rather than global so
  * that an outage seen only by one bucket (a failing `put` on the data plane, say)
@@ -275,9 +299,10 @@ function logCacheFault(
   error: unknown,
   phase: FaultPhase,
 ): void {
-  // Keyed by phase as well as kind, so a transient stall in the write cannot hide a
-  // later fault in the limiter's own logic on the same bucket for the whole window.
-  logOncePerWindow(`fault:${keyKind}:${phase}`, (suppressed, sinceMs) => {
+  // Keyed by phase and error class as well as kind, so a transient stall in the write
+  // cannot hide a later fault in the limiter's own logic on the same bucket for the
+  // whole window, nor a persistent bug of another class in the same phase.
+  logOncePerWindow(`fault:${keyKind}:${phase}:${faultClass(error)}`, (suppressed, sinceMs) => {
     // `decide` is the limiter's own logic failing after the cache answered, not the
     // cache failing, and it should not read as one.
     console.error(
@@ -1180,7 +1205,7 @@ export function __selectBucket(
 async function isPrivilegedToken(env: Bindings, hashedApiKey: string): Promise<boolean> {
   const cacheKey = new Request(`https://rate-limit.internal/admin-flag:${hashedApiKey}`);
   const fault = (phase: string, err: unknown) =>
-    logOncePerWindow(`admin-flag:${phase}`, (suppressed, sinceMs) => {
+    logOncePerWindow(`admin-flag:${phase}:${faultClass(err)}`, (suppressed, sinceMs) => {
       // The write is the one phase that does not fail the lookup: the database
       // already answered, so the line says what broke rather than that the lookup did.
       console.warn(

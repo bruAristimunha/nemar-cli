@@ -151,7 +151,7 @@ describe("a failing cache write is logged once per kind per window", () => {
   test("sinceMs is never negative on a milestone line either, when the clock steps back inside a window", async () => {
     install(new PutFailingCache());
     const app = buildApp();
-    // The 10th swallowed call at +30 s, then the clock steps back to +20 s for the 100th.
+    // The 11th call at +30 s, then the clock steps back to +20 s for the 101st.
     for (let i = 0; i < 10; i++) {
       h.clock = T0 + 1000;
       await hit(app, edge(ADDRESS));
@@ -191,6 +191,65 @@ describe("a failing cache write is logged once per kind per window", () => {
       ["put", "TypeError"],
       ["match", "RangeError"],
     ]);
+  });
+
+  test("a transient fault does not hide a persistent one of another class in the same phase", async () => {
+    // A write fails once with a TypeError and then, every time, with a RangeError.
+    class WriteFaultChanges extends InMemoryCache {
+      puts = 0;
+      async put(): Promise<void> {
+        this.puts++;
+        if (this.puts === 1) throw new TypeError("a transient write fault");
+        throw new RangeError("a persistent write fault");
+      }
+    }
+    install(new WriteFaultChanges());
+    const app = buildApp();
+    for (let i = 0; i < 5; i++) await hit(app, edge(ADDRESS));
+    const lines = faults().map((c) => c[1] as { phase: string; error: string; suppressed: number });
+    // One line for each class, and the persistent one swallows its repeats.
+    expect(lines.map((l) => [l.phase, l.error])).toEqual([
+      ["put", "TypeError"],
+      ["put", "RangeError"],
+    ]);
+    expect(lines[1]?.suppressed).toBe(0);
+  });
+
+  test("a stalled write does not hide a persistent fault in the same phase", async () => {
+    // The first write never settles and is given up on; every later one fails outright.
+    class StallsOnceThenFails extends InMemoryCache {
+      puts = 0;
+      put(): Promise<void> {
+        this.puts++;
+        if (this.puts === 1) return new Promise<void>(() => {});
+        return Promise.reject(new TypeError("a persistent write fault"));
+      }
+    }
+    install(new StallsOnceThenFails());
+    const app = buildApp();
+    for (let i = 0; i < 4; i++) await hit(app, edge(ADDRESS));
+    const lines = faults().map((c) => c[1] as { phase: string; error: string });
+    expect(lines.map((l) => [l.phase, l.error])).toEqual([
+      ["put", "CacheStallError"],
+      ["put", "TypeError"],
+    ]);
+  });
+
+  test("error names a runtime invents share one key, so the key space has a ceiling", async () => {
+    let n = 0;
+    class InventiveWrites extends InMemoryCache {
+      async put(): Promise<void> {
+        const error = new Error("a write fault");
+        error.name = `Fault${n++}`;
+        throw error;
+      }
+    }
+    install(new InventiveWrites());
+    const app = buildApp();
+    for (let i = 0; i < 6; i++) await hit(app, edge(ADDRESS));
+    // The first names itself on its line; the rest are the same unnamed class.
+    expect(faults().length).toBe(1);
+    expect(faults()[0]?.[1]).toMatchObject({ phase: "put", error: "Fault0" });
   });
 });
 

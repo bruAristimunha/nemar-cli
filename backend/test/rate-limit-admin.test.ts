@@ -147,6 +147,28 @@ describe("a token the database says is an admin", () => {
     expect(writes()[0]?.[1]).toMatchObject({ phase: "put", error: "CacheStallError" });
   });
 
+  test("a transient write fault does not hide a persistent one of another class", async () => {
+    // The write fails once with a TypeError and then, every time, with a RangeError:
+    // both are the same phase, and each class gets its own line.
+    class WriteFaultChanges extends InMemoryCache {
+      puts = 0;
+      async put(request: RequestInfo | URL, response: Response): Promise<void> {
+        if (!(request as Request).url.includes("admin-flag")) return super.put(request, response);
+        this.puts++;
+        if (this.puts === 1) throw new TypeError("a transient write fault");
+        throw new RangeError("a persistent write fault");
+      }
+    }
+    (globalThis as { caches?: unknown }).caches = { default: new WriteFaultChanges() };
+    for (let i = 0; i < 4; i++) {
+      expect((await ask()).headers.get("X-RateLimit-Bucket")).toBe("admin-bypass");
+    }
+    expect(writes().map((c) => (c[1] as { error: string }).error)).toEqual([
+      "TypeError",
+      "RangeError",
+    ]);
+  });
+
   describe("when the cached flag is damaged", () => {
     const cases: Array<[string, unknown, string]> = [
       ["is not JSON", "this is not json", "unparseable"],
