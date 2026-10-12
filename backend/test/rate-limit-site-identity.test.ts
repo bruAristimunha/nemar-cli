@@ -14,17 +14,7 @@
  * ADR says what remains for production.
  */
 
-import {
-  afterAll,
-  afterEach,
-  beforeAll,
-  beforeEach,
-  describe,
-  expect,
-  spyOn,
-  test,
-} from "bun:test";
-import { Hono } from "hono";
+import { describe, expect, test } from "bun:test";
 import {
   __firstForwardedIp,
   __limits,
@@ -32,77 +22,19 @@ import {
   __resetIdentityLogForTests,
   __selectBucket,
   checkDataMissBudget,
-  rateLimiter,
 } from "../src/middleware/rateLimit";
-import type { Bindings, Variables } from "../src/types/bindings";
-import { InMemoryCache } from "./helpers/cache";
+import type { Bindings } from "../src/types/bindings";
+import {
+  PROD_ENV,
+  T0,
+  buildApp,
+  edge,
+  hit,
+  useRateLimitHarness,
+  viaBinding,
+} from "./helpers/rate-limit-harness";
 
-type AppEnv = { Bindings: Bindings; Variables: Variables };
-
-let cache = new InMemoryCache();
-let originalCaches: typeof caches | undefined;
-// The limiter logs once per window for a caller that is not an ordinary public one
-// (and the privileged-token lookup warns when this suite has no database), which is
-// noise here; the log tests read these spies instead of the console.
-let logSpy: ReturnType<typeof spyOn>;
-let warnSpy: ReturnType<typeof spyOn>;
-
-beforeAll(() => {
-  // biome-ignore lint/suspicious/noExplicitAny: test-only runtime patch
-  originalCaches = (globalThis as any).caches;
-});
-
-afterAll(() => {
-  // biome-ignore lint/suspicious/noExplicitAny: test-only runtime restore
-  (globalThis as any).caches = originalCaches as CacheStorage;
-});
-
-beforeEach(() => {
-  cache = new InMemoryCache();
-  // biome-ignore lint/suspicious/noExplicitAny: test-only runtime patch
-  (globalThis as any).caches = { default: cache } as unknown as CacheStorage;
-  __resetIdentityLogForTests();
-  logSpy = spyOn(console, "log").mockImplementation(() => {});
-  warnSpy = spyOn(console, "warn").mockImplementation(() => {});
-});
-
-afterEach(() => {
-  logSpy.mockRestore();
-  warnSpy.mockRestore();
-});
-
-const PROD_ENV = {
-  ENVIRONMENT: "production",
-  API_BASE_URL: "http://localhost",
-  FRONTEND_URL: "http://localhost",
-  AWS_REGION: "us-east-2",
-  S3_BUCKET: "nemar",
-  DB: undefined as unknown as D1Database,
-  TEST_BYPASS_TOKEN: "site-identity-bypass-token",
-} satisfies Partial<Bindings> as unknown as Bindings;
-
-function buildApp(): Hono<AppEnv> {
-  const app = new Hono<AppEnv>();
-  app.use("*", rateLimiter);
-  app.get("/datasets", (c) => c.json({ ok: true }));
-  app.get("/auth/login", (c) => c.json({ ok: true }));
-  app.get("/data/*", (c) => c.json({ ok: true }));
-  return app;
-}
-
-async function hit(
-  app: Hono<AppEnv>,
-  headers: Record<string, string>,
-  path = "/datasets",
-  env: Bindings = PROD_ENV,
-): Promise<Response> {
-  return app.fetch(new Request(`http://localhost${path}`, { method: "GET", headers }), env);
-}
-
-/** A request through a service binding: the visitor forwarded, no `CF-Connecting-IP`. */
-function viaBinding(visitor: string): Record<string, string> {
-  return { "X-Forwarded-For": visitor };
-}
+const h = useRateLimitHarness();
 
 const A = "203.0.113.10";
 const B = "203.0.113.11";
@@ -344,10 +276,7 @@ describe("a request through the service binding is counted per forwarded visitor
 
     const over = await hit(app, viaBinding(A));
     expect(over.status).toBe(429);
-    // The seconds left in the window, which depend on how long the loop above
-    // took; `rate-limit-fixed-window.test.ts` pins the exact value with a held clock.
-    expect(Number(over.headers.get("Retry-After"))).toBeGreaterThan(0);
-    expect(Number(over.headers.get("Retry-After"))).toBeLessThanOrEqual(__limits.WINDOW_SIZE);
+    expect(over.headers.get("Retry-After")).toBe(String(__limits.WINDOW_SIZE));
     expect(over.headers.get("X-RateLimit-Bucket")).toBe("site-ip");
     expect(over.headers.get("X-RateLimit-Limit")).toBe(String(CAP));
     expect(over.headers.get("X-RateLimit-Remaining")).toBe("0");
@@ -405,14 +334,10 @@ describe("a request through the service binding is counted per forwarded visitor
   });
 
   test("a bearer still selects the token bucket", async () => {
-    const app = new Hono<AppEnv>();
-    app.use("*", rateLimiter);
-    app.get("/admin/users", (c) => c.json({ ok: true }));
-    const res = await app.fetch(
-      new Request("http://localhost/admin/users", {
-        headers: { ...viaBinding(A), Authorization: `Bearer ${"a".repeat(48)}` },
-      }),
-      PROD_ENV,
+    const res = await hit(
+      buildApp(),
+      { ...viaBinding(A), Authorization: `Bearer ${"a".repeat(48)}` },
+      "/admin/users",
     );
     expect(res.headers.get("X-RateLimit-Bucket")).toBe("token");
   });
@@ -475,22 +400,17 @@ describe("a request with no usable address shares one bucket", () => {
 
   test("the shared bucket still has a ceiling", async () => {
     const app = buildApp();
-    await cache.put(
-      new Request("https://rate-limit.internal/rl:site-unattributed:unattributed"),
-      new Response(
-        JSON.stringify({ count: __limits.SITE_UNATTRIBUTED_MAX_REQUESTS - 1, warned: false }),
-        { headers: { "Content-Type": "application/json", "Cache-Control": "max-age=60" } },
-      ),
-    );
+    await h.seed("site-unattributed:unattributed", {
+      count: __limits.SITE_UNATTRIBUTED_MAX_REQUESTS - 1,
+      warned: false,
+      windowEnd: T0 + __limits.WINDOW_SIZE * 1000,
+    });
     const last = await hit(app, {});
     expect(last.status).toBe(200);
     expect(last.headers.get("X-RateLimit-Remaining")).toBe("0");
     const over = await hit(app, { "X-Forwarded-For": "junk" });
     expect(over.status).toBe(429);
-    // The seconds left in the window, which depend on how long the loop above
-    // took; `rate-limit-fixed-window.test.ts` pins the exact value with a held clock.
-    expect(Number(over.headers.get("Retry-After"))).toBeGreaterThan(0);
-    expect(Number(over.headers.get("Retry-After"))).toBeLessThanOrEqual(__limits.WINDOW_SIZE);
+    expect(over.headers.get("Retry-After")).toBe(String(__limits.WINDOW_SIZE));
     expect(over.headers.get("X-RateLimit-Bucket")).toBe("site-unattributed");
   });
 
@@ -510,7 +430,7 @@ describe("what is unchanged", () => {
   test("the test bypass header skips the limiter for a site caller too", async () => {
     const res = await hit(buildApp(), {
       ...viaBinding(A),
-      "X-Test-Bypass": "site-identity-bypass-token",
+      "X-Test-Bypass": PROD_ENV.TEST_BYPASS_TOKEN as string,
     });
     expect(res.status).toBe(200);
     expect(res.headers.get("X-RateLimit-Bucket")).toBeNull();
@@ -529,13 +449,15 @@ describe("what is unchanged", () => {
   });
 
   test("the window still resets: an exhausted visitor gets a fresh allowance after it", async () => {
-    let now = Date.now();
-    cache.getNow = () => now;
     const app = buildApp();
     for (let i = 0; i < CAP; i++) await hit(app, viaBinding(A));
     expect((await hit(app, viaBinding(A))).status).toBe(429);
-    now += (__limits.WINDOW_SIZE + 1) * 1000;
-    expect((await hit(app, viaBinding(A))).status).toBe(200);
+    h.clock = T0 + __limits.WINDOW_SIZE * 1000 - 1;
+    expect((await hit(app, viaBinding(A))).status).toBe(429);
+    h.clock = T0 + __limits.WINDOW_SIZE * 1000;
+    const fresh = await hit(app, viaBinding(A));
+    expect(fresh.status).toBe(200);
+    expect(fresh.headers.get("X-RateLimit-Remaining")).toBe(String(CAP - 1));
   });
 });
 
@@ -543,12 +465,12 @@ describe("the log line", () => {
   test("a site caller is logged once per window and an ordinary one never", async () => {
     const app = buildApp();
     await hit(app, { "CF-Connecting-IP": A });
-    expect(logSpy.mock.calls.length).toBe(0);
+    expect(h.log.mock.calls.length).toBe(0);
     await hit(app, viaBinding(A));
     await hit(app, viaBinding(B));
-    expect(logSpy.mock.calls.length).toBe(1);
+    expect(h.log.mock.calls.length).toBe(1);
     // No address in it.
-    expect(JSON.stringify(logSpy.mock.calls[0])).not.toContain(A);
+    expect(JSON.stringify(h.log.mock.calls[0])).not.toContain(A);
   });
 
   test("an unattributed caller is warned about once per window, then again after it", async () => {
@@ -556,7 +478,7 @@ describe("the log line", () => {
     await hit(app, {});
     await hit(app, { "X-Forwarded-For": "junk" });
     const unattributed = () =>
-      warnSpy.mock.calls.filter((c) => String(c[0]).includes("unattributed"));
+      h.warn.mock.calls.filter((c) => String(c[0]).includes("unattributed"));
     expect(unattributed().length).toBe(1);
     __resetIdentityLogForTests();
     await hit(app, {});
@@ -574,12 +496,7 @@ describe("checkDataMissBudget uses the same identity", () => {
   const ask = (headers: Record<string, string>) =>
     checkDataMissBudget(env, new Request("http://localhost/data/x", { headers }), undefined);
   const seed = (key: string, count: number) =>
-    cache.put(
-      new Request(`https://rate-limit.internal/rl:data-miss-ip:${key}`),
-      new Response(JSON.stringify({ count }), {
-        headers: { "Content-Type": "application/json", "Cache-Control": "max-age=60" },
-      }),
-    );
+    h.seed(`data-miss-ip:${key}`, { count, warned: false, windowEnd: T0 + 60_000 });
 
   test("a forwarded visitor spends their own budget", async () => {
     await seed(`site:${A}`, MISS);

@@ -502,35 +502,35 @@ describe("rateLimiter end-to-end", () => {
     }
   });
 
-  test("bucket resets after the TTL window expires", async () => {
-    // Exercise the window-expiry path: exhaust the IP bucket, advance
-    // the injected clock past WINDOW_SIZE seconds so cached entries are
-    // treated as expired, then confirm the client gets a fresh quota.
-    // This covers the TTL/window-reset code path that `beforeEach` clears
-    // globally but never exercises within a single window.
-    let fakeNow = Date.now();
-    ourCache.getNow = () => fakeNow;
+  test("bucket resets exactly when its window ends", async () => {
+    // One clock for the limiter and the cache (`Date.now`, held by a spy), so the
+    // window the limiter stores and the entry's expiry are both walked across.
+    let fakeNow = 1_800_000_000_000;
+    const nowSpy = spyOn(Date, "now").mockImplementation(() => fakeNow);
+    try {
+      const { app, env } = buildApp(PROD_ENV);
+      const headers = { "CF-Connecting-IP": "10.99.0.7" };
 
-    const { app, env } = buildApp(PROD_ENV);
-    const headers = { "CF-Connecting-IP": "10.99.0.7" };
+      // Exhaust the unauthenticated IP bucket.
+      for (let i = 0; i < __limits.MAX_REQUESTS; i++) {
+        const res = await hit(app, env, "/datasets", headers);
+        expect(res.status).toBe(200);
+      }
+      // Next request must be rate-limited.
+      expect((await hit(app, env, "/datasets", headers)).status).toBe(429);
 
-    // Exhaust the unauthenticated IP bucket.
-    for (let i = 0; i < __limits.MAX_REQUESTS; i++) {
-      const res = await hit(app, env, "/datasets", headers);
-      expect(res.status).toBe(200);
+      // A millisecond before the window ends it still is.
+      fakeNow += __limits.WINDOW_SIZE * 1000 - 1;
+      expect((await hit(app, env, "/datasets", headers)).status).toBe(429);
+
+      // At the end the client gets a fresh quota.
+      fakeNow += 1;
+      const resetRes = await hit(app, env, "/datasets", headers);
+      expect(resetRes.status).toBe(200);
+      expect(resetRes.headers.get("X-RateLimit-Remaining")).toBe(String(__limits.MAX_REQUESTS - 1));
+    } finally {
+      nowSpy.mockRestore();
     }
-    // Next request must be rate-limited.
-    expect((await hit(app, env, "/datasets", headers)).status).toBe(429);
-
-    // Advance the clock past the 60s window so all cache entries expire.
-    fakeNow += (__limits.WINDOW_SIZE + 1) * 1000;
-
-    // The bucket is now expired; the client should get a fresh quota.
-    const resetRes = await hit(app, env, "/datasets", headers);
-    expect(resetRes.status).toBe(200);
-
-    // Restore the real clock for subsequent tests.
-    ourCache.getNow = () => Date.now();
   });
 });
 

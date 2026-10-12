@@ -14,84 +14,26 @@
  * second by second. The clock is the only thing replaced.
  */
 
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { Hono } from "hono";
+import { describe, expect, test } from "bun:test";
 import {
   __limits,
   __readCounter,
   checkDataMissBudget,
   checkPrivateGrantBudget,
-  rateLimiter,
 } from "../src/middleware/rateLimit";
 import { hashApiKey } from "../src/services/token";
-import type { Bindings, Variables } from "../src/types/bindings";
-import { InMemoryCache } from "./helpers/cache";
+import type { Bindings } from "../src/types/bindings";
+import { T0, buildApp, edge, hit, useRateLimitHarness } from "./helpers/rate-limit-harness";
 
-type AppEnv = { Bindings: Bindings; Variables: Variables };
-
-/** A whole second, so epoch-second arithmetic below is exact. */
-const T0 = 1_800_000_000_000;
 const WINDOW = __limits.WINDOW_SIZE;
 const WINDOW_MS = WINDOW * 1000;
-
-let clock = T0;
-let cache = new InMemoryCache();
-let originalCaches: unknown;
-let nowSpy: ReturnType<typeof spyOn>;
-let warnSpy: ReturnType<typeof spyOn>;
-let logSpy: ReturnType<typeof spyOn>;
-
-beforeEach(() => {
-  clock = T0;
-  nowSpy = spyOn(Date, "now").mockImplementation(() => clock);
-  // The privileged-token lookup warns when this suite has no database, and the
-  // limiter logs a line for a caller without CF-Connecting-IP: noise here.
-  warnSpy = spyOn(console, "warn").mockImplementation(() => {});
-  logSpy = spyOn(console, "log").mockImplementation(() => {});
-  cache = new InMemoryCache();
-  originalCaches = (globalThis as { caches?: unknown }).caches;
-  (globalThis as { caches?: unknown }).caches = { default: cache };
-});
-
-afterEach(() => {
-  nowSpy.mockRestore();
-  warnSpy.mockRestore();
-  logSpy.mockRestore();
-  (globalThis as { caches?: unknown }).caches = originalCaches;
-});
-
-const PROD_ENV = {
-  ENVIRONMENT: "production",
-  API_BASE_URL: "http://localhost",
-  FRONTEND_URL: "http://localhost",
-  DB: undefined as unknown as D1Database,
-} satisfies Partial<Bindings> as unknown as Bindings;
-
-function buildApp(options: { observeOnly?: boolean } = {}): Hono<AppEnv> {
-  const app = new Hono<AppEnv>();
-  app.use("*", (c, next) => rateLimiter(c, next, options));
-  app.get("/datasets", (c) => c.json({ ok: true }));
-  app.get("/auth/login", (c) => c.json({ ok: true }));
-  app.get("/admin/users", (c) => c.json({ ok: true }));
-  app.get("/neurobagel/index.json", (c) => c.json({ ok: true }));
-  app.get("/data/*", (c) => c.json({ ok: true }));
-  return app;
-}
-
-async function hit(
-  app: Hono<AppEnv>,
-  headers: Record<string, string>,
-  path = "/datasets",
-): Promise<Response> {
-  return app.fetch(new Request(`http://localhost${path}`, { headers }), PROD_ENV);
-}
-
 const ANON_CAP = __limits.MAX_REQUESTS;
-const edge = (ip: string) => ({ "CF-Connecting-IP": ip });
+
+const h = useRateLimitHarness();
 
 /** Walk one client at a steady `rate` per second for `seconds` and count the outcomes. */
 async function steady(
-  app: Hono<AppEnv>,
+  app: ReturnType<typeof buildApp>,
   headers: Record<string, string>,
   rate: number,
   seconds: number,
@@ -99,31 +41,15 @@ async function steady(
   let ok = 0;
   let refused = 0;
   const step = 1000 / rate;
-  const start = clock;
+  const start = h.clock;
   for (let t = 0; t < seconds * 1000; t += step) {
-    clock = start + t;
+    h.clock = start + t;
     const res = await hit(app, headers);
     if (res.status === 200) ok++;
     else if (res.status === 429) refused++;
     else throw new Error(`unexpected status ${res.status}`);
   }
   return { ok, refused };
-}
-
-/** The record a bucket stores, parsed, or undefined. */
-async function stored(key: string): Promise<Record<string, unknown> | undefined> {
-  const res = await cache.match(new Request(`https://rate-limit.internal/rl:${key}`));
-  return res ? ((await res.json()) as Record<string, unknown>) : undefined;
-}
-
-/** Put a record under a bucket's key, as the limiter itself would have. */
-async function seed(key: string, record: unknown, maxAgeSeconds = WINDOW): Promise<void> {
-  await cache.put(
-    new Request(`https://rate-limit.internal/rl:${key}`),
-    new Response(typeof record === "string" ? record : JSON.stringify(record), {
-      headers: { "Content-Type": "application/json", "Cache-Control": `max-age=${maxAgeSeconds}` },
-    }),
-  );
 }
 
 // --------------------------------------------------------------------------
@@ -232,7 +158,7 @@ describe("a rate above the cap is refused exactly the excess a fixed window must
     let ok = 0;
     let refused = 0;
     for (let t = 0; t < 1800 * 1000; t += 2000) {
-      clock = T0 + t;
+      h.clock = T0 + t;
       const res = await hit(app, edge("203.0.113.4"), "/auth/login");
       if (res.status === 200) ok++;
       else refused++;
@@ -252,7 +178,7 @@ describe("a burst at the cap is refused for the rest of its window only", () => 
 
     const second = (n: number) => T0 + n * 1000;
     const refusedAt = async (at: number) => {
-      clock = at;
+      h.clock = at;
       return hit(app, headers);
     };
 
@@ -279,11 +205,11 @@ describe("a burst at the cap is refused for the rest of its window only", () => 
     for (let i = 0; i < ANON_CAP; i++) await hit(app, headers);
     // A request every 50 ms for the whole window, every one of them refused...
     for (let t = 50; t < WINDOW_MS; t += 50) {
-      clock = T0 + t;
+      h.clock = T0 + t;
       expect((await hit(app, headers)).status).toBe(429);
     }
     // ...and the first at the boundary is admitted all the same.
-    clock = T0 + WINDOW_MS;
+    h.clock = T0 + WINDOW_MS;
     expect((await hit(app, headers)).status).toBe(200);
   });
 
@@ -291,7 +217,7 @@ describe("a burst at the cap is refused for the rest of its window only", () => 
     const app = buildApp();
     const headers = edge("203.0.113.7");
     for (let i = 0; i < ANON_CAP; i++) await hit(app, headers);
-    clock = T0 + WINDOW_MS;
+    h.clock = T0 + WINDOW_MS;
     let ok = 0;
     for (let i = 0; i < ANON_CAP + 5; i++) {
       if ((await hit(app, headers)).status === 200) ok++;
@@ -307,10 +233,10 @@ describe("a burst at the cap is refused for the rest of its window only", () => 
     const app = buildApp();
     const headers = edge("203.0.113.8");
     await hit(app, headers);
-    const first = await stored("ip:203.0.113.8");
-    clock = T0 + 40_000;
+    const first = await h.stored("ip:203.0.113.8");
+    h.clock = T0 + 40_000;
     await hit(app, headers);
-    const second = await stored("ip:203.0.113.8");
+    const second = await h.stored("ip:203.0.113.8");
     expect(first?.windowEnd).toBe(T0 + WINDOW_MS);
     expect(second?.windowEnd).toBe(T0 + WINDOW_MS);
     expect(second?.count).toBe(2);
@@ -323,7 +249,7 @@ describe("Retry-After and X-RateLimit-Reset agree with the window", () => {
     const headers = edge("203.0.113.9");
     for (let i = 0; i < ANON_CAP; i++) await hit(app, headers);
 
-    clock = T0 + 12_300;
+    h.clock = T0 + 12_300;
     const res = await hit(app, headers);
     expect(res.status).toBe(429);
     const retryAfter = Number(res.headers.get("Retry-After"));
@@ -331,7 +257,7 @@ describe("Retry-After and X-RateLimit-Reset agree with the window", () => {
     const body = (await res.json()) as { retry_after: number; message: string };
 
     expect(reset).toBe((T0 + WINDOW_MS) / 1000);
-    expect(retryAfter).toBe(Math.ceil((reset * 1000 - clock) / 1000));
+    expect(retryAfter).toBe(Math.ceil((reset * 1000 - h.clock) / 1000));
     expect(retryAfter).toBe(48);
     expect(body.retry_after).toBe(retryAfter);
     expect(body.message).toContain(`${retryAfter} seconds`);
@@ -340,7 +266,7 @@ describe("Retry-After and X-RateLimit-Reset agree with the window", () => {
     expect(res.headers.get("X-RateLimit-Bucket")).toBe("ip");
 
     // Never undershoots: a client that waits exactly Retry-After is let in.
-    clock += retryAfter * 1000;
+    h.clock += retryAfter * 1000;
     expect((await hit(app, headers)).status).toBe(200);
   });
 
@@ -349,7 +275,7 @@ describe("Retry-After and X-RateLimit-Reset agree with the window", () => {
     const headers = edge("203.0.113.10");
     for (let i = 0; i < ANON_CAP; i++) await hit(app, headers);
     for (const at of [0, 1, 999, 30_000, WINDOW_MS - 1]) {
-      clock = T0 + at;
+      h.clock = T0 + at;
       const res = await hit(app, headers);
       const retryAfter = Number(res.headers.get("Retry-After"));
       expect(retryAfter).toBeGreaterThanOrEqual(1);
@@ -361,29 +287,29 @@ describe("Retry-After and X-RateLimit-Reset agree with the window", () => {
     const app = buildApp();
     const headers = edge("203.0.113.11");
     await hit(app, headers);
-    clock = T0 + 50_000;
+    h.clock = T0 + 50_000;
     await hit(app, headers);
     // 10 seconds remain. The record was written with max-age=10, so at T0 + 61 s
     // the cache itself has dropped it, with no help from the limiter.
-    clock = T0 + 61_000;
-    expect(await stored("ip:203.0.113.11")).toBeUndefined();
+    h.clock = T0 + 61_000;
+    expect(await h.stored("ip:203.0.113.11")).toBeUndefined();
   });
 });
 
 describe("a record written before windows were stored is read safely", () => {
   test("below the cap it is counted on and given a window of its own", async () => {
-    await seed("ip:203.0.113.20", { count: ANON_CAP - 1, warned: false });
+    await h.seed("ip:203.0.113.20", { count: ANON_CAP - 1, warned: false });
     const app = buildApp();
     const last = await hit(app, edge("203.0.113.20"));
     expect(last.status).toBe(200);
     expect(last.headers.get("X-RateLimit-Remaining")).toBe("0");
-    expect((await stored("ip:203.0.113.20"))?.windowEnd).toBe(T0 + WINDOW_MS);
+    expect((await h.stored("ip:203.0.113.20"))?.windowEnd).toBe(T0 + WINDOW_MS);
     const over = await hit(app, edge("203.0.113.20"));
     expect(over.status).toBe(429);
   });
 
   test("at the cap it refuses with a window as the bound, and is gone once its entry is", async () => {
-    await seed("ip:203.0.113.21", { count: ANON_CAP, warned: false });
+    await h.seed("ip:203.0.113.21", { count: ANON_CAP, warned: false });
     const app = buildApp();
     const res = await hit(app, edge("203.0.113.21"));
     expect(res.status).toBe(429);
@@ -391,44 +317,44 @@ describe("a record written before windows were stored is read safely", () => {
     expect(res.headers.get("X-RateLimit-Reset")).toBe(String((T0 + WINDOW_MS) / 1000));
 
     // Refusals write nothing, so the old entry runs out on its own TTL.
-    clock = T0 + WINDOW_MS + 1000;
+    h.clock = T0 + WINDOW_MS + 1000;
     const after = await hit(app, edge("203.0.113.21"));
     expect(after.status).toBe(200);
     expect(after.headers.get("X-RateLimit-Remaining")).toBe(String(ANON_CAP - 1));
   });
 
   test("a count-only record, as the budgets used to write, behaves the same", async () => {
-    await seed("ip:203.0.113.22", { count: ANON_CAP });
+    await h.seed("ip:203.0.113.22", { count: ANON_CAP });
     expect((await hit(buildApp(), edge("203.0.113.22"))).status).toBe(429);
   });
 });
 
 describe("a damaged or stale record does not wedge a bucket", () => {
   test("an end far in the future holds the bucket for one window at most", async () => {
-    await seed("ip:203.0.113.30", { count: ANON_CAP, windowEnd: T0 + 10 * 86_400_000 });
+    await h.seed("ip:203.0.113.30", { count: ANON_CAP, windowEnd: T0 + 10 * 86_400_000 });
     const app = buildApp();
     const res = await hit(app, edge("203.0.113.30"));
     expect(res.status).toBe(429);
     expect(res.headers.get("Retry-After")).toBe("60");
-    clock = T0 + WINDOW_MS + 1000;
+    h.clock = T0 + WINDOW_MS + 1000;
     expect((await hit(app, edge("203.0.113.30"))).status).toBe(200);
   });
 
   test("a window that has ended but whose entry the cache still holds is a new window", async () => {
-    await seed("ip:203.0.113.31", { count: ANON_CAP, warned: false, windowEnd: T0 - 1 }, 3600);
+    await h.seed("ip:203.0.113.31", { count: ANON_CAP, warned: false, windowEnd: T0 - 1 }, 3600);
     const res = await hit(buildApp(), edge("203.0.113.31"));
     expect(res.status).toBe(200);
     expect(res.headers.get("X-RateLimit-Remaining")).toBe(String(ANON_CAP - 1));
-    expect((await stored("ip:203.0.113.31"))?.windowEnd).toBe(T0 + WINDOW_MS);
+    expect((await h.stored("ip:203.0.113.31"))?.windowEnd).toBe(T0 + WINDOW_MS);
   });
 
   test("a body that is not JSON is replaced, not trusted and not failed open on", async () => {
-    await seed("ip:203.0.113.32", "this is not json", 3600);
+    await h.seed("ip:203.0.113.32", "this is not json", 3600);
     const app = buildApp();
     const first = await hit(app, edge("203.0.113.32"));
     expect(first.status).toBe(200);
     expect(first.headers.get("X-RateLimit-Remaining")).toBe(String(ANON_CAP - 1));
-    expect((await stored("ip:203.0.113.32"))?.count).toBe(1);
+    expect((await h.stored("ip:203.0.113.32"))?.count).toBe(1);
   });
 });
 
@@ -499,7 +425,7 @@ describe("every bucket kind keeps its window's end and ends its block there", ()
   test.each(cases)("$kind (cap $cap)", async ({ kind, key, cap, path, headers }) => {
     // Thirty seconds into a window, three requests from the cap.
     const k = await key();
-    await seed(k, { count: cap - 3, warned: false, windowEnd: T0 + 30_000 }, 30);
+    await h.seed(k, { count: cap - 3, warned: false, windowEnd: T0 + 30_000 }, 30);
     const app = buildApp();
 
     for (let left = 2; left >= 0; left--) {
@@ -509,7 +435,7 @@ describe("every bucket kind keeps its window's end and ends its block there", ()
       expect(res.headers.get("X-RateLimit-Remaining")).toBe(String(left));
     }
     // Writing back kept the end where it was.
-    expect((await stored(k))?.windowEnd).toBe(T0 + 30_000);
+    expect((await h.stored(k))?.windowEnd).toBe(T0 + 30_000);
 
     const over = await hit(app, headers, path);
     expect(over.status).toBe(429);
@@ -517,13 +443,13 @@ describe("every bucket kind keeps its window's end and ends its block there", ()
     expect(over.headers.get("Retry-After")).toBe("30");
     expect(over.headers.get("X-RateLimit-Reset")).toBe(String((T0 + 30_000) / 1000));
 
-    clock = T0 + 29_999;
+    h.clock = T0 + 29_999;
     expect((await hit(app, headers, path)).status).toBe(429);
-    clock = T0 + 30_000;
+    h.clock = T0 + 30_000;
     const fresh = await hit(app, headers, path);
     expect(fresh.status).toBe(200);
     expect(fresh.headers.get("X-RateLimit-Remaining")).toBe(String(cap - 1));
-    expect((await stored(k))?.windowEnd).toBe(T0 + 30_000 + WINDOW_MS);
+    expect((await h.stored(k))?.windowEnd).toBe(T0 + 30_000 + WINDOW_MS);
   });
 
   test("the miss budget of the data plane", async () => {
@@ -538,7 +464,7 @@ describe("every bucket kind keeps its window's end and ends its block there", ()
         undefined,
       );
     const cap = __limits.DATA_MISS_MAX_REQUESTS;
-    await seed("data-miss-ip:203.0.113.46", { count: cap - 1, windowEnd: T0 + 20_000 }, 20);
+    await h.seed("data-miss-ip:203.0.113.46", { count: cap - 1, windowEnd: T0 + 20_000 }, 20);
     expect((await ask()).allowed).toBe(true);
     const refused = await ask();
     expect(refused.allowed).toBe(false);
@@ -547,7 +473,7 @@ describe("every bucket kind keeps its window's end and ends its block there", ()
       expect(refused.response.headers.get("X-RateLimit-Reset")).toBe(String((T0 + 20_000) / 1000));
       expect(refused.response.headers.get("X-RateLimit-Bucket")).toBe("data-miss-ip");
     }
-    clock = T0 + 20_000;
+    h.clock = T0 + 20_000;
     expect((await ask()).allowed).toBe(true);
   });
 
@@ -561,13 +487,13 @@ describe("every bucket kind keeps its window's end and ends its block there", ()
     for (let i = 0; i < __limits.PRIVATE_GRANT_MAX_REQUESTS; i++) {
       expect((await ask()).allowed).toBe(true);
     }
-    clock = T0 + 45_000;
+    h.clock = T0 + 45_000;
     const refused = await ask();
     expect(refused.allowed).toBe(false);
     if (!refused.allowed) {
       expect(refused.response.headers.get("Retry-After")).toBe("15");
     }
-    clock = T0 + WINDOW_MS;
+    h.clock = T0 + WINDOW_MS;
     expect((await ask()).allowed).toBe(true);
   });
 });
@@ -575,21 +501,21 @@ describe("every bucket kind keeps its window's end and ends its block there", ()
 describe("observe-only counting follows the same window", () => {
   test("the one warning per window resets at the boundary, with the count", async () => {
     const observe = (text: string) =>
-      warnSpy.mock.calls.filter((c) => String(c[0]).includes(text)).length;
+      h.warn.mock.calls.filter((c) => String(c[0]).includes(text)).length;
     const app = buildApp({ observeOnly: true });
     const headers = edge("203.0.113.50");
-    await seed("ip:203.0.113.50", { count: ANON_CAP, warned: false, windowEnd: T0 + 20_000 }, 20);
+    await h.seed("ip:203.0.113.50", { count: ANON_CAP, warned: false, windowEnd: T0 + 20_000 }, 20);
 
     // Observe-only never refuses.
     expect((await hit(app, headers)).status).toBe(200);
     expect((await hit(app, headers)).status).toBe(200);
     expect(observe("observe-only bucket would have tripped")).toBe(1);
-    expect((await stored("ip:203.0.113.50"))?.windowEnd).toBe(T0 + 20_000);
+    expect((await h.stored("ip:203.0.113.50"))?.windowEnd).toBe(T0 + 20_000);
 
     // The window ends: the count and the warning start over.
-    clock = T0 + 20_000;
+    h.clock = T0 + 20_000;
     expect((await hit(app, headers)).status).toBe(200);
-    expect((await stored("ip:203.0.113.50"))?.count).toBe(1);
-    expect((await stored("ip:203.0.113.50"))?.warned).toBe(false);
+    expect((await h.stored("ip:203.0.113.50"))?.count).toBe(1);
+    expect((await h.stored("ip:203.0.113.50"))?.warned).toBe(false);
   });
 });
