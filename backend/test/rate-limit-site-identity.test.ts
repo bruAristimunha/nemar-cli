@@ -18,6 +18,7 @@ import { describe, expect, test } from "bun:test";
 import {
   __firstForwardedIp,
   __limits,
+  __parseForwardedFor,
   __readCallerIdentity,
   __resetIdentityLogForTests,
   __selectBucket,
@@ -48,16 +49,23 @@ describe("__firstForwardedIp", () => {
   test.each([
     ["203.0.113.7", "203.0.113.7"],
     ["  203.0.113.7  ", "203.0.113.7"],
-    ["0.0.0.0", "0.0.0.0"],
     ["255.255.255.255", "255.255.255.255"],
+    // Only the exact unspecified address is refused, not its neighbors.
+    ["0.0.0.1", "0.0.0.1"],
+    ["126.255.255.255", "126.255.255.255"],
+    ["128.0.0.1", "128.0.0.1"],
     ["2001:db8::1", "2001:db8::1"],
     // The URL parser compresses and lowercases, so one visitor is one key.
     ["2001:DB8:0:0:0:0:0:1", "2001:db8::1"],
-    ["::1", "::1"],
-    ["::ffff:203.0.113.7", "::ffff:cb00:7107"],
+    // An IPv4-mapped address is the IPv4 visitor it wraps, however it is written.
+    ["::ffff:203.0.113.7", "203.0.113.7"],
+    ["::FFFF:CB00:7107", "203.0.113.7"],
+    ["0:0:0:0:0:ffff:cb00:7107", "203.0.113.7"],
     // Only the first entry counts, however many follow.
     ["203.0.113.7, 10.0.0.1, 10.0.0.2", "203.0.113.7"],
     ["203.0.113.7,10.0.0.1", "203.0.113.7"],
+    // The longest legitimate literal is 45 characters, and is accepted (as the IPv4 it wraps).
+    ["0000:0000:0000:0000:0000:ffff:255.255.255.255", "255.255.255.255"],
   ])("%j reads as %j", (header, expected) => {
     expect(__firstForwardedIp(header)).toBe(expected);
   });
@@ -72,7 +80,12 @@ describe("__firstForwardedIp", () => {
     ["example.com"],
     ["203.0.113"],
     ["203.0.113.256"],
+    // A leading zero is refused whatever the octet (some parsers read it as octal).
+    ["203.0.113.07"],
     ["203.0.113.007"],
+    ["203.0.113.00"],
+    ["203.0.113.010"],
+    ["01.2.3.4"],
     ["203.0.113.7:8080"],
     ["[2001:db8::1]"],
     ["[2001:db8::1]:443"],
@@ -85,14 +98,79 @@ describe("__firstForwardedIp", () => {
     // The FIRST entry decides: an unreadable one is not skipped to reach a later one.
     ["unknown, 203.0.113.7"],
     [", 203.0.113.7"],
+    // A placeholder is no visitor: counting it would put thousands of them in one key.
+    ["0.0.0.0"],
+    ["::"],
+    ["0:0:0:0:0:0:0:0"],
+    ["127.0.0.1"],
+    ["127.255.255.255"],
+    ["::1"],
+    ["0:0:0:0:0:0:0:1"],
+    ["::ffff:127.0.0.1"],
+    ["::ffff:0.0.0.0"],
   ])("%j is not an address", (header) => {
     expect(__firstForwardedIp(header)).toBeNull();
   });
 
-  test("a header or an address over its length bound is not read", () => {
+  test("the header bound is exact: 512 characters are read and 513 are not", () => {
+    const padded = (length: number) => `203.0.113.7,${" ".repeat(length - "203.0.113.7,".length)}`;
+    expect(padded(512)).toHaveLength(512);
+    expect(__firstForwardedIp(padded(512))).toBe("203.0.113.7");
+    expect(__firstForwardedIp(padded(513))).toBeNull();
+  });
+
+  test("an address over its own length bound is not read", () => {
     expect(__firstForwardedIp(`203.0.113.7, ${"1.1.1.1, ".repeat(100)}`)).toBeNull();
     expect(__firstForwardedIp("a".repeat(600))).toBeNull();
     expect(__firstForwardedIp(`${"0".repeat(60)}:1`)).toBeNull();
+  });
+});
+
+describe("__parseForwardedFor says why there is no address", () => {
+  test.each([
+    [undefined, "absent", 0],
+    [null, "absent", 0],
+    ["", "absent", 0],
+    ["a".repeat(513), "too-long", 513],
+    ["unknown", "first-entry-not-an-ip", 7],
+    ["0.0.0.0", "unspecified-or-loopback", 7],
+    ["::", "unspecified-or-loopback", 2],
+    ["127.0.0.1, 203.0.113.7", "unspecified-or-loopback", 22],
+    ["::1", "unspecified-or-loopback", 3],
+    ["::ffff:127.0.0.1", "unspecified-or-loopback", 16],
+  ] as const)("%j is %s (length %d)", (header, reason, forwardedLength) => {
+    const parsed = __parseForwardedFor(header);
+    expect(parsed.ok).toBe(false);
+    expect(parsed).toMatchObject({ reason, forwardedLength });
+  });
+
+  test.each([
+    ["", "empty"],
+    ["   ", "empty"],
+    ["unknown", "word"],
+    ["_hidden", "word"],
+    ["203.0.113.7:8080", "ipv4-with-port"],
+    ["[2001:db8::1]", "bracketed"],
+    ["[2001:db8::1]:443", "bracketed"],
+    ["fe80::1%eth0", "zone-id"],
+    ["2001:db8::g1", "other"],
+    ["2001:db8:::1", "malformed-ipv6"],
+    ["203.0.113", "malformed-ipv4"],
+    ["203.0.113.256", "malformed-ipv4"],
+    ["not an address!", "other"],
+  ])("a first entry of %j has the shape %s", (header, shape) => {
+    const parsed = __parseForwardedFor(header.trim() === "" ? `${header},203.0.113.7` : header);
+    expect(parsed).toMatchObject({ ok: false, reason: "first-entry-not-an-ip", shape });
+  });
+
+  test("the shape is a class and the reason a fixed word: neither carries the value", () => {
+    const value = "secret-token-value";
+    const parsed = __parseForwardedFor(value);
+    expect(JSON.stringify(parsed)).not.toContain(value);
+  });
+
+  test("a readable address has no reason", () => {
+    expect(__parseForwardedFor("203.0.113.7")).toEqual({ ok: true, ip: "203.0.113.7" });
   });
 });
 
@@ -125,11 +203,21 @@ describe("__readCallerIdentity", () => {
     expect(__readCallerIdentity("", "203.0.113.7").source).toBe("site");
   });
 
-  test("with neither, or with an unreadable forward, the caller is unattributed", () => {
-    for (const forwarded of [undefined, null, "", "unknown", "203.0.113.7:80", "a".repeat(600)]) {
-      expect(__readCallerIdentity(undefined, forwarded)).toEqual({
+  test("with neither, or with an unreadable forward, the caller is unattributed, with the reason", () => {
+    const cases = [
+      [undefined, "absent"],
+      [null, "absent"],
+      ["", "absent"],
+      ["unknown", "first-entry-not-an-ip"],
+      ["203.0.113.7:80", "first-entry-not-an-ip"],
+      ["a".repeat(600), "too-long"],
+      ["0.0.0.0", "unspecified-or-loopback"],
+    ] as const;
+    for (const [forwarded, reason] of cases) {
+      expect(__readCallerIdentity(undefined, forwarded)).toMatchObject({
         source: "unattributed",
         key: "unattributed",
+        detail: { reason },
       });
     }
   });
@@ -199,6 +287,11 @@ describe("__selectBucket by caller source", () => {
 });
 
 describe("the caps", () => {
+  test("the website's caps are the numbers the owner chose", () => {
+    expect(__limits.SITE_IP_MAX_REQUESTS).toBe(2000);
+    expect(__limits.SITE_UNATTRIBUTED_MAX_REQUESTS).toBe(20_000);
+  });
+
   test("a visitor through the website is never treated more strictly than a public caller", () => {
     expect(__limits.SITE_IP_MAX_REQUESTS).toBeGreaterThanOrEqual(__limits.MAX_REQUESTS);
   });
@@ -312,6 +405,25 @@ describe("a request through the service binding is counted per forwarded visitor
     const second = await hit(app, viaBinding("2001:db8::1"));
     expect(first.headers.get("X-RateLimit-Remaining")).toBe(String(CAP - 1));
     expect(second.headers.get("X-RateLimit-Remaining")).toBe(String(CAP - 2));
+  });
+
+  test("an IPv4 visitor written as an IPv4-mapped IPv6 address is the same visitor", async () => {
+    const app = buildApp();
+    const plain = await hit(app, viaBinding("203.0.113.30"));
+    const mapped = await hit(app, viaBinding("::ffff:203.0.113.30"));
+    const hex = await hit(app, viaBinding("::FFFF:CB00:711E"));
+    expect(plain.headers.get("X-RateLimit-Remaining")).toBe(String(CAP - 1));
+    expect(mapped.headers.get("X-RateLimit-Remaining")).toBe(String(CAP - 2));
+    expect(hex.headers.get("X-RateLimit-Remaining")).toBe(String(CAP - 3));
+  });
+
+  test("a placeholder address names nobody: it is counted with the unattributed", async () => {
+    const app = buildApp();
+    for (const placeholder of ["0.0.0.0", "::", "127.0.0.1", "::1"]) {
+      const res = await hit(app, viaBinding(placeholder));
+      expect(res.headers.get("X-RateLimit-Bucket")).toBe("site-unattributed");
+      expect(res.headers.get("X-RateLimit-Caller")).toBe("unattributed");
+    }
   });
 
   test("a site visitor and a public caller at the same address do not share a counter", async () => {
@@ -461,28 +573,152 @@ describe("what is unchanged", () => {
   });
 });
 
-describe("the log line", () => {
-  test("a site caller is logged once per window and an ordinary one never", async () => {
+describe("the response says how the caller was identified", () => {
+  test("edge, site and unattributed callers each carry X-RateLimit-Caller", async () => {
     const app = buildApp();
-    await hit(app, { "CF-Connecting-IP": A });
-    expect(h.log.mock.calls.length).toBe(0);
+    expect((await hit(app, edge(A))).headers.get("X-RateLimit-Caller")).toBe("edge");
+    expect((await hit(app, viaBinding(A))).headers.get("X-RateLimit-Caller")).toBe("site");
+    expect((await hit(app, {})).headers.get("X-RateLimit-Caller")).toBe("unattributed");
+  });
+
+  test("it is there on the buckets whose own header cannot tell the sources apart", async () => {
+    const app = buildApp();
+    for (const [path, bucket] of [
+      ["/auth/login", "auth-ip"],
+      ["/data/nm000108/v1.0.0/x", "data-ip"],
+      ["/neurobagel/index.json", "neurobagel-ip"],
+    ] as const) {
+      const none = await hit(app, {}, path);
+      expect(none.headers.get("X-RateLimit-Bucket")).toBe(bucket);
+      expect(none.headers.get("X-RateLimit-Caller")).toBe("unattributed");
+      const site = await hit(app, viaBinding(B), path);
+      expect(site.headers.get("X-RateLimit-Bucket")).toBe(bucket);
+      expect(site.headers.get("X-RateLimit-Caller")).toBe("site");
+    }
+  });
+
+  test("a refusal carries it too", async () => {
+    const app = buildApp();
+    for (let i = 0; i < __limits.AUTH_MAX_REQUESTS; i++)
+      await hit(app, viaBinding(A), "/auth/login");
+    const over = await hit(app, viaBinding(A), "/auth/login");
+    expect(over.status).toBe(429);
+    expect(over.headers.get("X-RateLimit-Caller")).toBe("site");
+    expect(over.headers.get("X-RateLimit-Bucket")).toBe("auth-ip");
+  });
+
+  test("the X-RateLimit-Bucket values are the same as before", async () => {
+    const app = buildApp();
+    expect((await hit(app, edge(A))).headers.get("X-RateLimit-Bucket")).toBe("ip");
+    expect((await hit(app, viaBinding(A))).headers.get("X-RateLimit-Bucket")).toBe("site-ip");
+    expect((await hit(app, {})).headers.get("X-RateLimit-Bucket")).toBe("site-unattributed");
+  });
+});
+
+describe("the identity log", () => {
+  const lines = () =>
+    [...h.log.mock.calls, ...h.warn.mock.calls].filter((c) =>
+      String(c[0]).startsWith("[rate-limit]"),
+    );
+
+  test("a public request logs nothing", async () => {
+    const app = buildApp();
+    await hit(app, edge(A));
+    await hit(app, edge(A), "/auth/login");
+    expect(lines()).toEqual([]);
+  });
+
+  test("a site caller is logged once per window per bucket, with the bucket and its cap", async () => {
+    const app = buildApp();
     await hit(app, viaBinding(A));
     await hit(app, viaBinding(B));
     expect(h.log.mock.calls.length).toBe(1);
-    // No address in it.
-    expect(JSON.stringify(h.log.mock.calls[0])).not.toContain(A);
+    expect(h.log.mock.calls[0]?.[1]).toMatchObject({
+      keyKind: "site-ip",
+      maxRequests: CAP,
+      path: "/datasets",
+      suppressed: 0,
+    });
+    // A second bucket is a second line: the first would otherwise hide it.
+    await hit(app, viaBinding(A), "/auth/login");
+    expect(h.log.mock.calls.length).toBe(2);
+    expect(h.log.mock.calls[1]?.[1]).toMatchObject({
+      keyKind: "auth-ip",
+      maxRequests: __limits.AUTH_MAX_REQUESTS,
+    });
+    // No address in either.
+    expect(JSON.stringify(h.log.mock.calls)).not.toContain(A);
+    expect(JSON.stringify(h.log.mock.calls)).not.toContain(B);
   });
 
-  test("an unattributed caller is warned about once per window, then again after it", async () => {
+  test("the line is held back until the window ends, then says how many it swallowed", async () => {
+    const app = buildApp();
+    await hit(app, viaBinding(A));
+    h.clock = T0 + __limits.WINDOW_SIZE * 1000 - 1;
+    await hit(app, viaBinding(A));
+    await hit(app, viaBinding(B));
+    expect(h.log.mock.calls.length).toBe(1);
+    h.clock = T0 + __limits.WINDOW_SIZE * 1000;
+    await hit(app, viaBinding(A));
+    expect(h.log.mock.calls.length).toBe(2);
+    expect(h.log.mock.calls[1]?.[1]).toMatchObject({ suppressed: 2 });
+  });
+
+  test("an unattributed caller is warned about on EVERY bucket it reaches, with the reason", async () => {
     const app = buildApp();
     await hit(app, {});
-    await hit(app, { "X-Forwarded-For": "junk" });
-    const unattributed = () =>
-      h.warn.mock.calls.filter((c) => String(c[0]).includes("unattributed"));
-    expect(unattributed().length).toBe(1);
-    __resetIdentityLogForTests();
-    await hit(app, {});
-    expect(unattributed().length).toBe(2);
+    await hit(app, { "X-Forwarded-For": "unknown" });
+    await hit(app, {}, "/auth/login");
+    await hit(app, { "X-Forwarded-For": "a".repeat(600) }, "/auth/login");
+    await hit(app, {}, "/data/nm000108/v1.0.0/x");
+    const warnings = h.warn.mock.calls.filter((c) => String(c[0]).startsWith("[rate-limit]"));
+    // Three buckets, one line each, however many requests reached them.
+    expect(warnings.map((c) => (c[1] as { keyKind: string }).keyKind).sort()).toEqual([
+      "auth-ip",
+      "data-ip",
+      "site-unattributed",
+    ]);
+    const anonymous = warnings.find(
+      (c) => (c[1] as { keyKind: string }).keyKind === "site-unattributed",
+    );
+    expect(anonymous?.[1]).toMatchObject({
+      maxRequests: __limits.SITE_UNATTRIBUTED_MAX_REQUESTS,
+      reason: "absent",
+      forwardedLength: 0,
+    });
+    const strict = warnings.find((c) => (c[1] as { keyKind: string }).keyKind === "auth-ip");
+    expect(strict?.[1]).toMatchObject({
+      maxRequests: __limits.AUTH_MAX_REQUESTS,
+      reason: "absent",
+    });
+  });
+
+  test("the reason and the shape say what was wrong without saying the value", async () => {
+    const secret = "leaky-secret-value-9";
+    const app = buildApp();
+    await hit(app, { "X-Forwarded-For": secret });
+    const [call] = h.warn.mock.calls.filter((c) => String(c[0]).startsWith("[rate-limit]"));
+    expect(call?.[1]).toMatchObject({
+      reason: "first-entry-not-an-ip",
+      forwardedLength: secret.length,
+      shape: "other",
+    });
+    expect(JSON.stringify(h.warn.mock.calls)).not.toContain(secret);
+  });
+
+  test("each kind of unreadable header is told apart in the one line it gets", async () => {
+    const cases = [
+      [{}, "absent"],
+      [{ "X-Forwarded-For": "203.0.113.7:8080" }, "first-entry-not-an-ip"],
+      [{ "X-Forwarded-For": "x".repeat(600) }, "too-long"],
+      [{ "X-Forwarded-For": "0.0.0.0" }, "unspecified-or-loopback"],
+    ] as const;
+    for (const [headers, reason] of cases) {
+      __resetIdentityLogForTests();
+      h.warn.mockClear();
+      await hit(buildApp(), headers);
+      expect(h.warn.mock.calls[0]?.[1]).toMatchObject({ reason });
+    }
   });
 });
 
@@ -504,6 +740,7 @@ describe("checkDataMissBudget uses the same identity", () => {
     expect(refused.allowed).toBe(false);
     if (!refused.allowed) {
       expect(refused.response.status).toBe(429);
+      expect(refused.response.headers.get("X-RateLimit-Caller")).toBe("site");
       expect(refused.response.headers.get("X-RateLimit-Bucket")).toBe("data-miss-ip");
     }
     expect((await ask(viaBinding(B))).allowed).toBe(true);

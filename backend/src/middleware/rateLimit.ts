@@ -316,12 +316,15 @@ async function readCounterRecord(
 
 /** The 429 every counter in this file answers with: the same body and headers
  *  whichever bucket tripped, `Retry-After` and `X-RateLimit-Reset` agreeing with
- *  the window, and only `X-RateLimit-Bucket` telling the buckets apart. */
+ *  the window, and only `X-RateLimit-Bucket` telling the buckets apart.
+ *  `X-RateLimit-Caller` says how the caller was identified (`edge`, `site` or
+ *  `unattributed`) whichever bucket it landed in. */
 function refusal(
   kind: string,
   maxRequests: number,
   state: __CounterState,
   now: number,
+  caller?: __CallerSource,
 ): { body: Record<string, unknown>; headers: Record<string, string> } {
   const retryAfter = secondsLeft(state, now);
   return {
@@ -336,6 +339,7 @@ function refusal(
       "X-RateLimit-Remaining": "0",
       "X-RateLimit-Reset": Math.ceil(state.windowEnd / 1000).toString(),
       "X-RateLimit-Bucket": kind,
+      ...(caller === undefined ? {} : { "X-RateLimit-Caller": caller }),
     },
   };
 }
@@ -660,11 +664,30 @@ export type __CallerSource = "edge" | "site" | "unattributed";
  *  `edge` caller, `site:<address>` for a `site` caller, and a fixed word for an
  *  `unattributed` one. The prefix puts every site key in a keyspace of its own,
  *  so it cannot collide with a real address (no IP literal starts with `s`,
- *  which is not a hex digit), and the fixed word cannot be an address either. */
+ *  which is not a hex digit), and the fixed word cannot be an address either.
+ *  An `unattributed` caller also says why, for the log and never the response. */
 export interface __CallerIdentity {
   source: __CallerSource;
   key: string;
+  detail?: __UnattributedDetail;
 }
+
+/** Why `X-Forwarded-For` named nobody. None of it is the value itself. */
+export type __UnattributedReason =
+  | "absent"
+  | "too-long"
+  | "first-entry-not-an-ip"
+  | "unspecified-or-loopback";
+
+export interface __UnattributedDetail {
+  reason: __UnattributedReason;
+  /** Length of the header, 0 when absent. */
+  forwardedLength: number;
+  /** For `first-entry-not-an-ip`, a coarse class of what the first entry looked like. */
+  shape?: string;
+}
+
+export type __ForwardedParse = { ok: true; ip: string } | ({ ok: false } & __UnattributedDetail);
 
 const SITE_KEY_PREFIX = "site:";
 const UNATTRIBUTED_KEY = "unattributed";
@@ -675,29 +698,84 @@ const MAX_IP_LITERAL_LENGTH = 45;
 /** Dotted-quad with each octet 0 to 255 and no leading zero, which some parsers read as octal. */
 const IPV4_LITERAL_RE =
   /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
+/** What the URL parser makes of an IPv4-mapped IPv6 address: two hex groups after `::ffff:`. */
+const MAPPED_IPV4_RE = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/;
 
 /**
- * An IP literal in canonical form, or null. IPv4 is matched strictly; IPv6 is
+ * An IP literal in canonical form, or null. IPv4 is matched strictly. IPv6 is
  * validated and compressed by the URL parser, so `2001:DB8:0:0::1` and
- * `2001:db8::1` are one key. Anything else (a host name, a port, brackets, a
- * zone id, an over-long string, `unknown`) is null.
+ * `2001:db8::1` are one key, and an IPv4-mapped address is turned back into the
+ * dotted address it wraps, so `::ffff:203.0.113.7` and `203.0.113.7` are one
+ * visitor too. Anything else (a host name, a port, brackets, a zone id, an
+ * over-long string, `unknown`) is null.
+ *
+ * The 45-character bound and the character pre-check say nothing the URL parser
+ * would not also refuse; they keep the parser from ever seeing an arbitrary
+ * string, which is the point of having them.
  */
 function canonicalIpLiteral(candidate: string): string | null {
   if (candidate.length === 0 || candidate.length > MAX_IP_LITERAL_LENGTH) return null;
   if (IPV4_LITERAL_RE.test(candidate)) return candidate;
   if (!candidate.includes(":") || !/^[0-9a-fA-F:.]+$/.test(candidate)) return null;
+  let canonical: string;
   try {
-    return new URL(`http://[${candidate}]/`).hostname.slice(1, -1);
+    canonical = new URL(`http://[${candidate}]/`).hostname.slice(1, -1);
   } catch {
     return null;
   }
+  const mapped = MAPPED_IPV4_RE.exec(canonical);
+  if (!mapped) return canonical;
+  const high = Number.parseInt(mapped[1] as string, 16);
+  const low = Number.parseInt(mapped[2] as string, 16);
+  return `${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`;
 }
 
-/** The first entry of an `X-Forwarded-For` value as a canonical IP literal, or null. */
-export function __firstForwardedIp(header: string | null | undefined): string | null {
-  if (!header || header.length > MAX_FORWARDED_HEADER_LENGTH) return null;
+/** The addresses a forwarding caller writes when it has no visitor to name: this host
+ *  and this machine. Counting thousands of visitors in one `site:` key would be a
+ *  silent bucket of everyone, so they are treated as no address at all. */
+function isUnspecifiedOrLoopback(ip: string): boolean {
+  return ip === "0.0.0.0" || ip === "::" || ip === "::1" || ip.startsWith("127.");
+}
+
+/** A coarse class of an entry that is not an address, never the entry. */
+function shapeOf(entry: string): string {
+  if (entry === "") return "empty";
+  if (/[[\]]/.test(entry)) return "bracketed";
+  if (entry.includes("%")) return "zone-id";
+  if (/^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(entry)) return "ipv4-with-port";
+  if (/^[0-9a-fA-F:.]+$/.test(entry))
+    return entry.includes(":") ? "malformed-ipv6" : "malformed-ipv4";
+  if (/^[A-Za-z_-]+$/.test(entry)) return "word";
+  return "other";
+}
+
+/**
+ * Read the first entry of an `X-Forwarded-For` value: its canonical address, or
+ * the reason there is none. Only the first entry is read, and an unreadable one
+ * is not skipped to reach a later one.
+ */
+export function __parseForwardedFor(header: string | null | undefined): __ForwardedParse {
+  if (!header) return { ok: false, reason: "absent", forwardedLength: 0 };
+  const forwardedLength = header.length;
+  if (forwardedLength > MAX_FORWARDED_HEADER_LENGTH) {
+    return { ok: false, reason: "too-long", forwardedLength };
+  }
   const comma = header.indexOf(",");
-  return canonicalIpLiteral((comma < 0 ? header : header.slice(0, comma)).trim());
+  const first = (comma < 0 ? header : header.slice(0, comma)).trim();
+  const ip = canonicalIpLiteral(first);
+  if (ip === null) {
+    return { ok: false, reason: "first-entry-not-an-ip", forwardedLength, shape: shapeOf(first) };
+  }
+  if (isUnspecifiedOrLoopback(ip)) {
+    return { ok: false, reason: "unspecified-or-loopback", forwardedLength };
+  }
+  return { ok: true, ip };
+}
+
+/** The first entry of an `X-Forwarded-For` value as a canonical address, or null. */
+export function __firstForwardedIp(header: string | null | undefined): string | null {
+  const parsed = __parseForwardedFor(header);
+  return parsed.ok ? parsed.ip : null;
 }
 
 /**
@@ -710,9 +788,10 @@ export function __readCallerIdentity(
   xForwardedFor: string | null | undefined,
 ): __CallerIdentity {
   if (cfConnectingIp) return { source: "edge", key: cfConnectingIp };
-  const visitor = __firstForwardedIp(xForwardedFor);
-  if (visitor) return { source: "site", key: `${SITE_KEY_PREFIX}${visitor}` };
-  return { source: "unattributed", key: UNATTRIBUTED_KEY };
+  const parsed = __parseForwardedFor(xForwardedFor);
+  if (parsed.ok) return { source: "site", key: `${SITE_KEY_PREFIX}${parsed.ip}` };
+  const { ok: _ok, ...detail } = parsed;
+  return { source: "unattributed", key: UNATTRIBUTED_KEY, detail };
 }
 
 /** The identity of a request. Shared by the middleware and the per-route budgets. */
@@ -721,23 +800,31 @@ function callerIdentityOf(headers: { get(name: string): string | null }): __Call
 }
 
 /**
- * One log line per isolate per window for each caller source that is not the
- * ordinary one. It is the way to see, with `wrangler tail`, that the website's
- * calls arrive as `site` (the property ADR 0098 rests on and cannot prove
- * before production), and to be told when a caller stops forwarding a visitor.
- * Never per request, and never the address.
+ * One line per isolate per window for each (caller source, bucket kind) that is
+ * not an ordinary public request. It is the way to see, with `wrangler tail`,
+ * that the website's calls arrive as `site` (the property ADR 0098 rests on and
+ * cannot prove before production), and to be told when a caller stops forwarding
+ * a visitor, on whichever bucket that happens. An unattributed line says why,
+ * by reason, header length and a coarse shape. Never per request, and never an
+ * address or the value of a header.
  */
-function logIdentityOnce(source: "site" | "unattributed", path: string): void {
-  logOncePerWindow(`identity:${source}`, () => {
-    if (source === "site") {
+function logIdentityOnce(
+  caller: __CallerIdentity,
+  keyKind: string,
+  maxRequests: number,
+  path: string,
+): void {
+  if (caller.source === "edge") return;
+  logOncePerWindow(`identity:${caller.source}:${keyKind}`, (suppressed) => {
+    if (caller.source === "site") {
       console.log(
         "[rate-limit] counting a request without CF-Connecting-IP by its forwarded visitor",
-        { path },
+        { keyKind, maxRequests, path, suppressed },
       );
     } else {
       console.warn(
-        "[rate-limit] request with neither CF-Connecting-IP nor a valid X-Forwarded-For; counted in the shared unattributed bucket",
-        { path },
+        "[rate-limit] request with neither CF-Connecting-IP nor a usable X-Forwarded-For; counted in a shared bucket",
+        { keyKind, maxRequests, path, suppressed, ...caller.detail },
       );
     }
   });
@@ -955,7 +1042,6 @@ export async function rateLimiter(
     c.req.header("CF-Connecting-IP"),
     c.req.header("X-Forwarded-For"),
   );
-  if (caller.source !== "edge") logIdentityOnce(caller.source, path);
 
   // `c.executionCtx.waitUntil`, or undefined outside a real Worker
   // invocation -- Hono throws on the getter then, the same fallback
@@ -980,6 +1066,7 @@ export async function rateLimiter(
     caller.key,
     caller.source,
   );
+  logIdentityOnce(caller, keyKind, maxRequests, path);
 
   // Token buckets hash the raw bearer; the auth middleware later
   // re-hashes the same value to look the user up in D1. IP buckets use
@@ -1077,7 +1164,7 @@ export async function rateLimiter(
     }
 
     if (count >= maxRequests) {
-      const refused = refusal(keyKind, maxRequests, state, now);
+      const refused = refusal(keyKind, maxRequests, state, now, caller.source);
       return c.json(refused.body, 429, refused.headers);
     }
 
@@ -1090,6 +1177,7 @@ export async function rateLimiter(
     c.header("X-RateLimit-Limit", maxRequests.toString());
     c.header("X-RateLimit-Remaining", (maxRequests - newCount).toString());
     c.header("X-RateLimit-Bucket", keyKind);
+    c.header("X-RateLimit-Caller", caller.source);
   } catch (error) {
     // Fail open so a cache outage doesn't block all traffic, but emit a
     // structured log (once per window per bucket kind per isolate, see
@@ -1174,13 +1262,15 @@ export async function checkDataMissBudget(
   // The same identity the middleware uses, so a visitor forwarded by the website
   // is charged to their own miss budget and an unattributed caller to one shared
   // budget, not to a fresh random one.
+  const caller = callerIdentityOf(request.headers);
   return consumeKeyedBudget(
     env,
     request,
     {
       kind: DATA_MISS_BUCKET_KIND,
-      key: callerIdentityOf(request.headers).key,
+      key: caller.key,
       maxRequests: DATA_MISS_MAX_REQUESTS,
+      caller: caller.source,
     },
     waitUntil,
   );
@@ -1233,7 +1323,7 @@ export async function checkPrivateGrantBudget(
 async function consumeKeyedBudget(
   env: Pick<Bindings, "ENVIRONMENT" | "TEST_BYPASS_TOKEN">,
   request: Request,
-  bucket: { kind: string; key: string; maxRequests: number },
+  bucket: { kind: string; key: string; maxRequests: number; caller?: __CallerSource },
   waitUntil: ((work: Promise<unknown>) => void) | undefined,
 ): Promise<DataMissBudgetOutcome> {
   // Same narrower check as `rateLimiter`'s dev bypass, deliberately: staging
@@ -1255,7 +1345,7 @@ async function consumeKeyedBudget(
     const state = await readCounterRecord(cached, now);
 
     if (state.count >= bucket.maxRequests) {
-      const refused = refusal(bucket.kind, bucket.maxRequests, state, now);
+      const refused = refusal(bucket.kind, bucket.maxRequests, state, now, bucket.caller);
       return {
         allowed: false,
         response: new Response(JSON.stringify(refused.body), {
