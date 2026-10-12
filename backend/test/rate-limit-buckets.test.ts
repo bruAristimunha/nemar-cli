@@ -83,7 +83,7 @@ describe("__selectBucket", () => {
     // One AUTH_PATHS entry covers both because the matcher treats entries as
     // prefixes. Asserted on the SUB-PATH as well as the entry itself: if that
     // prefix behaviour ever changes, /auth/email/verify/request silently
-    // falls to the 500/min IP bucket and a code-mailing endpoint loses its
+    // falls to the 1000/min IP bucket and a code-mailing endpoint loses its
     // floor.
     for (const path of ["/auth/email/verify", "/auth/email/verify/request"]) {
       const sel = __selectBucket(path, null, "10.0.0.1");

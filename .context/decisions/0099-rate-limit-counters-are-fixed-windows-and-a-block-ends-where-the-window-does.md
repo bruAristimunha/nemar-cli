@@ -37,6 +37,8 @@ It does not supersede ADR 0098, whose other decisions stand whether or not this 
    A record whose window has ended is a new window even if the cache has not dropped it yet.
    An end more than one window away (a skewed clock, a damaged record) is cut to one window.
    A count that is not a finite number above zero is zero, and a body that is not JSON is replaced instead of failing the bucket open.
+   The repair is reported, not silent: one log line per window per bucket kind and kind of damage (`unparseable`, `bad-count`, `bad-end`), never the record.
+   A few seconds of clock difference between isolates is cut to one window and is not called damage.
 
 ## Consequences
 

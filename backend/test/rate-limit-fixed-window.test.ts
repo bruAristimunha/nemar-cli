@@ -1,12 +1,10 @@
 /**
- * The counter is a fixed window (#1709, ADR 0098).
+ * The counter is a fixed window (#1709, ADR 0099).
  *
- * It used to rewrite its record with a fresh full window on every allowed
- * request, so the window slid: a pool that never went quiet for a whole window
- * was refused for about a minute after every `cap / rate` seconds, whatever the
- * cap. Measured with the real limiter, a steady 5 requests a second against a
- * cap of 500 was refused 36.5 percent of the time and 8 a second 47.9 percent,
- * which is the 40 percent seen in production.
+ * A bucket's window starts with the first request that finds none and ends 60
+ * seconds later; an allowed request writes back with the time that remains, a
+ * refusal writes nothing, and a block ends where the window does. A rate below the
+ * cap per window is therefore never refused, whatever the rate.
  *
  * Driven through the real Hono app and the real limiter against the shared
  * in-memory Cache double, with one controllable clock that the limiter and the

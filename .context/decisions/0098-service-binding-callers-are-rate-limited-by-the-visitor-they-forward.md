@@ -33,13 +33,21 @@ The Cloudflare account is the trust boundary, as in ADR 0078, and no secret head
    Nothing changes for a request that carries it.
 2. **Without it, the first entry of `X-Forwarded-For` names the visitor if it is a valid IP literal.**
    IPv4 is matched strictly: four octets up to 255, no leading zeros.
-   IPv6 is validated and canonicalized by the URL parser, so one visitor is one key however the address is written.
+   IPv6 is validated and canonicalized by the URL parser, so one visitor is one key however the address is written,
+   and an IPv4-mapped address is the IPv4 visitor it wraps.
    A header longer than 512 characters, an entry longer than 45, a host name, a port, brackets, a zone id, `unknown` and an empty value are not addresses.
+   Neither are the placeholders a caller writes when it has no visitor to name (`0.0.0.0`, `::`, `127.0.0.0/8`, `::1`):
+   counting them would put thousands of visitors in one `site:` key, so they are treated as no address at all.
    Only the first entry is read, and an unreadable first entry is not skipped to reach a later one.
 3. **A visitor so named is counted in `site-ip`, keyed `site:<address>`.**
    The prefix is a keyspace of its own: no IP literal starts with `s`,
    so a site key can never equal a public caller's key, and exhausting one never touches the other.
-   The cap is 2000 per window, sized to the heaviest page the website renders (eleven API calls: one search and ten hydrations).
+   The cap is 2000 per window.
+   A default Discover page costs eleven API calls (one search and up to ten hydrations of `GET /datasets/:id`), so 2000 is about 180 such views, three a second from one address.
+   The largest page the website can render today, `page_size=100`, hydrates every id in its slice, about 101 calls, and spends the whole allowance in about 19 views:
+   a visitor or a crawler that loads such pages faster than one every three seconds reaches the cap inside a window.
+   The number stays, because the goal for this traffic is that the data gets found and the bucket is a floor against a runaway loop, not a quota;
+   capping what one page hydrates is the website's to decide.
    It is never below the anonymous cap `MAX_REQUESTS`,
    because a visitor who reaches the API through the website must not be treated more strictly than one who reaches it directly; a test pins that relation.
    The response carries `X-RateLimit-Bucket: site-ip`.
@@ -48,10 +56,14 @@ The Cloudflare account is the trust boundary, as in ADR 0078, and no secret head
    The public network cannot produce such a request, so it is a caller inside the account that did not say who it acts for.
    On the anonymous path it is counted in `site-unattributed`, capped at 20,000 per window, far above the whole website's rate.
    On the strict, data and Neurobagel paths it shares the bucket of its kind, at that bucket's own cap.
-   Pooling rather than leaving it unlimited makes a broken forward visible and bounded:
-   the header `X-RateLimit-Bucket: site-unattributed` says so, and the limiter logs one line per window per isolate.
-   It also means a sign-in route keeps a floor instead of silently losing it,
-   and that a zone setting which stripped `CF-Connecting-IP` from public traffic would pool that traffic rather than switch the limiter off.
+   Pooling rather than leaving it unlimited makes a broken forward visible and bounded.
+   Every answer carries `X-RateLimit-Caller: edge | site | unattributed`, which says so on every bucket, including the strict, data and Neurobagel buckets whose `X-RateLimit-Bucket` keeps the same name for every source.
+   The limiter logs one line per window per isolate for each bucket an unattributed or site caller reaches, naming the bucket and its cap.
+   An unattributed line also says why (`absent`, `too-long`, `first-entry-not-an-ip` with a coarse shape, or `unspecified-or-loopback`) and the header's length, never its value.
+   Pooling also means a sign-in route keeps a floor instead of silently losing it.
+   If a zone setting stripped `CF-Connecting-IP` from public traffic, that traffic would be pooled rather than switch the limiter off, but only if the setting stripped `X-Forwarded-For` as well:
+   one that removed only `CF-Connecting-IP` would let a public client's own `X-Forwarded-For` choose its bucket, which is decision 1 failing.
+   Nothing in this repository can see such a setting, so it is listed here as a thing to check if the zone's header handling ever changes.
 5. **Everything else is unchanged.**
    The strict, data, Neurobagel and data-miss buckets keep their caps; only their key differs for a site or unattributed caller,
    so a forwarded visitor gets ten sign-in requests of their own (the address half of #1354).
@@ -60,13 +72,13 @@ The Cloudflare account is the trust boundary, as in ADR 0078, and no secret head
    The website sets it to the address in its own `CF-Connecting-IP` and replaces whatever the visitor sent.
    The first entry is trusted, so a header copied from the browser would let a visitor choose their bucket.
    A caller with no address to give omits the header and lands in the shared bucket, visibly.
-7. **The counter is unchanged, and it is the larger part of the cause.**
-   Each allowed request refreshes the counter's expiry, so a cap bounds the requests between two quiet gaps of a window, not the requests in any minute.
-   A pool that never goes quiet for 60 seconds is therefore refused for about a minute after every `cap / rate` seconds, whatever the cap.
-   Measured in process with the real limiter and an injected clock, a steady 5 requests a second against a cap of 500 is refused 36.5 percent of the time and 8 a second 47.9 percent,
+7. **The counter's window is fixed, and that is the larger part of the cure: ADR 0099, in the same change.**
+   The counter used to refresh its expiry on every allowed request, so a cap bounded the requests between two quiet gaps of a window, not the requests in any minute.
+   A pool that never went quiet for 60 seconds was refused for about a minute after every `cap / rate` seconds, whatever the cap.
+   Measured in process with the real limiter and an injected clock, a steady 5 requests a second against a cap of 500 was refused 36.5 percent of the time and 8 a second 47.9 percent,
    which matches the 40 percent observed on 2026-10-11.
-   Making the window fixed is a separate decision and is not made here.
-   It matters more than any cap number, because raising a cap only moves the refusal rate along the same curve.
+   ADR 0099 makes the window fixed, with its measurements and its cost.
+   It matters more than any cap number, because raising a cap only moved the refusal rate along the same curve.
 
 ## Consequences
 
@@ -80,15 +92,27 @@ The Cloudflare account is the trust boundary, as in ADR 0078, and no secret head
   and a caller that sets the header itself is believed, as it is for any header.
   Local workerd is not the Cloudflare edge, and the development Worker bypasses the limiter entirely (`ENVIRONMENT=development`),
   so the keying can be observed only on the production Worker.
-- **How to verify after the first deploy.**
-  Tail the production API Worker while a few website pages load:
+- **How to verify after the first deploy, as a gate and not a glance.**
+  The Cache API's `put` "resolves to undefined regardless of whether the cache successfully stored the response", and Cloudflare says nothing about a call that arrived over a service binding.
+  If the counter silently does not persist there, every answer reads `site-ip` with `X-RateLimit-Remaining` at 1999 for ever and nothing is ever limited, with no log line and no failure.
+  So the property that must be shown, not assumed, is that **two sequential calls from one visitor over the binding show `X-RateLimit-Remaining` falling**.
+  The website logs `remaining` on its first call and logs one error per isolate, `the API's rate-limit count did not move`, if five calls for a visitor inside one window leave it unchanged (website pull request #450).
+  Read that line, or the header by hand, before treating the deploy as done; "no log means fine" is not evidence.
+  Then tail the production API Worker while a few website pages load:
   `bunx cfman wrangler --account sccn tail nemar-api --search "[rate-limit]"`.
-  A line `counting a request without CF-Connecting-IP by its forwarded visitor` (once per isolate per minute) means the hypothesis holds.
-  A warning `request with neither` means the website is not forwarding a visitor, and its responses carry `X-RateLimit-Bucket: site-unattributed`.
+  A line `counting a request without CF-Connecting-IP by its forwarded visitor` (once per isolate per minute per bucket) means the hypothesis about the missing header holds.
+  A warning `request with neither` means the website is not forwarding a usable visitor, and says why;
+  its responses carry `X-RateLimit-Caller: unattributed`.
   No such line, with the website working, means a binding call carries a `CF-Connecting-IP` after all:
   its requests are in `ip`, nothing has regressed and nothing has improved, and this ADR needs an amendment.
-  Any website response or log that shows the API's `X-RateLimit-Bucket` should read `site-ip` with a falling `X-RateLimit-Remaining`;
-  a call with no such header at all means the Cache API failed for it (the limiter fails open and logs a cache fault).
+- **What an absent header means, and what it does not.**
+  The `X-RateLimit-*` headers are set on the finished response, so a handler that builds its own `Response` keeps them.
+  An answer without them was not counted: the development Worker, a bypass, or a cache fault (which is logged, once per window per bucket kind).
+  They are not proof of a count either: the data plane hands its write to `waitUntil`, so its answer states a count whether or not the write lands, and a failing `put` there leaves `X-RateLimit-Remaining` unchanged while the line is logged.
+  The falling `X-RateLimit-Remaining` above is the evidence; the header's presence alone is not.
+- **The limiter reports its own faults and does not wait on the cache for ever.**
+  A repaired counter record, a refusal, and a cache fault are each logged once per window per bucket kind (with how many lines were swallowed), by name and never with an address or a message.
+  Every wait on the Cache API is bounded at 500 ms and then fails open with a logged fault, so a stalled cache costs a request at most that.
 - Any Worker in the account that binds to the default entrypoint can name any visitor, so it can spend a visitor's `site:` allowances.
   It cannot touch a public caller's buckets, which is why the keyspaces are apart,
   and ADR 0078 rule 4 already makes deploy access to the account access to this surface.
@@ -115,13 +139,13 @@ The Cloudflare account is the trust boundary, as in ADR 0078, and no secret head
   going higher means raising the token cap in a decision of its own.
   `/mcp` shares this bucket, so its ceiling doubles with it.
 - **Leaving a request with no address unlimited, as it is today.**
-  Rejected: it silently turns the limiter off, for the strict paths too, and would do so for everyone if a zone setting stripped `CF-Connecting-IP`.
+  Rejected: it silently turns the limiter off, for the strict paths too, and would do so for everyone if a zone setting stripped `CF-Connecting-IP` and `X-Forwarded-For`.
 - **Forwarding the visitor as `X-Real-IP` over the public network.**
   Cloudflare documents that on a same-zone Worker subrequest `CF-Connecting-IP` reflects `x-real-ip`, which a Worker can set.
   Not used: it keeps the call on the public network, depends on behavior this repository cannot test,
   and gives the API a value it cannot tell from a real edge address.
 - **Fixing the window in the same change.**
-  Deferred, as decision 7 says: it changes every bucket and deserves its own review.
+  Done, in a commit of its own and with its own ADR (0099), because it changes every bucket and deserves its own review.
 - **Keying the website's strict buckets on the session cookie (#1354, option 1).**
   Not done: the address is the key everywhere else, and a cookie-derived key needs its own forgery analysis.
 
@@ -134,6 +158,6 @@ The Cloudflare account is the trust boundary, as in ADR 0078, and no secret head
   "In same-zone Worker subrequests, the value of `CF-Connecting-IP` reflects the value of `x-real-ip`",
   cross-zone subrequests get a fixed Worker address, and nothing is said of service bindings.
 - Cloudflare, "Cache API", <https://developers.cloudflare.com/workers/runtime-apis/cache/>, read 2026-10-12:
-  the cache does not replicate outside the originating data center.
+  the cache does not replicate outside the originating data center, and `put()` "resolves to `undefined` regardless of whether the cache successfully stored the response".
 - The counter, measured: the real `rateLimiter` driven at a steady rate against a cap of 500 for 30 simulated minutes,
   refused 0 percent of requests at 0.2 a second, 3.2 at 0.5, 9.8 at 1, 16.7 at 2, 36.5 at 5 and 47.9 at 8.

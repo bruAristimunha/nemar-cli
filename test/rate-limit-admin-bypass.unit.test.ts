@@ -1,8 +1,8 @@
 /**
  * Unit tests for the bucket-selector portion of the rate-limit middleware.
  * The admin bypass itself depends on D1 + caches.default and is covered by
- * post-deploy assertion (an admin token must succeed at >500/60s and a
- * non-admin token must 429 at the 501st call); structural tests here pin
+ * post-deploy assertion (an admin token must succeed at >1000/60s and a
+ * non-admin token must 429 at the 1001st call); structural tests here pin
  * the selector logic that decides which bucket a request lands in.
  */
 

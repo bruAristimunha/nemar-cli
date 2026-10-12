@@ -5,7 +5,7 @@
  * Cache API has no daily limits and is designed for this use case.
  *
  * Bucket policy:
- *   - Unauthenticated requests are keyed by IP and capped at 500/60s
+ *   - Unauthenticated requests are keyed by IP and capped at 1000/60s
  *     (`MAX_REQUESTS`).
  *   - Authenticated requests are keyed by the SHA-256 hash of the
  *     bearer token and capped at 1000/60s (`TOKEN_MAX_REQUESTS_AUTHED`).
@@ -35,11 +35,13 @@
  *     buckets), and a request with neither is counted in one shared bucket.
  *     `X-Forwarded-For` never chooses the bucket of a request that carries
  *     `CF-Connecting-IP`.
- *   - Every counter is a fixed window (`__CounterState`): it starts with the first
- *     request that finds none and ends 60 seconds later, `Retry-After` and
- *     `X-RateLimit-Reset` say when, and a busy client is refused until then and
- *     no longer. Before #1709 the window slid, which refused a pool for about a
- *     minute after every `cap / rate` seconds.
+ *   - Every counter is a fixed window (`__CounterState`, ADR 0099): it starts with
+ *     the first request that finds none and ends 60 seconds later, `Retry-After`
+ *     and `X-RateLimit-Reset` say when, and a busy client is refused until then
+ *     and no longer.
+ *   - Every answer says how the caller was identified in `X-RateLimit-Caller`
+ *     (`edge`, `site` or `unattributed`), on the bucket header's side, because the
+ *     strict, data and Neurobagel buckets keep their names for every source.
  */
 
 import type { Context, Next } from "hono";
@@ -60,13 +62,12 @@ const WINDOW_SIZE = 60; // seconds
 // adding Cache-Control to the three dataset GET endpoints (which is the
 // real architectural fix; this cap raise is defense-in-depth).
 //
-// Bumped again 500 → 1000 in #1709 (ADR 0098), as a change of its own so it can be
-// reverted without touching the site-ip work below. The website's ordinary traffic
-// no longer rides this bucket (it is counted per visitor in `site-ip`); this is
-// defense in depth for the callers that still reach the API as one client: the
-// website when it cannot use its binding (a Pages preview, local development, or
-// if a binding call turns out to carry an address after all), the docs gate's
-// Pages Function, and shared CI runners.
+// 1000 since #1709 (ADR 0098), up from 500. The website's ordinary traffic does not
+// ride this bucket (it is counted per visitor in `site-ip`); this is defense in
+// depth for the callers that still reach the API as one client: the website when
+// it cannot use its binding (a Pages preview, local development, or if a binding
+// call turns out to carry an address after all), the docs gate's Pages Function,
+// and shared CI runners.
 //
 // What a counted request costs: one Worker invocation and, for the catalog reads
 // that dominate, two or three D1 reads (a page of rows and its count; a search adds
@@ -86,12 +87,9 @@ const WINDOW_SIZE = 60; // seconds
 // Why 1000 and not more. A token holder must never be limited more strictly than an
 // anonymous caller. `TOKEN_MAX_REQUESTS_AUTHED` is 1000, so this cannot go
 // above it without raising that one too, which is a separate decision; a test pins
-// the relation. The number is not what made the website's pool trip it. Until the
-// window was made fixed (`__CounterState`) each allowed request refreshed the
-// counter's expiry, so a pool that never went quiet for 60 seconds was refused for
-// about a minute after every `cap / rate` seconds: at six requests a second about
-// 42 percent at 500 and 26 at 1000. Now a rate below the cap per window is never
-// refused. ADR 0098 gives the measurements.
+// the relation. The number is not what made the website's pool trip it: the counter
+// is a fixed window (`__CounterState`), so a rate below the cap per window is never
+// refused, whatever the cap. ADR 0099 has the measurements.
 const MAX_REQUESTS = 1000;
 // The website's own bucket, per forwarded visitor (#1709, ADR 0098). The website
 // reaches this Worker through a service binding, which carries no
@@ -100,13 +98,15 @@ const MAX_REQUESTS = 1000;
 // The pool problem MAX_REQUESTS describes does not arise: each key is one
 // visitor, not every visitor behind a handful of Cloudflare egress addresses.
 //
-// Sized to the heaviest page the website renders. A search page makes one search
-// call and up to ten `GET /datasets/:id` hydrations, eleven calls in all, so 2000
-// covers about 180 such page views in a window, three a second from one address:
-// more than a person produces, and the rate at which a crawler is a load problem
-// for the website itself rather than for this API. The goal for this traffic,
-// robots included, is that the data gets found, so the number is generous; the
-// bucket stays a floor against a runaway loop, not a quota.
+// What a page costs, and so what the number buys. A default Discover page makes
+// one search call and up to ten `GET /datasets/:id` hydrations, eleven calls, so
+// 2000 covers about 180 such page views in a window, three a second from one
+// address: more than a person produces. The largest page the website can render
+// today (`page_size=100`) hydrates every id in its slice, about 101 calls, and
+// spends the whole allowance in about 19 views, so a visitor or a crawler loading
+// such pages faster than one every three seconds reaches the cap inside a window.
+// The goal for this traffic, robots included, is that the data gets found, so the
+// number is generous, and it stays a floor against a runaway loop, not a quota.
 //
 // NEVER BELOW MAX_REQUESTS. A visitor who reaches the API through the website must
 // not be treated more strictly than a caller who reaches it directly, and a test
@@ -119,16 +119,17 @@ const SITE_IP_MAX_REQUESTS = 2000;
 // A request with neither `CF-Connecting-IP` nor a usable `X-Forwarded-For`. The
 // public network cannot produce one (Cloudflare always sets the first), so it is a
 // caller inside the account that did not say who it acts for: today only the
-// website, if its forwarding broke. It used to get a fresh random bucket per
-// request, which is no bucket at all and silently turned the limiter off for the
-// strict buckets too. Now every such request shares ONE bucket per kind, so the
-// failure is bounded and visible (`X-RateLimit-Bucket: site-unattributed`, and a
-// log line once per window) rather than silent.
+// website, if its forwarding broke. Every such request shares ONE bucket per kind,
+// not a fresh random one each, which would be no bucket at all and would switch the
+// limiter off for the strict buckets too. So the failure is bounded and visible:
+// `X-RateLimit-Caller: unattributed` on every answer, and a log line per bucket
+// per window that says why the forward was unusable.
 //
 // The shared bucket is the whole site's traffic at once, so its cap is far above
 // any one visitor's: 20,000 is about 333 requests a second, some fifty times the
 // six or so a second that the 2026-10-11 production sample implies for the whole
-// website (a 40 percent refusal rate at a cap of 500), and still bounds a loop. The
+// website (a 40 percent refusal rate against the old sliding counter at a cap of
+// 500, ADR 0099), and still bounds a loop. The
 // strict, data and Neurobagel buckets keep their own caps for unattributed
 // callers, so a broken forward on a sign-in route throttles at the strict cap,
 // the same behavior the route had behind the shared egress pool (#1354), instead
@@ -250,23 +251,22 @@ export const __resetIdentityLogForTests = __resetRateLimitLogsForTests;
 
 /**
  * The state of a bucket's CURRENT window, as its cache record stores it
- * (#1709, ADR 0098). The window is FIXED: it starts with the first request that
+ * (#1709, ADR 0099). The window is FIXED: it starts with the first request that
  * finds no live window and ends `WINDOW_SIZE` seconds later, and nothing that
  * happens inside it moves the end. `windowEnd` is epoch milliseconds.
  *
- * The counter used to rewrite its record with a fresh full window on every
- * allowed request, so the window slid: a pool that never went quiet for a whole
- * window was refused for about a minute after every `cap / rate` seconds, whatever
- * the cap, and that was most of the 40 percent of refusals in #1709. Now a record
- * is written back with the time that REMAINS in its window as the cache `max-age`,
- * so the cache drops it at the end and a block ends at a boundary the client can
- * compute from `Retry-After`.
+ * A record is written back with the time that REMAINS in its window as the cache
+ * `max-age`, so the cache drops it at the end and a block ends at a boundary the
+ * client can compute from `Retry-After`. Refreshing the expiry on every allowed
+ * request instead would make the window slide, and a client that never went quiet
+ * for a whole window would be refused for about a minute after every `cap / rate`
+ * seconds, whatever the cap.
  *
  * The cost of a fixed window is that a client can spend a full cap at the end of
  * one window and another at the start of the next, up to twice the cap across the
  * boundary. The cap is a floor against a runaway loop, not a quota, and the
- * sustained ceiling is the same cap per window as before; ADR 0098 records why
- * that is acceptable.
+ * sustained ceiling is the cap per window; ADR 0099 records why that is
+ * acceptable.
  */
 export interface __CounterState {
   count: number;
@@ -537,8 +537,8 @@ const DATA_PATH_RE = /^\/(nemar\/)?data(\/|$)/;
 // make every novel one cost a D1 lookup (the hole `anonymousSurface` below documents
 // for /mcp). And the one legitimate client, the node's loader, fetches an index and
 // then up to three files per dataset in one run: about 2,400 requests for 800
-// datasets, which the 500/min anonymous floor would refuse halfway through a first
-// load. The loader is sequential and fetches at most a few requests a second, so
+// datasets, which the 1,000/min anonymous floor would refuse about 58 percent of
+// (2,400 requests against 1,000) in a first load. The loader is sequential and fetches at most a few requests a second, so
 // 1,200/min is above any rate it sustains and still bounds a runaway caller.
 const NEUROBAGEL_PATH_RE = /^\/neurobagel(\/|$)/;
 const NEUROBAGEL_MAX_REQUESTS = 1200;
@@ -569,7 +569,7 @@ const AUTH_PATHS = [
   "/auth/code/verify",
   "/auth/logout",
   // Settings self-service (#912/#911): cookie-authenticated mutations.
-  // Without these entries they'd fall to the generic ip bucket (500/min);
+  // Without these entries they'd fall to the generic ip bucket (1000/min);
   // the email-change request in particular reveals address collisions to
   // the (authenticated) caller, so the 10/min floor is load-bearing.
   "/auth/profile",
@@ -603,7 +603,7 @@ const AUTH_PATHS = [
   // code). At that cadence 10 polls fit inside the strict bucket's 60s
   // window and the 11th trips it, about 50 seconds in -- not the "third
   // poll" a looser count might suggest. In practice this route lands in
-  // the plain `ip` bucket (500/min), not `token`: the CLI has not
+  // the plain `ip` bucket (1000/min), not `token`: the CLI has not
   // collected a key yet while it is polling, so it holds no bearer to
   // authenticate a request with. Its own per-row 5-second floor
   // (`DEVICE_POLL_SQL`) answers `slow_down` to anything faster than that
@@ -637,11 +637,11 @@ const AUTH_PATHS = [
   // bucket. One admin clicking through the dozen operations pages would sit at
   // the strict cap on their own, and two browsing at once would trip it, which
   // would read as "the gate is broken" rather than "you are rate limited". It
-  // rides the generic ip bucket (500/min) instead: the route mints nothing,
+  // rides the generic ip bucket (1000/min) instead: the route mints nothing,
   // reveals nothing beyond whether one 256-bit value is a live admin session,
   // and cannot be brute-forced at any rate a bucket would help with. Note the
   // comment on MAX_REQUESTS below -- shared CF egress IPs are why that bucket
-  // is 500 rather than 100 in the first place.
+  // is far above the 100 it started at.
   //
   // `/auth/docs/cli-session` IS here, and unlike the two above it is called by
   // a person's own machine rather than by a Worker, so the per-IP key is a real
@@ -1154,8 +1154,8 @@ export async function rateLimiter(
   const path = c.req.path;
   // Who this request's address names. `CF-Connecting-IP` decides whenever it is
   // present and `X-Forwarded-For` is then never read, so a client cannot choose
-  // its bucket; see `__CallerSource`. A request with neither used to get a random
-  // UUID, a fresh bucket each time, which is no limit at all; it now shares one.
+  // its bucket; see `__CallerSource`. A request with neither shares ONE bucket per
+  // kind; a fresh random one each would be no limit at all.
   const caller = __readCallerIdentity(
     c.req.header("CF-Connecting-IP"),
     c.req.header("X-Forwarded-For"),
