@@ -605,9 +605,9 @@ describe("a damaged or stale record does not wedge a bucket", () => {
     await hit(app, { "X-Forwarded-For": "203.0.113.34" });
     await hit(app, edge("203.0.113.35"), "/auth/login");
     expect(damaged().map((c) => c[1])).toEqual([
-      { keyKind: "ip", damage: "unparseable", suppressed: 0 },
-      { keyKind: "site-ip", damage: "bad-count", suppressed: 0 },
-      { keyKind: "auth-ip", damage: "bad-end", suppressed: 0 },
+      { keyKind: "ip", damage: "unparseable", suppressed: 0, sinceMs: 0 },
+      { keyKind: "site-ip", damage: "bad-count", suppressed: 0, sinceMs: 0 },
+      { keyKind: "auth-ip", damage: "bad-end", suppressed: 0, sinceMs: 0 },
     ]);
     // The repair wrote a good record, so the same buckets are quiet from here on.
     await hit(app, edge("203.0.113.33"));

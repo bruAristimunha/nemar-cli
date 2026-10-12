@@ -8,7 +8,7 @@
  * runtime may quote it in a message).
  */
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { __limits, checkDataMissBudget } from "../src/middleware/rateLimit";
 import type { Bindings } from "../src/types/bindings";
 import { InMemoryCache } from "./helpers/cache";
@@ -157,6 +157,7 @@ describe("refusals are logged once per window per bucket kind", () => {
       maxRequests: __limits.MAX_REQUESTS,
       retryAfter: 30,
       suppressed: 0,
+      sinceMs: 0,
     });
     // A minute later, in another full window: one more line, which says how many
     // refusals the quiet period swallowed.
@@ -183,14 +184,29 @@ describe("refusals are logged once per window per bucket kind", () => {
     await hit(app, viaBinding("203.0.113.91"), "/auth/login");
     await hit(app, {}, "/auth/login");
     expect(refusals().map((c) => c[1])).toEqual([
-      { keyKind: "auth-ip", caller: "edge", maxRequests: 10, retryAfter: 60, suppressed: 0 },
-      { keyKind: "auth-ip", caller: "site", maxRequests: 10, retryAfter: 60, suppressed: 0 },
+      {
+        keyKind: "auth-ip",
+        caller: "edge",
+        maxRequests: 10,
+        retryAfter: 60,
+        suppressed: 0,
+        sinceMs: 0,
+      },
+      {
+        keyKind: "auth-ip",
+        caller: "site",
+        maxRequests: 10,
+        retryAfter: 60,
+        suppressed: 0,
+        sinceMs: 0,
+      },
       {
         keyKind: "auth-ip",
         caller: "unattributed",
         maxRequests: 10,
         retryAfter: 60,
         suppressed: 0,
+        sinceMs: 0,
       },
     ]);
   });
@@ -233,5 +249,74 @@ describe("refusals are logged once per window per bucket kind", () => {
     }
     expect(refusals().length).toBe(1);
     expect(refusals()[0]?.[1]).toMatchObject({ keyKind: "data-miss-ip", retryAfter: 20 });
+  });
+});
+
+describe("a fault line says where the work failed", () => {
+  const phaseOf = () => (faults()[0]?.[1] as { phase?: string; error?: string } | undefined) ?? {};
+
+  test("the lookup", async () => {
+    class MatchFails extends InMemoryCache {
+      async match(): Promise<Response | undefined> {
+        throw new Error("the lookup failed");
+      }
+    }
+    install(new MatchFails());
+    await hit(buildApp(), edge(ADDRESS));
+    expect(phaseOf()).toMatchObject({ phase: "match", error: "Error" });
+  });
+
+  test("the read of the record's body", async () => {
+    class BodyFails extends InMemoryCache {
+      async match(): Promise<Response | undefined> {
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.error(new Error("network connection lost"));
+            },
+          }),
+        );
+      }
+    }
+    install(new BodyFails());
+    await hit(buildApp(), edge(ADDRESS));
+    expect(phaseOf()).toMatchObject({ phase: "read", error: "Error" });
+  });
+
+  test("the write", async () => {
+    install(new PutFailingCache());
+    await hit(buildApp(), edge(ADDRESS));
+    expect(phaseOf()).toMatchObject({ phase: "put" });
+  });
+
+  test("the limiter's own logic is a different phase, so a bug there is not mistaken for the cache", async () => {
+    // The observe-only warning hashes the key before it logs; a platform that cannot
+    // hash makes the limiter itself fail after the cache answered.
+    await h.seed(`ip:${ADDRESS}`, {
+      count: __limits.MAX_REQUESTS,
+      warned: false,
+      windowEnd: T0 + 30_000,
+    });
+    const digest = spyOn(crypto.subtle, "digest").mockImplementation(() => {
+      throw new TypeError("digest is unavailable");
+    });
+    try {
+      const res = await hit(buildApp({ observeOnly: true }), edge(ADDRESS));
+      expect(res.status).toBe(200);
+    } finally {
+      digest.mockRestore();
+    }
+    expect(phaseOf()).toMatchObject({ phase: "decide", error: "TypeError" });
+  });
+
+  test("a line that comes back says how long ago the burst it reports began", async () => {
+    install(new PutFailingCache());
+    const app = buildApp();
+    await hit(app, edge(ADDRESS));
+    await hit(app, edge(ADDRESS));
+    h.clock = T0 + __limits.WINDOW_SIZE * 1000 + 250;
+    await hit(app, edge(ADDRESS));
+    expect(faults()[0]?.[1]).toMatchObject({ suppressed: 0, sinceMs: 0 });
+    expect(faults()[1]?.[1]).toMatchObject({ suppressed: 1, sinceMs: 60_250 });
   });
 });

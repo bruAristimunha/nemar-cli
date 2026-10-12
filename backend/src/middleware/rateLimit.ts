@@ -168,13 +168,14 @@ const logSlots = new Map<string, LogSlot>();
 
 /**
  * Run `emit` at most once per rate-limit window per `key`, per isolate, and hand
- * it the number of calls swallowed since the previous emission, so a line can
- * say how much it is standing for. Every log in this file that a request can
+ * it the number of calls swallowed since the previous emission and how long ago
+ * that was (`sinceMs`, 0 for the first), so a line can say how much it is
+ * standing for: the count is for the PREVIOUS stretch, not the one just opening. Every log in this file that a request can
  * trigger goes through here: during a sustained fault or a flood, one line per
  * kind per minute is the ONE line worth reading, and a line per request buries
  * it. The key space is bounded by the kinds, sources and reasons below.
  */
-function logOncePerWindow(key: string, emit: (suppressed: number) => void): void {
+function logOncePerWindow(key: string, emit: (suppressed: number, sinceMs: number) => void): void {
   const now = Date.now();
   const slot = logSlots.get(key);
   // A clock that went backwards ends the quiet period as well: otherwise a slot
@@ -184,7 +185,7 @@ function logOncePerWindow(key: string, emit: (suppressed: number) => void): void
     return;
   }
   logSlots.set(key, { at: now, suppressed: 0 });
-  emit(slot?.suppressed ?? 0);
+  emit(slot?.suppressed ?? 0, slot ? now - slot.at : 0);
 }
 
 /** The error's class name and nothing else. A cache key is a URL that carries the
@@ -219,6 +220,12 @@ function boundedWait<T>(work: Promise<T>, what: string): Promise<T> {
   return Promise.race([work, stalled]).finally(() => clearTimeout(timer));
 }
 
+/** Where in a counter's work a fault happened: `match` the lookup, `read` the
+ *  record's body, `decide` the limiter's own logic, `put` the write. A `TypeError`
+ *  in `decide` is a limiter bug; the same in `match` or `put` is the runtime
+ *  refusing a call, and the two want different people. */
+type FaultPhase = "match" | "read" | "decide" | "put";
+
 /**
  * Log a Cache API fault (the enforcement path failing open) once per window per
  * bucket kind. One fault is one outage for every request of that kind, and a
@@ -227,13 +234,20 @@ function boundedWait<T>(work: Promise<T>, what: string): Promise<T> {
  * that an outage seen only by one bucket (a failing `put` on the data plane, say)
  * is not hidden behind a different bucket's line.
  */
-function logCacheFault(keyKind: string, route: string | undefined, error: unknown): void {
-  logOncePerWindow(`fault:${keyKind}`, (suppressed) => {
+function logCacheFault(
+  keyKind: string,
+  route: string | undefined,
+  error: unknown,
+  phase: FaultPhase,
+): void {
+  logOncePerWindow(`fault:${keyKind}`, (suppressed, sinceMs) => {
     console.error("[rate-limit] cache failure", {
       keyKind,
       ...(route === undefined ? {} : { route }),
+      phase,
       error: errorName(error),
       suppressed,
+      sinceMs,
     });
   });
 }
@@ -410,11 +424,12 @@ async function readCounterRecord(
   const state = __readCounter(data, now);
   if (state.damage) {
     const damage = state.damage;
-    logOncePerWindow(`damage:${keyKind}:${damage}`, (suppressed) => {
+    logOncePerWindow(`damage:${keyKind}:${damage}`, (suppressed, sinceMs) => {
       console.warn("[rate-limit] repaired a damaged counter record", {
         keyKind,
         damage,
         suppressed,
+        sinceMs,
       });
     });
   }
@@ -462,13 +477,14 @@ function logRefusal(
   retryAfter: number,
   caller: __CallerSource | undefined,
 ): void {
-  logOncePerWindow(`refusal:${caller ?? "account"}:${keyKind}`, (suppressed) => {
+  logOncePerWindow(`refusal:${caller ?? "account"}:${keyKind}`, (suppressed, sinceMs) => {
     console.warn("[rate-limit] refusing", {
       keyKind,
       ...(caller === undefined ? {} : { caller }),
       maxRequests,
       retryAfter,
       suppressed,
+      sinceMs,
     });
   });
 }
@@ -497,10 +513,11 @@ function stampHeaders(c: RateLimitContext, headers: Record<string, string>): voi
     // The answer is the handler's and is good; the headers are a courtesy. Failing
     // here would turn a success into a 500 that `--search "[rate-limit]"` could not
     // find, so it is told once, with the tag, and the response goes out without.
-    logOncePerWindow("stamp", (suppressed) => {
+    logOncePerWindow("stamp", (suppressed, sinceMs) => {
       console.warn("[rate-limit] could not set the rate limit headers on a response", {
         error: errorName(err),
         suppressed,
+        sinceMs,
       });
     });
   }
@@ -995,16 +1012,16 @@ function logIdentityOnce(
   if (caller.source === "edge" || caller.source === "internal") return;
   logOncePerWindow(
     `identity:${caller.source}:${keyKind}:${caller.detail?.reason ?? ""}`,
-    (suppressed) => {
+    (suppressed, sinceMs) => {
       if (caller.source === "site") {
         console.log(
           "[rate-limit] counting a request without CF-Connecting-IP by its forwarded visitor",
-          { keyKind, maxRequests, path, suppressed },
+          { keyKind, maxRequests, path, suppressed, sinceMs },
         );
       } else {
         console.warn(
           "[rate-limit] request with neither CF-Connecting-IP nor a usable X-Forwarded-For; counted in a shared bucket",
-          { keyKind, maxRequests, path, suppressed, ...caller.detail },
+          { keyKind, maxRequests, path, suppressed, sinceMs, ...caller.detail },
         );
       }
     },
@@ -1105,11 +1122,12 @@ export function __selectBucket(
 async function isPrivilegedToken(env: Bindings, hashedApiKey: string): Promise<boolean> {
   const cacheKey = new Request(`https://rate-limit.internal/admin-flag:${hashedApiKey}`);
   const fault = (phase: string, err: unknown) =>
-    logOncePerWindow(`admin-flag:${phase}`, (suppressed) => {
+    logOncePerWindow(`admin-flag:${phase}`, (suppressed, sinceMs) => {
       console.warn("[rate-limit] admin-flag lookup failed", {
         phase,
         error: errorName(err),
         suppressed,
+        sinceMs,
       });
     });
 
@@ -1359,7 +1377,9 @@ export async function rateLimiter(
     if (defer) {
       // Bounded and logged like every other wait: a put that never settles would
       // otherwise leave no line and no count.
-      defer(boundedWait(write, "put").catch((err: unknown) => logCacheFault(keyKind, path, err)));
+      defer(
+        boundedWait(write, "put").catch((err: unknown) => logCacheFault(keyKind, path, err, "put")),
+      );
       return;
     }
     // No execution context -- a route test driving the app directly, per
@@ -1371,7 +1391,7 @@ export async function rateLimiter(
     try {
       await boundedWait(write, "put");
     } catch (err) {
-      logCacheFault(keyKind, path, err);
+      logCacheFault(keyKind, path, err, "put");
     }
   }
 
@@ -1379,6 +1399,8 @@ export async function rateLimiter(
   // the handler ran: a handler that builds its own `Response` replaces anything
   // set on the context before it, so setting them first would lose them.
   let stamp: Record<string, string> | undefined;
+  // Where a fault happened, for the log (see `FaultPhase`).
+  let phase: FaultPhase = "match";
 
   try {
     const cache = caches.default;
@@ -1388,7 +1410,9 @@ export async function rateLimiter(
     // Worker's clock only moves at I/O.
     const cached = await boundedWait(cache.match(cacheKey), "match");
     const now = Date.now();
+    phase = "read";
     const state = await readCounterRecord(cached, now, keyKind);
+    phase = "decide";
     const count = state.count;
     let warned = state.warned;
 
@@ -1405,17 +1429,19 @@ export async function rateLimiter(
         const ipHash = await hashIp(rawKey);
         // Once per window per bucket kind as well as once per address: a flood
         // from many addresses must not be a line each.
-        logOncePerWindow(`observe:${keyKind}`, (suppressed) => {
+        logOncePerWindow(`observe:${keyKind}`, (suppressed, sinceMs) => {
           console.warn("[rate-limit] observe-only bucket would have tripped", {
             ipHash,
             path,
             count: count + 1,
             suppressed,
+            sinceMs,
           });
         });
         warned = true;
       }
       const observed = { ...state, count: count + 1, warned };
+      phase = "put";
       await writeCount(cache.put(cacheKey, counterRecord(observed, now)));
     } else if (count >= maxRequests) {
       const refused = refusal(keyKind, maxRequests, state, now, caller.source);
@@ -1425,7 +1451,9 @@ export async function rateLimiter(
       // Increment the counter. The record keeps the window's original end and
       // expires with it; a refused request above writes nothing.
       const newCount = count + 1;
+      phase = "put";
       await writeCount(cache.put(cacheKey, counterRecord({ ...state, count: newCount }, now)));
+      phase = "decide";
       stamp = {
         "X-RateLimit-Limit": maxRequests.toString(),
         "X-RateLimit-Remaining": (maxRequests - newCount).toString(),
@@ -1438,7 +1466,7 @@ export async function rateLimiter(
     // structured log (once per window per bucket kind per isolate, see
     // `logCacheFault`) so Workers tail / log tooling surfaces the issue.
     // TODO(#478): replace with Sentry captureException once DSN is wired.
-    logCacheFault(keyKind, path, error);
+    logCacheFault(keyKind, path, error, phase);
   }
 
   await next();
@@ -1594,12 +1622,15 @@ async function consumeKeyedBudget(
   }
 
   const cacheKey = new Request(`https://rate-limit.internal/rl:${bucket.kind}:${bucket.key}`);
+  let phase: FaultPhase = "match";
 
   try {
     const cache = caches.default;
     const cached = await boundedWait(cache.match(cacheKey), "match");
     const now = Date.now();
+    phase = "read";
     const state = await readCounterRecord(cached, now, bucket.kind);
+    phase = "decide";
 
     if (state.count >= bucket.maxRequests) {
       const refused = refusal(bucket.kind, bucket.maxRequests, state, now, bucket.caller);
@@ -1618,18 +1649,19 @@ async function consumeKeyedBudget(
       };
     }
 
+    phase = "put";
     const write = cache.put(cacheKey, counterRecord({ ...state, count: state.count + 1 }, now));
     if (waitUntil) {
       waitUntil(
         boundedWait(write, "put").catch((err: unknown) =>
-          logCacheFault(bucket.kind, undefined, err),
+          logCacheFault(bucket.kind, undefined, err, "put"),
         ),
       );
     } else {
       try {
         await boundedWait(write, "put");
       } catch (err) {
-        logCacheFault(bucket.kind, undefined, err);
+        logCacheFault(bucket.kind, undefined, err, "put");
       }
     }
     return { allowed: true };
@@ -1637,7 +1669,7 @@ async function consumeKeyedBudget(
     // Fail open, the same policy `rateLimiter` itself follows on a cache
     // outage: a broken Cache API must not block traffic. Logged the same way,
     // once per window per bucket kind.
-    logCacheFault(bucket.kind, undefined, error);
+    logCacheFault(bucket.kind, undefined, error, phase);
     return { allowed: true };
   }
 }

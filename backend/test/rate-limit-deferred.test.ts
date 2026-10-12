@@ -96,7 +96,7 @@ describe("a deferred write that fails", () => {
     expect(res.status).toBe(200);
     await ctx.settled();
     expect(faults().length).toBe(1);
-    expect(faults()[0]?.[1]).toMatchObject({ keyKind: "data-ip", error: "Error" });
+    expect(faults()[0]?.[1]).toMatchObject({ keyKind: "data-ip", phase: "put", error: "Error" });
   });
 
   test("on the miss budget is logged, and the settled work does not reject", async () => {
