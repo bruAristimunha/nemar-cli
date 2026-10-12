@@ -148,7 +148,9 @@ const SITE_UNATTRIBUTED_MAX_REQUESTS = 20_000;
 // in code review, not at runtime.
 const TOKEN_MAX_REQUESTS_AUTHED = 1000;
 
-/** See `writeCount`'s no-`waitUntil` fallback, below. */
+/** The longest the limiter waits for the Cache API on any one call, and for a
+ *  data-plane write handed no `waitUntil`. A healthy call settles in
+ *  milliseconds, so the bound is only ever felt when the cache has stalled. */
 const RATE_LIMIT_WRITE_STALL_MS = 500;
 
 const WINDOW_MS = WINDOW_SIZE * 1000;
@@ -188,6 +190,31 @@ function logOncePerWindow(key: string, emit: (suppressed: number) => void): void
  *  cache or database fault reaches the logs. */
 function errorName(error: unknown): string {
   return error instanceof Error ? error.name : typeof error;
+}
+
+/** The Cache API did not answer within the bound. Reported like any cache fault. */
+class CacheStallError extends Error {
+  constructor(what: string) {
+    super(`cache ${what} did not settle within ${RATE_LIMIT_WRITE_STALL_MS} ms`);
+    this.name = "CacheStallError";
+  }
+}
+
+/**
+ * Wait for a Cache API call at most `RATE_LIMIT_WRITE_STALL_MS`, then give up
+ * with a {@link CacheStallError}, which every caller treats as a cache fault: the
+ * limiter fails open and logs it. Without a bound a stalled `match` or `put`
+ * leaves the request pending for as long as the runtime lets it, and the
+ * limiter sits in front of every API request, the website's server-side renders
+ * included. A call that fails after the bound is swallowed, not left unhandled.
+ */
+function boundedWait<T>(work: Promise<T>, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const stalled = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new CacheStallError(what)), RATE_LIMIT_WRITE_STALL_MS);
+  });
+  work.catch(() => {});
+  return Promise.race([work, stalled]).finally(() => clearTimeout(timer));
 }
 
 /**
@@ -1013,7 +1040,7 @@ async function isPrivilegedToken(env: Bindings, hashedApiKey: string): Promise<b
   const cacheKey = new Request(`https://rate-limit.internal/admin-flag:${hashedApiKey}`);
   try {
     const cache = caches.default;
-    const cached = await cache.match(cacheKey);
+    const cached = await boundedWait(cache.match(cacheKey), "match");
     if (cached) {
       const data = (await cached.json()) as { admin: boolean };
       return data.admin === true;
@@ -1035,14 +1062,17 @@ async function isPrivilegedToken(env: Bindings, hashedApiKey: string): Promise<b
       .first<{ role: string | null }>();
     const admin = row?.role === "admin" || row?.role === "owner";
     const ttl = admin ? WINDOW_SIZE : Math.min(WINDOW_SIZE, 30);
-    await cache.put(
-      cacheKey,
-      new Response(JSON.stringify({ admin }), {
-        headers: {
-          "Content-Type": "application/json",
-          "Cache-Control": `max-age=${ttl}`,
-        },
-      }),
+    await boundedWait(
+      cache.put(
+        cacheKey,
+        new Response(JSON.stringify({ admin }), {
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": `max-age=${ttl}`,
+          },
+        }),
+      ),
+      "put",
     );
     return admin;
   } catch (err) {
@@ -1194,13 +1224,12 @@ export async function rateLimiter(
   // Every other bucket keeps the exact synchronous behavior it always had.
   async function writeCount(write: Promise<unknown>): Promise<void> {
     if (keyKind !== "data-ip") {
-      await write;
+      await boundedWait(write, "put");
       return;
     }
-    const logFailure = (err: unknown) => logCacheFault(keyKind, path, err);
     const defer = dataPlaneDefer();
     if (defer) {
-      defer(write.catch(logFailure));
+      defer(write.catch((err: unknown) => logCacheFault(keyKind, path, err)));
       return;
     }
     // No execution context -- a route test driving the app directly, per
@@ -1209,10 +1238,11 @@ export async function rateLimiter(
     // `git-file-cache.ts`'s own no-`waitUntil` fallback: a healthy write
     // settles in microtasks, so this bound is never felt in practice, and
     // it keeps the count observable to a test that awaits the response.
-    await Promise.race([
-      write.catch(logFailure),
-      new Promise<void>((resolve) => setTimeout(resolve, RATE_LIMIT_WRITE_STALL_MS)),
-    ]);
+    try {
+      await boundedWait(write, "put");
+    } catch (err) {
+      logCacheFault(keyKind, path, err);
+    }
   }
 
   // The headers this request's answer will carry, decided here and applied after
@@ -1226,7 +1256,7 @@ export async function rateLimiter(
     // The bucket's current window: its count and (for the observe-only path)
     // whether it already warned once. Read after the cache lookup, because a
     // Worker's clock only moves at I/O.
-    const cached = await cache.match(cacheKey);
+    const cached = await boundedWait(cache.match(cacheKey), "match");
     const now = Date.now();
     const state = await readCounterRecord(cached, now, keyKind);
     const count = state.count;
@@ -1431,7 +1461,7 @@ async function consumeKeyedBudget(
 
   try {
     const cache = caches.default;
-    const cached = await cache.match(cacheKey);
+    const cached = await boundedWait(cache.match(cacheKey), "match");
     const now = Date.now();
     const state = await readCounterRecord(cached, now, bucket.kind);
 
@@ -1447,16 +1477,15 @@ async function consumeKeyedBudget(
       };
     }
 
-    const write = cache
-      .put(cacheKey, counterRecord({ ...state, count: state.count + 1 }, now))
-      .catch((err: unknown) => logCacheFault(bucket.kind, undefined, err));
+    const write = cache.put(cacheKey, counterRecord({ ...state, count: state.count + 1 }, now));
     if (waitUntil) {
-      waitUntil(write);
+      waitUntil(write.catch((err: unknown) => logCacheFault(bucket.kind, undefined, err)));
     } else {
-      await Promise.race([
-        write,
-        new Promise<void>((resolve) => setTimeout(resolve, RATE_LIMIT_WRITE_STALL_MS)),
-      ]);
+      try {
+        await boundedWait(write, "put");
+      } catch (err) {
+        logCacheFault(bucket.kind, undefined, err);
+      }
     }
     return { allowed: true };
   } catch (error) {
