@@ -352,8 +352,13 @@ export function __readCounter(data: unknown, now: number): __CounterState {
   };
 }
 
-/** Whole seconds left in the window, at least 1 and at most one window. */
-function secondsLeft(state: __CounterState, now: number): number {
+/**
+ * Whole seconds left in the window, at least 1 and at most one window. A state
+ * read by {@link __readCounter} is already inside those bounds, so they are the
+ * header staying honest for any state a caller builds some other way, and a test
+ * drives them directly.
+ */
+export function __secondsLeft(state: __CounterState, now: number): number {
   return Math.min(WINDOW_SIZE, Math.max(1, Math.ceil((state.windowEnd - now) / 1000)));
 }
 
@@ -364,7 +369,7 @@ function counterRecord(state: __CounterState, now: number): Response {
     {
       headers: {
         "Content-Type": "application/json",
-        "Cache-Control": `max-age=${secondsLeft(state, now)}`,
+        "Cache-Control": `max-age=${__secondsLeft(state, now)}`,
       },
     },
   );
@@ -414,7 +419,7 @@ function refusal(
   now: number,
   caller?: __CallerSource,
 ): { body: Record<string, unknown>; headers: Record<string, string> } {
-  const retryAfter = secondsLeft(state, now);
+  const retryAfter = __secondsLeft(state, now);
   return {
     body: {
       error: "Rate limit exceeded",

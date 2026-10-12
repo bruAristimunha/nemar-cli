@@ -60,6 +60,28 @@ describe("headers on what a handler built", () => {
     expect(res.headers.get("X-RateLimit-Caller")).toBe("site");
   });
 
+  test("a response whose headers refuse a write is rebuilt, body and status kept", async () => {
+    // What a Response from fetch() looks like in a Worker: its headers are immutable.
+    const app = new Hono<AppEnv>();
+    app.use("*", rateLimiter);
+    app.get("/frozen", () => {
+      const res = new Response("from upstream", {
+        status: 203,
+        headers: { "X-Upstream": "kept" },
+      });
+      res.headers.set = () => {
+        throw new TypeError("immutable");
+      };
+      return res;
+    });
+    const res = await hit(app, edge("203.0.113.9"), "/frozen");
+    expect(res.status).toBe(203);
+    expect(await res.text()).toBe("from upstream");
+    expect(res.headers.get("X-Upstream")).toBe("kept");
+    expect(res.headers.get("X-RateLimit-Bucket")).toBe("ip");
+    expect(res.headers.get("X-RateLimit-Remaining")).toBe(String(CAP - 1));
+  });
+
   test("an answer to a handler that threw still says what the limiter counted", async () => {
     const res = await hit(appWithHandlers(), edge("203.0.113.5"), "/boom");
     expect(res.status).toBe(500);

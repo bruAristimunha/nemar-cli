@@ -16,6 +16,7 @@ import { describe, expect, test } from "bun:test";
 import {
   __limits,
   __readCounter,
+  __secondsLeft,
   checkDataMissBudget,
   checkPrivateGrantBudget,
 } from "../src/middleware/rateLimit";
@@ -143,6 +144,9 @@ describe("__readCounter", () => {
       windowEnd: now + WINDOW_MS,
       damage: "bad-end",
     });
+    // Both wrong at once: the count is reported, the more consequential of the two.
+    expect(read({ count: "lots", windowEnd: "soon" })).toMatchObject({ damage: "bad-count" });
+    expect(read({ windowEnd: null })).toMatchObject({ damage: "bad-count" });
     // Anything that is not a record.
     for (const junk of [null, 5, "text", true, [1, 2]]) {
       expect(read(junk)).toEqual({
@@ -169,6 +173,26 @@ describe("__readCounter", () => {
     expect(read({ count: 1, windowEnd: now + WINDOW_MS + 1 }).damage).toBeUndefined();
     expect(read({ count: 1, windowEnd: now + WINDOW_MS + 5000 }).damage).toBeUndefined();
     expect(read({ count: 1, windowEnd: now + WINDOW_MS + 5001 }).damage).toBe("bad-end");
+  });
+});
+
+describe("__secondsLeft", () => {
+  const state = (windowEnd: number) => ({ count: 1, warned: false, windowEnd });
+
+  test("counts whole seconds up, so waiting that long always reaches the end", () => {
+    expect(__secondsLeft(state(T0 + 1), T0)).toBe(1);
+    expect(__secondsLeft(state(T0 + 1000), T0)).toBe(1);
+    expect(__secondsLeft(state(T0 + 1001), T0)).toBe(2);
+    expect(__secondsLeft(state(T0 + WINDOW_MS), T0)).toBe(WINDOW);
+  });
+
+  test("is never zero or negative and never more than a window, for any state", () => {
+    // `__readCounter` never builds these; a caller that builds a state some other
+    // way still gets an honest header.
+    expect(__secondsLeft(state(T0), T0)).toBe(1);
+    expect(__secondsLeft(state(T0 - 5000), T0)).toBe(1);
+    expect(__secondsLeft(state(T0 + 10 * 86_400_000), T0)).toBe(WINDOW);
+    expect(__secondsLeft(state(T0 + WINDOW_MS + 1), T0)).toBe(WINDOW);
   });
 });
 
@@ -420,6 +444,37 @@ describe("concurrent requests", () => {
     expect(record?.count as number).toBeGreaterThanOrEqual(1);
     expect(record?.count as number).toBeLessThanOrEqual(__limits.AUTH_MAX_REQUESTS + 1);
     expect(record?.windowEnd).toBe(T0 + WINDOW_MS);
+  });
+});
+
+describe("the clock is read after the cache answers, in the budgets too", () => {
+  test("a window that ends during the lookup is a new window for the miss budget", async () => {
+    class SlowMatch extends InMemoryCache {
+      async match(request: RequestInfo | URL): Promise<Response | undefined> {
+        const found = await super.match(request);
+        h.clock += 2000;
+        return found;
+      }
+    }
+    const slow = new SlowMatch();
+    (globalThis as { caches?: unknown }).caches = { default: slow };
+    await slow.put(
+      new Request("https://rate-limit.internal/rl:data-miss-ip:203.0.113.65"),
+      new Response(
+        JSON.stringify({
+          count: __limits.DATA_MISS_MAX_REQUESTS,
+          warned: false,
+          windowEnd: T0 + 1000,
+        }),
+        { headers: { "Content-Type": "application/json", "Cache-Control": "max-age=3600" } },
+      ),
+    );
+    const outcome = await checkDataMissBudget(
+      { ENVIRONMENT: "production" } as Pick<Bindings, "ENVIRONMENT" | "TEST_BYPASS_TOKEN">,
+      new Request("http://localhost/data/x", { headers: edge("203.0.113.65") }),
+      undefined,
+    );
+    expect(outcome.allowed).toBe(true);
   });
 });
 
