@@ -863,14 +863,17 @@ export interface __BucketSelection {
  *    caller names the visitor it acts for. The caller must SET the header from
  *    its own `CF-Connecting-IP`, never pass a visitor's header through.
  *  - `unattributed`: neither. Not reachable from the public network.
- *  - `internal`: a request this Worker built for itself and handed to one of its
- *    own sub-apps (an MCP tool reading `index.json` through the zarr gateway, the
- *    Neurobagel gatherer reading the data plane). It is marked by object identity
- *    (`lib/internal-request.ts`), which nothing a client sends can claim, and the
- *    limiter does not count it: the request that caused it was counted where it
- *    arrived. It is never a bucket and never a warning.
+ *
+ * A request this Worker built for itself and handed to one of its own sub-apps (an
+ * MCP tool reading `index.json` through the zarr gateway, the Neurobagel gatherer
+ * reading the data plane) is not a source of its own. It has no address, so it reads
+ * as `unattributed`; what sets it apart is a mark held by object identity
+ * (`lib/internal-request.ts`), which nothing a client sends can claim. The mark
+ * exempts it from the data plane's two buckets (`data-ip` and the miss budget) and
+ * from nothing else, so a request marked by mistake is still counted, loudly,
+ * everywhere that matters more.
  */
-export type __CallerSource = "edge" | "site" | "unattributed" | "internal";
+export type __CallerSource = "edge" | "site" | "unattributed";
 
 /** A caller's source and its bucket key. The key is the address itself for an
  *  `edge` caller, `site:<address>` for a `site` caller, and a fixed word for an
@@ -1010,11 +1013,11 @@ export function __readCallerIdentity(
   return { source: "unattributed", key: UNATTRIBUTED_KEY, detail };
 }
 
-const INTERNAL_CALLER: __CallerIdentity = { source: "internal", key: "internal" };
-
-/** The identity of a request. Shared by the middleware and the per-route budgets. */
+/** The identity of a request, read from its headers. The one place the middleware and
+ *  the per-route budgets (`checkDataMissBudget`, `checkPrivateGrantBudget`) take it
+ *  from. Whether a request is the Worker's own is a separate question,
+ *  {@link isInternalRequest}, which only the data plane's buckets ask. */
 function callerIdentityOf(request: Request): __CallerIdentity {
-  if (isInternalRequest(request)) return INTERNAL_CALLER;
   return __readCallerIdentity(
     request.headers.get("CF-Connecting-IP"),
     request.headers.get("X-Forwarded-For"),
@@ -1036,7 +1039,7 @@ function logIdentityOnce(
   maxRequests: number,
   path: string,
 ): void {
-  if (caller.source === "edge" || caller.source === "internal") return;
+  if (caller.source === "edge") return;
   logOncePerWindow(
     `identity:${caller.source}:${keyKind}:${caller.detail?.reason ?? ""}`,
     (suppressed, sinceMs) => {
@@ -1322,23 +1325,12 @@ export async function rateLimiter(
     return;
   }
 
-  // A request this Worker built for itself is not a caller: see `__CallerSource`.
-  // It used to be bucketed by a random UUID, which is to say not at all, and the
-  // pooled bucket that now catches a caller with no address must not catch it.
-  if (isInternalRequest(c.req.raw)) {
-    await next();
-    return;
-  }
-
   const path = c.req.path;
   // Who this request's address names. `CF-Connecting-IP` decides whenever it is
   // present and `X-Forwarded-For` is then never read, so a client cannot choose
   // its bucket; see `__CallerSource`. A request with neither shares ONE bucket per
   // kind; a fresh random one each would be no limit at all.
-  const caller = __readCallerIdentity(
-    c.req.header("CF-Connecting-IP"),
-    c.req.header("X-Forwarded-For"),
-  );
+  const caller = callerIdentityOf(c.req.raw);
 
   // `c.executionCtx.waitUntil`, or undefined outside a real Worker
   // invocation -- Hono throws on the getter then, the same fallback
@@ -1363,6 +1355,16 @@ export async function rateLimiter(
     caller.key,
     caller.source,
   );
+  // A request this Worker built for itself is not a caller of the data plane: see
+  // `__CallerSource`. It used to be bucketed by a random UUID, which is to say not at
+  // all, and the pooled bucket that now catches a caller with no address must not
+  // catch it. The exemption is this bucket's alone: on any other kind the mark
+  // changes nothing, so a request marked by mistake is counted and logged like any
+  // other caller with no address.
+  if (keyKind === "data-ip" && isInternalRequest(c.req.raw)) {
+    await next();
+    return;
+  }
   // Only where the address chose the bucket. A token bucket is keyed by the token,
   // so a line about "counted by its forwarded visitor" or "in a shared bucket"
   // would be false of it.
@@ -1585,11 +1587,13 @@ export async function checkDataMissBudget(
   request: Request,
   waitUntil: ((work: Promise<unknown>) => void) | undefined,
 ): Promise<DataMissBudgetOutcome> {
+  // A request this Worker built for itself spends no miss budget, any more than it
+  // spends the `data-ip` bucket (see `rateLimiter`): this is the data plane's own.
+  if (isInternalRequest(request)) return { allowed: true };
   // The same identity the middleware uses, so a visitor forwarded by the website
   // is charged to their own miss budget and an unattributed caller to one shared
   // budget, not to a fresh random one.
   const caller = callerIdentityOf(request);
-  if (caller.source === "internal") return { allowed: true };
   return consumeKeyedBudget(
     env,
     request,
