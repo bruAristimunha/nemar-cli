@@ -51,9 +51,10 @@ describe("a failing cache write is logged once per kind per window", () => {
       const res = await hit(app, edge(ADDRESS), "/data/nm000108/v1.0.0/x");
       expect(res.status).toBe(200);
     }
-    // The line that opens the window, then one when 10 and one when 100 calls have been
-    // swallowed: the burst's size without a line per request.
-    expect(faults().map((c) => (c[1] as { suppressed: number }).suppressed)).toEqual([0, 10, 90]);
+    // The line that opens the window, then the 11th and the 101st call speak, each
+    // reporting only the calls swallowed since the previous line: the burst's size
+    // without a line per request.
+    expect(faults().map((c) => (c[1] as { suppressed: number }).suppressed)).toEqual([0, 9, 89]);
     expect(faults()[0]?.[1]).toMatchObject({ keyKind: "data-ip", error: "Error" });
   });
 
@@ -104,19 +105,37 @@ describe("a failing cache write is logged once per kind per window", () => {
     expect(faults()[1]?.[1]).toMatchObject({ suppressed: 5 });
   });
 
-  test("a burst that ends inside the window is sized on its own lines, at 10, 100 and 1000", async () => {
+  test("a burst that ends inside the window is sized on its own lines: the 11th, 101st and 1001st call speak", async () => {
     install(new PutFailingCache());
     const app = buildApp();
+    const spoke: number[] = [];
     for (let i = 0; i < 1100; i++) {
       h.clock = T0 + i;
+      const before = faults().length;
       await hit(app, edge(ADDRESS));
+      if (faults().length > before) spoke.push(i + 1);
     }
-    // Opening line, then the 10th, 100th and 1000th swallowed call: four lines and no more.
-    expect(faults().map((c) => (c[1] as { suppressed: number }).suppressed)).toEqual([
-      0, 10, 90, 900,
-    ]);
-    // Each line says how long ago the previous one was.
+    // The opening call, then the 11th, 101st and 1001st: four lines and no more.
+    expect(spoke).toEqual([1, 11, 101, 1001]);
+    // Each line reports the calls swallowed since the previous line, not the one speaking,
+    // so the lines and what they swallowed add up to the calls made up to the last line.
+    const swallowed = faults().map((c) => (c[1] as { suppressed: number }).suppressed);
+    expect(swallowed).toEqual([0, 9, 89, 899]);
+    expect(swallowed.reduce((a, b) => a + b, 0) + faults().length).toBe(1001);
+    // Each line says how long ago the previous one was (a call a millisecond).
     expect(faults().map((c) => (c[1] as { sinceMs: number }).sinceMs)).toEqual([0, 10, 90, 900]);
+  });
+
+  test("the next window's first line reports the calls swallowed since the last line, milestone or not", async () => {
+    install(new PutFailingCache());
+    const app = buildApp();
+    // 15 calls: the opening line, the 11th call's line, then 4 swallowed.
+    for (let i = 0; i < 15; i++) await hit(app, edge(ADDRESS));
+    expect(faults().length).toBe(2);
+    h.clock = T0 + __limits.WINDOW_SIZE * 1000;
+    await hit(app, edge(ADDRESS));
+    expect(faults().length).toBe(3);
+    expect(faults()[2]?.[1]).toMatchObject({ suppressed: 4 });
   });
 
   test("a clock that went backwards does not silence the line, and sinceMs is never negative", async () => {

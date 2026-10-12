@@ -131,8 +131,9 @@ The Cloudflare account is the trust boundary, as in ADR 0078, and no secret head
   The falling `X-RateLimit-Remaining` above is the evidence; the header's presence alone is not.
 - **The limiter reports its own faults and does not wait on the cache for ever.**
   A repaired counter record, a replaced admin-flag record, a refusal, and a cache fault are each logged once per window per bucket kind (refusals and identities also per caller source, a fault also per phase), by name and never with an address or a message.
-  A line says how many lines for its key were swallowed since the previous line (`suppressed`) and how long ago that previous line was (`sinceMs`, the time since the previous line, not since the window opened).
-  A key that keeps firing inside its window speaks again when its swallowed count in the window reaches 10, 100 and 1000, so the size of a burst is on the log without a line per request, at no more than four lines per key per window.
+  A line says how many calls for its key were swallowed since the previous line (`suppressed`, which does not count the call that is speaking) and how long ago that previous line was (`sinceMs`, the time since the previous line, not since the window opened).
+  A key that keeps firing inside its window speaks again on the 11th, 101st and 1001st call in the window, so the size of a burst is on the log without a line per request, at no more than four lines per key per window.
+  The lines and the calls they swallowed add up to the calls made, but the size is exact only to a factor of ten: a burst that ends between milestones shows as the last milestone it passed.
   A fault line says in which phase the work failed (`match`, `read`, `decide` or `put`), so a bug in the limiter is told from the runtime refusing a call.
   `read` is the wait on the record's body and nothing else; the limiter interpreting what it read is `decide`, and a fault there is logged as a `limiter fault` and not as a cache failure.
   A record that cannot be read at all (a stream that errors, one that never finishes) is a cache fault, not a damaged record.

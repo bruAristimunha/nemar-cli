@@ -169,21 +169,25 @@ interface LogSlot {
 /** Module-level so it persists across requests in a warm isolate. */
 const logSlots = new Map<string, LogSlot>();
 
-/** Swallowed calls in one window at which a line speaks again, so a burst that ends
- *  inside the window shows its size without a line per call: at most four lines. */
+/** How many calls after a window's opening call a line speaks again (so the 11th,
+ *  101st and 1001st call in the window), so a burst that ends inside the window
+ *  shows its size without a line per call: at most four lines. */
 const LOG_MILESTONES: ReadonlySet<number> = new Set([10, 100, 1000]);
 
 /**
  * Run `emit` at most once per rate-limit window per `key`, per isolate, and again
- * when the calls it swallows in that window reach 10, 100 and 1000. It is handed
- * `suppressed`, the calls swallowed since the PREVIOUS LINE for that key, and
- * `sinceMs`, the time since that previous line (0 for the first). So the line that
- * opens a window reports the stretch before it, not the one just opening, and the
- * size of a burst that ends inside a window is on the milestone lines, not on the
- * next window's. Every log in this file that a request can trigger goes through
- * here: during a sustained fault or a flood, a handful of lines per kind per minute
- * is the line worth reading, and a line per request buries it. The key space is
- * bounded by the kinds, sources and reasons below.
+ * on the 11th, 101st and 1001st call in the window. It is handed `suppressed`, the
+ * calls swallowed since the PREVIOUS LINE for that key (the call that is speaking is
+ * not one of them, so the lines and what they swallowed add up to the calls made),
+ * and `sinceMs`, the time since that previous line (0 for the first). So the line
+ * that opens a window reports the stretch before it, not the one just opening, and
+ * the size of a burst that ends inside a window is on the milestone lines, not on
+ * the next window's. That size is exact only to a factor of ten: a burst that ends
+ * between milestones shows as the last milestone it passed. Every log in this file
+ * that a request can trigger goes through here: during a sustained fault or a
+ * flood, a handful of lines per kind per minute is the line worth reading, and a
+ * line per request buries it. The key space is bounded by the kinds, sources and
+ * reasons below.
  */
 function logOncePerWindow(key: string, emit: (suppressed: number, sinceMs: number) => void): void {
   const now = Date.now();
@@ -194,7 +198,8 @@ function logOncePerWindow(key: string, emit: (suppressed: number, sinceMs: numbe
     slot.inWindow++;
     slot.sinceLine++;
     if (LOG_MILESTONES.has(slot.inWindow)) {
-      const suppressed = slot.sinceLine;
+      // `sinceLine` has just counted this call, which is speaking and so is not swallowed.
+      const suppressed = slot.sinceLine - 1;
       const sinceMs = Math.max(0, now - slot.lastAt);
       slot.sinceLine = 0;
       slot.lastAt = now;
