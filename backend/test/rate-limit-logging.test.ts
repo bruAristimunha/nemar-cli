@@ -380,6 +380,55 @@ describe("a fault line says where the work failed", () => {
     expect(faults()).toEqual([]);
   });
 
+  describe("a bug in reading the record is the limiter's, not the read's", () => {
+    // A record whose `count` throws when the limiter looks at it: the body arrived and
+    // parsed, and what fails is the limiter's own interpretation of it.
+    class HostileRecord extends InMemoryCache {
+      async match(): Promise<Response | undefined> {
+        const response = new Response("{}");
+        response.json = async () =>
+          Object.defineProperty({}, "count", {
+            get() {
+              throw new RangeError("the record is hostile");
+            },
+          });
+        return response;
+      }
+    }
+    const limiterFaults = () =>
+      h.error.mock.calls.filter((c) => c[0] === "[rate-limit] limiter fault");
+
+    test("on the request path", async () => {
+      install(new HostileRecord());
+      const res = await hit(buildApp(), edge(ADDRESS));
+      expect(res.status).toBe(200);
+      expect(limiterFaults().length).toBe(1);
+      expect(limiterFaults()[0]?.[1]).toMatchObject({ phase: "decide", error: "RangeError" });
+      expect(faults()).toEqual([]);
+    });
+
+    test("on the keyed-budget path", async () => {
+      const env = { ENVIRONMENT: "production" } as Pick<
+        Bindings,
+        "ENVIRONMENT" | "TEST_BYPASS_TOKEN"
+      >;
+      install(new HostileRecord());
+      const outcome = await checkDataMissBudget(
+        env,
+        new Request("http://localhost/data/x", { headers: edge(ADDRESS) }),
+        undefined,
+      );
+      expect(outcome.allowed).toBe(true);
+      expect(limiterFaults().length).toBe(1);
+      expect(limiterFaults()[0]?.[1]).toMatchObject({
+        keyKind: "data-miss-ip",
+        phase: "decide",
+        error: "RangeError",
+      });
+      expect(faults()).toEqual([]);
+    });
+  });
+
   test("a line that comes back says how long ago the burst it reports began", async () => {
     install(new PutFailingCache());
     const app = buildApp();

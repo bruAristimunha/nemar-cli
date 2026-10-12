@@ -421,29 +421,34 @@ function counterRecord(state: __CounterState, now: number): Response {
 }
 
 /**
- * Read a bucket's record. A record that will not parse or will not make sense is
- * repaired, not trusted and not failed open on, and the repair is logged once per
- * window per bucket kind and kind of damage: the self-heal is right, a silent one
- * would hide whatever is writing bad records.
+ * Read a bucket's stored body: `undefined` when nothing is stored, `null` when
+ * what is stored is not JSON, the parsed value otherwise. This is the whole of
+ * the `read` phase of a fault: waiting on the body and nothing that interprets it.
  */
-async function readCounterRecord(
-  cached: Response | undefined,
-  now: number,
-  keyKind: string,
-): Promise<__CounterState> {
-  if (!cached) return freshWindow(now);
-  let data: unknown;
+async function readRecordBody(cached: Response | undefined): Promise<unknown> {
+  if (!cached) return undefined;
   try {
-    data = await boundedWait(cached.json(), "read");
+    return await boundedWait(cached.json(), "read");
   } catch (err) {
     // Only a body that is not JSON is a damaged record. A body that cannot be read
     // at all (a stream that errors, one that never finishes) says nothing about
     // the record: it is a cache fault, and goes to the fail-open, loud path rather
     // than being "repaired" into a reset counter that never limits.
     if (!(err instanceof SyntaxError)) throw err;
-    data = null;
+    return null;
   }
-  const state = __readCounter(data, now);
+}
+
+/**
+ * Turn a stored body (see {@link readRecordBody}) into the bucket's state. A record
+ * that will not parse or will not make sense is repaired, not trusted and not failed
+ * open on, and the repair is logged once per window per bucket kind and kind of
+ * damage: the self-heal is right, a silent one would hide whatever is writing bad
+ * records. A fault in here is the limiter's own (phase `decide`), not the cache's.
+ */
+function interpretRecord(body: unknown, now: number, keyKind: string): __CounterState {
+  if (body === undefined) return freshWindow(now);
+  const state = __readCounter(body, now);
   if (state.damage) {
     const damage = state.damage;
     logOncePerWindow(`damage:${keyKind}:${damage}`, (suppressed, sinceMs) => {
@@ -1433,8 +1438,9 @@ export async function rateLimiter(
     const cached = await boundedWait(cache.match(cacheKey), "match");
     const now = Date.now();
     phase = "read";
-    const state = await readCounterRecord(cached, now, keyKind);
+    const body = await readRecordBody(cached);
     phase = "decide";
+    const state = interpretRecord(body, now, keyKind);
     const count = state.count;
     let warned = state.warned;
 
@@ -1651,8 +1657,9 @@ async function consumeKeyedBudget(
     const cached = await boundedWait(cache.match(cacheKey), "match");
     const now = Date.now();
     phase = "read";
-    const state = await readCounterRecord(cached, now, bucket.kind);
+    const body = await readRecordBody(cached);
     phase = "decide";
+    const state = interpretRecord(body, now, bucket.kind);
 
     if (state.count >= bucket.maxRequests) {
       const refused = refusal(bucket.kind, bucket.maxRequests, state, now, bucket.caller);
