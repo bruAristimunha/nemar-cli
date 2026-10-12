@@ -156,6 +156,8 @@ describe("a write handed to waitUntil is handed over, counted, and never waited 
     expect(res.status).toBe(200);
     expect(performance.now() - started).toBeLessThan(250);
     expect(ctx.work.length).toBe(1);
+    // Let the abandoned write give up inside this test, not inside the next one.
+    await ctx.settled();
   });
 
   test("the miss budget hands over one write, which lands", async () => {

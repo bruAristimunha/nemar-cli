@@ -316,6 +316,22 @@ describe("the caps", () => {
     expect(__limits.SITE_UNATTRIBUTED_MAX_REQUESTS).toBe(20_000);
   });
 
+  test("every cap is the number it was sized to", () => {
+    // Other tables take their numbers from `__limits`, so they cannot see one change.
+    expect(__limits).toEqual({
+      AUTH_MAX_REQUESTS: 10,
+      TOKEN_MAX_REQUESTS_AUTHED: 1000,
+      MAX_REQUESTS: 1000,
+      SITE_IP_MAX_REQUESTS: 2000,
+      SITE_UNATTRIBUTED_MAX_REQUESTS: 20_000,
+      DATA_MAX_REQUESTS: 100_000,
+      DATA_MISS_MAX_REQUESTS: 10_000,
+      NEUROBAGEL_MAX_REQUESTS: 1200,
+      PRIVATE_GRANT_MAX_REQUESTS: 10,
+      WINDOW_SIZE: 60,
+    });
+  });
+
   test("the Neurobagel and miss-budget caps are the numbers they were sized to", () => {
     // The tables elsewhere read their numbers from `__limits`, so they could not see
     // one of these change.
@@ -868,7 +884,7 @@ describe("checkDataMissBudget uses the same identity", () => {
   });
 });
 
-describe("the token bucket is keyed by the bearer, whoever forwarded it", () => {
+describe("the token bucket follows the bearer, not who forwarded it", () => {
   const A_KEY = `a${"x".repeat(47)}`;
   const B_KEY = `b${"x".repeat(47)}`;
 
@@ -879,7 +895,7 @@ describe("the token bucket is keyed by the bearer, whoever forwarded it", () => 
     expect(none).toMatchObject({ keyKind: "token", rawKey: A_KEY });
   });
 
-  test("one bearer from two visitors is one count; two bearers from one visitor are two", async () => {
+  test("the count follows the bearer: the same token via two visitors shares one, another token has its own", async () => {
     const app = buildApp();
     const as = (key: string, visitor: string) => ({
       ...viaBinding(visitor),
