@@ -68,9 +68,13 @@ The Cloudflare account is the trust boundary, as in ADR 0078, and no secret head
    An MCP tool reading a dataset's `index.json` through the zarr gateway, and the Neurobagel gatherer reading the data plane, hand a bare `Request` to a sub-app in process, with neither header.
    They are marked by object identity (`lib/internal-request.ts`), which nothing a client sends can claim and a copy of the request does not inherit,
    and the data plane's two buckets, `data-ip` and the miss budget, let them through uncounted and unlogged.
+   That holds only for a request that also carries neither address header, as the two real callers' requests do:
+   one that carries a usable `CF-Connecting-IP` or `X-Forwarded-For` is counted as that address, marked or not.
    The exemption is those two buckets' alone.
-   On any other bucket a marked request is counted by its headers like every other caller, and having none, is pooled and logged,
-   so a request marked by mistake cannot skip the strict, token, anonymous, Neurobagel or private-grant limits.
+   On any other bucket the mark changes nothing: the request is counted in whatever bucket it would reach unmarked,
+   a strict, anonymous or Neurobagel bucket by its address (or the pooled bucket and its warning when it has none), a token bucket by its bearer, the private-grant budget by its account,
+   so a request marked by mistake cannot skip those limits.
+   A marked request refused on a bucket other than the data plane's, which the two current callers cannot produce, would not be told apart from a broken website forward in the refusal line, since both read as `unattributed`, and the MCP index reader would report only `index.json fetch answered HTTP 429`.
    What the mark leaves uncounted is bounded elsewhere.
    An MCP tool's request was counted where it arrived.
    The scheduled Neurobagel reconcile has no arriving request:
