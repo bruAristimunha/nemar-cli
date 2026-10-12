@@ -75,6 +75,10 @@ export interface RateLimitHarness {
   seed(key: string, record: unknown, maxAgeSeconds?: number): Promise<void>;
   /** The record a bucket stores, parsed, or undefined. */
   stored(key: string): Promise<Record<string, unknown> | undefined>;
+  /** Put the cached "is this token an admin" record for a token hash. */
+  seedAdminFlag(tokenHash: string, record: unknown, maxAgeSeconds?: number): Promise<void>;
+  /** The cached admin-flag record for a token hash, parsed, or undefined. */
+  storedAdminFlag(tokenHash: string): Promise<Record<string, unknown> | undefined>;
 }
 
 export function useRateLimitHarness(): RateLimitHarness {
@@ -141,6 +145,23 @@ export function useRateLimitHarness(): RateLimitHarness {
     },
     async stored(key) {
       const res = await cache.match(new Request(`https://rate-limit.internal/rl:${key}`));
+      return res ? ((await res.json()) as Record<string, unknown>) : undefined;
+    },
+    async seedAdminFlag(tokenHash, record, maxAgeSeconds = 60) {
+      await cache.put(
+        new Request(`https://rate-limit.internal/admin-flag:${tokenHash}`),
+        new Response(typeof record === "string" ? record : JSON.stringify(record), {
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": `max-age=${maxAgeSeconds}`,
+          },
+        }),
+      );
+    },
+    async storedAdminFlag(tokenHash) {
+      const res = await cache.match(
+        new Request(`https://rate-limit.internal/admin-flag:${tokenHash}`),
+      );
       return res ? ((await res.json()) as Record<string, unknown>) : undefined;
     },
   };

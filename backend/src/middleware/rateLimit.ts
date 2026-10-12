@@ -1068,13 +1068,37 @@ export function __selectBucket(
  */
 async function isPrivilegedToken(env: Bindings, hashedApiKey: string): Promise<boolean> {
   const cacheKey = new Request(`https://rate-limit.internal/admin-flag:${hashedApiKey}`);
+  const fault = (phase: string, err: unknown) =>
+    logOncePerWindow(`admin-flag:${phase}`, (suppressed) => {
+      console.warn("[rate-limit] admin-flag lookup failed", {
+        phase,
+        error: errorName(err),
+        suppressed,
+      });
+    });
+
+  // The cached answer, if there is a usable one. A cache that fails here fails the
+  // lookup closed (not an admin): nothing was learned.
+  let phase = "match";
+  let cache: Cache;
   try {
-    const cache = caches.default;
+    cache = caches.default;
     const cached = await boundedWait(cache.match(cacheKey), "match");
     if (cached) {
-      const data = (await cached.json()) as { admin: boolean };
-      return data.admin === true;
+      phase = "read";
+      const known = await readAdminFlag(cached);
+      if (known !== undefined) return known;
+      // A record that is not a usable flag is read again from the database and
+      // replaced below, rather than holding the token to "not an admin" until it
+      // expires.
     }
+  } catch (err) {
+    fault(phase, err);
+    return false;
+  }
+
+  let admin: boolean;
+  try {
     // Same status set authMiddleware accepts (ADR 0040 phase 2): the quota a
     // token gets must be decided over the same population that token can
     // authenticate as, or an admin sitting at `verified` would authenticate
@@ -1090,7 +1114,16 @@ async function isPrivilegedToken(env: Bindings, hashedApiKey: string): Promise<b
     )
       .bind(hashedApiKey)
       .first<{ role: string | null }>();
-    const admin = row?.role === "admin" || row?.role === "owner";
+    admin = row?.role === "admin" || row?.role === "owner";
+  } catch (err) {
+    fault("lookup", err);
+    return false;
+  }
+
+  // Remembering the answer is an optimization. The database already said who this
+  // is, so a cache that cannot take the write must not turn an admin it confirmed
+  // into a stranger.
+  try {
     const ttl = admin ? WINDOW_SIZE : Math.min(WINDOW_SIZE, 30);
     await boundedWait(
       cache.put(
@@ -1104,13 +1137,26 @@ async function isPrivilegedToken(env: Bindings, hashedApiKey: string): Promise<b
       ),
       "put",
     );
-    return admin;
   } catch (err) {
-    logOncePerWindow("admin-flag", (suppressed) => {
-      console.warn("[rate-limit] admin-flag lookup failed", { error: errorName(err), suppressed });
-    });
-    return false;
+    fault("put", err);
   }
+  return admin;
+}
+
+/** The flag a cached admin-flag record holds, or undefined when it holds none that
+ *  can be used (not JSON, or no boolean `admin`). Anything else that goes wrong
+ *  reading the body is a cache fault and propagates. */
+async function readAdminFlag(cached: Response): Promise<boolean | undefined> {
+  let data: unknown;
+  try {
+    data = await boundedWait(cached.json(), "read");
+  } catch (err) {
+    if (err instanceof SyntaxError) return undefined;
+    throw err;
+  }
+  const admin =
+    typeof data === "object" && data !== null ? (data as { admin?: unknown }).admin : undefined;
+  return typeof admin === "boolean" ? admin : undefined;
 }
 
 export interface RateLimiterOptions {
@@ -1233,11 +1279,16 @@ export async function rateLimiter(
   // operations (mass reindex, release sweeps) routinely exceed the
   // 1000/60s token bucket; capping them produced opaque "Network error"
   // failures in the CLI because requests dropped after the local
-  // limiter 429d. The CF-edge layer still enforces its own per-IP
-  // ceilings, so the floor isn't absent.
+  // limiter 429d. A call over the website's service binding reaches this Worker
+  // without the zone's edge protections (WAF, rate-limiting rules, bot
+  // management), so for a site caller these counters are the only floor and this
+  // bypass removes it: the admin token is the control there, not a limit.
   if (keyKind === "token" && (await isPrivilegedToken(c.env, bucketKeyValue))) {
     await next();
-    stampHeaders(c, { "X-RateLimit-Bucket": "admin-bypass" });
+    stampHeaders(c, {
+      "X-RateLimit-Bucket": "admin-bypass",
+      "X-RateLimit-Caller": caller.source,
+    });
     return;
   }
 
