@@ -824,9 +824,13 @@ const MAPPED_IPV4_RE = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/;
  * visitor too. Anything else (a host name, a port, brackets, a zone id, an
  * over-long string, `unknown`) is null.
  *
- * The 45-character bound and the character pre-check say nothing the URL parser
- * would not also refuse; they keep the parser from ever seeing an arbitrary
- * string, which is the point of having them.
+ * Two checks come before the parser, for different reasons. The 45-character
+ * bound refuses nothing the parser would accept (no valid literal is longer);
+ * it, like the character set, keeps the parser from being handed an arbitrary
+ * string. The character set is NOT redundant: the parser reads
+ * `http://[<candidate>]/`, so a candidate such as `2001:db8::5]/x` closes the
+ * bracket itself and the rest is taken as a path, and would be accepted as
+ * `2001:db8::5` with junk after it.
  */
 function canonicalIpLiteral(candidate: string): string | null {
   if (candidate.length === 0 || candidate.length > MAX_IP_LITERAL_LENGTH) return null;

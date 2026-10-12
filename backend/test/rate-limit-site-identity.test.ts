@@ -96,6 +96,13 @@ describe("__firstForwardedIp", () => {
     ["1:2:3:4:5:6:7:8:9"],
     ["203.0.113.7\n10.0.0.1"],
     ["203.0.113.7;x"],
+    // Junk after an address that the URL parser alone would take for a path: it reads
+    // the candidate between brackets, so a closing bracket in it ends the host early.
+    ["2001:db8::5]/x"],
+    ["2001:db8::5]?x"],
+    ["2001:db8::5]#x"],
+    ["2001:db8::5]\\x"],
+    ["::1]/@[::2"],
     // The FIRST entry decides: an unreadable one is not skipped to reach a later one.
     ["unknown, 203.0.113.7"],
     [", 203.0.113.7"],
