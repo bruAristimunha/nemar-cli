@@ -211,7 +211,10 @@ None blocks shipping the review switched off. Decide the first two before it is 
   in `next` would record the approval and then print "Not merged: GitHub says it cannot be merged
   cleanly (a check is failing). The approval stands." Either accept `unstable` when both required checks
   pass (the merge call still enforces the ruleset, and no bypass is used) or say in ADR 0093 that these
-  are merged by hand.
+  are merged by hand. **Settled in part, 2026-10-12:** ADR 0093 (amendment of that date) reads the state
+  before anything is written, so `--merge` and `y` refuse a held pull request without approving it and
+  `y` is not offered for one. That is the second option's direction, with the refusal moved ahead of the
+  approval. Whether to accept `unstable` instead is still the maintainer's.
 - **`nemar dataset update --monitor` waits for every check**, this one included, and stops on a non-pass.
   That is the right signal for a contributor, but it means a pull request the review holds is not offered
   the merge. Installed older CLIs behave the same.

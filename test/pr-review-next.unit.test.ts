@@ -6,7 +6,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { PassThrough } from "node:stream";
-import { approvalGate } from "../src/lib/pr-review-approve";
+import { type MergeCheck, approvalGate, mergeCheckOf } from "../src/lib/pr-review-approve";
 import { approveAllowed, parseChoice } from "../src/lib/pr-review-next";
 import { LineReader } from "../src/lib/prompt-lines";
 
@@ -29,7 +29,7 @@ describe("what a typed answer means", () => {
 
 describe("when y may approve and merge", () => {
   const pass = approvalGate({ verdict: "pass", staleVerdict: null });
-  const green = { bids: "pass", version: "pass" };
+  const green = { bids: "pass", version: "pass", merge: mergeCheckOf("clean") };
 
   test("a pass with both required checks green", () => {
     expect(approveAllowed({ gate: pass, force: false, ...green })).toEqual({ ok: true });
@@ -52,7 +52,13 @@ describe("when y may approve and merge", () => {
       ["pass", "pending", "version pending"],
     ] as const) {
       for (const force of [false, true]) {
-        const r = approveAllowed({ gate: pass, force, bids, version });
+        const r = approveAllowed({
+          gate: pass,
+          force,
+          bids,
+          version,
+          merge: mergeCheckOf("clean"),
+        });
         expect(r.ok, `${bids}/${version}/${force}`).toBe(false);
         if (!r.ok) {
           expect(r.reason).toContain(word);
@@ -75,31 +81,76 @@ describe("when y may approve and merge", () => {
     }
   });
 
-  test("a pull request that cannot be merged as it is, is not offered y", () => {
+  test("only a pull request GitHub reports as clean is offered y, whatever --force says", () => {
+    // Every other state is refused BEFORE an approval is written, because the merge y promises
+    // would be refused after it (ADR 0093): unstable is a check or status that is not required and
+    // is not passing or has not reported, which a pull request the automated review holds is
+    // expected to be.
     for (const [mergeable, word] of [
+      ["unstable", "a check or status that is not required is not passing or has not reported"],
+      ["blocked", "a required check or review is not satisfied"],
       ["dirty", "merge conflicts"],
       ["behind", "behind main"],
+      ["draft", "it is a draft"],
+      ["unknown", "has not said whether it can be merged"],
+      ["has_hooks", "merges only a pull request GitHub reports as clean"],
+      ["a state nobody has heard of", "merges only a pull request GitHub reports as clean"],
+      // A state that was not read is not a clean one.
+      [undefined, "has not said whether it can be merged"],
+      ["", "has not said whether it can be merged"],
     ] as const) {
-      const r = approveAllowed({ gate: pass, force: true, ...green, mergeable });
-      expect(r.ok, mergeable).toBe(false);
-      if (!r.ok) expect(r.reason).toContain(word);
+      for (const force of [false, true]) {
+        const r = approveAllowed({ gate: pass, force, ...green, merge: mergeCheckOf(mergeable) });
+        expect(r.ok, `${mergeable}/${force}`).toBe(false);
+        if (!r.ok) {
+          expect(r.reason).toContain(word);
+          expect(r.reason).toContain("so a merge would not be attempted");
+        }
+      }
     }
-    // Everything else GitHub says is left to the merge itself: blocked may be waiting on this approval.
-    for (const mergeable of ["clean", "unknown", "blocked", "unstable", "has_hooks", undefined]) {
-      expect(
-        approveAllowed({ gate: pass, force: false, ...green, mergeable }),
-        String(mergeable),
-      ).toEqual({ ok: true });
+    expect(approveAllowed({ gate: pass, force: false, ...green })).toEqual({ ok: true });
+  });
+
+  test("a merge check that could not be made says what happened, and --force does not reach it", () => {
+    const failed: MergeCheck = {
+      ok: false,
+      why: "Could not check whether it can be merged (Server Error (HTTP 502)).",
+      card: "could not be checked (Server Error (HTTP 502))",
+      advice: "retry",
+    };
+    for (const force of [false, true]) {
+      const r = approveAllowed({ gate: pass, force, ...green, merge: failed });
+      expect(r.ok, String(force)).toBe(false);
+      if (!r.ok) expect(r.reason).toContain("Could not check whether it can be merged");
     }
   });
 
   test("both reasons are given when both apply", () => {
     const gate = approvalGate({ verdict: "fail", staleVerdict: null });
-    const r = approveAllowed({ gate, force: false, bids: "fail", version: "pass" });
+    const r = approveAllowed({
+      gate,
+      force: false,
+      bids: "fail",
+      version: "pass",
+      merge: mergeCheckOf("clean"),
+    });
     expect(r.ok).toBe(false);
     if (!r.ok) {
       expect(r.reason).toContain("BIDS failing");
       expect(r.reason).toContain("needs changes");
+    }
+    const all = approveAllowed({
+      gate,
+      force: false,
+      bids: "fail",
+      version: "pass",
+      merge: mergeCheckOf("unstable"),
+    });
+    expect(all.ok).toBe(false);
+    if (!all.ok) {
+      expect(all.reason).toContain("BIDS failing");
+      expect(all.reason).toContain("'unstable'");
+      expect(all.reason).toContain("needs changes");
     }
   });
 });

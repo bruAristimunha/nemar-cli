@@ -179,6 +179,8 @@ const nodes = (...specs: PrSpec[]) => {
 const seed = (r: Parameters<typeof seedReview>[1]) => seedReview(db, r);
 const reviewPosts = () => gh.seen.filter((s) => s.method === "POST" && s.path.endsWith("/reviews"));
 const mergePuts = () => gh.seen.filter((s) => s.method === "PUT" && s.path.endsWith("/merge"));
+/** Everything the administrator's own token wrote to GitHub: an approval, a merge, a comment, a close. */
+const adminWrites = () => gh.seen.filter((s) => s.method !== "GET" && s.token === ADMIN_TOKEN);
 
 // ---------------------------------------------------------------------------------------------
 // list
@@ -1071,13 +1073,275 @@ describe("nemar admin pr-reviews approve", () => {
       expect(refused.stdout).not.toContain("Outcome unknown");
     });
 
-    test("a pull request that is not clean says nothing was sent, and has_hooks is not clean", async () => {
-      reviewed("pass");
-      gh.pulls["nm000201#7"].mergeableState = "has_hooks";
+    /** A pull request the automated review holds: `uncertain` leaves its check at action_required, which GitHub reports as unstable. */
+    function held(verdict: "uncertain" | "fail" = "uncertain") {
+      reviewed(verdict);
+      gh.pulls["nm000201#7"].mergeableState = "unstable";
+    }
+
+    test("--merge on a pull request the review holds (unstable) writes nothing, and says which state and why", async () => {
+      held();
       const r = await approve(["--merge"]);
       expect(r.exitCode).toBe(1);
-      expect(r.stdout).not.toContain("Outcome unknown");
+      expect(r.stdout).toContain("GitHub reports this pull request as 'unstable'");
+      expect(r.stdout).toContain(
+        "a check or status that is not required is not passing or has not reported",
+      );
+      expect(r.stdout).toContain("so a merge would not be attempted");
+      expect(r.stdout).toContain("Nothing was approved or merged.");
+      // Refused by the early check, before the card is shown, not by the look right before the write.
+      expect(r.stdout).not.toContain("Checked again just before approving");
+      expect(r.stdout).not.toContain("Approve nm000201 #7");
+      // The way to approve without merging is named.
+      expect(r.stdout).toContain("without --merge");
+      // The assertions that matter: no approval was recorded and no merge was asked for.
+      expect(r.stdout).not.toContain("Approved nm000201");
+      expect(reviewPosts()).toHaveLength(0);
       expect(mergePuts()).toHaveLength(0);
+      expect(adminWrites()).toHaveLength(0);
+    });
+
+    test("it refuses before asking for confirmation, so the question is not put for something that cannot be done", async () => {
+      held();
+      // Without --yes the confirmation is asked for, and with no terminal it answers "Not
+      // approved." (see confirm). The refusal about the merge comes first, so it is what is said.
+      const r = await cli([...PR, "approve", "nm000201", "7", "--merge"]);
+      expect(r.exitCode).toBe(1);
+      expect(r.stdout).toContain("Nothing was approved or merged.");
+      expect(r.stdout).not.toContain("Not approved.");
+      expect(adminWrites()).toHaveLength(0);
+    });
+
+    test("--dry-run --merge reports the same refusal, because it is what the real run would do", async () => {
+      held();
+      const r = await approve(["--merge", "--dry-run"]);
+      expect(r.exitCode).toBe(1);
+      expect(r.stdout).toContain("GitHub reports this pull request as 'unstable'");
+      expect(r.stdout).not.toContain("Dry run: nothing was approved or merged.");
+      expect(adminWrites()).toHaveLength(0);
+    });
+
+    test("approve alone on a pull request the review holds still approves, and says --merge would not be tried", async () => {
+      held();
+      const r = await approve();
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout).toContain("Approved nm000201 #7");
+      expect(r.stdout).toContain("It is not merged.");
+      expect(r.stdout).toContain("GitHub reports this pull request as 'unstable'");
+      expect(r.stdout).toContain("so a merge would not be attempted");
+      expect(r.stdout).not.toContain("Run approve again with --merge");
+      expect(reviewPosts()).toHaveLength(1);
+      expect(reviewPosts()[0].token).toBe(ADMIN_TOKEN);
+      expect(mergePuts()).toHaveLength(0);
+    });
+
+    test("approve alone while GitHub has not said still offers --merge again, because that state may clear", async () => {
+      reviewed("pass");
+      gh.pulls["nm000201#7"].unknownReads = 99;
+      const r = await approve();
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout).toContain("Approved nm000201 #7");
+      expect(r.stdout).toContain("Run approve again with --merge");
+      expect(r.stdout).not.toContain("a merge would not be attempted");
+    });
+
+    test("approve alone on a held pull request whose review FAILED still needs --force, and with it approves", async () => {
+      held("fail");
+      const refused = await approve();
+      expect(refused.exitCode).toBe(1);
+      expect(refused.stdout).toContain("--force");
+      expect(reviewPosts()).toHaveLength(0);
+
+      const forced = await approve(["--force"]);
+      expect(forced.exitCode).toBe(0);
+      expect(forced.stdout).toContain("Approved nm000201 #7");
+      expect(reviewPosts()).toHaveLength(1);
+      expect(mergePuts()).toHaveLength(0);
+    });
+
+    test("--merge --force on a held pull request whose review FAILED still refuses: --force is about the verdict, not the state", async () => {
+      held("fail");
+      const r = await approve(["--merge", "--force"]);
+      expect(r.exitCode).toBe(1);
+      expect(r.stdout).toContain("GitHub reports this pull request as 'unstable'");
+      expect(r.stdout).toContain("Nothing was approved or merged.");
+      // The EARLY check refused it, before the card was shown: not the late one, which would also
+      // have written nothing but only after "Approve nm000201 #7" and the confirmation.
+      expect(r.stdout).not.toContain("Checked again just before approving");
+      expect(r.stdout).not.toContain("Approve nm000201 #7");
+      expect(adminWrites()).toHaveLength(0);
+    });
+
+    test("an answer that carries no mergeable_state is not clean: it reads as unknown, and nothing is written", async () => {
+      reviewed("pass");
+      gh.pulls["nm000201#7"].omitMergeableState = true;
+      const r = await approve(["--merge"]);
+      expect(r.exitCode).toBe(1);
+      expect(r.stdout).toContain("GitHub reports this pull request as 'unknown'");
+      expect(r.stdout).toContain("Nothing was approved or merged.");
+      expect(adminWrites()).toHaveLength(0);
+    });
+
+    test("every state but clean refuses --merge before anything is written, whatever the verdict", async () => {
+      // `has_hooks` is a GitHub Enterprise Server value and the last is one nobody has heard of:
+      // neither is clean. `draft` is GitHub's own word for a pull request still marked as one.
+      for (const state of ["blocked", "behind", "dirty", "draft", "has_hooks", "brand_new_state"]) {
+        gh.reset();
+        db.run("DELETE FROM pr_reviews");
+        reviewed("pass");
+        gh.pulls["nm000201#7"].mergeableState = state;
+        const r = await approve(["--merge"]);
+        expect(r.exitCode, state).toBe(1);
+        expect(r.stdout, state).toContain(`GitHub reports this pull request as '${state}'`);
+        expect(r.stdout, state).toContain("Nothing was approved or merged.");
+        expect(adminWrites(), state).toHaveLength(0);
+      }
+    });
+
+    test("a state GitHub never settles is treated as not clean, never as clean", async () => {
+      reviewed("pass");
+      gh.pulls["nm000201#7"].unknownReads = 99;
+      const r = await approve(["--merge"]);
+      expect(r.exitCode).toBe(1);
+      expect(r.stdout).toContain("GitHub reports this pull request as 'unknown'");
+      expect(r.stdout).toContain("Nothing was approved or merged.");
+      // A state that may clear by itself is not met with "approve without --merge".
+      expect(r.stdout).toContain("again in a moment");
+      expect(r.stdout).not.toContain("without --merge");
+      expect(adminWrites()).toHaveLength(0);
+    });
+
+    test("when asking again fails, or finds the branch moved, nothing is written and the reason is said", async () => {
+      // The first read says unknown, so the state is asked about again; that second read is the
+      // one that cannot be trusted to say clean.
+      for (const [later, said, advice] of [
+        // A failed read may clear: wait a moment and run it again.
+        [{ status: 502 }, "Could not check whether it can be merged", "again in a moment"],
+        // A moved head will not clear by waiting: a fresh run reads the new commit.
+        [
+          { sha: SHA_B },
+          "The pull request changed since it was read.",
+          "again to read it as it is now",
+        ],
+      ] as const) {
+        gh.reset();
+        db.run("DELETE FROM pr_reviews");
+        reviewed("pass");
+        Object.assign(gh.pulls["nm000201#7"], { unknownReads: 1, adminReadsAfterFirst: later });
+        const r = await approve(["--merge"]);
+        expect(r.exitCode, said).toBe(1);
+        expect(r.stdout, said).toContain(said);
+        expect(r.stdout, said).toContain(advice);
+        expect(r.stdout, said).not.toContain("without --merge");
+        expect(r.stdout, said).not.toContain("Approved nm000201");
+        expect(adminWrites(), said).toHaveLength(0);
+      }
+    });
+
+    test("a pull request closed or merged while it was being checked is refused, with nothing to retry", async () => {
+      for (const [later, word] of [
+        [{ state: "closed" }, "closed"],
+        [{ state: "closed", merged: true }, "merged"],
+      ] as const) {
+        gh.reset();
+        db.run("DELETE FROM pr_reviews");
+        reviewed("pass");
+        Object.assign(gh.pulls["nm000201#7"], { unknownReads: 1, adminReadsAfterFirst: later });
+        const r = await approve(["--merge"]);
+        expect(r.exitCode, word).toBe(1);
+        expect(r.stdout, word).toContain(`The pull request is no longer open (it was ${word}).`);
+        expect(r.stdout, word).toContain("Nothing was approved or merged.");
+        expect(r.stdout, word).not.toContain("in a moment");
+        expect(r.stdout, word).not.toContain("without --merge");
+        expect(adminWrites(), word).toHaveLength(0);
+      }
+    });
+
+    test("a state GitHub is still working out is asked about again, and a clean answer then merges", async () => {
+      reviewed("pass");
+      gh.pulls["nm000201#7"].unknownReads = 2;
+      const r = await approve(["--merge"]);
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout).toContain("Approved nm000201 #7");
+      expect(r.stdout).toContain("Merged nm000201 #7 (merge).");
+      expect(reviewPosts()).toHaveLength(1);
+      expect(mergePuts()).toHaveLength(1);
+    });
+
+    /** The administrator's own reads of the pull request: the first is the card, the rest are looks at the state. */
+    const adminPullReads = () =>
+      gh.seen.filter(
+        (s) => s.method === "GET" && s.path.endsWith("/pulls/7") && s.token === ADMIN_TOKEN,
+      );
+
+    test("the state is read again right before the approval: one that stopped being clean after the first look writes nothing", async () => {
+      // Clean when the pull request was read and checked, unstable by the time the approval would
+      // be written (a check started, or the review reported). The early check alone would pass.
+      reviewed("pass");
+      gh.pulls["nm000201#7"].adminReadsAfterFirst = { mergeableState: "unstable" };
+      const r = await approve(["--merge"]);
+      expect(r.exitCode).toBe(1);
+      expect(r.stdout).toContain("Checked again just before approving:");
+      expect(r.stdout).toContain("GitHub reports this pull request as 'unstable'");
+      expect(r.stdout).toContain("Nothing was approved or merged.");
+      expect(r.stdout).not.toContain("Approved nm000201");
+      expect(adminWrites()).toHaveLength(0);
+    });
+
+    test("the late look refuses a read that fails, a branch that moved and a pull request that closed, too", async () => {
+      for (const [later, said] of [
+        [{ status: 502 }, "Could not check whether it can be merged"],
+        [{ sha: SHA_B }, "The pull request changed since it was read."],
+        [{ state: "closed" }, "The pull request is no longer open (it was closed)."],
+      ] as const) {
+        gh.reset();
+        db.run("DELETE FROM pr_reviews");
+        reviewed("pass");
+        gh.pulls["nm000201#7"].adminReadsAfterFirst = later;
+        const r = await approve(["--merge"]);
+        expect(r.exitCode, said).toBe(1);
+        expect(r.stdout, said).toContain(`Checked again just before approving: ${said}`);
+        expect(adminWrites(), said).toHaveLength(0);
+      }
+    });
+
+    test("the late look costs one more read when the state is clean, and nothing for an approval alone", async () => {
+      reviewed("pass");
+      const merged = await approve(["--merge"]);
+      expect(merged.exitCode).toBe(0);
+      // The first read, the look right before the approval, and the look right before the merge.
+      expect(adminPullReads()).toHaveLength(3);
+
+      gh.reset();
+      db.run("DELETE FROM pr_reviews");
+      reviewed("pass");
+      const alone = await approve();
+      expect(alone.exitCode).toBe(0);
+      expect(adminPullReads()).toHaveLength(1);
+    });
+
+    test("the late look comes after the confirmation: when it is not given there is no second read", async () => {
+      reviewed("pass");
+      // No --yes and no terminal, so the confirmation is not given. A look taken before it would
+      // reopen the whole interactive window the look exists to close.
+      const r = await cli([...PR, "approve", "nm000201", "7", "--merge"]);
+      expect(r.exitCode).toBe(1);
+      expect(r.stdout).toContain("Not approved.");
+      expect(adminPullReads()).toHaveLength(1); // the first read only
+      expect(adminWrites()).toHaveLength(0);
+    });
+
+    test("a clean pull request is approved first and merged second, both with the administrator's token", async () => {
+      // The other direction of the precheck: it must not refuse what it should let through.
+      reviewed("pass");
+      const r = await approve(["--merge"]);
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout).toContain("Merged nm000201 #7 (merge).");
+      expect(adminWrites().map((w) => `${w.method} ${w.path.split("/").pop()}`)).toEqual([
+        "POST reviews",
+        "PUT merge",
+      ]);
+      expect(adminWrites().every((w) => w.token === ADMIN_TOKEN)).toBe(true);
     });
 
     test("happens only with --merge, only on the approved commit, and with the chosen method", async () => {
@@ -1090,9 +1354,11 @@ describe("nemar admin pr-reviews approve", () => {
       expect(mergePuts()[0].body).toEqual({ sha: SHA_A, merge_method: "squash" });
     });
 
-    test("is never done around the ruleset: a blocked pull request stays approved and unmerged", async () => {
+    test("is never done around the ruleset: a pull request that stops being clean after the approval stays approved and unmerged", async () => {
+      // The precheck passed (clean when read), then a check turned pending: the second look,
+      // right before the merge, is the one that holds.
       reviewed("pass");
-      gh.pulls["nm000201#7"].mergeableState = "blocked";
+      gh.pulls["nm000201#7"].mergeableStateAfterReview = "blocked";
       const r = await approve(["--merge"]);
       expect(r.exitCode).toBe(1);
       expect(r.stdout).toContain("Approved nm000201 #7");
@@ -1418,8 +1684,9 @@ describe("nemar admin pr-reviews next", () => {
   });
 
   test("a merge GitHub will not do leaves the approval standing and goes on", async () => {
+    // Clean when the card was shown (so y was offered), blocked by the time of the merge.
     nodes(ready("nm000201", 7), ready("nm000202", 3));
-    gh.pulls["nm000201#7"].mergeableState = "blocked";
+    gh.pulls["nm000201#7"].mergeableStateAfterReview = "blocked";
     const r = await next("y\ns\n");
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("Approved nm000201 #7");
@@ -1522,8 +1789,226 @@ describe("nemar admin pr-reviews next", () => {
     const r = await next("y\nq\n");
     expect(r.stdout).toContain("Merge:    it has merge conflicts");
     expect(r.stdout).toContain("y is not available:");
-    expect(r.stdout).toContain("merge conflicts, so it cannot be merged as it is");
+    expect(r.stdout).toContain("'dirty' (it has merge conflicts)");
     expect(writes()).toHaveLength(0);
+  });
+
+  /** The prompt line for a card: `y` is in it only when `y` will be accepted. */
+  const PROMPT_WITH_Y = "\ny approve + squash merge, n close, c comment";
+  const PROMPT_WITHOUT_Y = "\nn close, c comment, d details, s skip, q quit > ";
+
+  test("a pull request the review holds (unstable) is not offered y, and answering y writes nothing", async () => {
+    nodes(ready("nm000201", 7, {}, "uncertain"));
+    gh.pulls["nm000201#7"].mergeableState = "unstable";
+    const r = await next("y\nq\n");
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain(
+      "Merge:    a check or status that is not required is not passing or has not reported",
+    );
+    expect(r.stdout).toContain("(GitHub: unstable)");
+    expect(r.stdout).toContain(
+      "y is not available: GitHub reports this pull request as 'unstable'",
+    );
+    expect(r.stdout).toContain("so a merge would not be attempted");
+    // The way to approve without merging, and what can be done here instead.
+    expect(r.stdout).toContain("nemar admin pr-reviews approve nm000201 7");
+    expect(r.stdout).toContain("without --merge");
+    // y is not on the prompt, and typing it anyway is refused with the reason, not obeyed.
+    expect(r.stdout).toContain(PROMPT_WITHOUT_Y);
+    expect(r.stdout).not.toContain(PROMPT_WITH_Y);
+    expect(r.stdout).toContain("Not approved: GitHub reports this pull request as 'unstable'");
+    // The assertions that matter: nothing was approved, nothing was merged, nothing was written.
+    expect(r.stdout).not.toContain("Approved nm000201");
+    expect(reviewPosts()).toHaveLength(0);
+    expect(mergePuts()).toHaveLength(0);
+    expect(writes()).toHaveLength(0);
+  });
+
+  test("a clean pull request is approved and merged, and the held one after it is refused y and can still be commented on", async () => {
+    // The queue lists a pass before a review that is not one, so the clean card comes first.
+    nodes(ready("nm000201", 7, {}, "uncertain"), ready("nm000202", 3));
+    gh.pulls["nm000201#7"].mergeableState = "unstable";
+    const r = await next("y\ny\nc\nWaiting for the review.\n");
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("Not approved: GitHub reports this pull request as 'unstable'");
+    expect(r.stdout).toContain("Commented on nm000201 #7.");
+    expect(r.stdout).toContain("Merged nm000202 #3 (squash).");
+    expect(r.stdout).toContain("Done: 1 merged, 1 commented.");
+    // Only the clean one was approved and merged, by the administrator's token.
+    expect(reviewPosts().map((p) => p.path)).toEqual([
+      "/repos/nemarDatasets/nm000202/pulls/3/reviews",
+    ]);
+    expect(mergePuts().map((p) => p.path)).toEqual(["/repos/nemarDatasets/nm000202/pulls/3/merge"]);
+    expect(writes().every((w) => w.token === ADMIN_TOKEN)).toBe(true);
+  });
+
+  test("y reads the state again right before approving: one that stopped being clean after the card was shown writes nothing", async () => {
+    nodes(ready("nm000201", 7));
+    // Clean when the card was built, so y is offered; unstable when y is answered.
+    gh.pulls["nm000201#7"].adminReadsAfterFirst = { mergeableState: "unstable" };
+    const r = await next("y\nq\n");
+    expect(r.stdout).toContain(PROMPT_WITH_Y);
+    expect(r.stdout).toContain(
+      "Not approved: Checked again just before approving: GitHub reports this pull request as 'unstable'",
+    );
+    expect(r.stdout).not.toContain("Approved nm000201");
+    expect(writes()).toHaveLength(0);
+  });
+
+  test("the late look in next refuses a read that fails, a branch that moved and a pull request that closed, too", async () => {
+    for (const [later, said] of [
+      [{ status: 502 }, "Could not check whether it can be merged"],
+      [{ sha: SHA_B }, "The pull request changed since it was read."],
+      [{ state: "closed" }, "The pull request is no longer open (it was closed)."],
+    ] as const) {
+      gh.reset();
+      db.run("DELETE FROM pr_reviews");
+      nodes(ready("nm000201", 7));
+      gh.pulls["nm000201#7"].adminReadsAfterFirst = later;
+      const r = await next("y\ny\nq\n");
+      expect(r.stdout, said).toContain(
+        `Not approved: Checked again just before approving: ${said}`,
+      );
+      // Typing y again takes the late look again against the head the card was shown for, so for a
+      // moved head it refuses every time: the advice is never "try y again".
+      expect(r.stdout, said).not.toContain("Try y again");
+      const again = "run 'nemar admin pr-reviews next' again to look again.";
+      if (said.includes("no longer open")) expect(r.stdout, said).not.toContain(again);
+      else expect(r.stdout, said).toContain(again);
+      expect(writes(), said).toHaveLength(0);
+    }
+  });
+
+  test("the late look in next is taken when y is answered, not when the card is shown", async () => {
+    nodes(ready("nm000201", 7));
+    const r = await next("q\n");
+    expect(r.stdout).toContain(PROMPT_WITH_Y);
+    // The card's own read only: nothing looked again before an answer was given.
+    expect(
+      gh.seen.filter(
+        (s) => s.method === "GET" && s.path.endsWith("/pulls/7") && s.token === ADMIN_TOKEN,
+      ),
+    ).toHaveLength(1);
+    expect(writes()).toHaveLength(0);
+  });
+
+  test("the late look in next costs one more read when the state is clean", async () => {
+    nodes(ready("nm000201", 7));
+    const r = await next("y\n");
+    expect(r.stdout).toContain("Merged nm000201 #7 (squash).");
+    // The card, the look right before the approval, and the look right before the merge.
+    expect(
+      gh.seen.filter(
+        (s) => s.method === "GET" && s.path.endsWith("/pulls/7") && s.token === ADMIN_TOKEN,
+      ),
+    ).toHaveLength(3);
+  });
+
+  test("a clean pull request is still offered y, approved first and merged second", async () => {
+    // The other direction: the state check must not take y away from a pull request that can merge.
+    nodes(ready("nm000201", 7));
+    const r = await next("y\n");
+    expect(r.stdout).toContain(PROMPT_WITH_Y);
+    expect(r.stdout).not.toContain("y is not available");
+    expect(writes().map((w) => `${w.method} ${w.path.split("/").pop()}`)).toEqual([
+      "POST reviews",
+      "PUT merge",
+    ]);
+  });
+
+  test("every state but clean takes y away, whatever --force says", async () => {
+    for (const state of ["blocked", "behind", "dirty", "draft", "has_hooks", "brand_new_state"]) {
+      gh.reset();
+      db.run("DELETE FROM pr_reviews");
+      nodes(ready("nm000201", 7));
+      gh.pulls["nm000201#7"].mergeableState = state;
+      const r = await next("y\nq\n", ["--force"]);
+      expect(r.stdout, state).toContain(
+        `y is not available: GitHub reports this pull request as '${state}'`,
+      );
+      expect(r.stdout, state).not.toContain(PROMPT_WITH_Y);
+      expect(writes(), state).toHaveLength(0);
+    }
+  });
+
+  test("an answer that carries no mergeable_state is not clean: y is not offered and nothing is written", async () => {
+    nodes(ready("nm000201", 7));
+    gh.pulls["nm000201#7"].omitMergeableState = true;
+    const r = await next("y\nq\n");
+    expect(r.stdout).toContain("y is not available: GitHub reports this pull request as 'unknown'");
+    expect(r.stdout).not.toContain(PROMPT_WITH_Y);
+    expect(writes()).toHaveLength(0);
+  });
+
+  test("a state GitHub never settles is not clean: y is not offered and nothing is written", async () => {
+    nodes(ready("nm000201", 7));
+    gh.pulls["nm000201#7"].unknownReads = 99;
+    const r = await next("y\nq\n");
+    expect(r.stdout).toContain("y is not available: GitHub reports this pull request as 'unknown'");
+    // y is not offered, so typing it again does not look again: the advice is to run next again.
+    expect(r.stdout).toContain(
+      "s skips it; run 'nemar admin pr-reviews next' again to look again.",
+    );
+    expect(r.stdout).not.toContain("Try y again");
+    expect(r.stdout).not.toContain(PROMPT_WITH_Y);
+    expect(writes()).toHaveLength(0);
+  });
+
+  test("when asking again fails or finds the branch moved, the card says which, and y is not offered", async () => {
+    for (const [later, card, said] of [
+      [{ status: 502 }, "could not be checked (", "Could not check whether it can be merged ("],
+      [
+        { sha: SHA_B },
+        "the pull request changed since it was read",
+        "The pull request changed since it was read.",
+      ],
+    ] as const) {
+      gh.reset();
+      db.run("DELETE FROM pr_reviews");
+      nodes(ready("nm000201", 7));
+      Object.assign(gh.pulls["nm000201#7"], { unknownReads: 1, adminReadsAfterFirst: later });
+      const r = await next("y\nq\n");
+      expect(r.stdout, said).toContain(`Merge:    ${card}`);
+      expect(r.stdout, said).toContain(`y is not available: ${said}`);
+      // Not the sentence for a state GitHub did not give: nothing of the kind happened.
+      expect(r.stdout, said).not.toContain("has not said whether it can be merged");
+      expect(r.stdout, said).toContain(
+        "s skips it; run 'nemar admin pr-reviews next' again to look again.",
+      );
+      expect(r.stdout, said).not.toContain("Try y again");
+      expect(r.stdout, said).not.toContain(PROMPT_WITH_Y);
+      expect(writes(), said).toHaveLength(0);
+    }
+  });
+
+  test("a pull request closed or merged while its card was being prepared is not offered y", async () => {
+    for (const [later, word] of [
+      [{ state: "closed" }, "closed"],
+      [{ state: "closed", merged: true }, "merged"],
+    ] as const) {
+      gh.reset();
+      db.run("DELETE FROM pr_reviews");
+      nodes(ready("nm000201", 7));
+      Object.assign(gh.pulls["nm000201#7"], { unknownReads: 1, adminReadsAfterFirst: later });
+      const r = await next("y\nq\n");
+      expect(r.stdout, word).toContain("Merge:    the pull request is no longer open");
+      expect(r.stdout, word).toContain(
+        `y is not available: The pull request is no longer open (it was ${word}).`,
+      );
+      expect(r.stdout, word).not.toContain("in a moment");
+      expect(r.stdout, word).not.toContain(PROMPT_WITH_Y);
+      expect(writes(), word).toHaveLength(0);
+    }
+  });
+
+  test("a state GitHub is still working out is asked about again before the card is shown", async () => {
+    nodes(ready("nm000201", 7));
+    gh.pulls["nm000201#7"].unknownReads = 1;
+    const r = await next("y\n");
+    expect(r.stdout).toContain(PROMPT_WITH_Y);
+    expect(r.stdout).toContain("Merged nm000201 #7 (squash).");
+    expect(reviewPosts()).toHaveLength(1);
+    expect(mergePuts()).toHaveLength(1);
   });
 
   test("--force says on the card that y will approve against the review", async () => {

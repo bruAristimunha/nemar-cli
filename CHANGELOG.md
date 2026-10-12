@@ -56,6 +56,23 @@ earlier releases are described only by their generated notes.
   still substring filters. Adjacent fix: `GET /datasets/search` now sends `Cache-Control:
   no-store` on every response; it sent no `Cache-Control` at all, including on its 400s, which
   `GET /datasets` already sent as `no-store`. No migration and no deploy coupling.
+- **`nemar admin pr-reviews approve --merge` and `y` in `next` no longer approve a pull request
+  they then refuse to merge (ADR 0093 amendment).** Both approved first and read GitHub's
+  `mergeable_state` afterwards, and `y` was offered for every state but `dirty` and `behind`, so a
+  pull request the automated review holds (its check is not required, so GitHub is expected to
+  report `unstable`: a check or status that is not required is not passing or has not reported) was
+  approved and left unmerged. The state is now read before anything is written, and again just before
+  the approval is written: unless GitHub says `clean` (asked again while it says `unknown`; an
+  unreadable or unrecognised state, a moved head and a pull request no longer open are not clean),
+  nothing is approved or merged, the state or the failed read is named with why it blocks, and the
+  way forward is given (approve without `--merge` for a state that will not clear, run the command
+  again for one that may or whose head changed; in `next`, `s` skips it and a fresh run looks again).
+  The second look narrows the window to one request and does not close it: GitHub has no
+  approve-and-merge call. `y` is not offered for such a pull request, `--force` does not reach it,
+  and `approve` without `--merge` is unchanged. The "clean only" rule itself is unchanged. A
+  repository whose protection required an approving review would read `blocked` before the approval
+  and is now refused; neither the ruleset applied to published datasets nor the classic protection on
+  the four legacy repositories requires one.
 
 ## 0.10.16 - 2026-10-11
 

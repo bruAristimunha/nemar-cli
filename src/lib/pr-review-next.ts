@@ -10,11 +10,13 @@
  *   d   show the whole report      s   leave it for now      q   stop
  *
  * What `y` may do is the same as for `approve`, plus one thing: it also merges, so it is only
- * offered when the two required checks are green. GitHub would refuse the merge otherwise, and an
- * approval nobody can follow with a merge is better made on purpose with `approve`.
+ * offered when the two required checks are green AND GitHub reports the pull request `clean`. The
+ * merge would be refused otherwise, and an approval nobody can follow with a merge is better made
+ * on purpose with `approve` (without `--merge`) than as the side effect of an answer that promised
+ * both (ADR 0093).
  */
 
-import type { ApprovalGate } from "./pr-review-approve.js";
+import type { ApprovalGate, MergeCheck } from "./pr-review-approve.js";
 
 export type NextChoice = "approve" | "close" | "comment" | "details" | "skip" | "quit";
 
@@ -51,17 +53,24 @@ export type ApproveVerdict = { ok: true } | { ok: false; reason: string };
  * Whether `y` may approve and merge this pull request now. The review's own verdict is judged as
  * for `approve` (`gate`): a failing or running review, or one that could not be read, needs
  * `--force`; the others only need the answer. The two required checks must both be green, whatever
- * `--force` says, because the merge that follows would be refused by GitHub, and so must the pull
- * request be mergeable as it is (no conflicts, not behind): an approval that cannot be followed by
- * the merge `y` promises is better made on purpose with `approve`.
+ * `--force` says, because the merge that follows would be refused by GitHub, and so must GitHub
+ * report the pull request `clean`: an approval that cannot be followed by the merge `y` promises is
+ * better made on purpose with `approve`. Any other state is refused, including `unstable` (a check
+ * that is not required is not passing, which is how a pull request the automated review holds is
+ * reported), `unknown` and one nobody has heard of; `--force` is about the review's verdict and
+ * does not reach it.
  */
 export function approveAllowed(input: {
   gate: ApprovalGate;
   force: boolean;
   bids: string;
   version: string;
-  /** GitHub's `mergeable_state` for the pull request now. Anything but `dirty` and `behind` passes. */
-  mergeable?: string;
+  /**
+   * What GitHub's `mergeable_state` allows, as `checkMergeable` made it (asked again while it was
+   * `unknown`, and a read that failed or found another head is a refusal that says so). Required,
+   * so a caller cannot forget it; only `clean` passes.
+   */
+  merge: MergeCheck;
 }): ApproveVerdict {
   const reasons: string[] = [];
   if (input.bids !== "pass" || input.version !== "pass") {
@@ -69,11 +78,7 @@ export function approveAllowed(input: {
       `A required check is not green (BIDS ${checkWord(input.bids)}, version ${checkWord(input.version)}), so GitHub would not let it merge.`,
     );
   }
-  if (input.mergeable === "dirty") {
-    reasons.push("GitHub reports merge conflicts, so it cannot be merged as it is.");
-  } else if (input.mergeable === "behind") {
-    reasons.push("GitHub reports the branch is behind main, so it cannot be merged as it is.");
-  }
+  if (!input.merge.ok) reasons.push(input.merge.why);
   if (input.gate.kind === "needs_force" && !input.force) {
     reasons.push(input.gate.reason);
   }
