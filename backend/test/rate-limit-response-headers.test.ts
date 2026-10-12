@@ -21,7 +21,7 @@ import {
   viaBinding,
 } from "./helpers/rate-limit-harness";
 
-useRateLimitHarness();
+const h = useRateLimitHarness();
 
 function appWithHandlers(): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
@@ -80,6 +80,31 @@ describe("headers on what a handler built", () => {
     expect(res.headers.get("X-Upstream")).toBe("kept");
     expect(res.headers.get("X-RateLimit-Bucket")).toBe("ip");
     expect(res.headers.get("X-RateLimit-Remaining")).toBe(String(CAP - 1));
+  });
+
+  test("headers that cannot be set at all leave the answer as the handler made it, and say so once", async () => {
+    // A response whose headers refuse every write and cannot be rebuilt either:
+    // this must not turn a good answer into a 500.
+    const app = new Hono<AppEnv>();
+    app.use("*", rateLimiter);
+    app.get("/hostile", () => {
+      const res = new Response("fine", { status: 202 });
+      Object.defineProperty(res, "headers", {
+        get() {
+          throw new TypeError("headers are unavailable");
+        },
+      });
+      return res;
+    });
+    for (let i = 0; i < 3; i++) {
+      const res = await hit(app, edge("203.0.113.14"), "/hostile");
+      expect(res.status).toBe(202);
+    }
+    const told = h.warn.mock.calls.filter((c) =>
+      String(c[0]).includes("could not set the rate limit headers"),
+    );
+    expect(told.length).toBe(1);
+    expect(told[0]?.[1]).toMatchObject({ error: "TypeError" });
   });
 
   test("an answer to a handler that threw still says what the limiter counted", async () => {

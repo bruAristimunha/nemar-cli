@@ -84,11 +84,23 @@ describe("__readCounter", () => {
   });
 
   test("a window that has ended is a new one, even if the cache still holds the record", () => {
-    for (const end of [now, now - 1, now - 5 * WINDOW_MS]) {
+    for (const end of [now, now - 1, now - 4999]) {
       expect(__readCounter({ count: 999, warned: true, windowEnd: end }, now)).toEqual({
         count: 0,
         warned: false,
         windowEnd: now + WINDOW_MS,
+      });
+    }
+  });
+
+  test("one that ended long ago is a new window and also damage: the cache cannot have kept it", () => {
+    // A count of 999 with an end in seconds (or 0) reset silently before.
+    for (const end of [now - 5000, now - 5 * WINDOW_MS, 0, Math.floor(now / 1000)]) {
+      expect(__readCounter({ count: 999, warned: true, windowEnd: end }, now)).toEqual({
+        count: 0,
+        warned: false,
+        windowEnd: now + WINDOW_MS,
+        damage: "bad-end",
       });
     }
   });
@@ -163,9 +175,10 @@ describe("__readCounter", () => {
     expect(read(undefined).damage).toBeUndefined();
     expect(read({ count: 7, warned: false }).damage).toBeUndefined();
     expect(read({ count: 0, warned: false, windowEnd: now + 1000 }).damage).toBeUndefined();
-    // An ended window, however stale, is simply over.
+    // An ended window is simply over, as long as it ended just now.
     expect(read({ count: 9, windowEnd: now - 1 }).damage).toBeUndefined();
     expect(read({ count: "lots", windowEnd: now - 1 }).damage).toBeUndefined();
+    expect(read({ count: 9, windowEnd: now - 4999 }).damage).toBeUndefined();
     // The few seconds two isolates' clocks may differ by are cut, not reported.
     expect(read({ count: 1, windowEnd: now + WINDOW_MS + 1 })).toMatchObject({
       windowEnd: now + WINDOW_MS,
@@ -554,6 +567,21 @@ describe("a damaged or stale record does not wedge a bucket", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("X-RateLimit-Remaining")).toBe(String(ANON_CAP - 1));
     expect((await h.stored("ip:203.0.113.31"))?.windowEnd).toBe(T0 + WINDOW_MS);
+  });
+
+  test("a record with an end written in seconds resets, and says so", async () => {
+    await h.seed(
+      "ip:203.0.113.37",
+      { count: ANON_CAP - 1, windowEnd: Math.floor(T0 / 1000) },
+      3600,
+    );
+    const res = await hit(buildApp(), edge("203.0.113.37"));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-RateLimit-Remaining")).toBe(String(ANON_CAP - 1));
+    const damaged = h.warn.mock.calls.filter(
+      (c) => c[0] === "[rate-limit] repaired a damaged counter record",
+    );
+    expect(damaged.map((c) => c[1])).toMatchObject([{ keyKind: "ip", damage: "bad-end" }]);
   });
 
   test("a body that is not JSON is replaced, not trusted and not failed open on", async () => {

@@ -294,7 +294,8 @@ function freshWindow(now: number): __CounterState {
  * undefined when there is none.
  *
  *  - No record, or one whose window has ended (the cache had not dropped it yet):
- *    a new window.
+ *    a new window. One that ended more than a few seconds ago is also reported as
+ *    damage, since the cache cannot have kept it that long.
  *  - A record from before windows were stored (`{count, warned}` only) has an end
  *    nobody wrote down, but its entry cannot outlive a window from its last write,
  *    so a full window from now is an upper bound for what a client is told, and the
@@ -332,7 +333,14 @@ export function __readCounter(data: unknown, now: number): __CounterState {
     };
   }
   if (typeof end === "number" && Number.isFinite(end)) {
-    if (end <= now) return freshWindow(now);
+    if (end <= now) {
+      // An ended window is simply over, unless it ended long ago: the cache drops
+      // an entry within a second of its end, so a record that old was not written
+      // by this code (an end in seconds, or 0, say) and is reported as damage.
+      return end <= now - CLOCK_SKEW_TOLERANCE_MS
+        ? { ...freshWindow(now), damage: "bad-end" }
+        : freshWindow(now);
+    }
     const damage = countDamaged
       ? ("bad-count" as const)
       : end > now + WINDOW_MS + CLOCK_SKEW_TOLERANCE_MS
@@ -478,9 +486,23 @@ function stampHeaders(c: RateLimitContext, headers: Record<string, string>): voi
   };
   try {
     apply(c.res);
+    return;
   } catch {
+    // Immutable headers: rebuild the response from itself below.
+  }
+  try {
     c.res = new Response(c.res.body, c.res);
     apply(c.res);
+  } catch (err) {
+    // The answer is the handler's and is good; the headers are a courtesy. Failing
+    // here would turn a success into a 500 that `--search "[rate-limit]"` could not
+    // find, so it is told once, with the tag, and the response goes out without.
+    logOncePerWindow("stamp", (suppressed) => {
+      console.warn("[rate-limit] could not set the rate limit headers on a response", {
+        error: errorName(err),
+        suppressed,
+      });
+    });
   }
 }
 
