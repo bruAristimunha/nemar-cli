@@ -136,3 +136,77 @@ describe("the privileged-token lookup", () => {
     expect(lookups[0]?.[1]).toMatchObject({ error: "TypeError", suppressed: 0 });
   });
 });
+
+describe("refusals are logged once per window per bucket kind", () => {
+  const refusals = () => h.warn.mock.calls.filter((c) => c[0] === "[rate-limit] refusing");
+
+  test("the first refusal says which bucket, its cap and when it ends; the rest are counted", async () => {
+    const app = buildApp();
+    await h.seed("ip:203.0.113.80", {
+      count: __limits.MAX_REQUESTS,
+      warned: false,
+      windowEnd: T0 + 30_000,
+    });
+    for (let i = 0; i < 50; i++) {
+      expect((await hit(app, edge("203.0.113.80"))).status).toBe(429);
+    }
+    expect(refusals().length).toBe(1);
+    expect(refusals()[0]?.[1]).toEqual({
+      keyKind: "ip",
+      maxRequests: __limits.MAX_REQUESTS,
+      retryAfter: 30,
+      suppressed: 0,
+    });
+    // A minute later, in another full window: one more line, which says how many
+    // refusals the quiet period swallowed.
+    h.clock = T0 + __limits.WINDOW_SIZE * 1000;
+    await h.seed("ip:203.0.113.80", {
+      count: __limits.MAX_REQUESTS,
+      warned: false,
+      windowEnd: h.clock + __limits.WINDOW_SIZE * 1000,
+    });
+    await hit(app, edge("203.0.113.80"));
+    expect(refusals().length).toBe(2);
+    expect(refusals()[1]?.[1]).toMatchObject({ suppressed: 49, retryAfter: 60 });
+  });
+
+  test("each bucket kind has its own line, and none holds an address", async () => {
+    const app = buildApp();
+    await h.seed("auth-ip:203.0.113.81", {
+      count: __limits.AUTH_MAX_REQUESTS,
+      windowEnd: T0 + 60_000,
+    });
+    await h.seed("site-ip:site:203.0.113.82", {
+      count: __limits.SITE_IP_MAX_REQUESTS,
+      windowEnd: T0 + 60_000,
+    });
+    await hit(app, edge("203.0.113.81"), "/auth/login");
+    await hit(app, viaBinding("203.0.113.82"));
+    expect(refusals().map((c) => (c[1] as { keyKind: string }).keyKind)).toEqual([
+      "auth-ip",
+      "site-ip",
+    ]);
+    expect(JSON.stringify(h.warn.mock.calls)).not.toContain("203.0.113.8");
+  });
+
+  test("the miss budget's refusals are logged too", async () => {
+    const env = { ENVIRONMENT: "production" } as Pick<
+      Bindings,
+      "ENVIRONMENT" | "TEST_BYPASS_TOKEN"
+    >;
+    await h.seed("data-miss-ip:203.0.113.83", {
+      count: __limits.DATA_MISS_MAX_REQUESTS,
+      windowEnd: T0 + 20_000,
+    });
+    for (let i = 0; i < 5; i++) {
+      const outcome = await checkDataMissBudget(
+        env,
+        new Request("http://localhost/data/x", { headers: edge("203.0.113.83") }),
+        undefined,
+      );
+      expect(outcome.allowed).toBe(false);
+    }
+    expect(refusals().length).toBe(1);
+    expect(refusals()[0]?.[1]).toMatchObject({ keyKind: "data-miss-ip", retryAfter: 20 });
+  });
+});

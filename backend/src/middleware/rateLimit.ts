@@ -245,7 +245,17 @@ export interface __CounterState {
   count: number;
   warned: boolean;
   windowEnd: number;
+  /** Set when the record had to be repaired to be read; never stored. */
+  damage?: __CounterDamage;
 }
+
+/** What was wrong with a record that was repaired rather than trusted. */
+export type __CounterDamage = "unparseable" | "bad-count" | "bad-end";
+
+/** How far past one window an end may lie before it is called damage and not
+ *  the small difference between two isolates' clocks. It is cut to one window
+ *  either way. */
+const CLOCK_SKEW_TOLERANCE_MS = 5000;
 
 function freshWindow(now: number): __CounterState {
   return { count: 0, warned: false, windowEnd: now + WINDOW_MS };
@@ -261,24 +271,58 @@ function freshWindow(now: number): __CounterState {
  *    nobody wrote down, but its entry cannot outlive a window from its last write,
  *    so a full window from now is an upper bound for what a client is told, and the
  *    entry's own expiry still clears it.
- *  - An end further away than one window (a skewed clock, a damaged record) is cut
- *    to one window, so no record can hold a bucket shut for longer than that.
+ *  - An end further away than one window is cut to one window, so no record can
+ *    hold a bucket shut for longer than that.
  *  - A count that is not a finite number above zero is zero.
+ *
+ * A record that is not an object, a count that is not a whole number above or at
+ * zero, and an end that is not a number or lies more than a few seconds past one
+ * window are repaired as above and also reported in `damage`, so the caller can
+ * say so: the bucket heals itself, and nobody learns that something wrote a bad
+ * record unless it is told.
  */
 export function __readCounter(data: unknown, now: number): __CounterState {
-  if (typeof data !== "object" || data === null) return freshWindow(now);
+  if (data === undefined) return freshWindow(now);
+  if (typeof data !== "object" || data === null || Array.isArray(data)) {
+    return { ...freshWindow(now), damage: "unparseable" };
+  }
   const record = data as { count?: unknown; warned?: unknown; windowEnd?: unknown };
+  const rawCount = record.count;
   const count =
-    typeof record.count === "number" && Number.isFinite(record.count) && record.count > 0
-      ? Math.floor(record.count)
+    typeof rawCount === "number" && Number.isFinite(rawCount) && rawCount > 0
+      ? Math.floor(rawCount)
       : 0;
+  const countDamaged = typeof rawCount !== "number" || !Number.isInteger(rawCount) || rawCount < 0;
   const warned = record.warned === true;
   const end = record.windowEnd;
+  if (end === undefined) {
+    return {
+      count,
+      warned,
+      windowEnd: now + WINDOW_MS,
+      ...(countDamaged ? { damage: "bad-count" as const } : {}),
+    };
+  }
   if (typeof end === "number" && Number.isFinite(end)) {
     if (end <= now) return freshWindow(now);
-    return { count, warned, windowEnd: Math.min(end, now + WINDOW_MS) };
+    const damage = countDamaged
+      ? ("bad-count" as const)
+      : end > now + WINDOW_MS + CLOCK_SKEW_TOLERANCE_MS
+        ? ("bad-end" as const)
+        : undefined;
+    return {
+      count,
+      warned,
+      windowEnd: Math.min(end, now + WINDOW_MS),
+      ...(damage ? { damage } : {}),
+    };
   }
-  return { count, warned, windowEnd: now + WINDOW_MS };
+  return {
+    count,
+    warned,
+    windowEnd: now + WINDOW_MS,
+    damage: countDamaged ? "bad-count" : "bad-end",
+  };
 }
 
 /** Whole seconds left in the window, at least 1 and at most one window. */
@@ -299,19 +343,36 @@ function counterRecord(state: __CounterState, now: number): Response {
   );
 }
 
-/** Read a bucket's record. A record that will not parse is replaced, not trusted. */
+/**
+ * Read a bucket's record. A record that will not parse or will not make sense is
+ * repaired, not trusted and not failed open on, and the repair is logged once per
+ * window per bucket kind and kind of damage: the self-heal is right, a silent one
+ * would hide whatever is writing bad records.
+ */
 async function readCounterRecord(
   cached: Response | undefined,
   now: number,
+  keyKind: string,
 ): Promise<__CounterState> {
   if (!cached) return freshWindow(now);
   let data: unknown;
   try {
     data = await cached.json();
   } catch {
-    data = undefined;
+    data = null;
   }
-  return __readCounter(data, now);
+  const state = __readCounter(data, now);
+  if (state.damage) {
+    const damage = state.damage;
+    logOncePerWindow(`damage:${keyKind}:${damage}`, (suppressed) => {
+      console.warn("[rate-limit] repaired a damaged counter record", {
+        keyKind,
+        damage,
+        suppressed,
+      });
+    });
+  }
+  return state;
 }
 
 /** The 429 every counter in this file answers with: the same body and headers
@@ -342,6 +403,14 @@ function refusal(
       ...(caller === undefined ? {} : { "X-RateLimit-Caller": caller }),
     },
   };
+}
+
+/** One line per window per bucket kind for the refusals, so `wrangler tail` can
+ *  show that a bucket is refusing and how often. Never an address. */
+function logRefusal(keyKind: string, maxRequests: number, retryAfter: number): void {
+  logOncePerWindow(`refusal:${keyKind}`, (suppressed) => {
+    console.warn("[rate-limit] refusing", { keyKind, maxRequests, retryAfter, suppressed });
+  });
 }
 
 /**
@@ -1159,7 +1228,7 @@ export async function rateLimiter(
     // Worker's clock only moves at I/O.
     const cached = await cache.match(cacheKey);
     const now = Date.now();
-    const state = await readCounterRecord(cached, now);
+    const state = await readCounterRecord(cached, now, keyKind);
     const count = state.count;
     let warned = state.warned;
 
@@ -1185,6 +1254,7 @@ export async function rateLimiter(
       await writeCount(cache.put(cacheKey, counterRecord(observed, now)));
     } else if (count >= maxRequests) {
       const refused = refusal(keyKind, maxRequests, state, now, caller.source);
+      logRefusal(keyKind, maxRequests, refused.body.retry_after as number);
       return c.json(refused.body, 429, refused.headers);
     } else {
       // Increment the counter. The record keeps the window's original end and
@@ -1363,10 +1433,11 @@ async function consumeKeyedBudget(
     const cache = caches.default;
     const cached = await cache.match(cacheKey);
     const now = Date.now();
-    const state = await readCounterRecord(cached, now);
+    const state = await readCounterRecord(cached, now, bucket.kind);
 
     if (state.count >= bucket.maxRequests) {
       const refused = refusal(bucket.kind, bucket.maxRequests, state, now, bucket.caller);
+      logRefusal(bucket.kind, bucket.maxRequests, refused.body.retry_after as number);
       return {
         allowed: false,
         response: new Response(JSON.stringify(refused.body), {

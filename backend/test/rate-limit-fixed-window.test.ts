@@ -104,19 +104,65 @@ describe("__readCounter", () => {
     expect(state.windowEnd).toBe(now + WINDOW_MS);
   });
 
-  test("damaged values cannot wedge a bucket", () => {
-    expect(__readCounter({ count: "lots", windowEnd: now + 1000 }, now).count).toBe(0);
-    expect(__readCounter({ count: -5, windowEnd: now + 1000 }, now).count).toBe(0);
-    expect(__readCounter({ count: 3.9, windowEnd: now + 1000 }, now).count).toBe(3);
-    expect(__readCounter({ count: 3, windowEnd: "soon" }, now).windowEnd).toBe(now + WINDOW_MS);
-    expect(__readCounter({ count: 3, windowEnd: null }, now).windowEnd).toBe(now + WINDOW_MS);
-    for (const junk of [null, 5, "text", true]) {
-      expect(__readCounter(junk, now)).toEqual({
+  test("damaged values cannot wedge a bucket, and are reported as damage", () => {
+    const read = (record: unknown) => __readCounter(record, now);
+    // A count that is not a whole number at or above zero.
+    expect(read({ count: "lots", windowEnd: now + 1000 })).toMatchObject({
+      count: 0,
+      damage: "bad-count",
+    });
+    expect(read({ count: -5, windowEnd: now + 1000 })).toMatchObject({
+      count: 0,
+      damage: "bad-count",
+    });
+    expect(read({ count: 3.9, windowEnd: now + 1000 })).toMatchObject({
+      count: 3,
+      damage: "bad-count",
+    });
+    expect(read({ windowEnd: now + 1000 })).toMatchObject({ count: 0, damage: "bad-count" });
+    expect(read({ count: Number.POSITIVE_INFINITY, windowEnd: now + 1000 })).toMatchObject({
+      count: 0,
+      damage: "bad-count",
+    });
+    // An end that is not a number, or lies well past one window.
+    expect(read({ count: 3, windowEnd: "soon" })).toMatchObject({
+      windowEnd: now + WINDOW_MS,
+      damage: "bad-end",
+    });
+    expect(read({ count: 3, windowEnd: null })).toMatchObject({
+      windowEnd: now + WINDOW_MS,
+      damage: "bad-end",
+    });
+    expect(read({ count: 3, windowEnd: now + 10 * 86_400_000 })).toMatchObject({
+      windowEnd: now + WINDOW_MS,
+      damage: "bad-end",
+    });
+    // Anything that is not a record.
+    for (const junk of [null, 5, "text", true, [1, 2]]) {
+      expect(read(junk)).toEqual({
         count: 0,
         warned: false,
         windowEnd: now + WINDOW_MS,
+        damage: "unparseable",
       });
     }
+  });
+
+  test("what is normal is not damage", () => {
+    const read = (record: unknown) => __readCounter(record, now);
+    expect(read(undefined).damage).toBeUndefined();
+    expect(read({ count: 7, warned: false }).damage).toBeUndefined();
+    expect(read({ count: 0, warned: false, windowEnd: now + 1000 }).damage).toBeUndefined();
+    // An ended window, however stale, is simply over.
+    expect(read({ count: 9, windowEnd: now - 1 }).damage).toBeUndefined();
+    expect(read({ count: "lots", windowEnd: now - 1 }).damage).toBeUndefined();
+    // The few seconds two isolates' clocks may differ by are cut, not reported.
+    expect(read({ count: 1, windowEnd: now + WINDOW_MS + 1 })).toMatchObject({
+      windowEnd: now + WINDOW_MS,
+    });
+    expect(read({ count: 1, windowEnd: now + WINDOW_MS + 1 }).damage).toBeUndefined();
+    expect(read({ count: 1, windowEnd: now + WINDOW_MS + 5000 }).damage).toBeUndefined();
+    expect(read({ count: 1, windowEnd: now + WINDOW_MS + 5001 }).damage).toBe("bad-end");
   });
 });
 
@@ -355,6 +401,46 @@ describe("a damaged or stale record does not wedge a bucket", () => {
     expect(first.status).toBe(200);
     expect(first.headers.get("X-RateLimit-Remaining")).toBe(String(ANON_CAP - 1));
     expect((await h.stored("ip:203.0.113.32"))?.count).toBe(1);
+  });
+
+  test("every repair is logged once per window per bucket and kind of damage, without the record", async () => {
+    const app = buildApp();
+    const damaged = () =>
+      h.warn.mock.calls.filter((c) => c[0] === "[rate-limit] repaired a damaged counter record");
+    // Three buckets, each with a different kind of damage.
+    await h.seed("ip:203.0.113.33", "this is not json", 3600);
+    await h.seed("site-ip:site:203.0.113.34", { count: "lots", windowEnd: T0 + 30_000 }, 3600);
+    await h.seed("auth-ip:203.0.113.35", { count: 2, windowEnd: "soon" }, 3600);
+    await hit(app, edge("203.0.113.33"));
+    await hit(app, { "X-Forwarded-For": "203.0.113.34" });
+    await hit(app, edge("203.0.113.35"), "/auth/login");
+    expect(damaged().map((c) => c[1])).toEqual([
+      { keyKind: "ip", damage: "unparseable", suppressed: 0 },
+      { keyKind: "site-ip", damage: "bad-count", suppressed: 0 },
+      { keyKind: "auth-ip", damage: "bad-end", suppressed: 0 },
+    ]);
+    // The repair wrote a good record, so the same buckets are quiet from here on.
+    await hit(app, edge("203.0.113.33"));
+    expect(damaged().length).toBe(3);
+    // Nothing in the lines quotes a record or an address.
+    expect(JSON.stringify(h.warn.mock.calls)).not.toContain("this is not json");
+    expect(JSON.stringify(h.warn.mock.calls)).not.toContain("203.0.113.3");
+  });
+
+  test("a bucket repaired again later in the window is counted, not repeated", async () => {
+    const app = buildApp();
+    const damaged = () =>
+      h.warn.mock.calls.filter((c) => c[0] === "[rate-limit] repaired a damaged counter record");
+    for (let i = 0; i < 4; i++) {
+      await h.seed("ip:203.0.113.36", "garbage", 3600);
+      await hit(app, edge("203.0.113.36"));
+    }
+    expect(damaged().length).toBe(1);
+    h.clock = T0 + WINDOW_MS;
+    await h.seed("ip:203.0.113.36", "garbage", 3600);
+    await hit(app, edge("203.0.113.36"));
+    expect(damaged().length).toBe(2);
+    expect(damaged()[1]?.[1]).toMatchObject({ suppressed: 3 });
   });
 });
 
