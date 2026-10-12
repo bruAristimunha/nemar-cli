@@ -1488,10 +1488,10 @@
           {
             "schema": {
               "type": "string",
-              "description": "Filter by modality name (exact match)."
+              "description": "Filter by modality: a whole-token, case-insensitive match against the dataset's modality list, so `eeg` does not match `ieeg`. A comma-separated list matches a dataset holding any of its modalities, at most 32 distinct values; more is refused."
             },
             "required": false,
-            "description": "Filter by modality name (exact match).",
+            "description": "Filter by modality: a whole-token, case-insensitive match against the dataset's modality list, so `eeg` does not match `ieeg`. A comma-separated list matches a dataset holding any of its modalities, at most 32 distinct values; more is refused.",
             "name": "modality",
             "in": "query"
           },
@@ -1854,7 +1854,7 @@
             }
           },
           "400": {
-            "description": "An invalid facet range, enum value, or filter token.",
+            "description": "An invalid facet range, enum value, or filter token, or a `modality` list naming more than 32 distinct values.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1932,10 +1932,10 @@
           {
             "schema": {
               "type": "string",
-              "description": "Filter by modality name (exact match)."
+              "description": "Filter by modality: a whole-token, case-insensitive match against the dataset's modality list, so `eeg` does not match `ieeg`. A comma-separated list matches a dataset holding any of its modalities, at most 32 distinct values; more is refused."
             },
             "required": false,
-            "description": "Filter by modality name (exact match).",
+            "description": "Filter by modality: a whole-token, case-insensitive match against the dataset's modality list, so `eeg` does not match `ieeg`. A comma-separated list matches a dataset holding any of its modalities, at most 32 distinct values; more is refused.",
             "name": "modality",
             "in": "query"
           },
@@ -2298,7 +2298,7 @@
             }
           },
           "400": {
-            "description": "Missing the required \"q\" parameter, or an invalid facet/range/enum filter.",
+            "description": "Missing the required \"q\" parameter, an invalid facet/range/enum filter, or a `modality` list naming more than 32 distinct values.",
             "content": {
               "application/json": {
                 "schema": {

@@ -23,6 +23,7 @@ import {
   parseLicenseTierFilter,
 } from "../backend/src/lib/license";
 import { buildDatasetFilterClauses } from "../backend/src/routes/datasets/catalog";
+import { MODALITY_TOKENS_SQL } from "../backend/src/services/dataset-filters";
 import { writeDatasetCatalogFields } from "../backend/src/services/dataset-metadata-columns";
 
 const MIG = join(import.meta.dir, "..", "backend/src/db/migrations");
@@ -218,16 +219,17 @@ describe("buildDatasetFilterClauses license clause", () => {
 
   test("accumulates params correctly alongside a preceding modality clause", () => {
     // Guards the shared-params spread: each tier must push as a flat value, so a
-    // combined modality + license filter binds ["%eeg%", "public"], never a
-    // nested ["%eeg%", ["public"]] that would corrupt the binding.
+    // combined modality + license filter binds ['["eeg"]', "public"] (the
+    // modality's token list is one JSON-array parameter, #1711), never a nested
+    // [['["eeg"]'], ["public"]] that would corrupt the binding.
     const params: (string | number)[] = [];
     const clause = buildDatasetFilterClauses(params, {
       modality: "eeg",
       licenseTiers: ["public"],
     });
-    expect(clause).toContain("LOWER(COALESCE(d.modalities, '')) LIKE ?");
+    expect(clause).toContain(MODALITY_TOKENS_SQL);
     expect(clause).toContain("d.license_tier IN (?)");
-    expect(params).toEqual(["%eeg%", "public"]);
+    expect(params).toEqual(['["eeg"]', "public"]);
   });
 
   test("filters real rows by tier end-to-end", () => {

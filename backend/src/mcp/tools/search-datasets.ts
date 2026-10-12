@@ -45,9 +45,11 @@ import { splitCsv } from "../../services/data-router.js";
 import { FacetEnumParseError, parseFacetFilters } from "../../services/dataset-facets.js";
 import {
   type DatasetFilterOptions,
+  ModalityTokenLimitError,
   PUBLISHED_AT_SQL,
   buildDatasetFilterClauses,
   buildPublicCatalogBase,
+  parseModalityFilter,
 } from "../../services/dataset-filters.js";
 import {
   DATASET_ID_IN_JSON_LIST,
@@ -218,8 +220,10 @@ const BESPOKE_OPTION_FIELD = {
  * is a non-empty string that `parseLicenseTierFilter` reduces to no tiers, a
  * version facet given `"v"` parses to an empty prefix, an enum facet given
  * `","` parses to no values, and `modality: "  "` is whitespace that the
- * builder's raw truthiness test accepts and binds as `%  %`. Every one of
- * those disagreements disappears once the question is asked after parsing.
+ * builder's raw truthiness test accepts (it still does: the clause binds an
+ * empty token list and matches nothing, since #1711, where it used to bind
+ * `%  %`). Every one of those disagreements disappears once the question is
+ * asked after parsing.
  *
  * The rules themselves are the builders': `buildDatasetFilterClauses` guards
  * each bespoke clause on bare truthiness (`if (opts.modality)`, `if
@@ -313,6 +317,19 @@ export async function searchDatasetsTool(
     return badFilterOutcome(
       `That filter value was not accepted: ${detail}. Ranges take \`10..20\`, \`64..\`, or \`..128\`; enum and version facets take a declared token.`,
     );
+  }
+
+  // #1711: an over-long modality list is refused, never truncated, and
+  // reported by name like a malformed facet value (ADR 0051). Checked after
+  // the facet parse so the more specific complaint comes first; the clause
+  // builder enforces the same bound as a backstop.
+  if (args.modality) {
+    try {
+      parseModalityFilter(args.modality);
+    } catch (err) {
+      if (!(err instanceof ModalityTokenLimitError)) throw err;
+      return badFilterOutcome(`That filter value was not accepted. ${err.message}`);
+    }
   }
 
   const filters = buildFilterOptions(args, facets);

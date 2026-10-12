@@ -19,7 +19,8 @@
  * Also not here: the pre-existing bespoke filters (`search`, `modality`,
  * `author`, `task`, `hasDoi`, `hasHed`, `hasZarr`, `hasZarrVerified`,
  * `dataComplete`, `recent`, `licenseTiers`) -- their semantics (FTS routing,
- * LIKE-joined lists, or -- for `hasZarr`, issue #1062 -- a derived "ready AND
+ * LIKE-joined `author` and `task` lists, a whole-token `modality` list (#1711),
+ * or -- for `hasZarr`, issue #1062 -- a derived "ready AND
  * has stores" predicate distinct from the `zarr` ENUM facet declared below,
  * which matches the raw `zarr_status` value instead) don't fit this table and
  * keep their existing home in `backend/src/services/dataset-filters.ts`.

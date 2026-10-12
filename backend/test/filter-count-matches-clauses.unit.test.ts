@@ -66,9 +66,12 @@ const BESPOKE: Record<string, { set: unknown; sql: string }> = {
 };
 
 /**
- * Supplied, non-empty, and inert: values a caller can really send that reach a
- * parser and come back with nothing to filter on. The class the old wire-level
- * count got wrong, and the reason the cap now runs after parsing.
+ * Supplied, non-empty, and inert after parsing, or live and narrowing to
+ * nothing: values a caller can really send that reach a parser and come back
+ * with no usable value. Each is either dropped (no clause, not counted) or
+ * kept as a clause that matches nothing (counted); the count and the SQL must
+ * settle it the same way. The class the old wire-level count got wrong, and
+ * the reason the filter cap now runs after parsing.
  */
 const INERT_VALUES: Record<string, unknown> = {
   // `parseLicenseTierFilter` keeps only declared tiers and drops the rest, and
@@ -76,7 +79,10 @@ const INERT_VALUES: Record<string, unknown> = {
   // identifier here is a caller doing what the schema invited.
   license: "CC0-1.0",
   // Whitespace: `narrows` used to trim and see "unset" while the builder's
-  // `if (opts.modality)` sees a truthy string and binds `%  %`.
+  // `if (opts.modality)` sees a truthy string. Since #1711 the builder keeps
+  // it as a LIVE filter that names no token: it binds an empty token list
+  // (`[]`) and matches nothing, and the count includes it. The other entries
+  // here are dropped instead; the assertion only needs the two to agree.
   modality: "  ",
   task: "\t",
   author: " ",

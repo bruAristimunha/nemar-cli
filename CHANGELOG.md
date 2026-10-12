@@ -40,6 +40,22 @@ earlier releases are described only by their generated notes.
   or `.yaml`, and the per-dataset templates for a `gh` call with no checkout, `GH_REPO` or
   `--repo`, a swallowed issue lookup, a lookup in a step that does not stop on error, and a
   swallowed label create. A pull request that edited only a workflow used to run no job at all.
+- **The `modality` filter matches a whole modality, not a substring (#1711, ADR 0032
+  amendment).** `GET /datasets`, `GET /datasets/search` and the MCP `search_datasets` tool
+  matched `LIKE '%eeg%'` over the comma-joined modality list, so `modality=EEG` also returned
+  datasets that were intracranial only (`ieeg`), and a `%` or `_` in the value matched every
+  row or any character. The filter now matches a whole token, ignoring case, and a space
+  inside a token is part of it. **A partial name no longer matches:** `modality=ee` and
+  `modality=mot` used to return datasets and now return nothing; use the full name (`eeg`,
+  `motion`). A comma-separated value matches a dataset holding any of its tokens (it used to
+  match only a list that held them adjacent and in stored order). A value that names no
+  modality, such as whitespace or a bare comma, matches nothing. **At most 32 distinct
+  modalities may be named in one request**; more is a 400 (a refused tool call on MCP) rather
+  than a truncated list. Result counts for `modality=eeg` drop to the datasets that hold an
+  `eeg` token, which is the count `GET /datasets/facets` reports. `task` and `author` are
+  still substring filters. Adjacent fix: `GET /datasets/search` now sends `Cache-Control:
+  no-store` on every response; it sent no `Cache-Control` at all, including on its 400s, which
+  `GET /datasets` already sent as `no-store`. No migration and no deploy coupling.
 
 ## 0.10.16 - 2026-10-11
 

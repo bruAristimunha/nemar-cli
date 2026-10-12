@@ -35,10 +35,12 @@ import {
 } from "../../services/dataset-facets";
 import {
   type DatasetFilterOptions,
+  ModalityTokenLimitError,
   PUBLISHED_AT_SQL,
   buildDatasetFilterClauses,
   buildPublicCatalogBase,
   escapeLikePattern,
+  parseModalityFilter,
 } from "../../services/dataset-filters";
 import { DEFAULT_MIN_SCORE, executeDatasetSearch } from "../../services/dataset-search";
 import { isValidDatasetId } from "../../services/datasetId";
@@ -441,9 +443,11 @@ export function parseMinScore(c: FilterQueryContext): number {
  * matching, and setting both would AND the query against itself through two
  * different matchers.
  *
- * Throws {@link RangeParseError} on an invalid facet range (`shared/range.ts`)
- * or `FacetEnumParseError` on an unrecognised enum token (#1165 review P1,
- * ADR 0032); the caller is expected to translate either into a 400. The
+ * Throws {@link RangeParseError} on an invalid facet range (`shared/range.ts`),
+ * `FacetEnumParseError` on an unrecognised enum token (#1165 review P1,
+ * ADR 0032), or `ModalityTokenLimitError` on a `modality` value naming more
+ * than `MAX_MODALITY_FILTER_TOKENS` distinct tokens (#1711); the caller is
+ * expected to translate any of them into a 400. The
  * pre-existing `license` param keeps its original drop-unrecognised
  * behaviour (`parseLicenseTierFilter`) -- a deliberate asymmetry, not an
  * oversight, since it predates this table and the website already depends
@@ -483,9 +487,14 @@ export function parseFilterQuery(
   const includeUnknownRaw = c.req.query("include_unknown");
   const includeUnknown = includeUnknownRaw === "1" || includeUnknownRaw === "true";
   const facets = parseFacetFilters((key) => c.req.query(key));
+  // #1711: refuse an over-long modality list here, at the parse step, so it is
+  // a 400 on both endpoints and never reaches a statement. The clause builder
+  // enforces the same bound as a backstop.
+  const modality = c.req.query("modality");
+  if (modality) parseModalityFilter(modality);
 
   const filters: DatasetFilterOptions = {
-    modality: c.req.query("modality"),
+    modality,
     author: c.req.query("author"),
     task: c.req.query("task"),
     hasDoi,
@@ -953,7 +962,11 @@ export function registerCatalogRoutes(datasetRoutes: DatasetsRouter): void {
     try {
       filters = parseFilterQuery(c);
     } catch (err) {
-      if (err instanceof RangeParseError || err instanceof FacetEnumParseError) {
+      if (
+        err instanceof RangeParseError ||
+        err instanceof FacetEnumParseError ||
+        err instanceof ModalityTokenLimitError
+      ) {
         return c.json({ error: err.message }, 400);
       }
       throw err;
@@ -1260,6 +1273,13 @@ export function registerCatalogRoutes(datasetRoutes: DatasetsRouter): void {
    * too would AND the query against itself through a second matcher.
    */
   datasetRoutes.get("/search", optionalAuthMiddleware, async (c) => {
+    // Safe Cache-Control default, set BEFORE any early return like every other
+    // handler in this file: the missing-`q` 400, a bad-filter 400 (an invalid
+    // range or enum, or a `modality` list over the token limit) and the 500
+    // all inherit no-store. This handler used to send no Cache-Control at all,
+    // so its 400s could be cached by a shared cache while the same 400s on
+    // GET /datasets were not.
+    c.header("Cache-Control", "no-store");
     const query = c.req.query("q");
     if (!query) {
       return c.json({ error: "Search query parameter 'q' is required" }, 400);
@@ -1270,7 +1290,11 @@ export function registerCatalogRoutes(datasetRoutes: DatasetsRouter): void {
     try {
       filters = parseFilterQuery(c, { includeSearch: false });
     } catch (err) {
-      if (err instanceof RangeParseError || err instanceof FacetEnumParseError) {
+      if (
+        err instanceof RangeParseError ||
+        err instanceof FacetEnumParseError ||
+        err instanceof ModalityTokenLimitError
+      ) {
         return c.json({ error: err.message }, 400);
       }
       throw err;

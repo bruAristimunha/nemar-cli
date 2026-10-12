@@ -50,6 +50,7 @@ import {
 } from "../../../shared/contract/mcp.js";
 import { DATASET_ID_RE, SOURCE_COMMIT_RE } from "../../../shared/contract/zarr-index.js";
 import { FACETS, describeFacet } from "../../../shared/facets.js";
+import { MODALITY_FILTER_DESCRIPTION } from "../../../shared/modality-filter.js";
 
 const DATASET_ID_DESCRIPTION =
   "NEMAR dataset id: two lowercase letters (nm/on/xx) followed by six digits, e.g. nm000132 (ERP CORE).";
@@ -89,10 +90,7 @@ export const searchDatasetsInputSchema4 = z4
         "Free-text search over dataset name, description, authors, tasks and modalities. " +
           "Omit to browse the public catalog instead (a plain, filtered list).",
       ),
-    modality: z4
-      .string()
-      .optional()
-      .describe("Filter to datasets whose modalities include this substring (e.g. 'eeg', 'meg')."),
+    modality: z4.string().optional().describe(MODALITY_FILTER_DESCRIPTION),
     task: z4.string().optional().describe("Filter to datasets whose tasks include this substring."),
     has_hed: z4
       .boolean()
