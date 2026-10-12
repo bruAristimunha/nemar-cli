@@ -235,16 +235,16 @@ describe("a failing cache write is logged once per kind per window", () => {
     ]);
   });
 
-  test("error names a runtime invents share one key, so the key space has a ceiling", async () => {
+  test("error names outside the known set share one key, so the key space has a ceiling", async () => {
     let n = 0;
-    class InventiveWrites extends InMemoryCache {
+    class UnlistedNameWrites extends InMemoryCache {
       async put(): Promise<void> {
         const error = new Error("a write fault");
         error.name = `Fault${n++}`;
         throw error;
       }
     }
-    install(new InventiveWrites());
+    install(new UnlistedNameWrites());
     const app = buildApp();
     for (let i = 0; i < 6; i++) await hit(app, edge(ADDRESS));
     // The first names itself on its line; the rest are the same unnamed class.
