@@ -44,21 +44,23 @@ function install(cache: InMemoryCache): void {
 const faults = () => h.error.mock.calls.filter((c) => c[0] === FAULT);
 
 describe("a failing cache write is logged once per kind per window", () => {
-  test("a thousand data-plane requests, one line, and every request is served", async () => {
+  test("a thousand data-plane requests, a handful of lines, and every request is served", async () => {
     install(new PutFailingCache());
     const app = buildApp();
     for (let i = 0; i < 1000; i++) {
       const res = await hit(app, edge(ADDRESS), "/data/nm000108/v1.0.0/x");
       expect(res.status).toBe(200);
     }
-    expect(faults().length).toBe(1);
+    // The line that opens the window, then one when 10 and one when 100 calls have been
+    // swallowed: the burst's size without a line per request.
+    expect(faults().map((c) => (c[1] as { suppressed: number }).suppressed)).toEqual([0, 10, 90]);
     expect(faults()[0]?.[1]).toMatchObject({ keyKind: "data-ip", error: "Error" });
   });
 
   test("each bucket kind has its own line, so one outage is not hidden behind another", async () => {
     install(new PutFailingCache());
     const app = buildApp();
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 5; i++) {
       await hit(app, edge(ADDRESS));
       await hit(app, viaBinding(ADDRESS));
       await hit(app, edge(ADDRESS), "/auth/login");
@@ -73,7 +75,7 @@ describe("a failing cache write is logged once per kind per window", () => {
       Bindings,
       "ENVIRONMENT" | "TEST_BYPASS_TOKEN"
     >;
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 5; i++) {
       const outcome = await checkDataMissBudget(
         env,
         new Request("http://localhost/data/x", { headers: edge(ADDRESS) }),
@@ -88,9 +90,9 @@ describe("a failing cache write is logged once per kind per window", () => {
   test("the line comes back after a window and says how many it swallowed", async () => {
     install(new PutFailingCache());
     const app = buildApp();
-    for (let i = 0; i < 20; i++) await hit(app, edge(ADDRESS));
+    for (let i = 0; i < 5; i++) await hit(app, edge(ADDRESS));
     expect(faults().length).toBe(1);
-    expect(faults()[0]?.[1]).toMatchObject({ suppressed: 0 });
+    expect(faults()[0]?.[1]).toMatchObject({ suppressed: 0, sinceMs: 0 });
 
     h.clock = T0 + __limits.WINDOW_SIZE * 1000 - 1;
     await hit(app, edge(ADDRESS));
@@ -99,16 +101,77 @@ describe("a failing cache write is logged once per kind per window", () => {
     h.clock = T0 + __limits.WINDOW_SIZE * 1000;
     await hit(app, edge(ADDRESS));
     expect(faults().length).toBe(2);
-    expect(faults()[1]?.[1]).toMatchObject({ suppressed: 20 });
+    expect(faults()[1]?.[1]).toMatchObject({ suppressed: 5 });
   });
 
-  test("a clock that went backwards does not silence the line", async () => {
+  test("a burst that ends inside the window is sized on its own lines, at 10, 100 and 1000", async () => {
+    install(new PutFailingCache());
+    const app = buildApp();
+    for (let i = 0; i < 1100; i++) {
+      h.clock = T0 + i;
+      await hit(app, edge(ADDRESS));
+    }
+    // Opening line, then the 10th, 100th and 1000th swallowed call: four lines and no more.
+    expect(faults().map((c) => (c[1] as { suppressed: number }).suppressed)).toEqual([
+      0, 10, 90, 900,
+    ]);
+    // Each line says how long ago the previous one was.
+    expect(faults().map((c) => (c[1] as { sinceMs: number }).sinceMs)).toEqual([0, 10, 90, 900]);
+  });
+
+  test("a clock that went backwards does not silence the line, and sinceMs is never negative", async () => {
     install(new PutFailingCache());
     const app = buildApp();
     await hit(app, edge(ADDRESS));
     h.clock = T0 - 5000;
     await hit(app, edge(ADDRESS));
     expect(faults().length).toBe(2);
+    expect(faults()[1]?.[1]).toMatchObject({ sinceMs: 0 });
+  });
+
+  test("sinceMs is never negative on a milestone line either, when the clock steps back inside a window", async () => {
+    install(new PutFailingCache());
+    const app = buildApp();
+    // The 10th swallowed call at +30 s, then the clock steps back to +20 s for the 100th.
+    for (let i = 0; i < 10; i++) {
+      h.clock = T0 + 1000;
+      await hit(app, edge(ADDRESS));
+    }
+    h.clock = T0 + 30_000;
+    await hit(app, edge(ADDRESS));
+    h.clock = T0 + 20_000;
+    for (let i = 0; i < 90; i++) await hit(app, edge(ADDRESS));
+    const since = faults().map((c) => (c[1] as { sinceMs: number }).sinceMs);
+    expect(since.length).toBe(3);
+    for (const ms of since) expect(ms).toBeGreaterThanOrEqual(0);
+    expect(since[2]).toBe(0);
+  });
+
+  test("a write fault does not hide a later fault of another phase on the same bucket", async () => {
+    // The limiter's own logic fails ten seconds after a transient stall in the write:
+    // keyed by kind alone, the second would be swallowed for the rest of the window.
+    class ThenMatchFails extends InMemoryCache {
+      failMatch = false;
+      async put(): Promise<void> {
+        throw new TypeError("a transient write fault");
+      }
+      async match(request: RequestInfo | URL): Promise<Response | undefined> {
+        if (this.failMatch) throw new RangeError("a later lookup fault");
+        return super.match(request);
+      }
+    }
+    const cache = new ThenMatchFails();
+    install(cache);
+    const app = buildApp();
+    await hit(app, edge(ADDRESS));
+    h.clock = T0 + 10_000;
+    cache.failMatch = true;
+    await hit(app, edge(ADDRESS));
+    const lines = faults().map((c) => c[1] as { phase: string; error: string });
+    expect(lines.map((l) => [l.phase, l.error])).toEqual([
+      ["put", "TypeError"],
+      ["match", "RangeError"],
+    ]);
   });
 });
 
@@ -129,7 +192,7 @@ describe("the privileged-token lookup", () => {
   test("a failing lookup warns once per window, by error class", async () => {
     const app = buildApp();
     const headers = { ...edge(ADDRESS), Authorization: `Bearer ${"a".repeat(48)}` };
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 5; i++) {
       // This suite has no database, so every lookup fails and the request is
       // counted in the ordinary token bucket.
       const res = await hit(app, headers, "/admin/users");
@@ -151,7 +214,7 @@ describe("refusals are logged once per window per bucket kind", () => {
       warned: false,
       windowEnd: T0 + 30_000,
     });
-    for (let i = 0; i < 50; i++) {
+    for (let i = 0; i < 5; i++) {
       expect((await hit(app, edge("203.0.113.80"))).status).toBe(429);
     }
     expect(refusals().length).toBe(1);
@@ -173,7 +236,7 @@ describe("refusals are logged once per window per bucket kind", () => {
     });
     await hit(app, edge("203.0.113.80"));
     expect(refusals().length).toBe(2);
-    expect(refusals()[1]?.[1]).toMatchObject({ suppressed: 49, retryAfter: 60 });
+    expect(refusals()[1]?.[1]).toMatchObject({ suppressed: 4, retryAfter: 60 });
   });
 
   test("a different caller on the same bucket has a line of its own, so noise cannot hide a site outage", async () => {
@@ -310,7 +373,11 @@ describe("a fault line says where the work failed", () => {
     } finally {
       digest.mockRestore();
     }
-    expect(phaseOf()).toMatchObject({ phase: "decide", error: "TypeError" });
+    // It is the limiter failing, not the cache, and the line says so.
+    const limiterFaults = h.error.mock.calls.filter((c) => c[0] === "[rate-limit] limiter fault");
+    expect(limiterFaults.length).toBe(1);
+    expect(limiterFaults[0]?.[1]).toMatchObject({ phase: "decide", error: "TypeError" });
+    expect(faults()).toEqual([]);
   });
 
   test("a line that comes back says how long ago the burst it reports began", async () => {

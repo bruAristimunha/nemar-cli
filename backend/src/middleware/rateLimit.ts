@@ -157,35 +157,56 @@ const RATE_LIMIT_WRITE_STALL_MS = 500;
 
 const WINDOW_MS = WINDOW_SIZE * 1000;
 
-/** When a log key last spoke, and how many lines it has swallowed since. */
+/** What a log key remembers: when its window opened, when it last spoke, and how
+ *  many calls it has swallowed in this window and since it last spoke. */
 interface LogSlot {
-  at: number;
-  suppressed: number;
+  windowAt: number;
+  lastAt: number;
+  inWindow: number;
+  sinceLine: number;
 }
 
 /** Module-level so it persists across requests in a warm isolate. */
 const logSlots = new Map<string, LogSlot>();
 
+/** Swallowed calls in one window at which a line speaks again, so a burst that ends
+ *  inside the window shows its size without a line per call: at most four lines. */
+const LOG_MILESTONES: ReadonlySet<number> = new Set([10, 100, 1000]);
+
 /**
- * Run `emit` at most once per rate-limit window per `key`, per isolate, and hand
- * it the number of calls swallowed since the previous emission and how long ago
- * that was (`sinceMs`, 0 for the first), so a line can say how much it is
- * standing for: the count is for the PREVIOUS stretch, not the one just opening. Every log in this file that a request can
- * trigger goes through here: during a sustained fault or a flood, one line per
- * kind per minute is the ONE line worth reading, and a line per request buries
- * it. The key space is bounded by the kinds, sources and reasons below.
+ * Run `emit` at most once per rate-limit window per `key`, per isolate, and again
+ * when the calls it swallows in that window reach 10, 100 and 1000. It is handed
+ * `suppressed`, the calls swallowed since the PREVIOUS LINE for that key, and
+ * `sinceMs`, the time since that previous line (0 for the first). So the line that
+ * opens a window reports the stretch before it, not the one just opening, and the
+ * size of a burst that ends inside a window is on the milestone lines, not on the
+ * next window's. Every log in this file that a request can trigger goes through
+ * here: during a sustained fault or a flood, a handful of lines per kind per minute
+ * is the line worth reading, and a line per request buries it. The key space is
+ * bounded by the kinds, sources and reasons below.
  */
 function logOncePerWindow(key: string, emit: (suppressed: number, sinceMs: number) => void): void {
   const now = Date.now();
   const slot = logSlots.get(key);
   // A clock that went backwards ends the quiet period as well: otherwise a slot
   // stamped in the future would silence its line until the clock caught up.
-  if (slot && now >= slot.at && now - slot.at < WINDOW_MS) {
-    slot.suppressed++;
+  if (slot && now >= slot.windowAt && now - slot.windowAt < WINDOW_MS) {
+    slot.inWindow++;
+    slot.sinceLine++;
+    if (LOG_MILESTONES.has(slot.inWindow)) {
+      const suppressed = slot.sinceLine;
+      const sinceMs = Math.max(0, now - slot.lastAt);
+      slot.sinceLine = 0;
+      slot.lastAt = now;
+      emit(suppressed, sinceMs);
+    }
     return;
   }
-  logSlots.set(key, { at: now, suppressed: 0 });
-  emit(slot?.suppressed ?? 0, slot ? now - slot.at : 0);
+  const suppressed = slot?.sinceLine ?? 0;
+  // Never negative, even if the clock has gone backwards since the previous line.
+  const sinceMs = slot ? Math.max(0, now - slot.lastAt) : 0;
+  logSlots.set(key, { windowAt: now, lastAt: now, inWindow: 0, sinceLine: 0 });
+  emit(suppressed, sinceMs);
 }
 
 /** The error's class name and nothing else. A cache key is a URL that carries the
@@ -227,8 +248,8 @@ function boundedWait<T>(work: Promise<T>, what: string): Promise<T> {
 type FaultPhase = "match" | "read" | "decide" | "put";
 
 /**
- * Log a Cache API fault (the enforcement path failing open) once per window per
- * bucket kind. One fault is one outage for every request of that kind, and a
+ * Log a fault in the enforcement path (which fails open) once per window per
+ * bucket kind and phase. One fault is one outage for every request of that kind, and a
  * request-volume-scaled flood of `console.error` lines is exactly the noise that
  * makes the line worth reading harder to find. Per kind rather than global so
  * that an outage seen only by one bucket (a failing `put` on the data plane, say)
@@ -240,15 +261,22 @@ function logCacheFault(
   error: unknown,
   phase: FaultPhase,
 ): void {
-  logOncePerWindow(`fault:${keyKind}`, (suppressed, sinceMs) => {
-    console.error("[rate-limit] cache failure", {
-      keyKind,
-      ...(route === undefined ? {} : { route }),
-      phase,
-      error: errorName(error),
-      suppressed,
-      sinceMs,
-    });
+  // Keyed by phase as well as kind, so a transient stall in the write cannot hide a
+  // later fault in the limiter's own logic on the same bucket for the whole window.
+  logOncePerWindow(`fault:${keyKind}:${phase}`, (suppressed, sinceMs) => {
+    // `decide` is the limiter's own logic failing after the cache answered, not the
+    // cache failing, and it should not read as one.
+    console.error(
+      phase === "decide" ? "[rate-limit] limiter fault" : "[rate-limit] cache failure",
+      {
+        keyKind,
+        ...(route === undefined ? {} : { route }),
+        phase,
+        error: errorName(error),
+        suppressed,
+        sinceMs,
+      },
+    );
   });
 }
 
