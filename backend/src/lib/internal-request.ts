@@ -11,10 +11,12 @@
  * caps. The data plane's limiter therefore must neither pool them with a caller
  * that failed to say who it is, nor warn about them.
  *
- * The exemption is the data plane's alone (`data-ip` and the miss budget). Any
- * other bucket counts a marked request by its headers like any other caller, so
- * marking a request by mistake cannot skip the strict, token or private-grant
- * limits.
+ * The exemption is the data plane's alone (`data-ip` and the miss budget), and
+ * only for a request that carries neither address header, as the two real callers
+ * build theirs. A marked request that carries a usable address is counted as that
+ * address, and any other bucket counts a marked request in whatever bucket it
+ * would reach unmarked, so marking a request by mistake cannot skip the strict,
+ * token or private-grant limits.
  *
  * The mark is an object identity held in module memory, not a header, so nothing
  * a client sends can claim it, and a copy of a marked request (`new Request(req)`)

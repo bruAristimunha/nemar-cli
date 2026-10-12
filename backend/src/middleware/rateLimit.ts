@@ -1416,8 +1416,10 @@ export async function rateLimiter(
   // all, and the pooled bucket that now catches a caller with no address must not
   // catch it. The exemption is this bucket's alone: on any other kind the mark
   // changes nothing, so a request marked by mistake is counted and logged like any
-  // other caller with no address.
-  if (keyKind === "data-ip" && isInternalRequest(c.req.raw)) {
+  // other caller with no address. It also needs the request to have no address, as
+  // the mark's definition says (`lib/internal-request.ts`): a marked request that
+  // carries a usable one is counted as that address, like an unmarked request.
+  if (keyKind === "data-ip" && caller.source === "unattributed" && isInternalRequest(c.req.raw)) {
     await next();
     return;
   }
@@ -1644,13 +1646,15 @@ export async function checkDataMissBudget(
   request: Request,
   waitUntil: ((work: Promise<unknown>) => void) | undefined,
 ): Promise<DataMissBudgetOutcome> {
-  // A request this Worker built for itself spends no miss budget, any more than it
-  // spends the `data-ip` bucket (see `rateLimiter`): this is the data plane's own.
-  if (isInternalRequest(request)) return { allowed: true };
   // The same identity the middleware uses, so a visitor forwarded by the website
   // is charged to their own miss budget and an unattributed caller to one shared
   // budget, not to a fresh random one.
   const caller = callerIdentityOf(request);
+  // A request this Worker built for itself spends no miss budget, any more than it
+  // spends the `data-ip` bucket (see `rateLimiter`): this is the data plane's own.
+  // The mark alone is not enough: a marked request carries neither address header,
+  // so one that carries a usable address is counted like any other caller.
+  if (caller.source === "unattributed" && isInternalRequest(request)) return { allowed: true };
   return consumeKeyedBudget(
     env,
     request,

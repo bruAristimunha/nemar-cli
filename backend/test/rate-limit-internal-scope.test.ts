@@ -11,7 +11,11 @@
 
 import { describe, expect, test } from "bun:test";
 import { internalRequest } from "../src/lib/internal-request";
-import { __limits, checkPrivateGrantBudget } from "../src/middleware/rateLimit";
+import {
+  __limits,
+  checkDataMissBudget,
+  checkPrivateGrantBudget,
+} from "../src/middleware/rateLimit";
 import { hashApiKey } from "../src/services/token";
 import type { Bindings } from "../src/types/bindings";
 import {
@@ -80,6 +84,57 @@ describe("a marked request outside the data plane is counted like any other", ()
     const res = await marked("/neurobagel/index.json");
     expect(res.headers.get("X-RateLimit-Bucket")).toBe("neurobagel-ip");
     expect((await h.stored("neurobagel-ip:unattributed"))?.count).toBe(1);
+  });
+});
+
+describe("the data plane's exemption needs no address as well as the mark", () => {
+  const url = "http://localhost/data/nm000108/v1.0.0/x";
+  const missEnv = { ENVIRONMENT: "production" } as Pick<
+    Bindings,
+    "ENVIRONMENT" | "TEST_BYPASS_TOKEN"
+  >;
+  const full = { count: __limits.DATA_MAX_REQUESTS, warned: false, windowEnd: WINDOW_END };
+  const fullMiss = { count: __limits.DATA_MISS_MAX_REQUESTS, warned: false, windowEnd: WINDOW_END };
+  const markedAt = (headers: Record<string, string>) =>
+    app.fetch(internalRequest(new Request(url, { headers })), PROD_ENV);
+
+  test("control: an unmarked request from a full address is refused", async () => {
+    await h.seed(`data-ip:${ADDRESS}`, full);
+    expect((await app.fetch(new Request(url, { headers: edge(ADDRESS) }), PROD_ENV)).status).toBe(
+      429,
+    );
+  });
+
+  test("a marked request carrying CF-Connecting-IP is refused at that address's cap", async () => {
+    await h.seed(`data-ip:${ADDRESS}`, full);
+    const res = await markedAt(edge(ADDRESS));
+    expect(res.status).toBe(429);
+    expect(res.headers.get("X-RateLimit-Caller")).toBe("edge");
+  });
+
+  test("a marked request carrying only a usable X-Forwarded-For is refused at that visitor's cap", async () => {
+    await h.seed(`data-ip:site:${ADDRESS}`, full);
+    const res = await markedAt(viaBinding(ADDRESS));
+    expect(res.status).toBe(429);
+    expect(res.headers.get("X-RateLimit-Caller")).toBe("site");
+  });
+
+  test("below the cap, a marked request that carries an address is counted", async () => {
+    const res = await markedAt(edge(ADDRESS));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-RateLimit-Bucket")).toBe("data-ip");
+    expect((await h.stored(`data-ip:${ADDRESS}`))?.count).toBe(1);
+  });
+
+  test("the miss budget is the same: an address makes it count", async () => {
+    await h.seed(`data-miss-ip:${ADDRESS}`, fullMiss);
+    await h.seed(`data-miss-ip:site:${ADDRESS}`, fullMiss);
+    const ask = (headers: Record<string, string>) =>
+      checkDataMissBudget(missEnv, internalRequest(new Request(url, { headers })), undefined);
+    expect((await ask(edge(ADDRESS))).allowed).toBe(false);
+    expect((await ask(viaBinding(ADDRESS))).allowed).toBe(false);
+    // Control: marked and addressless still passes.
+    expect((await ask({})).allowed).toBe(true);
   });
 });
 
