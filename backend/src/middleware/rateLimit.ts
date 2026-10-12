@@ -1150,12 +1150,14 @@ async function isPrivilegedToken(env: Bindings, hashedApiKey: string): Promise<b
   const cacheKey = new Request(`https://rate-limit.internal/admin-flag:${hashedApiKey}`);
   const fault = (phase: string, err: unknown) =>
     logOncePerWindow(`admin-flag:${phase}`, (suppressed, sinceMs) => {
-      console.warn("[rate-limit] admin-flag lookup failed", {
-        phase,
-        error: errorName(err),
-        suppressed,
-        sinceMs,
-      });
+      // The write is the one phase that does not fail the lookup: the database
+      // already answered, so the line says what broke rather than that the lookup did.
+      console.warn(
+        phase === "put"
+          ? "[rate-limit] admin-flag cache write failed"
+          : "[rate-limit] admin-flag lookup failed",
+        { phase, error: errorName(err), suppressed, sinceMs },
+      );
     });
 
   // The cached answer, if there is a usable one. A cache that fails here fails the
@@ -1168,10 +1170,20 @@ async function isPrivilegedToken(env: Bindings, hashedApiKey: string): Promise<b
     if (cached) {
       phase = "read";
       const known = await readAdminFlag(cached);
-      if (known !== undefined) return known;
+      if ("admin" in known) return known.admin;
       // A record that is not a usable flag is read again from the database and
       // replaced below, rather than holding the token to "not an admin" until it
-      // expires.
+      // expires, and reported like a damaged counter record: the self-heal is
+      // right, a silent one would hide whatever is writing bad records.
+      const damage = known.damage;
+      logOncePerWindow(`admin-flag-damaged:${damage}`, (suppressed, sinceMs) => {
+        console.warn("[rate-limit] replaced a damaged admin-flag record", {
+          keyKind: "admin-flag",
+          damage,
+          suppressed,
+          sinceMs,
+        });
+      });
     }
   } catch (err) {
     fault(phase, err);
@@ -1224,20 +1236,22 @@ async function isPrivilegedToken(env: Bindings, hashedApiKey: string): Promise<b
   return admin;
 }
 
-/** The flag a cached admin-flag record holds, or undefined when it holds none that
- *  can be used (not JSON, or no boolean `admin`). Anything else that goes wrong
- *  reading the body is a cache fault and propagates. */
-async function readAdminFlag(cached: Response): Promise<boolean | undefined> {
+/** What a cached admin-flag record holds: the flag, or why it holds none that can be
+ *  used (`unparseable`: not JSON; `no-boolean`: JSON without a boolean `admin`).
+ *  Anything else that goes wrong reading the body is a cache fault and propagates. */
+type AdminFlagRead = { admin: boolean } | { damage: "unparseable" | "no-boolean" };
+
+async function readAdminFlag(cached: Response): Promise<AdminFlagRead> {
   let data: unknown;
   try {
     data = await boundedWait(cached.json(), "read");
   } catch (err) {
-    if (err instanceof SyntaxError) return undefined;
+    if (err instanceof SyntaxError) return { damage: "unparseable" };
     throw err;
   }
   const admin =
     typeof data === "object" && data !== null ? (data as { admin?: unknown }).admin : undefined;
-  return typeof admin === "boolean" ? admin : undefined;
+  return typeof admin === "boolean" ? { admin } : { damage: "no-boolean" };
 }
 
 export interface RateLimiterOptions {
