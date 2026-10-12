@@ -23,6 +23,7 @@ import {
   __resetRateLimitLogsForTests,
   __selectBucket,
   checkDataMissBudget,
+  checkPrivateGrantBudget,
 } from "../src/middleware/rateLimit";
 import { createMcpRoutes } from "../src/routes/mcp";
 import type { Bindings } from "../src/types/bindings";
@@ -881,6 +882,39 @@ describe("checkDataMissBudget uses the same identity", () => {
     expect((await ask({})).allowed).toBe(false);
     expect((await ask({ "X-Forwarded-For": "junk" })).allowed).toBe(false);
     expect((await ask(viaBinding(A))).allowed).toBe(true);
+  });
+});
+
+describe("checkPrivateGrantBudget says how the request arrived", () => {
+  const env = { ENVIRONMENT: "production" } as Pick<Bindings, "ENVIRONMENT" | "TEST_BYPASS_TOKEN">;
+  const CAP = __limits.PRIVATE_GRANT_MAX_REQUESTS;
+
+  test("a refusal carries X-RateLimit-Caller for each source, though the key is the account", async () => {
+    const cases: Array<[string, Record<string, string>]> = [
+      ["edge", { "CF-Connecting-IP": A }],
+      ["site", viaBinding(A)],
+      ["unattributed", {}],
+    ];
+    for (const [i, [source, headers]] of cases.entries()) {
+      const userId = 400 + i;
+      await h.seed(`private-grant-account:user-${userId}`, {
+        count: CAP,
+        warned: false,
+        windowEnd: T0 + 60_000,
+      });
+      const refused = await checkPrivateGrantBudget(
+        env,
+        new Request("http://localhost/auth/private/grant", { headers }),
+        userId,
+        undefined,
+      );
+      expect(refused.allowed).toBe(false);
+      if (!refused.allowed) {
+        expect(refused.response.status).toBe(429);
+        expect(refused.response.headers.get("X-RateLimit-Bucket")).toBe("private-grant-account");
+        expect(refused.response.headers.get("X-RateLimit-Caller")).toBe(source);
+      }
+    }
   });
 });
 

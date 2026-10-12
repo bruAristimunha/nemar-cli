@@ -1633,6 +1633,9 @@ export async function checkPrivateGrantBudget(
       kind: PRIVATE_GRANT_BUCKET_KIND,
       key: `user-${userId}`,
       maxRequests: PRIVATE_GRANT_MAX_REQUESTS,
+      // Keyed by account, but the answer still says how the request arrived, as
+      // every other refusal does.
+      caller: callerIdentityOf(request).source,
     },
     waitUntil,
   );
