@@ -24,6 +24,7 @@ import {
   __selectBucket,
   checkDataMissBudget,
 } from "../src/middleware/rateLimit";
+import { createMcpRoutes } from "../src/routes/mcp";
 import type { Bindings } from "../src/types/bindings";
 import {
   PROD_ENV,
@@ -719,6 +720,55 @@ describe("the identity log", () => {
       await hit(buildApp(), headers);
       expect(h.warn.mock.calls[0]?.[1]).toMatchObject({ reason });
     }
+  });
+});
+
+describe("the other entry points count a forwarded visitor too", () => {
+  test("the MCP sub-app (anonymousSurface) counts it in site-ip", async () => {
+    const app = createMcpRoutes();
+    const res = await app.fetch(
+      new Request("http://mcp.nemar.org/", { headers: viaBinding(A) }),
+      PROD_ENV,
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-RateLimit-Bucket")).toBe("site-ip");
+    expect(res.headers.get("X-RateLimit-Caller")).toBe("site");
+    expect(res.headers.get("X-RateLimit-Remaining")).toBe(String(CAP - 1));
+  });
+
+  test("and refuses it at the same cap, saying who it was", async () => {
+    await h.seed(`site-ip:site:${B}`, {
+      count: CAP,
+      warned: false,
+      windowEnd: T0 + __limits.WINDOW_SIZE * 1000,
+    });
+    const res = await createMcpRoutes().fetch(
+      new Request("http://mcp.nemar.org/", { headers: viaBinding(B) }),
+      PROD_ENV,
+    );
+    expect(res.status).toBe(429);
+    expect(res.headers.get("X-RateLimit-Bucket")).toBe("site-ip");
+    expect(res.headers.get("X-RateLimit-Caller")).toBe("site");
+  });
+
+  test("observe-only counting (the zarr redirect) keeps a forwarded visitor's own count and never refuses", async () => {
+    const app = buildApp({ observeOnly: true });
+    await h.seed(`site-ip:site:${A}`, {
+      count: CAP,
+      warned: false,
+      windowEnd: T0 + __limits.WINDOW_SIZE * 1000,
+    });
+    const res = await hit(app, viaBinding(A));
+    expect(res.status).toBe(200);
+    expect((await h.stored(`site-ip:site:${A}`))?.count).toBe(CAP + 1);
+    // The public bucket at the same address was not touched.
+    expect(await h.stored(`ip:${A}`)).toBeUndefined();
+    // And it said so once, with the hash of the key and not the address.
+    const tripped = h.warn.mock.calls.filter((c) =>
+      String(c[0]).includes("observe-only bucket would have tripped"),
+    );
+    expect(tripped.length).toBe(1);
+    expect(JSON.stringify(tripped)).not.toContain(A);
   });
 });
 

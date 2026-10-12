@@ -23,7 +23,15 @@ import {
 } from "../src/middleware/rateLimit";
 import { hashApiKey } from "../src/services/token";
 import type { Bindings } from "../src/types/bindings";
-import { T0, buildApp, edge, hit, useRateLimitHarness } from "./helpers/rate-limit-harness";
+import { InMemoryCache } from "./helpers/cache";
+import {
+  T0,
+  buildApp,
+  edge,
+  hit,
+  useRateLimitHarness,
+  viaBinding,
+} from "./helpers/rate-limit-harness";
 
 const WINDOW = __limits.WINDOW_SIZE;
 const WINDOW_MS = WINDOW * 1000;
@@ -339,6 +347,107 @@ describe("Retry-After and X-RateLimit-Reset agree with the window", () => {
     // the cache itself has dropped it, with no help from the limiter.
     h.clock = T0 + 61_000;
     expect(await h.stored("ip:203.0.113.11")).toBeUndefined();
+  });
+});
+
+describe("a window that starts mid-second", () => {
+  test("X-RateLimit-Reset rounds UP, and waiting until it is enough", async () => {
+    const app = buildApp();
+    const headers = edge("203.0.113.60");
+    h.clock = T0 + 250; // the window ends at T0 + 60_250
+    for (let i = 0; i < __limits.AUTH_MAX_REQUESTS; i++) await hit(app, headers, "/auth/login");
+    h.clock = T0 + 10_000;
+    const over = await hit(app, headers, "/auth/login");
+    expect(over.status).toBe(429);
+    const reset = Number(over.headers.get("X-RateLimit-Reset"));
+    // 60.25 seconds after T0 is T0/1000 + 61 whole seconds, not 60.
+    expect(reset).toBe(T0 / 1000 + 61);
+    expect(over.headers.get("Retry-After")).toBe("51");
+    // A client that waits until the advertised Reset is let in...
+    h.clock = reset * 1000;
+    expect((await hit(app, headers, "/auth/login")).status).toBe(200);
+  });
+
+  test("and one that retries a second early is not", async () => {
+    const app = buildApp();
+    const headers = edge("203.0.113.61");
+    h.clock = T0 + 250;
+    for (let i = 0; i < __limits.AUTH_MAX_REQUESTS; i++) await hit(app, headers, "/auth/login");
+    h.clock = T0 + 60_249;
+    expect((await hit(app, headers, "/auth/login")).status).toBe(429);
+    h.clock = T0 + 60_250;
+    expect((await hit(app, headers, "/auth/login")).status).toBe(200);
+  });
+});
+
+describe("the price of a fixed window: up to twice the cap across a boundary", () => {
+  // ADR 0099 accepts this, and this test is where the acceptance is pinned: a full
+  // cap at the end of one window and a full cap at the start of the next are both
+  // admitted, and nothing beyond them is.
+  test("2 x cap - 1 requests are admitted in the second around the boundary, and no more", async () => {
+    const app = buildApp();
+    const headers = edge("203.0.113.62");
+    await hit(app, headers); // opens the window at T0
+    h.clock = T0 + WINDOW_MS - 1000;
+    let admitted = 0;
+    for (let i = 0; i < ANON_CAP + 5; i++) {
+      if ((await hit(app, headers)).status === 200) admitted++;
+    }
+    expect(admitted).toBe(ANON_CAP - 1); // the cap, counting the one that opened the window
+    h.clock = T0 + WINDOW_MS;
+    for (let i = 0; i < ANON_CAP + 5; i++) {
+      if ((await hit(app, headers)).status === 200) admitted++;
+    }
+    expect(admitted).toBe(2 * ANON_CAP - 1);
+    expect((await hit(app, headers)).status).toBe(429);
+  });
+});
+
+describe("concurrent requests", () => {
+  // The counter is a read, then a write, against a cache with no atomic increment, so
+  // requests in flight together can each read the same count and each write the same
+  // next one: the cap can be overrun by the concurrency, never by more than that.
+  // What must hold is that every request is answered and the record stays whole.
+  test("eleven at once on the strict bucket are all answered and leave a well-formed record", async () => {
+    const app = buildApp();
+    const headers = viaBinding("203.0.113.63");
+    const answers = await Promise.all(
+      Array.from({ length: __limits.AUTH_MAX_REQUESTS + 1 }, () =>
+        hit(app, headers, "/auth/login"),
+      ),
+    );
+    for (const res of answers) expect([200, 429]).toContain(res.status);
+    const record = await h.stored("auth-ip:site:203.0.113.63");
+    expect(Number.isInteger(record?.count)).toBe(true);
+    expect(record?.count as number).toBeGreaterThanOrEqual(1);
+    expect(record?.count as number).toBeLessThanOrEqual(__limits.AUTH_MAX_REQUESTS + 1);
+    expect(record?.windowEnd).toBe(T0 + WINDOW_MS);
+  });
+});
+
+describe("the clock is read after the cache answers", () => {
+  // A Worker's clock only moves at I/O. A cache whose lookup takes two seconds is
+  // the way to see which side of it the limiter reads: before the lookup, a record
+  // that ends in one second still looks live; after, it has ended.
+  test("a window that ends during the lookup is a new window", async () => {
+    class SlowMatch extends InMemoryCache {
+      async match(request: RequestInfo | URL): Promise<Response | undefined> {
+        const found = await super.match(request);
+        h.clock += 2000;
+        return found;
+      }
+    }
+    const slow = new SlowMatch();
+    (globalThis as { caches?: unknown }).caches = { default: slow };
+    await slow.put(
+      new Request("https://rate-limit.internal/rl:ip:203.0.113.64"),
+      new Response(JSON.stringify({ count: ANON_CAP, warned: false, windowEnd: T0 + 1000 }), {
+        headers: { "Content-Type": "application/json", "Cache-Control": "max-age=3600" },
+      }),
+    );
+    const res = await hit(buildApp(), edge("203.0.113.64"));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-RateLimit-Remaining")).toBe(String(ANON_CAP - 1));
   });
 });
 
