@@ -45,6 +45,7 @@ import {
   zarrIndexLegacySchema,
   zarrIndexSchema,
 } from "../../../shared/contract/zarr-index.js";
+import { internalRequest } from "../lib/internal-request.js";
 import { zarrCacheBaseUrl } from "../services/cloudflare.js";
 import type { Bindings } from "../types/bindings.js";
 
@@ -150,7 +151,7 @@ export async function readZarrIndex(
   datasetId: string,
 ): Promise<IndexReadResult> {
   const zarrBase = zarrCacheBaseUrl(env) ?? DEFAULT_ZARR_BASE;
-  const request = new Request(`${zarrBase}/${datasetId}/zarr/index.json`);
+  const request = internalRequest(new Request(`${zarrBase}/${datasetId}/zarr/index.json`));
   const response = await deps.zarrRoutes.fetch(request, env, executionCtx);
 
   if (response.status === 404) {

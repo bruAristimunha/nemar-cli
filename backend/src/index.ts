@@ -131,7 +131,17 @@ api.use(
     },
     allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowHeaders: ["Content-Type", "Authorization", "X-CLI-Version"],
-    exposeHeaders: ["X-Request-Id"],
+    // The rate limit's answer is for browser callers too: a page on a nemar.org host
+    // that is refused can read how long to wait.
+    exposeHeaders: [
+      "X-Request-Id",
+      "Retry-After",
+      "X-RateLimit-Limit",
+      "X-RateLimit-Remaining",
+      "X-RateLimit-Reset",
+      "X-RateLimit-Bucket",
+      "X-RateLimit-Caller",
+    ],
     credentials: true,
     maxAge: 86400,
   }),

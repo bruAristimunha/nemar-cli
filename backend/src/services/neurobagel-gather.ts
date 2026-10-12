@@ -28,6 +28,7 @@
  */
 
 import type { NeurobagelInput } from "../../../shared/neurobagel/index.js";
+import { internalRequest } from "../lib/internal-request.js";
 import { dataRoutes } from "../routes/data.js";
 import type { Bindings } from "../types/bindings.js";
 import { CHUNK_GETS_USED_HEADER, CHUNK_GET_BUDGET_HEADER } from "./chunked-delivery.js";
@@ -139,16 +140,18 @@ function decode(bytes: Uint8Array): string {
 }
 
 function dataPlaneRequest(env: Bindings, path: string, chunkGetBudget?: number): Request {
-  return new Request(`${resolveDataBaseOrigin(env)}${path}`, {
-    method: "GET",
-    headers: {
-      Accept: "application/json",
-      "User-Agent": USER_AGENT,
-      ...(chunkGetBudget === undefined
-        ? {}
-        : { [CHUNK_GET_BUDGET_HEADER]: String(chunkGetBudget) }),
-    },
-  });
+  return internalRequest(
+    new Request(`${resolveDataBaseOrigin(env)}${path}`, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        "User-Agent": USER_AGENT,
+        ...(chunkGetBudget === undefined
+          ? {}
+          : { [CHUNK_GET_BUDGET_HEADER]: String(chunkGetBudget) }),
+      },
+    }),
+  );
 }
 
 async function callDataPlane(

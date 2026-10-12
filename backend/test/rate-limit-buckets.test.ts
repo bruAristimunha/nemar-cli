@@ -20,7 +20,7 @@ import {
   __limits,
   __normalizeMountPath,
   __readBearerTokenFromHeader,
-  __resetCacheFaultLogForTests,
+  __resetRateLimitLogsForTests,
   __selectBucket,
   rateLimiter,
 } from "../src/middleware/rateLimit";
@@ -83,7 +83,7 @@ describe("__selectBucket", () => {
     // One AUTH_PATHS entry covers both because the matcher treats entries as
     // prefixes. Asserted on the SUB-PATH as well as the entry itself: if that
     // prefix behaviour ever changes, /auth/email/verify/request silently
-    // falls to the 500/min IP bucket and a code-mailing endpoint loses its
+    // falls to the 1000/min IP bucket and a code-mailing endpoint loses its
     // floor.
     for (const path of ["/auth/email/verify", "/auth/email/verify/request"]) {
       const sel = __selectBucket(path, null, "10.0.0.1");
@@ -186,7 +186,9 @@ describe("__selectBucket", () => {
     expect(sel.keyKind).toBe("token");
     expect(sel.rawKey).toBe(VALID_TOKEN);
     expect(sel.maxRequests).toBe(__limits.TOKEN_MAX_REQUESTS_AUTHED);
-    expect(sel.maxRequests).toBeGreaterThan(__limits.MAX_REQUESTS);
+    // Never stricter than an anonymous caller. Equal since #1709 raised the
+    // anonymous cap to the token cap; see the comment on MAX_REQUESTS.
+    expect(sel.maxRequests).toBeGreaterThanOrEqual(__limits.MAX_REQUESTS);
   });
 
   test("unauthenticated requests bucket on IP with legacy cap", () => {
@@ -223,7 +225,7 @@ describe("__selectBucket", () => {
     expect(anonymous.keyKind).toBe("ip");
     expect(anonymous.rawKey).toBe("10.0.0.3");
     expect(anonymous.maxRequests).toBe(__limits.MAX_REQUESTS);
-    expect(anonymous.maxRequests).toBeLessThan(__limits.TOKEN_MAX_REQUESTS_AUTHED);
+    expect(anonymous.maxRequests).toBeLessThanOrEqual(__limits.TOKEN_MAX_REQUESTS_AUTHED);
   });
 
   test("admin paths use the token bucket (not exempt)", () => {
@@ -352,6 +354,36 @@ describe("the MCP sub-app really passes anonymousSurface (epic #1065)", () => {
   });
 });
 
+describe("the anonymous cap (#1709)", () => {
+  test("is 1000, and no stricter for a token holder or for the website's visitors", () => {
+    // Pinned so a change to the number is a decision. It may not exceed the token
+    // cap without raising that one (a holder must not be limited more strictly
+    // than someone with no token), and the website's per-visitor bucket may not
+    // fall below it.
+    expect(__limits.MAX_REQUESTS).toBe(1000);
+    expect(__limits.MAX_REQUESTS).toBeLessThanOrEqual(__limits.TOKEN_MAX_REQUESTS_AUTHED);
+    expect(__limits.MAX_REQUESTS).toBeLessThanOrEqual(__limits.SITE_IP_MAX_REQUESTS);
+  });
+
+  test("the 1000th request from one address passes and the 1001st is refused", async () => {
+    const { app, env } = buildApp(PROD_ENV);
+    const headers = { "CF-Connecting-IP": "10.99.0.8" };
+    let last: Response | undefined;
+    for (let i = 0; i < 1000; i++) {
+      last = await hit(app, env, "/datasets", headers);
+      expect(last.status).toBe(200);
+    }
+    expect(last?.headers.get("X-RateLimit-Remaining")).toBe("0");
+    const over = await hit(app, env, "/datasets", headers);
+    expect(over.status).toBe(429);
+    expect(over.headers.get("X-RateLimit-Limit")).toBe("1000");
+    // The seconds left in the window, which depend on how long the loop above
+    // took; `rate-limit-fixed-window.test.ts` pins the exact value with a held clock.
+    expect(Number(over.headers.get("Retry-After"))).toBeGreaterThan(0);
+    expect(Number(over.headers.get("Retry-After"))).toBeLessThanOrEqual(__limits.WINDOW_SIZE);
+  });
+});
+
 describe("rateLimiter end-to-end", () => {
   test("authenticated client survives 150 requests (used to 429 at 100)", async () => {
     // Pre-#275: an admin running `publish approve` on a few datasets
@@ -470,35 +502,35 @@ describe("rateLimiter end-to-end", () => {
     }
   });
 
-  test("bucket resets after the TTL window expires", async () => {
-    // Exercise the window-expiry path: exhaust the IP bucket, advance
-    // the injected clock past WINDOW_SIZE seconds so cached entries are
-    // treated as expired, then confirm the client gets a fresh quota.
-    // This covers the TTL/window-reset code path that `beforeEach` clears
-    // globally but never exercises within a single window.
-    let fakeNow = Date.now();
-    ourCache.getNow = () => fakeNow;
+  test("bucket resets exactly when its window ends", async () => {
+    // One clock for the limiter and the cache (`Date.now`, held by a spy), so the
+    // window the limiter stores and the entry's expiry are both walked across.
+    let fakeNow = 1_800_000_000_000;
+    const nowSpy = spyOn(Date, "now").mockImplementation(() => fakeNow);
+    try {
+      const { app, env } = buildApp(PROD_ENV);
+      const headers = { "CF-Connecting-IP": "10.99.0.7" };
 
-    const { app, env } = buildApp(PROD_ENV);
-    const headers = { "CF-Connecting-IP": "10.99.0.7" };
+      // Exhaust the unauthenticated IP bucket.
+      for (let i = 0; i < __limits.MAX_REQUESTS; i++) {
+        const res = await hit(app, env, "/datasets", headers);
+        expect(res.status).toBe(200);
+      }
+      // Next request must be rate-limited.
+      expect((await hit(app, env, "/datasets", headers)).status).toBe(429);
 
-    // Exhaust the unauthenticated IP bucket.
-    for (let i = 0; i < __limits.MAX_REQUESTS; i++) {
-      const res = await hit(app, env, "/datasets", headers);
-      expect(res.status).toBe(200);
+      // A millisecond before the window ends it still is.
+      fakeNow += __limits.WINDOW_SIZE * 1000 - 1;
+      expect((await hit(app, env, "/datasets", headers)).status).toBe(429);
+
+      // At the end the client gets a fresh quota.
+      fakeNow += 1;
+      const resetRes = await hit(app, env, "/datasets", headers);
+      expect(resetRes.status).toBe(200);
+      expect(resetRes.headers.get("X-RateLimit-Remaining")).toBe(String(__limits.MAX_REQUESTS - 1));
+    } finally {
+      nowSpy.mockRestore();
     }
-    // Next request must be rate-limited.
-    expect((await hit(app, env, "/datasets", headers)).status).toBe(429);
-
-    // Advance the clock past the 60s window so all cache entries expire.
-    fakeNow += (__limits.WINDOW_SIZE + 1) * 1000;
-
-    // The bucket is now expired; the client should get a fresh quota.
-    const resetRes = await hit(app, env, "/datasets", headers);
-    expect(resetRes.status).toBe(200);
-
-    // Restore the real clock for subsequent tests.
-    ourCache.getNow = () => Date.now();
   });
 });
 
@@ -643,7 +675,7 @@ describe("logCacheFaultOnce dedup", () => {
     // Module-level state (`lastCacheFaultLoggedAt`), and this file shares a
     // process with the rest of the suite -- start from a known-clean slate
     // rather than trusting nothing else tripped it first.
-    __resetCacheFaultLogForTests();
+    __resetRateLimitLogsForTests();
     const saved = (globalThis as { caches?: CacheStorage }).caches;
     // biome-ignore lint/suspicious/noExplicitAny: test-only runtime patch
     (globalThis as any).caches = { default: new FaultingCache() } as unknown as CacheStorage;
@@ -664,7 +696,7 @@ describe("logCacheFaultOnce dedup", () => {
       // Advancing the real 60s window is not worth a real sleep; the reset
       // hook exists for exactly this ("let a test see the very next fault
       // log again rather than waiting out a real window").
-      __resetCacheFaultLogForTests();
+      __resetRateLimitLogsForTests();
 
       const third = await hit(app, env, "/datasets", headers);
       expect(third.status).toBe(200);
@@ -676,7 +708,7 @@ describe("logCacheFaultOnce dedup", () => {
       errorSpy.mockRestore();
       // biome-ignore lint/suspicious/noExplicitAny: test-only runtime restore
       (globalThis as any).caches = saved as CacheStorage;
-      __resetCacheFaultLogForTests();
+      __resetRateLimitLogsForTests();
     }
   });
 });
