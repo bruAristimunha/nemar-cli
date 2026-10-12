@@ -331,7 +331,8 @@ function freshWindow(now: number): __CounterState {
  *
  *  - No record, or one whose window has ended (the cache had not dropped it yet):
  *    a new window. One that ended more than a few seconds ago is also reported as
- *    damage, since the cache cannot have kept it that long.
+ *    damage: the entry expires with its window, and local workerd drops it within a
+ *    second of its end (production's promptness is not verified here).
  *  - A record from before windows were stored (`{count, warned}` only) has an end
  *    nobody wrote down, but its entry cannot outlive a window from its last write,
  *    so a full window from now is an upper bound for what a client is told, and the
@@ -370,9 +371,16 @@ export function __readCounter(data: unknown, now: number): __CounterState {
   }
   if (typeof end === "number" && Number.isFinite(end)) {
     if (end <= now) {
-      // An ended window is simply over, unless it ended long ago: the cache drops
-      // an entry within a second of its end, so a record that old was not written
-      // by this code (an end in seconds, or 0, say) and is reported as damage.
+      // An ended window is simply over, unless it ended long ago: the entry expires
+      // with its window (local workerd drops it within a second; production's
+      // promptness is not verified), so a record that old was most likely not
+      // written by this code (an end in seconds, or 0, say) and is reported as
+      // damage. One exception is a write that was abandoned at the 500 ms bound
+      // (`boundedWait`) and landed afterward: it carries a `max-age` computed when
+      // it was issued, so the record can outlive its `windowEnd` by the length of
+      // the stall, and a stall of five seconds or more can log a `bad-end` repair on
+      // top of the cache-fault line. The repair is right, the window had ended; the
+      // extra line is what not waiting costs.
       return end <= now - CLOCK_SKEW_TOLERANCE_MS
         ? { ...freshWindow(now), damage: "bad-end" }
         : freshWindow(now);
