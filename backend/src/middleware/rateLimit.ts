@@ -258,12 +258,6 @@ export function __resetRateLimitLogsForTests(): void {
   logSlots.clear();
 }
 
-/** Test-only: the same reset, under the name the fault-log tests already use. */
-export const __resetCacheFaultLogForTests = __resetRateLimitLogsForTests;
-
-/** Test-only: the same reset, under the name the identity-log tests already use. */
-export const __resetIdentityLogForTests = __resetRateLimitLogsForTests;
-
 /**
  * The state of a bucket's CURRENT window, as its cache record stores it
  * (#1709, ADR 0099). The window is FIXED: it starts with the first request that
@@ -1244,7 +1238,7 @@ export interface RateLimiterOptions {
    *
    *  1. The bucket is keyed on the raw bearer, so rotating a fresh 32-character
    *     string per request minted a fresh 1000/min bucket every time and the
-   *     500/min IP floor was bypassed entirely.
+   *     1000/min IP floor was bypassed entirely.
    *  2. Every novel token reached {@link isPrivilegedToken}, which is a cache
    *     miss plus a D1 `SELECT` joining `tokens` to `users` -- an
    *     unauthenticated D1-query amplifier, one query per request, from one IP.

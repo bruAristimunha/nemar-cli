@@ -20,7 +20,7 @@ import {
   __limits,
   __normalizeMountPath,
   __readBearerTokenFromHeader,
-  __resetCacheFaultLogForTests,
+  __resetRateLimitLogsForTests,
   __selectBucket,
   rateLimiter,
 } from "../src/middleware/rateLimit";
@@ -675,7 +675,7 @@ describe("logCacheFaultOnce dedup", () => {
     // Module-level state (`lastCacheFaultLoggedAt`), and this file shares a
     // process with the rest of the suite -- start from a known-clean slate
     // rather than trusting nothing else tripped it first.
-    __resetCacheFaultLogForTests();
+    __resetRateLimitLogsForTests();
     const saved = (globalThis as { caches?: CacheStorage }).caches;
     // biome-ignore lint/suspicious/noExplicitAny: test-only runtime patch
     (globalThis as any).caches = { default: new FaultingCache() } as unknown as CacheStorage;
@@ -696,7 +696,7 @@ describe("logCacheFaultOnce dedup", () => {
       // Advancing the real 60s window is not worth a real sleep; the reset
       // hook exists for exactly this ("let a test see the very next fault
       // log again rather than waiting out a real window").
-      __resetCacheFaultLogForTests();
+      __resetRateLimitLogsForTests();
 
       const third = await hit(app, env, "/datasets", headers);
       expect(third.status).toBe(200);
@@ -708,7 +708,7 @@ describe("logCacheFaultOnce dedup", () => {
       errorSpy.mockRestore();
       // biome-ignore lint/suspicious/noExplicitAny: test-only runtime restore
       (globalThis as any).caches = saved as CacheStorage;
-      __resetCacheFaultLogForTests();
+      __resetRateLimitLogsForTests();
     }
   });
 });

@@ -20,7 +20,7 @@ import {
   __limits,
   __parseForwardedFor,
   __readCallerIdentity,
-  __resetIdentityLogForTests,
+  __resetRateLimitLogsForTests,
   __selectBucket,
   checkDataMissBudget,
 } from "../src/middleware/rateLimit";
@@ -771,7 +771,7 @@ describe("the identity log", () => {
       [{ "X-Forwarded-For": "0.0.0.0" }, "unspecified-or-loopback"],
     ] as const;
     for (const [headers, reason] of cases) {
-      __resetIdentityLogForTests();
+      __resetRateLimitLogsForTests();
       h.warn.mockClear();
       await hit(buildApp(), headers);
       expect(h.warn.mock.calls[0]?.[1]).toMatchObject({ reason });
