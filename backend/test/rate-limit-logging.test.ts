@@ -44,21 +44,24 @@ function install(cache: InMemoryCache): void {
 const faults = () => h.error.mock.calls.filter((c) => c[0] === FAULT);
 
 describe("a failing cache write is logged once per kind per window", () => {
-  test("a thousand data-plane requests, one line, and every request is served", async () => {
+  test("a thousand data-plane requests, a handful of lines, and every request is served", async () => {
     install(new PutFailingCache());
     const app = buildApp();
     for (let i = 0; i < 1000; i++) {
       const res = await hit(app, edge(ADDRESS), "/data/nm000108/v1.0.0/x");
       expect(res.status).toBe(200);
     }
-    expect(faults().length).toBe(1);
+    // The line that opens the window, then the 11th and the 101st call speak, each
+    // reporting only the calls swallowed since the previous line: the burst's size
+    // without a line per request.
+    expect(faults().map((c) => (c[1] as { suppressed: number }).suppressed)).toEqual([0, 9, 89]);
     expect(faults()[0]?.[1]).toMatchObject({ keyKind: "data-ip", error: "Error" });
   });
 
   test("each bucket kind has its own line, so one outage is not hidden behind another", async () => {
     install(new PutFailingCache());
     const app = buildApp();
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 5; i++) {
       await hit(app, edge(ADDRESS));
       await hit(app, viaBinding(ADDRESS));
       await hit(app, edge(ADDRESS), "/auth/login");
@@ -73,7 +76,7 @@ describe("a failing cache write is logged once per kind per window", () => {
       Bindings,
       "ENVIRONMENT" | "TEST_BYPASS_TOKEN"
     >;
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 5; i++) {
       const outcome = await checkDataMissBudget(
         env,
         new Request("http://localhost/data/x", { headers: edge(ADDRESS) }),
@@ -88,9 +91,9 @@ describe("a failing cache write is logged once per kind per window", () => {
   test("the line comes back after a window and says how many it swallowed", async () => {
     install(new PutFailingCache());
     const app = buildApp();
-    for (let i = 0; i < 20; i++) await hit(app, edge(ADDRESS));
+    for (let i = 0; i < 5; i++) await hit(app, edge(ADDRESS));
     expect(faults().length).toBe(1);
-    expect(faults()[0]?.[1]).toMatchObject({ suppressed: 0 });
+    expect(faults()[0]?.[1]).toMatchObject({ suppressed: 0, sinceMs: 0 });
 
     h.clock = T0 + __limits.WINDOW_SIZE * 1000 - 1;
     await hit(app, edge(ADDRESS));
@@ -99,16 +102,154 @@ describe("a failing cache write is logged once per kind per window", () => {
     h.clock = T0 + __limits.WINDOW_SIZE * 1000;
     await hit(app, edge(ADDRESS));
     expect(faults().length).toBe(2);
-    expect(faults()[1]?.[1]).toMatchObject({ suppressed: 20 });
+    expect(faults()[1]?.[1]).toMatchObject({ suppressed: 5 });
   });
 
-  test("a clock that went backwards does not silence the line", async () => {
+  test("a burst that ends inside the window is sized on its own lines: the 11th, 101st and 1001st call speak", async () => {
+    install(new PutFailingCache());
+    const app = buildApp();
+    const spoke: number[] = [];
+    for (let i = 0; i < 1100; i++) {
+      h.clock = T0 + i;
+      const before = faults().length;
+      await hit(app, edge(ADDRESS));
+      if (faults().length > before) spoke.push(i + 1);
+    }
+    // The opening call, then the 11th, 101st and 1001st: four lines and no more.
+    expect(spoke).toEqual([1, 11, 101, 1001]);
+    // Each line reports the calls swallowed since the previous line, not the one speaking,
+    // so the lines and what they swallowed add up to the calls made up to the last line.
+    const swallowed = faults().map((c) => (c[1] as { suppressed: number }).suppressed);
+    expect(swallowed).toEqual([0, 9, 89, 899]);
+    expect(swallowed.reduce((a, b) => a + b, 0) + faults().length).toBe(1001);
+    // Each line says how long ago the previous one was (a call a millisecond).
+    expect(faults().map((c) => (c[1] as { sinceMs: number }).sinceMs)).toEqual([0, 10, 90, 900]);
+  });
+
+  test("the next window's first line reports the calls swallowed since the last line, milestone or not", async () => {
+    install(new PutFailingCache());
+    const app = buildApp();
+    // 15 calls: the opening line, the 11th call's line, then 4 swallowed.
+    for (let i = 0; i < 15; i++) await hit(app, edge(ADDRESS));
+    expect(faults().length).toBe(2);
+    h.clock = T0 + __limits.WINDOW_SIZE * 1000;
+    await hit(app, edge(ADDRESS));
+    expect(faults().length).toBe(3);
+    expect(faults()[2]?.[1]).toMatchObject({ suppressed: 4 });
+  });
+
+  test("a clock that went backwards does not silence the line, and sinceMs is never negative", async () => {
     install(new PutFailingCache());
     const app = buildApp();
     await hit(app, edge(ADDRESS));
     h.clock = T0 - 5000;
     await hit(app, edge(ADDRESS));
     expect(faults().length).toBe(2);
+    expect(faults()[1]?.[1]).toMatchObject({ sinceMs: 0 });
+  });
+
+  test("sinceMs is never negative on a milestone line either, when the clock steps back inside a window", async () => {
+    install(new PutFailingCache());
+    const app = buildApp();
+    // The 11th call at +30 s, then the clock steps back to +20 s for the 101st.
+    for (let i = 0; i < 10; i++) {
+      h.clock = T0 + 1000;
+      await hit(app, edge(ADDRESS));
+    }
+    h.clock = T0 + 30_000;
+    await hit(app, edge(ADDRESS));
+    h.clock = T0 + 20_000;
+    for (let i = 0; i < 90; i++) await hit(app, edge(ADDRESS));
+    const since = faults().map((c) => (c[1] as { sinceMs: number }).sinceMs);
+    expect(since.length).toBe(3);
+    for (const ms of since) expect(ms).toBeGreaterThanOrEqual(0);
+    expect(since[2]).toBe(0);
+  });
+
+  test("a write fault does not hide a later fault of another phase on the same bucket", async () => {
+    // The limiter's own logic fails ten seconds after a transient stall in the write:
+    // keyed by kind alone, the second would be swallowed for the rest of the window.
+    class ThenMatchFails extends InMemoryCache {
+      failMatch = false;
+      async put(): Promise<void> {
+        throw new TypeError("a transient write fault");
+      }
+      async match(request: RequestInfo | URL): Promise<Response | undefined> {
+        if (this.failMatch) throw new RangeError("a later lookup fault");
+        return super.match(request);
+      }
+    }
+    const cache = new ThenMatchFails();
+    install(cache);
+    const app = buildApp();
+    await hit(app, edge(ADDRESS));
+    h.clock = T0 + 10_000;
+    cache.failMatch = true;
+    await hit(app, edge(ADDRESS));
+    const lines = faults().map((c) => c[1] as { phase: string; error: string });
+    expect(lines.map((l) => [l.phase, l.error])).toEqual([
+      ["put", "TypeError"],
+      ["match", "RangeError"],
+    ]);
+  });
+
+  test("a transient fault does not hide a persistent one of another class in the same phase", async () => {
+    // A write fails once with a TypeError and then, every time, with a RangeError.
+    class WriteFaultChanges extends InMemoryCache {
+      puts = 0;
+      async put(): Promise<void> {
+        this.puts++;
+        if (this.puts === 1) throw new TypeError("a transient write fault");
+        throw new RangeError("a persistent write fault");
+      }
+    }
+    install(new WriteFaultChanges());
+    const app = buildApp();
+    for (let i = 0; i < 5; i++) await hit(app, edge(ADDRESS));
+    const lines = faults().map((c) => c[1] as { phase: string; error: string; suppressed: number });
+    // One line for each class, and the persistent one swallows its repeats.
+    expect(lines.map((l) => [l.phase, l.error])).toEqual([
+      ["put", "TypeError"],
+      ["put", "RangeError"],
+    ]);
+    expect(lines[1]?.suppressed).toBe(0);
+  });
+
+  test("a stalled write does not hide a persistent fault in the same phase", async () => {
+    // The first write never settles and is given up on; every later one fails outright.
+    class StallsOnceThenFails extends InMemoryCache {
+      puts = 0;
+      put(): Promise<void> {
+        this.puts++;
+        if (this.puts === 1) return new Promise<void>(() => {});
+        return Promise.reject(new TypeError("a persistent write fault"));
+      }
+    }
+    install(new StallsOnceThenFails());
+    const app = buildApp();
+    for (let i = 0; i < 4; i++) await hit(app, edge(ADDRESS));
+    const lines = faults().map((c) => c[1] as { phase: string; error: string });
+    expect(lines.map((l) => [l.phase, l.error])).toEqual([
+      ["put", "CacheStallError"],
+      ["put", "TypeError"],
+    ]);
+  });
+
+  test("error names outside the known set share one key, so the key space has a ceiling", async () => {
+    let n = 0;
+    class UnlistedNameWrites extends InMemoryCache {
+      async put(): Promise<void> {
+        const error = new Error("a write fault");
+        error.name = `Fault${n++}`;
+        throw error;
+      }
+    }
+    install(new UnlistedNameWrites());
+    const app = buildApp();
+    for (let i = 0; i < 6; i++) await hit(app, edge(ADDRESS));
+    // The first names itself on its line; the rest are the same unnamed class.
+    expect(faults().length).toBe(1);
+    expect(faults()[0]?.[1]).toMatchObject({ phase: "put", error: "Fault0" });
   });
 });
 
@@ -129,7 +270,7 @@ describe("the privileged-token lookup", () => {
   test("a failing lookup warns once per window, by error class", async () => {
     const app = buildApp();
     const headers = { ...edge(ADDRESS), Authorization: `Bearer ${"a".repeat(48)}` };
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 5; i++) {
       // This suite has no database, so every lookup fails and the request is
       // counted in the ordinary token bucket.
       const res = await hit(app, headers, "/admin/users");
@@ -151,7 +292,7 @@ describe("refusals are logged once per window per bucket kind", () => {
       warned: false,
       windowEnd: T0 + 30_000,
     });
-    for (let i = 0; i < 50; i++) {
+    for (let i = 0; i < 5; i++) {
       expect((await hit(app, edge("203.0.113.80"))).status).toBe(429);
     }
     expect(refusals().length).toBe(1);
@@ -173,7 +314,7 @@ describe("refusals are logged once per window per bucket kind", () => {
     });
     await hit(app, edge("203.0.113.80"));
     expect(refusals().length).toBe(2);
-    expect(refusals()[1]?.[1]).toMatchObject({ suppressed: 49, retryAfter: 60 });
+    expect(refusals()[1]?.[1]).toMatchObject({ suppressed: 4, retryAfter: 60 });
   });
 
   test("a different caller on the same bucket has a line of its own, so noise cannot hide a site outage", async () => {
@@ -310,7 +451,72 @@ describe("a fault line says where the work failed", () => {
     } finally {
       digest.mockRestore();
     }
-    expect(phaseOf()).toMatchObject({ phase: "decide", error: "TypeError" });
+    // It is the limiter failing, not the cache, and the line says so.
+    const limiterFaults = h.error.mock.calls.filter((c) => c[0] === "[rate-limit] limiter fault");
+    expect(limiterFaults.length).toBe(1);
+    expect(limiterFaults[0]?.[1]).toMatchObject({ phase: "decide", error: "TypeError" });
+    expect(faults()).toEqual([]);
+  });
+
+  describe("a bug in reading the record is the limiter's, not the read's", () => {
+    // A record whose `count` throws when the limiter looks at it: the body arrived and
+    // parsed, and what fails is the limiter's own interpretation of it.
+    class HostileRecord extends InMemoryCache {
+      puts = 0;
+      async put(request: RequestInfo | URL, response: Response): Promise<void> {
+        this.puts++;
+        return super.put(request, response);
+      }
+      async match(): Promise<Response | undefined> {
+        const response = new Response("{}");
+        response.json = async () =>
+          Object.defineProperty({}, "count", {
+            get() {
+              throw new RangeError("the record is hostile");
+            },
+          });
+        return response;
+      }
+    }
+    const limiterFaults = () =>
+      h.error.mock.calls.filter((c) => c[0] === "[rate-limit] limiter fault");
+
+    test("on the request path", async () => {
+      const cache = new HostileRecord();
+      install(cache);
+      const res = await hit(buildApp(), edge(ADDRESS));
+      expect(res.status).toBe(200);
+      expect(limiterFaults().length).toBe(1);
+      expect(limiterFaults()[0]?.[1]).toMatchObject({ phase: "decide", error: "RangeError" });
+      expect(faults()).toEqual([]);
+      // It failed open: nothing was counted, so nothing was written and nothing announced.
+      expect(cache.puts).toBe(0);
+      expect([...res.headers.keys()].filter((name) => name.startsWith("x-ratelimit"))).toEqual([]);
+    });
+
+    test("on the keyed-budget path", async () => {
+      const env = { ENVIRONMENT: "production" } as Pick<
+        Bindings,
+        "ENVIRONMENT" | "TEST_BYPASS_TOKEN"
+      >;
+      const cache = new HostileRecord();
+      install(cache);
+      const outcome = await checkDataMissBudget(
+        env,
+        new Request("http://localhost/data/x", { headers: edge(ADDRESS) }),
+        undefined,
+      );
+      expect(outcome.allowed).toBe(true);
+      // Failed open: no count was written.
+      expect(cache.puts).toBe(0);
+      expect(limiterFaults().length).toBe(1);
+      expect(limiterFaults()[0]?.[1]).toMatchObject({
+        keyKind: "data-miss-ip",
+        phase: "decide",
+        error: "RangeError",
+      });
+      expect(faults()).toEqual([]);
+    });
   });
 
   test("a line that comes back says how long ago the burst it reports began", async () => {
@@ -322,6 +528,36 @@ describe("a fault line says where the work failed", () => {
     await hit(app, edge(ADDRESS));
     expect(faults()[0]?.[1]).toMatchObject({ suppressed: 0, sinceMs: 0 });
     expect(faults()[1]?.[1]).toMatchObject({ suppressed: 1, sinceMs: 60_250 });
+  });
+});
+
+describe("the identity lines", () => {
+  const siteLines = () =>
+    h.log.mock.calls.filter((c) => String(c[0]).includes("counting a request without"));
+  const unattributedLines = () =>
+    h.warn.mock.calls.filter((c) => String(c[0]).includes("request with neither"));
+
+  test("the healthy site line is one per window, however many calls the website makes", async () => {
+    const app = buildApp();
+    for (let i = 0; i < 1100; i++) {
+      h.clock = T0 + i;
+      await hit(app, viaBinding(ADDRESS));
+    }
+    expect(siteLines().length).toBe(1);
+    // The window ends: the next line reports what the first window swallowed.
+    h.clock = T0 + __limits.WINDOW_SIZE * 1000;
+    await hit(app, viaBinding(ADDRESS));
+    expect(siteLines().length).toBe(2);
+    expect(siteLines()[1]?.[1]).toMatchObject({ suppressed: 1099 });
+  });
+
+  test("a caller that names nobody is a symptom and keeps its milestones", async () => {
+    const app = buildApp();
+    for (let i = 0; i < 1100; i++) {
+      h.clock = T0 + i;
+      await hit(app, {});
+    }
+    expect(unattributedLines().length).toBe(4);
   });
 });
 

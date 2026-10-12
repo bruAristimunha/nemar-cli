@@ -4,10 +4,19 @@
  * or the Neurobagel gatherer reading the data plane (#1709, ADR 0098).
  *
  * They carry neither `CF-Connecting-IP` nor `X-Forwarded-For`, and they are not a
- * visitor: the request that caused them was already counted where it arrived, and
- * what they fan out into is bounded by their own caps. The limiter therefore must
- * neither pool them with a caller that failed to say who it is, nor warn about
- * them.
+ * visitor. An MCP tool's request was already counted where it arrived. The
+ * scheduled Neurobagel reconcile has no arriving request: it is bounded by its
+ * per-tick limit (`NEUROBAGEL_RECONCILE_MAX` datasets) and by the writer's
+ * operations budget (`OP_BUDGET`). What each fans out into is bounded by its own
+ * caps. The data plane's limiter therefore must neither pool them with a caller
+ * that failed to say who it is, nor warn about them.
+ *
+ * The exemption is the data plane's alone (`data-ip` and the miss budget), and
+ * only for a request that carries neither address header, as the two real callers
+ * build theirs. A marked request that carries a usable address is counted as that
+ * address, and any other bucket counts a marked request in whatever bucket it
+ * would reach unmarked, so marking a request by mistake cannot skip the strict,
+ * token or private-grant limits.
  *
  * The mark is an object identity held in module memory, not a header, so nothing
  * a client sends can claim it, and a copy of a marked request (`new Request(req)`)

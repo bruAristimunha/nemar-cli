@@ -33,6 +33,8 @@ const MEMBER_KEY = `member-${"m".repeat(41)}`;
 const bearer = (key: string) => ({ Authorization: `Bearer ${key}` });
 const lookups = () =>
   h.warn.mock.calls.filter((c) => String(c[0]).includes("admin-flag lookup failed"));
+const writes = () =>
+  h.warn.mock.calls.filter((c) => String(c[0]).includes("admin-flag cache write failed"));
 
 describe("a cached admin flag", () => {
   test("is not counted, and the answer says for whom it was not counted", async () => {
@@ -126,8 +128,10 @@ describe("a token the database says is an admin", () => {
     (globalThis as { caches?: unknown }).caches = { default: new PutFails() };
     const res = await ask();
     expect(res.headers.get("X-RateLimit-Bucket")).toBe("admin-bypass");
-    expect(lookups().length).toBe(1);
-    expect(lookups()[0]?.[1]).toMatchObject({ phase: "put", error: "Error" });
+    // The database answered, so this is a write that failed, not a lookup that did.
+    expect(lookups()).toEqual([]);
+    expect(writes().length).toBe(1);
+    expect(writes()[0]?.[1]).toMatchObject({ phase: "put", error: "Error" });
   });
 
   test("stays an admin when the cache write stalls", async () => {
@@ -139,17 +143,95 @@ describe("a token the database says is an admin", () => {
     (globalThis as { caches?: unknown }).caches = { default: new PutStalls() };
     const res = await ask();
     expect(res.headers.get("X-RateLimit-Bucket")).toBe("admin-bypass");
-    expect(lookups()[0]?.[1]).toMatchObject({ phase: "put", error: "CacheStallError" });
+    expect(lookups()).toEqual([]);
+    expect(writes()[0]?.[1]).toMatchObject({ phase: "put", error: "CacheStallError" });
   });
 
-  test("is read again from the database when the cached flag is damaged, and the record replaced", async () => {
-    const hash = await hashApiKey(ADMIN_KEY);
-    for (const damaged of ["this is not json", { admin: "yes" }, { other: true }]) {
-      await h.seedAdminFlag(hash, damaged);
-      const res = await ask();
-      expect(res.headers.get("X-RateLimit-Bucket")).toBe("admin-bypass");
-      expect(await h.storedAdminFlag(hash)).toEqual({ admin: true });
+  test("a transient write fault does not hide a persistent one of another class", async () => {
+    // The write fails once with a TypeError and then, every time, with a RangeError:
+    // both are the same phase, and each class gets its own line.
+    class WriteFaultChanges extends InMemoryCache {
+      puts = 0;
+      async put(request: RequestInfo | URL, response: Response): Promise<void> {
+        if (!(request as Request).url.includes("admin-flag")) return super.put(request, response);
+        this.puts++;
+        if (this.puts === 1) throw new TypeError("a transient write fault");
+        throw new RangeError("a persistent write fault");
+      }
     }
+    (globalThis as { caches?: unknown }).caches = { default: new WriteFaultChanges() };
+    for (let i = 0; i < 4; i++) {
+      expect((await ask()).headers.get("X-RateLimit-Bucket")).toBe("admin-bypass");
+    }
+    expect(writes().map((c) => (c[1] as { error: string }).error)).toEqual([
+      "TypeError",
+      "RangeError",
+    ]);
+  });
+
+  describe("when the cached flag is damaged", () => {
+    const cases: Array<[string, unknown, string]> = [
+      ["is not JSON", "this is not json", "unparseable"],
+      ["has a flag that is not a boolean", { admin: "yes" }, "no-boolean"],
+      ["has no flag", { other: true }, "no-boolean"],
+    ];
+    const reports = () =>
+      h.warn.mock.calls.filter(
+        (c) => c[0] === "[rate-limit] found a damaged admin-flag record, reading the database",
+      );
+
+    for (const [what, damaged, kind] of cases) {
+      test(`a record that ${what} is read again from the database, replaced, and reported as ${kind}`, async () => {
+        const hash = await hashApiKey(ADMIN_KEY);
+        await h.seedAdminFlag(hash, damaged);
+        const res = await ask();
+        expect(res.headers.get("X-RateLimit-Bucket")).toBe("admin-bypass");
+        // Replaced ...
+        expect(await h.storedAdminFlag(hash)).toEqual({ admin: true });
+        // ... and reported, with the fields of the counter's repair line.
+        expect(reports().length).toBe(1);
+        expect(reports()[0]?.[1]).toEqual({
+          keyKind: "admin-flag",
+          damage: kind,
+          suppressed: 0,
+          sinceMs: 0,
+        });
+        expect(lookups()).toEqual([]);
+      });
+    }
+
+    test("is reported as found, not as replaced, when the database then fails and nothing is replaced", async () => {
+      const hash = await hashApiKey(ADMIN_KEY);
+      await h.seedAdminFlag(hash, { admin: "yes" });
+      const broken = { ...env, DB: undefined } as unknown as Bindings;
+      const res = await hit(
+        buildApp(),
+        { ...edge("203.0.113.15"), ...bearer(ADMIN_KEY) },
+        "/admin/users",
+        broken,
+      );
+      // The database failed, so the token is not an admin and the record is as it was.
+      expect(res.headers.get("X-RateLimit-Bucket")).toBe("token");
+      expect(await h.storedAdminFlag(hash)).toEqual({ admin: "yes" });
+      expect(lookups()[0]?.[1]).toMatchObject({ phase: "lookup" });
+      // The line did not claim a replacement that did not happen.
+      expect(reports().length).toBe(1);
+      expect(String(reports()[0]?.[0])).not.toContain("replaced");
+    });
+
+    test("is reported once per window and kind of damage, not per request", async () => {
+      const hash = await hashApiKey(ADMIN_KEY);
+      for (let i = 0; i < 5; i++) {
+        await h.seedAdminFlag(hash, "this is not json");
+        await ask();
+      }
+      await h.seedAdminFlag(hash, { admin: "yes" });
+      await ask();
+      expect(reports().map((c) => (c[1] as { damage: string }).damage)).toEqual([
+        "unparseable",
+        "no-boolean",
+      ]);
+    });
   });
 
   test("a database that fails fails closed: not an admin, and says so once", async () => {

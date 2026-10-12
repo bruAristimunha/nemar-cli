@@ -59,13 +59,26 @@ The Cloudflare account is the trust boundary, as in ADR 0078, and no secret head
    On the strict, data and Neurobagel paths it shares the bucket of its kind, at that bucket's own cap.
    Pooling rather than leaving it unlimited makes a broken forward visible and bounded.
    Every answer carries `X-RateLimit-Caller: edge | site | unattributed`, the admin-bypass answer included, which says so on every bucket, including the strict, data and Neurobagel buckets whose `X-RateLimit-Bucket` keeps the same name for every source.
-   The limiter logs one line per window per isolate for each bucket an unattributed or site caller reaches, naming the bucket and its cap.
+   The limiter logs an identity line for each combination of caller source, bucket and reason, once per isolate per window, naming the bucket and its cap.
+   A warning for an unattributed caller repeats on the 11th, 101st and 1001st call in the window, like every limiter log below; the `site` line, which is the healthy case, does not, so it is one line a window per bucket at any rate.
+   It writes none for a token bucket: that bucket is keyed by the bearer and not by the address, so a line about a forwarded visitor or a shared bucket would be false of it.
    An unattributed line also says why (`absent`, `too-long`, `first-entry-not-an-ip` with a coarse shape, or `unspecified-or-loopback`) and the header's length, never its value.
    Pooling also means a sign-in route keeps a floor instead of silently losing it.
-   The Worker's own calls are not callers and are not pooled.
+   The Worker's own calls are not callers of the data plane and are not pooled there.
    An MCP tool reading a dataset's `index.json` through the zarr gateway, and the Neurobagel gatherer reading the data plane, hand a bare `Request` to a sub-app in process, with neither header.
    They are marked by object identity (`lib/internal-request.ts`), which nothing a client sends can claim and a copy of the request does not inherit,
-   and the limiter lets them through uncounted and unlogged: the request that caused them was counted where it arrived.
+   and the data plane's two buckets, `data-ip` and the miss budget, let them through uncounted and unlogged.
+   That holds only for a request that also carries neither address header, as the two real callers' requests do:
+   one that carries a usable `CF-Connecting-IP` or `X-Forwarded-For` is counted as that address, marked or not.
+   The exemption is those two buckets' alone.
+   On any other bucket the mark changes nothing: the request is counted in whatever bucket it would reach unmarked,
+   a strict, anonymous or Neurobagel bucket by its address (or the pooled bucket and its warning when it has none), a token bucket by its bearer, the private-grant budget by its account,
+   so a request marked by mistake cannot skip those limits.
+   A marked request refused on a bucket other than the data plane's, which the two current callers cannot produce, would not be told apart from a broken website forward in the refusal line, since both read as `unattributed`, and the MCP index reader would report only `index.json fetch answered HTTP 429`.
+   What the mark leaves uncounted is bounded elsewhere.
+   An MCP tool's request was counted where it arrived.
+   The scheduled Neurobagel reconcile has no arriving request:
+   it examines at most `NEUROBAGEL_RECONCILE_MAX` datasets per tick, and the writer's operations budget (`OP_BUDGET`) bounds each run.
    Without the mark they would share the pooled data-plane bucket and miss budget with any real caller that failed to say who it is, warn on a healthy system, and be refused whenever a public flood filled that pool.
    If a zone setting stripped `CF-Connecting-IP` from public traffic, that traffic would be pooled rather than switch the limiter off, but only if the setting stripped `X-Forwarded-For` as well:
    one that removed only `CF-Connecting-IP` would let a public client's own `X-Forwarded-For` choose its bucket, which is decision 1 failing.
@@ -110,23 +123,31 @@ The Cloudflare account is the trust boundary, as in ADR 0078, and no secret head
   it is the only detector for "put resolves but nothing persists" and for a binding call that carries a `CF-Connecting-IP` after all.
   Then tail the production API Worker while a few website pages load:
   `bunx cfman wrangler --account sccn tail nemar-api --search "[rate-limit]"`.
-  A line `counting a request without CF-Connecting-IP by its forwarded visitor` (once per isolate per minute per bucket) means the hypothesis about the missing header holds.
+  A line `counting a request without CF-Connecting-IP by its forwarded visitor` (once per isolate per window for each source, bucket and reason, with no repeats, and never for a token bucket) means the hypothesis about the missing header holds.
   A warning `request with neither` means the website is not forwarding a usable visitor, and says why;
   its responses carry `X-RateLimit-Caller: unattributed`.
   No such line, with the website working, means a binding call carries a `CF-Connecting-IP` after all:
   its requests are in `ip`, nothing has regressed and nothing has improved, and this ADR needs an amendment.
 - **What an absent header means, and what it does not.**
   The `X-RateLimit-*` headers are set on the finished response, so a handler that builds its own `Response` keeps them.
-  An answer without them was not announced as counted: the development Worker, a bypass, a cache fault (which is logged, once per window per bucket kind), or an observe-only count.
+  An answer without them was not announced as counted: the development Worker, a bypass, a cache fault (which is logged, once per window per bucket kind and again at the milestones described below), or an observe-only count.
   That last is the zarr redirect path, which counts a request against the shared bucket and never announces it, so "no headers" does not mean "not counted" there.
   They are not proof of a count either: the data plane hands its write to `waitUntil`, so its answer states a count whether or not the write lands, and a failing `put` there leaves `X-RateLimit-Remaining` unchanged while the line is logged.
   The falling `X-RateLimit-Remaining` above is the evidence; the header's presence alone is not.
 - **The limiter reports its own faults and does not wait on the cache for ever.**
-  A repaired counter record, a refusal, and a cache fault are each logged once per window per bucket kind (refusals and identities also per caller source), with how many lines were swallowed and how long ago the previous one was, by name and never with an address or a message.
+  A repaired counter record, a damaged admin-flag record found (which is then read again from the database and replaced if the database and the write allow), a refusal, and a cache fault are each logged once per window per bucket kind (refusals and identities also per caller source, a fault, and the admin-flag lookup's, also per phase and error class, so a transient stall in a write cannot hide a persistent bug of another class in the same phase; a class not on a short list counts as `other`, which bounds the key space), by name and never with an address or a message.
+  A line says how many calls for its key were swallowed since the previous line (`suppressed`, which does not count the call that is speaking) and how long ago that previous line was (`sinceMs`, the time since the previous line, not since the window opened).
+  A key that keeps firing inside its window speaks again on the 11th, 101st and 1001st call in the window, so the size of a burst is on the log without a line per request, at no more than four lines per key per window.
+  The lines and the calls they swallowed add up to the calls made, but the size is exact only to a factor of ten: a burst that ends between milestones shows as the last milestone it passed.
   A fault line says in which phase the work failed (`match`, `read`, `decide` or `put`), so a bug in the limiter is told from the runtime refusing a call.
+  `read` is the wait on the record's body and nothing else; the limiter interpreting what it read is `decide`, and a fault there is logged as a `limiter fault` and not as a cache failure.
   A record that cannot be read at all (a stream that errors, one that never finishes) is a cache fault, not a damaged record.
   Every call to the Cache API (the lookup, the read of the record's body, the write) is bounded at 500 ms and then fails open with a logged fault.
-  The bound is per call, not per request: a request makes up to three such calls in the counter, up to three more when a bearer's admin flag is not cached, and up to three more in the data plane's miss budget, so a stalled cache costs it up to 1.5 s in each of those, not 500 ms in all.
+  The bound is per call and per place, not per request.
+  The counter makes up to three awaited calls (the lookup, the read of the record's body, the write), and on the data plane at most two, because its write is handed to `waitUntil`.
+  A bearer's admin flag that is not cached makes two (the lookup, then the write of the database's answer), and three when a cached flag is damaged and so is read and replaced.
+  The data plane's miss budget awaits two (the lookup and the read) when `waitUntil` exists, because its write is deferred, and three when it does not.
+  The places fail independently, so a cache that hangs costs a request up to 500 ms in each place it uses (the admin flag and the counter for a token request, the counter and the miss budget for a data request), about a second, not 500 ms in all.
   The writes handed to `waitUntil` (the data plane's counter, the miss budget, the private-grant budget) are bounded and logged the same way and are not waited on.
   A latch that skipped a cache known to be stalled until the window's end would cut the cost to one stall (issue #1715).
 - Any Worker in the account that binds to the default entrypoint can name any visitor, so it can spend a visitor's `site:` allowances.

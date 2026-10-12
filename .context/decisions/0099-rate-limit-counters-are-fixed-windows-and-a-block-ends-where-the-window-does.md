@@ -29,16 +29,20 @@ It does not supersede ADR 0098, whose other decisions stand whether or not this 
    Waiting exactly `Retry-After` seconds is always enough.
    Before this, `Retry-After` was a flat 60 and `Reset` was "now plus 60", neither of which was true after the first refusal.
 3. **One code path.**
-   `rateLimiter` and `consumeKeyedBudget` read, write and refuse through the same three functions (`readCounterRecord`, `counterRecord`, `refusal`).
+   `rateLimiter` and `consumeKeyedBudget` read, write and refuse through the same functions (`readRecordBody` and `interpretRecord`, `counterRecord`, `refusal`).
    That covers the anonymous, `site-ip`, `site-unattributed`, strict, data, token and Neurobagel buckets, the data plane's miss budget and the private-grant budget, and the observe-only path, where the one warning per window now resets at the boundary.
    Keys, caps, bucket names and the other headers are unchanged, and so are the admin bypass, the development bypass and `X-Test-Bypass`.
 4. **Records from before, and damaged ones, cannot wedge a bucket.**
    A record with no `windowEnd` (written by the old code) keeps its count and is given a full window as the bound it reports; its cache entry still expires within a window of its last write, and a refusal never rewrites it.
-   A record whose window has ended is a new window even if the cache has not dropped it yet; one that ended five seconds ago or more is also reported as `bad-end`, since the cache drops an entry within a second of its end.
+   A record whose window has ended is a new window even if the cache has not dropped it yet; one that ended five seconds ago or more is also reported as `bad-end`, because an entry expires with its window.
+   Only local workerd has been observed to drop it within a second of its end; how promptly Cloudflare's production cache drops an expired entry is not verified here, and nothing depends on it, since an ended window is a new window whether or not the entry is still held.
+   A write abandoned at the 500 ms bound (ADR 0098) can still land afterward, so a record can outlive its `windowEnd` by the length of the stall,
+   and a stall of five seconds or more can log a `bad-end` repair on top of the cache-fault line.
+   The repair is right, since the window had ended; the extra line is what not waiting costs.
    An end more than one window away (a skewed clock, a damaged record) is cut to one window.
    A count that is not a finite number above zero is zero, and a body that is not JSON is replaced instead of failing the bucket open.
    A body that cannot be read at all, by contrast, says nothing about the record: it is a cache fault (fail open, logged), not a damaged record to reset.
-   The repair is reported, not silent: one log line per window per bucket kind and kind of damage (`unparseable`, `bad-count`, `bad-end`), never the record.
+   The repair is reported, not silent: a log line per bucket kind and kind of damage (`unparseable`, `bad-count`, `bad-end`), once per window and again at the milestones every limiter log has (ADR 0098), never the record.
    A few seconds of clock difference between isolates is cut to one window and is not called damage.
 
 ## Consequences
@@ -89,5 +93,6 @@ It does not supersede ADR 0098, whose other decisions stand whether or not this 
 
 - Issue #1709; ADR 0098 decision 7 and its last alternative.
 - `backend/src/middleware/rateLimit.ts` (`__CounterState`, `__readCounter`), `backend/test/rate-limit-fixed-window.test.ts`.
-- The tests fail when the window is refreshed on every allowed request again (15 of 35), when an ended window the cache still holds is trusted (7), and when `Retry-After` is a flat 60 (11).
+- The fixed-window tests fail when the window is refreshed on every allowed request again, when an ended window the cache still holds is trusted, and when `Retry-After` is a flat 60.
+  Counts of failing tests are not recorded here: they change with every test added, and a number that is out of date is worse than none.
 - The measurement: the real `rateLimiter` driven at a steady rate with a held clock, as ADR 0098 describes.
