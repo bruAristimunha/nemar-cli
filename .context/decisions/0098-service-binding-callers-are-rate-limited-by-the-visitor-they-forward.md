@@ -48,16 +48,17 @@ The Cloudflare account is the trust boundary, as in ADR 0078, and no secret head
    a visitor or a crawler that loads such pages faster than one every three seconds reaches the cap inside a window.
    The number stays, because the goal for this traffic is that the data gets found and the bucket is a floor against a runaway loop, not a quota;
    capping what one page hydrates is the website's to decide.
+   The arithmetic errs in the safe direction: the counter is a read and then a write, so the parallel hydrations of one page can read the same count and count as fewer calls than they made (the documented race of ADR 0099), and the allowance a page really spends is no more than the figures above.
    It is never below the anonymous cap `MAX_REQUESTS`,
    because a visitor who reaches the API through the website must not be treated more strictly than one who reaches it directly; a test pins that relation.
    The response carries `X-RateLimit-Bucket: site-ip`.
 4. **A request with neither a `CF-Connecting-IP` nor a readable `X-Forwarded-For` shares one bucket per kind.**
-   Until now it got a fresh random bucket, which is no bucket at all.
+   When both headers were absent it used to get a fresh random bucket, which is no bucket at all (an unusable `X-Forwarded-For` on its own was keyed on its raw string).
    The public network cannot produce such a request, so it is a caller inside the account that did not say who it acts for.
    On the anonymous path it is counted in `site-unattributed`, capped at 20,000 per window, far above the whole website's rate.
    On the strict, data and Neurobagel paths it shares the bucket of its kind, at that bucket's own cap.
    Pooling rather than leaving it unlimited makes a broken forward visible and bounded.
-   Every answer carries `X-RateLimit-Caller: edge | site | unattributed`, which says so on every bucket, including the strict, data and Neurobagel buckets whose `X-RateLimit-Bucket` keeps the same name for every source.
+   Every answer carries `X-RateLimit-Caller: edge | site | unattributed`, the admin-bypass answer included, which says so on every bucket, including the strict, data and Neurobagel buckets whose `X-RateLimit-Bucket` keeps the same name for every source.
    The limiter logs one line per window per isolate for each bucket an unattributed or site caller reaches, naming the bucket and its cap.
    An unattributed line also says why (`absent`, `too-long`, `first-entry-not-an-ip` with a coarse shape, or `unspecified-or-loopback`) and the header's length, never its value.
    Pooling also means a sign-in route keeps a floor instead of silently losing it.
@@ -103,6 +104,10 @@ The Cloudflare account is the trust boundary, as in ADR 0078, and no secret head
   So the property that must be shown, not assumed, is that **two sequential calls from one visitor over the binding show `X-RateLimit-Remaining` falling**.
   The website logs `remaining` on its first call and logs one error per isolate, `the API's rate-limit count did not move`, if five calls for a visitor inside one window leave it unchanged (website pull request #450).
   Read that line, or the header by hand, before treating the deploy as done; "no log means fine" is not evidence.
+  A bare "remaining must fall" is not enough either: a mis-forward that put every visitor under one `site:<address>` key would pass it.
+  So the gate is also that **two different visitors each read `X-RateLimit-Bucket: site-ip` and a first call of 1999**, one per visitor.
+  Website pull request #450, already merged to staging, is a prerequisite of the deploy and not a nicety:
+  it is the only detector for "put resolves but nothing persists" and for a binding call that carries a `CF-Connecting-IP` after all.
   Then tail the production API Worker while a few website pages load:
   `bunx cfman wrangler --account sccn tail nemar-api --search "[rate-limit]"`.
   A line `counting a request without CF-Connecting-IP by its forwarded visitor` (once per isolate per minute per bucket) means the hypothesis about the missing header holds.
@@ -112,15 +117,23 @@ The Cloudflare account is the trust boundary, as in ADR 0078, and no secret head
   its requests are in `ip`, nothing has regressed and nothing has improved, and this ADR needs an amendment.
 - **What an absent header means, and what it does not.**
   The `X-RateLimit-*` headers are set on the finished response, so a handler that builds its own `Response` keeps them.
-  An answer without them was not counted: the development Worker, a bypass, or a cache fault (which is logged, once per window per bucket kind).
+  An answer without them was not announced as counted: the development Worker, a bypass, a cache fault (which is logged, once per window per bucket kind), or an observe-only count.
+  That last is the zarr redirect path, which counts a request against the shared bucket and never announces it, so "no headers" does not mean "not counted" there.
   They are not proof of a count either: the data plane hands its write to `waitUntil`, so its answer states a count whether or not the write lands, and a failing `put` there leaves `X-RateLimit-Remaining` unchanged while the line is logged.
   The falling `X-RateLimit-Remaining` above is the evidence; the header's presence alone is not.
 - **The limiter reports its own faults and does not wait on the cache for ever.**
-  A repaired counter record, a refusal, and a cache fault are each logged once per window per bucket kind (with how many lines were swallowed), by name and never with an address or a message.
-  Every wait on the Cache API is bounded at 500 ms and then fails open with a logged fault, so a stalled cache costs a request at most that.
+  A repaired counter record, a refusal, and a cache fault are each logged once per window per bucket kind (refusals and identities also per caller source), with how many lines were swallowed and how long ago the previous one was, by name and never with an address or a message.
+  A fault line says in which phase the work failed (`match`, `read`, `decide` or `put`), so a bug in the limiter is told from the runtime refusing a call.
+  A record that cannot be read at all (a stream that errors, one that never finishes) is a cache fault, not a damaged record.
+  Every call to the Cache API (the lookup, the read of the record's body, the write) is bounded at 500 ms and then fails open with a logged fault.
+  The bound is per call, not per request: a request makes up to three such calls in the counter, up to three more when a bearer's admin flag is not cached, and up to three more in the data plane's miss budget, so a stalled cache costs it up to 1.5 s in each of those, not 500 ms in all.
+  The writes handed to `waitUntil` (the data plane's counter, the miss budget, the private-grant budget) are bounded and logged the same way and are not waited on.
+  A latch that skipped a cache known to be stalled until the window's end would cut the cost to one stall (issue #1715).
 - Any Worker in the account that binds to the default entrypoint can name any visitor, so it can spend a visitor's `site:` allowances.
   It cannot touch a public caller's buckets, which is why the keyspaces are apart,
   and ADR 0078 rule 4 already makes deploy access to the account access to this surface.
+- A call over the service binding reaches the Worker without the zone's edge protections (WAF, rate-limiting rules, bot management), so these counters are the only floor for a site caller.
+  The admin and owner bypass removes even that for a site caller carrying an admin token, as it does for a public one: the token is the control there.
 - Counters stay per data center, as before, because they live in the Cache API.
 - An IPv6 visitor can rotate within their prefix, one bucket per address, here as in the public `ip` bucket; this does not change that.
 - The default entrypoint applies maintenance mode and CORS to the website's calls, as it does to everyone's.

@@ -34,9 +34,10 @@ It does not supersede ADR 0098, whose other decisions stand whether or not this 
    Keys, caps, bucket names and the other headers are unchanged, and so are the admin bypass, the development bypass and `X-Test-Bypass`.
 4. **Records from before, and damaged ones, cannot wedge a bucket.**
    A record with no `windowEnd` (written by the old code) keeps its count and is given a full window as the bound it reports; its cache entry still expires within a window of its last write, and a refusal never rewrites it.
-   A record whose window has ended is a new window even if the cache has not dropped it yet.
+   A record whose window has ended is a new window even if the cache has not dropped it yet; one that ended five seconds ago or more is also reported as `bad-end`, since the cache drops an entry within a second of its end.
    An end more than one window away (a skewed clock, a damaged record) is cut to one window.
    A count that is not a finite number above zero is zero, and a body that is not JSON is replaced instead of failing the bucket open.
+   A body that cannot be read at all, by contrast, says nothing about the record: it is a cache fault (fail open, logged), not a damaged record to reset.
    The repair is reported, not silent: one log line per window per bucket kind and kind of damage (`unparseable`, `bad-count`, `bad-end`), never the record.
    A few seconds of clock difference between isolates is cut to one window and is not called damage.
 
