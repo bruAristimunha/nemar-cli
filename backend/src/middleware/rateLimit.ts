@@ -151,36 +151,75 @@ const TOKEN_MAX_REQUESTS_AUTHED = 1000;
 /** See `writeCount`'s no-`waitUntil` fallback, below. */
 const RATE_LIMIT_WRITE_STALL_MS = 500;
 
-/** Last time {@link logCacheFaultOnce} actually emitted a log, module-level so
- *  it persists across requests in a warm isolate. */
-let lastCacheFaultLoggedAt = 0;
+const WINDOW_MS = WINDOW_SIZE * 1000;
+
+/** When a log key last spoke, and how many lines it has swallowed since. */
+interface LogSlot {
+  at: number;
+  suppressed: number;
+}
+
+/** Module-level so it persists across requests in a warm isolate. */
+const logSlots = new Map<string, LogSlot>();
 
 /**
- * Log a Cache API fault (the enforcement path failing open) at most once per
- * rate-limit window, per isolate. During a sustained Cache API outage every
- * request through `rateLimiter` or `checkDataMissBudget` used to hit this
- * same catch block and log unconditionally, which turns an outage into a
- * request-volume-scaled flood of `console.error` lines -- exactly the kind of
- * noise that makes the ONE line worth reading (the fault itself) harder to
- * find, not easier. A module-level timestamp is enough: it does not need to
- * be keyed by bucket or route, because the thing being reported is "the Cache
- * API is unavailable to this isolate right now," which is true for every
- * caller at once.
+ * Run `emit` at most once per rate-limit window per `key`, per isolate, and hand
+ * it the number of calls swallowed since the previous emission, so a line can
+ * say how much it is standing for. Every log in this file that a request can
+ * trigger goes through here: during a sustained fault or a flood, one line per
+ * kind per minute is the ONE line worth reading, and a line per request buries
+ * it. The key space is bounded by the kinds, sources and reasons below.
  */
-function logCacheFaultOnce(details: Record<string, unknown>): void {
+function logOncePerWindow(key: string, emit: (suppressed: number) => void): void {
   const now = Date.now();
-  if (now - lastCacheFaultLoggedAt < WINDOW_SIZE * 1000) return;
-  lastCacheFaultLoggedAt = now;
-  console.error("[rate-limit] cache failure", details);
+  const slot = logSlots.get(key);
+  // A clock that went backwards ends the quiet period as well: otherwise a slot
+  // stamped in the future would silence its line until the clock caught up.
+  if (slot && now >= slot.at && now - slot.at < WINDOW_MS) {
+    slot.suppressed++;
+    return;
+  }
+  logSlots.set(key, { at: now, suppressed: 0 });
+  emit(slot?.suppressed ?? 0);
 }
 
-/** Test-only: let a test see the very next fault log again rather than
- *  waiting out a real window. */
-export function __resetCacheFaultLogForTests(): void {
-  lastCacheFaultLoggedAt = 0;
+/** The error's class name and nothing else. A cache key is a URL that carries the
+ *  caller's address and a runtime may quote it in a message, so no message from a
+ *  cache or database fault reaches the logs. */
+function errorName(error: unknown): string {
+  return error instanceof Error ? error.name : typeof error;
 }
 
-const WINDOW_MS = WINDOW_SIZE * 1000;
+/**
+ * Log a Cache API fault (the enforcement path failing open) once per window per
+ * bucket kind. One fault is one outage for every request of that kind, and a
+ * request-volume-scaled flood of `console.error` lines is exactly the noise that
+ * makes the line worth reading harder to find. Per kind rather than global so
+ * that an outage seen only by one bucket (a failing `put` on the data plane, say)
+ * is not hidden behind a different bucket's line.
+ */
+function logCacheFault(keyKind: string, route: string | undefined, error: unknown): void {
+  logOncePerWindow(`fault:${keyKind}`, (suppressed) => {
+    console.error("[rate-limit] cache failure", {
+      keyKind,
+      ...(route === undefined ? {} : { route }),
+      error: errorName(error),
+      suppressed,
+    });
+  });
+}
+
+/** Test-only: let a test see the very next log lines again rather than waiting
+ *  out a real window. Clears every once-per-window slot. */
+export function __resetRateLimitLogsForTests(): void {
+  logSlots.clear();
+}
+
+/** Test-only: the same reset, under the name the fault-log tests already use. */
+export const __resetCacheFaultLogForTests = __resetRateLimitLogsForTests;
+
+/** Test-only: the same reset, under the name the identity-log tests already use. */
+export const __resetIdentityLogForTests = __resetRateLimitLogsForTests;
 
 /**
  * The state of a bucket's CURRENT window, as its cache record stores it
@@ -681,8 +720,6 @@ function callerIdentityOf(headers: { get(name: string): string | null }): __Call
   return __readCallerIdentity(headers.get("CF-Connecting-IP"), headers.get("X-Forwarded-For"));
 }
 
-const identityLoggedAt = new Map<string, number>();
-
 /**
  * One log line per isolate per window for each caller source that is not the
  * ordinary one. It is the way to see, with `wrangler tail`, that the website's
@@ -691,28 +728,19 @@ const identityLoggedAt = new Map<string, number>();
  * Never per request, and never the address.
  */
 function logIdentityOnce(source: "site" | "unattributed", path: string): void {
-  const now = Date.now();
-  const last = identityLoggedAt.get(source);
-  if (last !== undefined && now - last < WINDOW_SIZE * 1000) return;
-  identityLoggedAt.set(source, now);
-  if (source === "site") {
-    console.log(
-      "[rate-limit] counting a request without CF-Connecting-IP by its forwarded visitor",
-      {
-        path,
-      },
-    );
-  } else {
-    console.warn(
-      "[rate-limit] request with neither CF-Connecting-IP nor a valid X-Forwarded-For; counted in the shared unattributed bucket",
-      { path },
-    );
-  }
-}
-
-/** Test-only: let a test see the next identity log line again. */
-export function __resetIdentityLogForTests(): void {
-  identityLoggedAt.clear();
+  logOncePerWindow(`identity:${source}`, () => {
+    if (source === "site") {
+      console.log(
+        "[rate-limit] counting a request without CF-Connecting-IP by its forwarded visitor",
+        { path },
+      );
+    } else {
+      console.warn(
+        "[rate-limit] request with neither CF-Connecting-IP nor a valid X-Forwarded-For; counted in the shared unattributed bucket",
+        { path },
+      );
+    }
+  });
 }
 
 /**
@@ -843,7 +871,9 @@ async function isPrivilegedToken(env: Bindings, hashedApiKey: string): Promise<b
     );
     return admin;
   } catch (err) {
-    console.warn(`[rate-limit] admin-flag lookup failed: ${(err as Error).message ?? err}`);
+    logOncePerWindow("admin-flag", (suppressed) => {
+      console.warn("[rate-limit] admin-flag lookup failed", { error: errorName(err), suppressed });
+    });
     return false;
   }
 }
@@ -992,13 +1022,7 @@ export async function rateLimiter(
       await write;
       return;
     }
-    const logFailure = (err: unknown) => {
-      console.error("[rate-limit] cache failure", {
-        route: path,
-        keyKind,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    };
+    const logFailure = (err: unknown) => logCacheFault(keyKind, path, err);
     const defer = dataPlaneDefer();
     if (defer) {
       defer(write.catch(logFailure));
@@ -1068,14 +1092,10 @@ export async function rateLimiter(
     c.header("X-RateLimit-Bucket", keyKind);
   } catch (error) {
     // Fail open so a cache outage doesn't block all traffic, but emit a
-    // structured log (deduped to once per window per isolate, see
-    // `logCacheFaultOnce`) so Workers tail / log tooling surfaces the issue.
+    // structured log (once per window per bucket kind per isolate, see
+    // `logCacheFault`) so Workers tail / log tooling surfaces the issue.
     // TODO(#478): replace with Sentry captureException once DSN is wired.
-    logCacheFaultOnce({
-      route: path,
-      keyKind,
-      error: error instanceof Error ? error.message : String(error),
-    });
+    logCacheFault(keyKind, path, error);
   }
 
   await next();
@@ -1247,12 +1267,7 @@ async function consumeKeyedBudget(
 
     const write = cache
       .put(cacheKey, counterRecord({ ...state, count: state.count + 1 }, now))
-      .catch((err: unknown) => {
-        console.error("[rate-limit] cache failure", {
-          keyKind: bucket.kind,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      });
+      .catch((err: unknown) => logCacheFault(bucket.kind, undefined, err));
     if (waitUntil) {
       waitUntil(write);
     } else {
@@ -1264,13 +1279,9 @@ async function consumeKeyedBudget(
     return { allowed: true };
   } catch (error) {
     // Fail open, the same policy `rateLimiter` itself follows on a cache
-    // outage: a broken Cache API must not block traffic. Deduped the same
-    // way, and against the SAME timestamp: one outage should log once total,
-    // not once per bucket kind.
-    logCacheFaultOnce({
-      keyKind: bucket.kind,
-      error: error instanceof Error ? error.message : String(error),
-    });
+    // outage: a broken Cache API must not block traffic. Logged the same way,
+    // once per window per bucket kind.
+    logCacheFault(bucket.kind, undefined, error);
     return { allowed: true };
   }
 }

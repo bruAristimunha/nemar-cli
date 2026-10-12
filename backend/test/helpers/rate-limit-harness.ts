@@ -12,8 +12,7 @@ import { afterEach, beforeEach, spyOn } from "bun:test";
 import { Hono } from "hono";
 import {
   type RateLimiterOptions,
-  __resetCacheFaultLogForTests,
-  __resetIdentityLogForTests,
+  __resetRateLimitLogsForTests,
   rateLimiter,
 } from "../../src/middleware/rateLimit";
 import type { Bindings, Variables } from "../../src/types/bindings";
@@ -96,8 +95,7 @@ export function useRateLimitHarness(): RateLimitHarness {
     cache = new InMemoryCache();
     originalCaches = (globalThis as { caches?: unknown }).caches;
     (globalThis as { caches?: unknown }).caches = { default: cache };
-    __resetCacheFaultLogForTests();
-    __resetIdentityLogForTests();
+    __resetRateLimitLogsForTests();
   });
 
   afterEach(() => {
@@ -108,8 +106,7 @@ export function useRateLimitHarness(): RateLimitHarness {
     (globalThis as { caches?: unknown }).caches = originalCaches;
     // The held clock is in the future: a slot left behind would silence the real
     // clock's logs for any later file in this process.
-    __resetCacheFaultLogForTests();
-    __resetIdentityLogForTests();
+    __resetRateLimitLogsForTests();
   });
 
   return {
