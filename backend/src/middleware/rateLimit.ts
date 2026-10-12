@@ -209,14 +209,14 @@ class CacheStallError extends Error {
  * limiter fails open and logs it. Without a bound a stalled `match` or `put`
  * leaves the request pending for as long as the runtime lets it, and the
  * limiter sits in front of every API request, the website's server-side renders
- * included. A call that fails after the bound is swallowed, not left unhandled.
+ * included. A call that fails after the bound is not left unhandled: the race
+ * subscribes to `work` as well, so its late rejection is already handled.
  */
 function boundedWait<T>(work: Promise<T>, what: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | null = null;
   const stalled = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new CacheStallError(what)), RATE_LIMIT_WRITE_STALL_MS);
   });
-  work.catch(() => {});
   return Promise.race([work, stalled]).finally(() => clearTimeout(timer));
 }
 
