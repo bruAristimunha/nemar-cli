@@ -1,0 +1,595 @@
+/**
+ * The counter is a fixed window (#1709, ADR 0098).
+ *
+ * It used to rewrite its record with a fresh full window on every allowed
+ * request, so the window slid: a pool that never went quiet for a whole window
+ * was refused for about a minute after every `cap / rate` seconds, whatever the
+ * cap. Measured with the real limiter, a steady 5 requests a second against a
+ * cap of 500 was refused 36.5 percent of the time and 8 a second 47.9 percent,
+ * which is the 40 percent seen in production.
+ *
+ * Driven through the real Hono app and the real limiter against the shared
+ * in-memory Cache double, with one controllable clock that the limiter and the
+ * cache both read (`Date.now`, held by a spy), so a window can be walked across
+ * second by second. The clock is the only thing replaced.
+ */
+
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { Hono } from "hono";
+import {
+  __limits,
+  __readCounter,
+  checkDataMissBudget,
+  checkPrivateGrantBudget,
+  rateLimiter,
+} from "../src/middleware/rateLimit";
+import { hashApiKey } from "../src/services/token";
+import type { Bindings, Variables } from "../src/types/bindings";
+import { InMemoryCache } from "./helpers/cache";
+
+type AppEnv = { Bindings: Bindings; Variables: Variables };
+
+/** A whole second, so epoch-second arithmetic below is exact. */
+const T0 = 1_800_000_000_000;
+const WINDOW = __limits.WINDOW_SIZE;
+const WINDOW_MS = WINDOW * 1000;
+
+let clock = T0;
+let cache = new InMemoryCache();
+let originalCaches: unknown;
+let nowSpy: ReturnType<typeof spyOn>;
+let warnSpy: ReturnType<typeof spyOn>;
+let logSpy: ReturnType<typeof spyOn>;
+
+beforeEach(() => {
+  clock = T0;
+  nowSpy = spyOn(Date, "now").mockImplementation(() => clock);
+  // The privileged-token lookup warns when this suite has no database, and the
+  // limiter logs a line for a caller without CF-Connecting-IP: noise here.
+  warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+  logSpy = spyOn(console, "log").mockImplementation(() => {});
+  cache = new InMemoryCache();
+  originalCaches = (globalThis as { caches?: unknown }).caches;
+  (globalThis as { caches?: unknown }).caches = { default: cache };
+});
+
+afterEach(() => {
+  nowSpy.mockRestore();
+  warnSpy.mockRestore();
+  logSpy.mockRestore();
+  (globalThis as { caches?: unknown }).caches = originalCaches;
+});
+
+const PROD_ENV = {
+  ENVIRONMENT: "production",
+  API_BASE_URL: "http://localhost",
+  FRONTEND_URL: "http://localhost",
+  DB: undefined as unknown as D1Database,
+} satisfies Partial<Bindings> as unknown as Bindings;
+
+function buildApp(options: { observeOnly?: boolean } = {}): Hono<AppEnv> {
+  const app = new Hono<AppEnv>();
+  app.use("*", (c, next) => rateLimiter(c, next, options));
+  app.get("/datasets", (c) => c.json({ ok: true }));
+  app.get("/auth/login", (c) => c.json({ ok: true }));
+  app.get("/admin/users", (c) => c.json({ ok: true }));
+  app.get("/neurobagel/index.json", (c) => c.json({ ok: true }));
+  app.get("/data/*", (c) => c.json({ ok: true }));
+  return app;
+}
+
+async function hit(
+  app: Hono<AppEnv>,
+  headers: Record<string, string>,
+  path = "/datasets",
+): Promise<Response> {
+  return app.fetch(new Request(`http://localhost${path}`, { headers }), PROD_ENV);
+}
+
+const ANON_CAP = __limits.MAX_REQUESTS;
+const edge = (ip: string) => ({ "CF-Connecting-IP": ip });
+
+/** Walk one client at a steady `rate` per second for `seconds` and count the outcomes. */
+async function steady(
+  app: Hono<AppEnv>,
+  headers: Record<string, string>,
+  rate: number,
+  seconds: number,
+): Promise<{ ok: number; refused: number }> {
+  let ok = 0;
+  let refused = 0;
+  const step = 1000 / rate;
+  const start = clock;
+  for (let t = 0; t < seconds * 1000; t += step) {
+    clock = start + t;
+    const res = await hit(app, headers);
+    if (res.status === 200) ok++;
+    else if (res.status === 429) refused++;
+    else throw new Error(`unexpected status ${res.status}`);
+  }
+  return { ok, refused };
+}
+
+/** The record a bucket stores, parsed, or undefined. */
+async function stored(key: string): Promise<Record<string, unknown> | undefined> {
+  const res = await cache.match(new Request(`https://rate-limit.internal/rl:${key}`));
+  return res ? ((await res.json()) as Record<string, unknown>) : undefined;
+}
+
+/** Put a record under a bucket's key, as the limiter itself would have. */
+async function seed(key: string, record: unknown, maxAgeSeconds = WINDOW): Promise<void> {
+  await cache.put(
+    new Request(`https://rate-limit.internal/rl:${key}`),
+    new Response(typeof record === "string" ? record : JSON.stringify(record), {
+      headers: { "Content-Type": "application/json", "Cache-Control": `max-age=${maxAgeSeconds}` },
+    }),
+  );
+}
+
+// --------------------------------------------------------------------------
+// The pure reading of a record
+// --------------------------------------------------------------------------
+
+describe("__readCounter", () => {
+  const now = T0;
+
+  test("no record is a new window that starts now", () => {
+    expect(__readCounter(undefined, now)).toEqual({
+      count: 0,
+      warned: false,
+      windowEnd: now + WINDOW_MS,
+    });
+  });
+
+  test("a live window is read as written, and its end is not moved", () => {
+    const end = now + 17_000;
+    expect(__readCounter({ count: 40, warned: true, windowEnd: end }, now)).toEqual({
+      count: 40,
+      warned: true,
+      windowEnd: end,
+    });
+  });
+
+  test("a window that has ended is a new one, even if the cache still holds the record", () => {
+    for (const end of [now, now - 1, now - 5 * WINDOW_MS]) {
+      expect(__readCounter({ count: 999, warned: true, windowEnd: end }, now)).toEqual({
+        count: 0,
+        warned: false,
+        windowEnd: now + WINDOW_MS,
+      });
+    }
+  });
+
+  test("a record from before windows were stored keeps its count and gets a full window as its bound", () => {
+    expect(__readCounter({ count: 7, warned: true }, now)).toEqual({
+      count: 7,
+      warned: true,
+      windowEnd: now + WINDOW_MS,
+    });
+    expect(__readCounter({ count: 7 }, now)).toEqual({
+      count: 7,
+      warned: false,
+      windowEnd: now + WINDOW_MS,
+    });
+  });
+
+  test("an end more than a window away is cut to one window", () => {
+    const state = __readCounter({ count: 1, windowEnd: now + 10 * 86_400_000 }, now);
+    expect(state.windowEnd).toBe(now + WINDOW_MS);
+  });
+
+  test("damaged values cannot wedge a bucket", () => {
+    expect(__readCounter({ count: "lots", windowEnd: now + 1000 }, now).count).toBe(0);
+    expect(__readCounter({ count: -5, windowEnd: now + 1000 }, now).count).toBe(0);
+    expect(__readCounter({ count: 3.9, windowEnd: now + 1000 }, now).count).toBe(3);
+    expect(__readCounter({ count: 3, windowEnd: "soon" }, now).windowEnd).toBe(now + WINDOW_MS);
+    expect(__readCounter({ count: 3, windowEnd: null }, now).windowEnd).toBe(now + WINDOW_MS);
+    for (const junk of [null, 5, "text", true]) {
+      expect(__readCounter(junk, now)).toEqual({
+        count: 0,
+        warned: false,
+        windowEnd: now + WINDOW_MS,
+      });
+    }
+  });
+});
+
+// --------------------------------------------------------------------------
+// The behavior #1709 was about
+// --------------------------------------------------------------------------
+
+describe("a steady rate below the cap is never refused", () => {
+  test.each([
+    [5, "the production pool's measured 5 a second"],
+    [8, "the production pool's measured 8 a second"],
+    [10, "ten a second, 600 a window"],
+  ])("%d requests a second for 30 minutes", async (rate) => {
+    const result = await steady(buildApp(), edge("203.0.113.1"), rate, 1800);
+    expect(result.refused).toBe(0);
+    expect(result.ok).toBe(rate * 1800);
+  });
+
+  test("the same rates against the website's per-visitor bucket", async () => {
+    const result = await steady(buildApp(), { "X-Forwarded-For": "203.0.113.2" }, 10, 1800);
+    expect(result.refused).toBe(0);
+  });
+});
+
+describe("a rate above the cap is refused exactly the excess a fixed window must refuse", () => {
+  test("25 a second against the cap of 1000 is refused one request in three", async () => {
+    // 25 a second is 1500 a window, 1000 of them admitted and 500 refused, in
+    // every window: 1 - cap / (rate * 60).
+    const result = await steady(buildApp(), edge("203.0.113.3"), 25, 1800);
+    const total = result.ok + result.refused;
+    expect(total).toBe(25 * 1800);
+    expect(result.ok).toBe(30 * ANON_CAP);
+    expect(result.refused / total).toBeCloseTo(1 - ANON_CAP / (25 * WINDOW), 6);
+  });
+
+  test("the strict bucket, at half a request a second, is refused two in three", async () => {
+    // 30 a window against a cap of 10: 20 refused.
+    const app = buildApp();
+    let ok = 0;
+    let refused = 0;
+    for (let t = 0; t < 1800 * 1000; t += 2000) {
+      clock = T0 + t;
+      const res = await hit(app, edge("203.0.113.4"), "/auth/login");
+      if (res.status === 200) ok++;
+      else refused++;
+    }
+    expect(ok).toBe(30 * __limits.AUTH_MAX_REQUESTS);
+    expect(refused).toBe(30 * (30 - __limits.AUTH_MAX_REQUESTS));
+  });
+});
+
+describe("a burst at the cap is refused for the rest of its window only", () => {
+  test("it is admitted again at the boundary, not a second sooner or later", async () => {
+    const app = buildApp();
+    const headers = edge("203.0.113.5");
+    for (let i = 0; i < ANON_CAP; i++) {
+      expect((await hit(app, headers)).status).toBe(200);
+    }
+
+    const second = (n: number) => T0 + n * 1000;
+    const refusedAt = async (at: number) => {
+      clock = at;
+      return hit(app, headers);
+    };
+
+    let res = await refusedAt(second(0));
+    expect(res.status).toBe(429);
+    expect(res.headers.get("Retry-After")).toBe("60");
+
+    res = await refusedAt(second(30));
+    expect(res.status).toBe(429);
+    expect(res.headers.get("Retry-After")).toBe("30");
+
+    res = await refusedAt(second(60) - 1);
+    expect(res.status).toBe(429);
+    expect(res.headers.get("Retry-After")).toBe("1");
+
+    res = await refusedAt(second(60));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-RateLimit-Remaining")).toBe(String(ANON_CAP - 1));
+  });
+
+  test("hammering during the block does not extend it", async () => {
+    const app = buildApp();
+    const headers = edge("203.0.113.6");
+    for (let i = 0; i < ANON_CAP; i++) await hit(app, headers);
+    // A request every 50 ms for the whole window, every one of them refused...
+    for (let t = 50; t < WINDOW_MS; t += 50) {
+      clock = T0 + t;
+      expect((await hit(app, headers)).status).toBe(429);
+    }
+    // ...and the first at the boundary is admitted all the same.
+    clock = T0 + WINDOW_MS;
+    expect((await hit(app, headers)).status).toBe(200);
+  });
+
+  test("the next window is a full one of its own", async () => {
+    const app = buildApp();
+    const headers = edge("203.0.113.7");
+    for (let i = 0; i < ANON_CAP; i++) await hit(app, headers);
+    clock = T0 + WINDOW_MS;
+    let ok = 0;
+    for (let i = 0; i < ANON_CAP + 5; i++) {
+      if ((await hit(app, headers)).status === 200) ok++;
+    }
+    expect(ok).toBe(ANON_CAP);
+    // It began at T0 + 60 s, so it ends at T0 + 120 s.
+    const res = await hit(app, headers);
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("X-RateLimit-Reset"))).toBe((T0 + 2 * WINDOW_MS) / 1000);
+  });
+
+  test("requests inside a window never move its end", async () => {
+    const app = buildApp();
+    const headers = edge("203.0.113.8");
+    await hit(app, headers);
+    const first = await stored("ip:203.0.113.8");
+    clock = T0 + 40_000;
+    await hit(app, headers);
+    const second = await stored("ip:203.0.113.8");
+    expect(first?.windowEnd).toBe(T0 + WINDOW_MS);
+    expect(second?.windowEnd).toBe(T0 + WINDOW_MS);
+    expect(second?.count).toBe(2);
+  });
+});
+
+describe("Retry-After and X-RateLimit-Reset agree with the window", () => {
+  test("both name the window's end, and waiting Retry-After seconds is enough", async () => {
+    const app = buildApp();
+    const headers = edge("203.0.113.9");
+    for (let i = 0; i < ANON_CAP; i++) await hit(app, headers);
+
+    clock = T0 + 12_300;
+    const res = await hit(app, headers);
+    expect(res.status).toBe(429);
+    const retryAfter = Number(res.headers.get("Retry-After"));
+    const reset = Number(res.headers.get("X-RateLimit-Reset"));
+    const body = (await res.json()) as { retry_after: number; message: string };
+
+    expect(reset).toBe((T0 + WINDOW_MS) / 1000);
+    expect(retryAfter).toBe(Math.ceil((reset * 1000 - clock) / 1000));
+    expect(retryAfter).toBe(48);
+    expect(body.retry_after).toBe(retryAfter);
+    expect(body.message).toContain(`${retryAfter} seconds`);
+    expect(res.headers.get("X-RateLimit-Limit")).toBe(String(ANON_CAP));
+    expect(res.headers.get("X-RateLimit-Remaining")).toBe("0");
+    expect(res.headers.get("X-RateLimit-Bucket")).toBe("ip");
+
+    // Never undershoots: a client that waits exactly Retry-After is let in.
+    clock += retryAfter * 1000;
+    expect((await hit(app, headers)).status).toBe(200);
+  });
+
+  test("Retry-After is never zero and never more than a window", async () => {
+    const app = buildApp();
+    const headers = edge("203.0.113.10");
+    for (let i = 0; i < ANON_CAP; i++) await hit(app, headers);
+    for (const at of [0, 1, 999, 30_000, WINDOW_MS - 1]) {
+      clock = T0 + at;
+      const res = await hit(app, headers);
+      const retryAfter = Number(res.headers.get("Retry-After"));
+      expect(retryAfter).toBeGreaterThanOrEqual(1);
+      expect(retryAfter).toBeLessThanOrEqual(WINDOW);
+    }
+  });
+
+  test("the cache entry expires with the window, not a full window after the last request", async () => {
+    const app = buildApp();
+    const headers = edge("203.0.113.11");
+    await hit(app, headers);
+    clock = T0 + 50_000;
+    await hit(app, headers);
+    // 10 seconds remain. The record was written with max-age=10, so at T0 + 61 s
+    // the cache itself has dropped it, with no help from the limiter.
+    clock = T0 + 61_000;
+    expect(await stored("ip:203.0.113.11")).toBeUndefined();
+  });
+});
+
+describe("a record written before windows were stored is read safely", () => {
+  test("below the cap it is counted on and given a window of its own", async () => {
+    await seed("ip:203.0.113.20", { count: ANON_CAP - 1, warned: false });
+    const app = buildApp();
+    const last = await hit(app, edge("203.0.113.20"));
+    expect(last.status).toBe(200);
+    expect(last.headers.get("X-RateLimit-Remaining")).toBe("0");
+    expect((await stored("ip:203.0.113.20"))?.windowEnd).toBe(T0 + WINDOW_MS);
+    const over = await hit(app, edge("203.0.113.20"));
+    expect(over.status).toBe(429);
+  });
+
+  test("at the cap it refuses with a window as the bound, and is gone once its entry is", async () => {
+    await seed("ip:203.0.113.21", { count: ANON_CAP, warned: false });
+    const app = buildApp();
+    const res = await hit(app, edge("203.0.113.21"));
+    expect(res.status).toBe(429);
+    expect(res.headers.get("Retry-After")).toBe("60");
+    expect(res.headers.get("X-RateLimit-Reset")).toBe(String((T0 + WINDOW_MS) / 1000));
+
+    // Refusals write nothing, so the old entry runs out on its own TTL.
+    clock = T0 + WINDOW_MS + 1000;
+    const after = await hit(app, edge("203.0.113.21"));
+    expect(after.status).toBe(200);
+    expect(after.headers.get("X-RateLimit-Remaining")).toBe(String(ANON_CAP - 1));
+  });
+
+  test("a count-only record, as the budgets used to write, behaves the same", async () => {
+    await seed("ip:203.0.113.22", { count: ANON_CAP });
+    expect((await hit(buildApp(), edge("203.0.113.22"))).status).toBe(429);
+  });
+});
+
+describe("a damaged or stale record does not wedge a bucket", () => {
+  test("an end far in the future holds the bucket for one window at most", async () => {
+    await seed("ip:203.0.113.30", { count: ANON_CAP, windowEnd: T0 + 10 * 86_400_000 });
+    const app = buildApp();
+    const res = await hit(app, edge("203.0.113.30"));
+    expect(res.status).toBe(429);
+    expect(res.headers.get("Retry-After")).toBe("60");
+    clock = T0 + WINDOW_MS + 1000;
+    expect((await hit(app, edge("203.0.113.30"))).status).toBe(200);
+  });
+
+  test("a window that has ended but whose entry the cache still holds is a new window", async () => {
+    await seed("ip:203.0.113.31", { count: ANON_CAP, warned: false, windowEnd: T0 - 1 }, 3600);
+    const res = await hit(buildApp(), edge("203.0.113.31"));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-RateLimit-Remaining")).toBe(String(ANON_CAP - 1));
+    expect((await stored("ip:203.0.113.31"))?.windowEnd).toBe(T0 + WINDOW_MS);
+  });
+
+  test("a body that is not JSON is replaced, not trusted and not failed open on", async () => {
+    await seed("ip:203.0.113.32", "this is not json", 3600);
+    const app = buildApp();
+    const first = await hit(app, edge("203.0.113.32"));
+    expect(first.status).toBe(200);
+    expect(first.headers.get("X-RateLimit-Remaining")).toBe(String(ANON_CAP - 1));
+    expect((await stored("ip:203.0.113.32"))?.count).toBe(1);
+  });
+});
+
+// --------------------------------------------------------------------------
+// One code path for every counter
+// --------------------------------------------------------------------------
+
+describe("every bucket kind keeps its window's end and ends its block there", () => {
+  const BEARER = "b".repeat(48);
+  const cases: Array<{
+    kind: string;
+    key: () => Promise<string>;
+    cap: number;
+    path: string;
+    headers: Record<string, string>;
+  }> = [
+    {
+      kind: "ip",
+      key: async () => "ip:203.0.113.40",
+      cap: __limits.MAX_REQUESTS,
+      path: "/datasets",
+      headers: edge("203.0.113.40"),
+    },
+    {
+      kind: "site-ip",
+      key: async () => "site-ip:site:203.0.113.41",
+      cap: __limits.SITE_IP_MAX_REQUESTS,
+      path: "/datasets",
+      headers: { "X-Forwarded-For": "203.0.113.41" },
+    },
+    {
+      kind: "site-unattributed",
+      key: async () => "site-unattributed:unattributed",
+      cap: __limits.SITE_UNATTRIBUTED_MAX_REQUESTS,
+      path: "/datasets",
+      headers: {},
+    },
+    {
+      kind: "auth-ip",
+      key: async () => "auth-ip:203.0.113.42",
+      cap: __limits.AUTH_MAX_REQUESTS,
+      path: "/auth/login",
+      headers: edge("203.0.113.42"),
+    },
+    {
+      kind: "token",
+      key: async () => `token:${await hashApiKey(BEARER)}`,
+      cap: __limits.TOKEN_MAX_REQUESTS_AUTHED,
+      path: "/admin/users",
+      headers: { ...edge("203.0.113.43"), Authorization: `Bearer ${BEARER}` },
+    },
+    {
+      kind: "neurobagel-ip",
+      key: async () => "neurobagel-ip:203.0.113.44",
+      cap: __limits.NEUROBAGEL_MAX_REQUESTS,
+      path: "/neurobagel/index.json",
+      headers: edge("203.0.113.44"),
+    },
+    {
+      kind: "data-ip",
+      key: async () => "data-ip:203.0.113.45",
+      cap: __limits.DATA_MAX_REQUESTS,
+      path: "/data/nm000108/v1.0.0/x",
+      headers: edge("203.0.113.45"),
+    },
+  ];
+
+  test.each(cases)("$kind (cap $cap)", async ({ kind, key, cap, path, headers }) => {
+    // Thirty seconds into a window, three requests from the cap.
+    const k = await key();
+    await seed(k, { count: cap - 3, warned: false, windowEnd: T0 + 30_000 }, 30);
+    const app = buildApp();
+
+    for (let left = 2; left >= 0; left--) {
+      const res = await hit(app, headers, path);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("X-RateLimit-Bucket")).toBe(kind);
+      expect(res.headers.get("X-RateLimit-Remaining")).toBe(String(left));
+    }
+    // Writing back kept the end where it was.
+    expect((await stored(k))?.windowEnd).toBe(T0 + 30_000);
+
+    const over = await hit(app, headers, path);
+    expect(over.status).toBe(429);
+    expect(over.headers.get("X-RateLimit-Bucket")).toBe(kind);
+    expect(over.headers.get("Retry-After")).toBe("30");
+    expect(over.headers.get("X-RateLimit-Reset")).toBe(String((T0 + 30_000) / 1000));
+
+    clock = T0 + 29_999;
+    expect((await hit(app, headers, path)).status).toBe(429);
+    clock = T0 + 30_000;
+    const fresh = await hit(app, headers, path);
+    expect(fresh.status).toBe(200);
+    expect(fresh.headers.get("X-RateLimit-Remaining")).toBe(String(cap - 1));
+    expect((await stored(k))?.windowEnd).toBe(T0 + 30_000 + WINDOW_MS);
+  });
+
+  test("the miss budget of the data plane", async () => {
+    const env = { ENVIRONMENT: "production" } as Pick<
+      Bindings,
+      "ENVIRONMENT" | "TEST_BYPASS_TOKEN"
+    >;
+    const ask = () =>
+      checkDataMissBudget(
+        env,
+        new Request("http://localhost/data/x", { headers: edge("203.0.113.46") }),
+        undefined,
+      );
+    const cap = __limits.DATA_MISS_MAX_REQUESTS;
+    await seed("data-miss-ip:203.0.113.46", { count: cap - 1, windowEnd: T0 + 20_000 }, 20);
+    expect((await ask()).allowed).toBe(true);
+    const refused = await ask();
+    expect(refused.allowed).toBe(false);
+    if (!refused.allowed) {
+      expect(refused.response.headers.get("Retry-After")).toBe("20");
+      expect(refused.response.headers.get("X-RateLimit-Reset")).toBe(String((T0 + 20_000) / 1000));
+      expect(refused.response.headers.get("X-RateLimit-Bucket")).toBe("data-miss-ip");
+    }
+    clock = T0 + 20_000;
+    expect((await ask()).allowed).toBe(true);
+  });
+
+  test("the private-grant budget, per account", async () => {
+    const env = { ENVIRONMENT: "production" } as Pick<
+      Bindings,
+      "ENVIRONMENT" | "TEST_BYPASS_TOKEN"
+    >;
+    const ask = () =>
+      checkPrivateGrantBudget(env, new Request("http://localhost/x"), 77, undefined);
+    for (let i = 0; i < __limits.PRIVATE_GRANT_MAX_REQUESTS; i++) {
+      expect((await ask()).allowed).toBe(true);
+    }
+    clock = T0 + 45_000;
+    const refused = await ask();
+    expect(refused.allowed).toBe(false);
+    if (!refused.allowed) {
+      expect(refused.response.headers.get("Retry-After")).toBe("15");
+    }
+    clock = T0 + WINDOW_MS;
+    expect((await ask()).allowed).toBe(true);
+  });
+});
+
+describe("observe-only counting follows the same window", () => {
+  test("the one warning per window resets at the boundary, with the count", async () => {
+    const observe = (text: string) =>
+      warnSpy.mock.calls.filter((c) => String(c[0]).includes(text)).length;
+    const app = buildApp({ observeOnly: true });
+    const headers = edge("203.0.113.50");
+    await seed("ip:203.0.113.50", { count: ANON_CAP, warned: false, windowEnd: T0 + 20_000 }, 20);
+
+    // Observe-only never refuses.
+    expect((await hit(app, headers)).status).toBe(200);
+    expect((await hit(app, headers)).status).toBe(200);
+    expect(observe("observe-only bucket would have tripped")).toBe(1);
+    expect((await stored("ip:203.0.113.50"))?.windowEnd).toBe(T0 + 20_000);
+
+    // The window ends: the count and the warning start over.
+    clock = T0 + 20_000;
+    expect((await hit(app, headers)).status).toBe(200);
+    expect((await stored("ip:203.0.113.50"))?.count).toBe(1);
+    expect((await stored("ip:203.0.113.50"))?.warned).toBe(false);
+  });
+});

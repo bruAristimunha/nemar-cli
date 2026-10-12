@@ -35,6 +35,11 @@
  *     buckets), and a request with neither is counted in one shared bucket.
  *     `X-Forwarded-For` never chooses the bucket of a request that carries
  *     `CF-Connecting-IP`.
+ *   - Every counter is a fixed window (`__CounterState`): it starts with the first
+ *     request that finds none and ends 60 seconds later, `Retry-After` and
+ *     `X-RateLimit-Reset` say when, and a busy client is refused until then and
+ *     no longer. Before #1709 the window slid, which refused a pool for about a
+ *     minute after every `cap / rate` seconds.
  */
 
 import type { Context, Next } from "hono";
@@ -73,21 +78,20 @@ const WINDOW_SIZE = 60; // seconds
 // What the number does and does not protect against. It bounds a runaway loop from
 // one address. It does not bound a crawl spread over many addresses (each has its
 // own bucket, each data center its own counter), or the cost of any single call.
-// `/mcp` shares this bucket, and
-// its tools read from S3 per call; those reads are bounded by their own byte limits
-// (#1498), not by this number, so a higher cap raises how many one address may
-// start. No Cloudflare rule in front of the Worker is documented in this
-// repository, so read this as the only floor.
+// `/mcp` shares this bucket, and its tools read from S3 per call; those reads are
+// bounded by their own byte limits (#1498), not by this number, so a higher cap
+// raises how many one address may start. No Cloudflare rule in front of the Worker
+// is documented in this repository, so read this as the only floor.
 //
 // Why 1000 and not more. A token holder must never be limited more strictly than an
-// anonymous caller: the bearer is the only difference between them, and a holder
-// could stop sending it. `TOKEN_MAX_REQUESTS_AUTHED` is 1000, so this cannot go
+// anonymous caller. `TOKEN_MAX_REQUESTS_AUTHED` is 1000, so this cannot go
 // above it without raising that one too, which is a separate decision; a test pins
-// the relation. And no number cures the website's refusals on its own, because
-// each allowed request refreshes the counter's expiry: a pool that never goes quiet
-// for 60 seconds is refused for about a minute after every `cap / rate` seconds.
-// At six requests a second that is about 42 percent refused at 500 and about 26 at 1000;
-// ADR 0098 gives the measurements and leaves the counter for a decision of its own.
+// the relation. The number is not what made the website's pool trip it. Until the
+// window was made fixed (`__CounterState`) each allowed request refreshed the
+// counter's expiry, so a pool that never went quiet for 60 seconds was refused for
+// about a minute after every `cap / rate` seconds: at six requests a second about
+// 42 percent at 500 and 26 at 1000. Now a rate below the cap per window is never
+// refused. ADR 0098 gives the measurements.
 const MAX_REQUESTS = 1000;
 // The website's own bucket, per forwarded visitor (#1709, ADR 0098). The website
 // reaches this Worker through a service binding, which carries no
@@ -108,10 +112,9 @@ const MAX_REQUESTS = 1000;
 // not be treated more strictly than a caller who reaches it directly, and a test
 // pins the relation so raising one cap cannot silently invert it.
 //
-// Counted the way every bucket in this file is counted: each allowed request
-// refreshes the counter's expiry, so a cap is a budget between two quiet gaps of
-// a window, not a rate per minute. That is a property of the counter, not of this
-// bucket, and ADR 0098 records it as a separate matter.
+// Counted like every bucket in this file, in a fixed window (`__CounterState`):
+// 2000 requests from one visitor in one window are admitted and the 2001st is
+// refused until the window ends, however busy the visitor is.
 const SITE_IP_MAX_REQUESTS = 2000;
 // A request with neither `CF-Connecting-IP` nor a usable `X-Forwarded-For`. The
 // public network cannot produce one (Cloudflare always sets the first), so it is a
@@ -175,6 +178,127 @@ function logCacheFaultOnce(details: Record<string, unknown>): void {
  *  waiting out a real window. */
 export function __resetCacheFaultLogForTests(): void {
   lastCacheFaultLoggedAt = 0;
+}
+
+const WINDOW_MS = WINDOW_SIZE * 1000;
+
+/**
+ * The state of a bucket's CURRENT window, as its cache record stores it
+ * (#1709, ADR 0098). The window is FIXED: it starts with the first request that
+ * finds no live window and ends `WINDOW_SIZE` seconds later, and nothing that
+ * happens inside it moves the end. `windowEnd` is epoch milliseconds.
+ *
+ * The counter used to rewrite its record with a fresh full window on every
+ * allowed request, so the window slid: a pool that never went quiet for a whole
+ * window was refused for about a minute after every `cap / rate` seconds, whatever
+ * the cap, and that was most of the 40 percent of refusals in #1709. Now a record
+ * is written back with the time that REMAINS in its window as the cache `max-age`,
+ * so the cache drops it at the end and a block ends at a boundary the client can
+ * compute from `Retry-After`.
+ *
+ * The cost of a fixed window is that a client can spend a full cap at the end of
+ * one window and another at the start of the next, up to twice the cap across the
+ * boundary. The cap is a floor against a runaway loop, not a quota, and the
+ * sustained ceiling is the same cap per window as before; ADR 0098 records why
+ * that is acceptable.
+ */
+export interface __CounterState {
+  count: number;
+  warned: boolean;
+  windowEnd: number;
+}
+
+function freshWindow(now: number): __CounterState {
+  return { count: 0, warned: false, windowEnd: now + WINDOW_MS };
+}
+
+/**
+ * The state a cache record means at time `now`. `data` is the parsed record, or
+ * undefined when there is none.
+ *
+ *  - No record, or one whose window has ended (the cache had not dropped it yet):
+ *    a new window.
+ *  - A record from before windows were stored (`{count, warned}` only) has an end
+ *    nobody wrote down, but its entry cannot outlive a window from its last write,
+ *    so a full window from now is an upper bound for what a client is told, and the
+ *    entry's own expiry still clears it.
+ *  - An end further away than one window (a skewed clock, a damaged record) is cut
+ *    to one window, so no record can hold a bucket shut for longer than that.
+ *  - A count that is not a finite number above zero is zero.
+ */
+export function __readCounter(data: unknown, now: number): __CounterState {
+  if (typeof data !== "object" || data === null) return freshWindow(now);
+  const record = data as { count?: unknown; warned?: unknown; windowEnd?: unknown };
+  const count =
+    typeof record.count === "number" && Number.isFinite(record.count) && record.count > 0
+      ? Math.floor(record.count)
+      : 0;
+  const warned = record.warned === true;
+  const end = record.windowEnd;
+  if (typeof end === "number" && Number.isFinite(end)) {
+    if (end <= now) return freshWindow(now);
+    return { count, warned, windowEnd: Math.min(end, now + WINDOW_MS) };
+  }
+  return { count, warned, windowEnd: now + WINDOW_MS };
+}
+
+/** Whole seconds left in the window, at least 1 and at most one window. */
+function secondsLeft(state: __CounterState, now: number): number {
+  return Math.min(WINDOW_SIZE, Math.max(1, Math.ceil((state.windowEnd - now) / 1000)));
+}
+
+/** The record to store: the state, expiring with its window rather than a full one. */
+function counterRecord(state: __CounterState, now: number): Response {
+  return new Response(
+    JSON.stringify({ count: state.count, warned: state.warned, windowEnd: state.windowEnd }),
+    {
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": `max-age=${secondsLeft(state, now)}`,
+      },
+    },
+  );
+}
+
+/** Read a bucket's record. A record that will not parse is replaced, not trusted. */
+async function readCounterRecord(
+  cached: Response | undefined,
+  now: number,
+): Promise<__CounterState> {
+  if (!cached) return freshWindow(now);
+  let data: unknown;
+  try {
+    data = await cached.json();
+  } catch {
+    data = undefined;
+  }
+  return __readCounter(data, now);
+}
+
+/** The 429 every counter in this file answers with: the same body and headers
+ *  whichever bucket tripped, `Retry-After` and `X-RateLimit-Reset` agreeing with
+ *  the window, and only `X-RateLimit-Bucket` telling the buckets apart. */
+function refusal(
+  kind: string,
+  maxRequests: number,
+  state: __CounterState,
+  now: number,
+): { body: Record<string, unknown>; headers: Record<string, string> } {
+  const retryAfter = secondsLeft(state, now);
+  return {
+    body: {
+      error: "Rate limit exceeded",
+      message: `Too many requests. Please try again in ${retryAfter} seconds.`,
+      retry_after: retryAfter,
+    },
+    headers: {
+      "Retry-After": retryAfter.toString(),
+      "X-RateLimit-Limit": maxRequests.toString(),
+      "X-RateLimit-Remaining": "0",
+      "X-RateLimit-Reset": Math.ceil(state.windowEnd / 1000).toString(),
+      "X-RateLimit-Bucket": kind,
+    },
+  };
 }
 
 // A legitimate full-dataset download over the data plane (`nemar-py
@@ -895,17 +1019,14 @@ export async function rateLimiter(
   try {
     const cache = caches.default;
 
-    // Get current count (and, for the observe-only path, whether this
-    // window already warned once) from cache.
+    // The bucket's current window: its count and (for the observe-only path)
+    // whether it already warned once. Read after the cache lookup, because a
+    // Worker's clock only moves at I/O.
     const cached = await cache.match(cacheKey);
-    let count = 0;
-    let warned = false;
-
-    if (cached) {
-      const data = (await cached.json()) as { count: number; warned?: boolean };
-      count = data.count;
-      warned = data.warned === true;
-    }
+    const now = Date.now();
+    const state = await readCounterRecord(cached, now);
+    const count = state.count;
+    let warned = state.warned;
 
     if (options.observeOnly) {
       // Never block -- just record the hit against the shared bucket and
@@ -925,52 +1046,21 @@ export async function rateLimiter(
         });
         warned = true;
       }
-      const newCount = count + 1;
-      await writeCount(
-        cache.put(
-          cacheKey,
-          new Response(JSON.stringify({ count: newCount, warned }), {
-            headers: {
-              "Content-Type": "application/json",
-              "Cache-Control": `max-age=${WINDOW_SIZE}`,
-            },
-          }),
-        ),
-      );
+      const observed = { ...state, count: count + 1, warned };
+      await writeCount(cache.put(cacheKey, counterRecord(observed, now)));
       await next();
       return;
     }
 
     if (count >= maxRequests) {
-      // Calculate retry-after (approximate)
-      const retryAfter = WINDOW_SIZE;
-
-      return c.json(
-        {
-          error: "Rate limit exceeded",
-          message: `Too many requests. Please try again in ${retryAfter} seconds.`,
-          retry_after: retryAfter,
-        },
-        429,
-        {
-          "Retry-After": retryAfter.toString(),
-          "X-RateLimit-Limit": maxRequests.toString(),
-          "X-RateLimit-Remaining": "0",
-          "X-RateLimit-Reset": (Math.floor(Date.now() / 1000) + retryAfter).toString(),
-          "X-RateLimit-Bucket": keyKind,
-        },
-      );
+      const refused = refusal(keyKind, maxRequests, state, now);
+      return c.json(refused.body, 429, refused.headers);
     }
 
-    // Increment counter and store in cache with TTL
+    // Increment the counter. The record keeps the window's original end and
+    // expires with it; a refused request above writes nothing.
     const newCount = count + 1;
-    const response = new Response(JSON.stringify({ count: newCount, warned }), {
-      headers: {
-        "Content-Type": "application/json",
-        "Cache-Control": `max-age=${WINDOW_SIZE}`,
-      },
-    });
-    await writeCount(cache.put(cacheKey, response));
+    await writeCount(cache.put(cacheKey, counterRecord({ ...state, count: newCount }, now)));
 
     // Add rate limit headers to response
     c.header("X-RateLimit-Limit", maxRequests.toString());
@@ -1045,8 +1135,8 @@ export type DataMissBudgetOutcome =
  * listing, or the "not in the manifest at all" 404 (none of those go through
  * this path either).
  *
- * Mirrors `rateLimiter`'s own mechanics: a Cache API counter (`{count}`
- * under `max-age=<WINDOW_SIZE>`; it needs no `warned` flag, having no
+ * Mirrors `rateLimiter`'s own mechanics: the same fixed-window Cache API
+ * counter (`__CounterState`; its `warned` flag is unused, there being no
  * observe-only mode), the same dev-environment and `X-Test-Bypass`
  * exemptions, and the same
  * `waitUntil`-deferred write with the bounded no-context fallback (so a
@@ -1114,10 +1204,9 @@ export async function checkPrivateGrantBudget(
 /**
  * The shared core of the keyed budgets a route checks itself, because the
  * key is something only the route knows (whether a request missed the cache,
- * which account a session names). Mirrors `rateLimiter`'s own mechanics: a
- * Cache API counter (`{count}` under `max-age=<WINDOW_SIZE>`, with no
- * `warned` flag because there is no observe-only mode), the same
- * dev-environment and `X-Test-Bypass`
+ * which account a session names). Mirrors `rateLimiter`'s own mechanics: the
+ * same fixed-window Cache API counter (`__CounterState`, read and written by the
+ * same functions), the same dev-environment and `X-Test-Bypass`
  * exemptions, the same fail-open on a cache outage, and the same
  * `waitUntil`-deferred write with the bounded no-context fallback.
  */
@@ -1142,44 +1231,22 @@ async function consumeKeyedBudget(
   try {
     const cache = caches.default;
     const cached = await cache.match(cacheKey);
-    const count = cached ? ((await cached.json()) as { count: number }).count : 0;
+    const now = Date.now();
+    const state = await readCounterRecord(cached, now);
 
-    if (count >= bucket.maxRequests) {
-      const retryAfter = WINDOW_SIZE;
+    if (state.count >= bucket.maxRequests) {
+      const refused = refusal(bucket.kind, bucket.maxRequests, state, now);
       return {
         allowed: false,
-        response: new Response(
-          JSON.stringify({
-            error: "Rate limit exceeded",
-            message: `Too many requests. Please try again in ${retryAfter} seconds.`,
-            retry_after: retryAfter,
-          }),
-          {
-            status: 429,
-            headers: {
-              "Content-Type": "application/json",
-              "Retry-After": retryAfter.toString(),
-              "X-RateLimit-Limit": bucket.maxRequests.toString(),
-              "X-RateLimit-Remaining": "0",
-              "X-RateLimit-Reset": (Math.floor(Date.now() / 1000) + retryAfter).toString(),
-              "X-RateLimit-Bucket": bucket.kind,
-            },
-          },
-        ),
+        response: new Response(JSON.stringify(refused.body), {
+          status: 429,
+          headers: { "Content-Type": "application/json", ...refused.headers },
+        }),
       };
     }
 
-    const newCount = count + 1;
     const write = cache
-      .put(
-        cacheKey,
-        new Response(JSON.stringify({ count: newCount }), {
-          headers: {
-            "Content-Type": "application/json",
-            "Cache-Control": `max-age=${WINDOW_SIZE}`,
-          },
-        }),
-      )
+      .put(cacheKey, counterRecord({ ...state, count: state.count + 1 }, now))
       .catch((err: unknown) => {
         console.error("[rate-limit] cache failure", {
           keyKind: bucket.kind,

@@ -344,7 +344,10 @@ describe("a request through the service binding is counted per forwarded visitor
 
     const over = await hit(app, viaBinding(A));
     expect(over.status).toBe(429);
-    expect(over.headers.get("Retry-After")).toBe(String(__limits.WINDOW_SIZE));
+    // The seconds left in the window, which depend on how long the loop above
+    // took; `rate-limit-fixed-window.test.ts` pins the exact value with a held clock.
+    expect(Number(over.headers.get("Retry-After"))).toBeGreaterThan(0);
+    expect(Number(over.headers.get("Retry-After"))).toBeLessThanOrEqual(__limits.WINDOW_SIZE);
     expect(over.headers.get("X-RateLimit-Bucket")).toBe("site-ip");
     expect(over.headers.get("X-RateLimit-Limit")).toBe(String(CAP));
     expect(over.headers.get("X-RateLimit-Remaining")).toBe("0");
@@ -484,7 +487,10 @@ describe("a request with no usable address shares one bucket", () => {
     expect(last.headers.get("X-RateLimit-Remaining")).toBe("0");
     const over = await hit(app, { "X-Forwarded-For": "junk" });
     expect(over.status).toBe(429);
-    expect(over.headers.get("Retry-After")).toBe(String(__limits.WINDOW_SIZE));
+    // The seconds left in the window, which depend on how long the loop above
+    // took; `rate-limit-fixed-window.test.ts` pins the exact value with a held clock.
+    expect(Number(over.headers.get("Retry-After"))).toBeGreaterThan(0);
+    expect(Number(over.headers.get("Retry-After"))).toBeLessThanOrEqual(__limits.WINDOW_SIZE);
     expect(over.headers.get("X-RateLimit-Bucket")).toBe("site-unattributed");
   });
 
