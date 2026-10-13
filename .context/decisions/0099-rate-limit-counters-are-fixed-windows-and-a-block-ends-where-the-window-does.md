@@ -74,6 +74,14 @@ It does not supersede ADR 0098, whose other decisions stand whether or not this 
   A Worker's clock moves at I/O, so the time is read after the cache lookup; isolates in one data center differ by milliseconds, and a larger skew is bounded by the cut to one window.
 - A rate below the cap per window is never refused, so a cap now means what its comment always said.
   Choosing the website's caps is therefore a question about load rather than about how the counter behaves.
+- **Verify after the deploy.**
+  The fixed window has been run only against a held clock, and the development Worker bypasses the limiter, so the first real window is production's.
+  From one address, drive a bucket to its cap and keep sending the refused request every few seconds until the window ends.
+  The strict bucket reaches its cap quickly (`AUTH_MAX_REQUESTS`, ten a window per address): eleven requests to one of its paths, for example `POST /auth/login` with a made-up key, are enough.
+  Across those refusals `Retry-After` counts down from at most 60 (the whole seconds left in the window, never below 1) instead of reading a flat 60, `X-RateLimit-Reset` stays the same epoch second until the window ends, and the body's `retry_after` agrees with the header.
+  Once that second has passed, the next request is answered and counted in a new window, so waiting exactly `Retry-After` was enough.
+  A flat 60 on every refusal, a `Reset` that moves, or a block that outlasts `Reset` is the old behavior or a regression.
+  The counters are per data center (ADR 0098), so a request that lands in another one is counted there and may not be refused; repeat the check rather than conclude from one answer.
 
 ## Alternatives considered
 

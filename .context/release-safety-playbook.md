@@ -79,7 +79,12 @@ Do NOT merge until every box is checked.
 
 ## Rollback plan
 
-- **Worker code:** `bunx cfman wrangler --account sccn -c backend/wrangler-sccn.toml rollback` (or redeploy the previous tag's commit).
+- **Worker code:** the release deploys twice (the merge commit, then the strip commit), so a bare `wrangler rollback` after both have landed goes to the pre-strip build, not to the previous release.
+  Before the merge, record the id of the production Worker version that is live in the release PR body (`cd backend && bunx cfman wrangler --account sccn deployments list -c wrangler-sccn.toml`, or `versions list`), and roll back to that id: `cd backend && bunx cfman wrangler --account sccn rollback <version-id> -c wrangler-sccn.toml`.
+  Redeploying the previous tag's commit is the alternative.
+  Do not pick a version older than a secret change.
+  Secret changes create their own versions, and a version's bindings include the secrets bound when it was created, so an older version probably restores older secret values.
+  Cloudflare's documentation does not say either way, so treat that as likely, not certain.
   Fast, no data change.
 - **Migrations:** D1 has no down-migrations. The release migrations are ADDITIVE, so rolling back the *code* is safe on its own — old code ignores the new column/index. **Check that claim per release rather than inheriting it**: an additive migration that also REWRITES existing rows (0084 rewrote `web_sessions.expires_at`) is not undone by a code rollback, so its data half needs a restore or nothing. Two restore paths, and they are not equivalent: Time Travel (`wrangler d1 time-travel restore nemar-db --bookmark=…`) returns the whole database to an instant and needs no dump, while `scripts/restore-remote.sh` in `nemar-db-backup` (`--force-prod`) replays a row-level snapshot. Prefer Time Travel for "undo the last hour"; the snapshot is the floor for anything older than its retention.
 - **The merge itself:** if the release is fundamentally bad, revert the merge commit on `main` and let the pipeline redeploy the prior version; then investigate on `dev`.
@@ -89,6 +94,6 @@ Do NOT merge until every box is checked.
 ## Known pipeline gaps (track these to closure)
 
 - **/health smoke is an alarm, not a hard gate on tagging.** `auto-tag`/`npm-publish`/`sync-dev` are separate workflows not gated on `deploy-backend` success, so a red smoke surfaces a bad prod deploy loudly but does not by itself stop the tag/publish. Watch the smoke.
-- **`contract-live` (CLI<->backend contract) is warn-only** until it is flipped to hard-fail. Verify the contract manually on a release that changes wire shapes.
+- **The live wire-contract check is `test/contract-live.test.ts`, inside the `integration-dev` job, not a separate `contract-live` check.** Its schema checks are hard asserts; only full neuroschema JSON-Schema conformance on the data-plane metadata is warn-only, until #1247 closes. Verify by hand whatever that test does not cover on a release that changes wire shapes.
 - **The D1 backup cron is hourly and skips hours.** Measured 2026-09-10: commits at 08:18, 13:13 and 14:13 UTC, so the schedule is hourly and a five-hour gap is a thing that happens. An earlier version of this line said "~daily, not hourly as older docs claim", which under-sold it in the other direction. Either way the rule is the same: **read the latest commit's timestamp rather than assuming a cadence.** It survives the FTS5 tables because it is a row-level dump, not `d1 export`.
 - **No automatic "does this new CLI command have staging coverage" gate.** New CLI features should get an `integration-dev` test that routes to the dev worker.

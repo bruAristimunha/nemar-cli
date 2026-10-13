@@ -119,10 +119,13 @@ export const ZARR_SWEEP_STAMP_ONLY_SQL =
  * walk, which tests cannot perform, so a test exercises the exact SQL text on a
  * real database instead of a hand copy.
  *
- * `modalities LIKE '%eeg%'` below is a SUBSTRING match on purpose, and it is not
- * the public `modality` filter (a whole-token match since #1711): it has to stay
- * in step with the channel-montage candidate selector, which says why it also
- * takes `ieeg`.
+ * `modalities LIKE '%eeg%'` below is a SUBSTRING match, and it is not the public
+ * `modality` filter (a whole-token match since #1711). It stays a substring match
+ * because it must be the same predicate as the channel-montage candidate selector,
+ * so that `remaining` converges. The extra `ieeg`-only candidates are harmless: the
+ * probe reads only `eeg/`, so they yield nothing and are stamped checked. Moving
+ * both to a whole-token match would stop spending a GitHub tree walk on them, and
+ * is a separate decision.
  */
 export const CHANNEL_MONTAGE_SWEEP_REMAINING_SQL = `SELECT COUNT(*) AS n FROM datasets
        WHERE github_repo IS NOT NULL

@@ -104,7 +104,8 @@ pair, the device flow, the passwordless web code flow, and the `check-username`,
   recovery timeline, and those dumps contain the hashes. Every snapshot taken before migration 0093 keeps
   them for as long as that history does, which is longer than Time Travel's 30 days. Restoring one would
   put hashes back, and a restore that recreates `users` would also lose migration 0094's trigger.
-  Whether to rewrite that history is the maintainer's decision and is not made here.
+  Whether to rewrite that history is the maintainer's decision and is not made here;
+  issue #1734 tracks it, together with how long the backup history is kept.
 - Rolling this back does not restore the live data: the hashes are gone from the
   table. Restoring password sign-in would be a new decision with a new way to set
   a password.

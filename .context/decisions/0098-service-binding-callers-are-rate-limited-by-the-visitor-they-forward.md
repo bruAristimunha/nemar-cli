@@ -114,15 +114,26 @@ The Cloudflare account is the trust boundary, as in ADR 0078, and no secret head
 - **How to verify after the first deploy, as a gate and not a glance.**
   The Cache API's `put` "resolves to undefined regardless of whether the cache successfully stored the response", and Cloudflare says nothing about a call that arrived over a service binding.
   If the counter silently does not persist there, every answer reads `site-ip` with `X-RateLimit-Remaining` at 1999 for ever and nothing is ever limited, with no log line and no failure.
-  So the property that must be shown, not assumed, is that **two sequential calls from one visitor over the binding show `X-RateLimit-Remaining` falling**.
-  The website logs `remaining` on its first call and logs one error per isolate, `the API's rate-limit count did not move`, if five calls for a visitor inside one window leave it unchanged (website pull request #450).
-  Read that line, or the header by hand, before treating the deploy as done; "no log means fine" is not evidence.
+  So the property that must be shown, not assumed, is that **the count for one visitor falls across calls over the binding**.
+  The first reading is the cap minus one (1999), and across six or more calls spaced one to two seconds apart the reading falls overall, with an occasional repeat or small rise, because the count is kept per data center and is not strictly monotonic.
+  A check that insists on a strict fall from the second call to the third would fail a healthy counter.
+  Measured on production, on the anonymous bucket through `/health` when its cap was 500: five calls 1.5 seconds apart read 499, 498, 499, 497, 498, and twelve calls read 499, 499, 496, 495, 494, 493, 492, 491, 490, 498, 489, 488.
   A bare "remaining must fall" is not enough either: a mis-forward that put every visitor under one `site:<address>` key would pass it.
-  So the gate is also that **two different visitors each read `X-RateLimit-Bucket: site-ip` and a first call of 1999**, one per visitor.
+  So the gate is also that **two different visitors each read `X-RateLimit-Bucket: site-ip` and `X-RateLimit-Caller: site`, and each starts at the cap minus one (1999)**, one per visitor.
+  That cannot be observed from the website as it ships, so it is observed from a throwaway Worker, before the website is promoted:
+  deploy a Worker in the same Cloudflare account with `[[services]]`, `binding = "API"` and `service = "nemar-api"` and no `entrypoint`, so that the binding reaches the default entrypoint this decision is about;
+  have it call a cheap anonymous read such as `/health` over the binding with `X-Forwarded-For` set to a reserved documentation address, 203.0.113.201 for one visitor and 203.0.113.202 for the other, and return the `X-RateLimit-Bucket`, `X-RateLimit-Remaining` and `X-RateLimit-Caller` values from each answer;
+  expect `site-ip`, `site`, and a first remaining of 1999 for each visitor that falls overall across six or more calls a second or two apart;
+  then delete the Worker.
+  A service binding has no URL, so there is nothing to call by hand, and the API never logs `remaining`.
+  The website's `reportBucket` logs `remaining` once per bucket kind per isolate, so it cannot show a fall either.
+  The only automated check is the website's own stuck-counter warning, `the API's rate-limit count did not fall over 4 calls for one visitor`, which one isolate raises once when three comparisons in a row, between calls one to ten seconds apart, show no fall (website pull request #450).
+  It detects that one failure and no other, and "no log means fine" is not evidence.
   Website pull request #450, already merged to staging, is a prerequisite of the deploy and not a nicety:
   it is the only detector for "put resolves but nothing persists" and for a binding call that carries a `CF-Connecting-IP` after all.
-  Then tail the production API Worker while a few website pages load:
-  `bunx cfman wrangler --account sccn tail nemar-api --search "[rate-limit]"`.
+  The development Worker bypasses the limiter, so the site-identity rule, the fixed windows (ADR 0099) and the stall breaker (the amendment below) have never run on a deployed Worker.
+  When the release reaches production, tail the API Worker from `backend/`:
+  `bunx cfman wrangler --account sccn tail nemar-api --search "[rate-limit]"`, and keep watching it while a few website pages load.
   A line `counting a request without CF-Connecting-IP by its forwarded visitor` (once per isolate per window for each source, bucket and reason, with no repeats, and never for a token bucket) means the hypothesis about the missing header holds.
   A warning `request with neither` means the website is not forwarding a usable visitor, and says why;
   its responses carry `X-RateLimit-Caller: unattributed`.
@@ -135,7 +146,7 @@ The Cloudflare account is the trust boundary, as in ADR 0078, and no secret head
   An answer without them was not announced as counted: the development Worker, a bypass, a cache fault (which is logged, once per window per bucket kind and again at the milestones described below), or an observe-only count.
   That last is the zarr redirect path, which counts a request against the shared bucket and never announces it, so "no headers" does not mean "not counted" there.
   They are not proof of a count either: the data plane hands its write to `waitUntil`, so its answer states a count whether or not the write lands, and a failing `put` there leaves `X-RateLimit-Remaining` unchanged while the line is logged.
-  The falling `X-RateLimit-Remaining` above is the evidence; the header's presence alone is not.
+  The overall fall in `X-RateLimit-Remaining` described above is the evidence; the header's presence alone is not.
 - **The limiter reports its own faults and does not wait on the cache for ever.**
   A repaired counter record, a damaged admin-flag record found (which is then read again from the database and replaced if the database and the write allow), a refusal, and a cache fault are each logged once per window per bucket kind (refusals and identities also per caller source, a fault, and the admin-flag lookup's, also per phase and error class, so a transient stall in a write cannot hide a persistent bug of another class in the same phase; a class not on a short list counts as `other`, which bounds the key space), by name and never with an address or a message.
   A line says how many calls for its key were swallowed since the previous line (`suppressed`, which does not count the call that is speaking) and how long ago that previous line was (`sinceMs`, the time since the previous line, not since the window opened).
@@ -191,6 +202,26 @@ The Cloudflare account is the trust boundary, as in ADR 0078, and no secret head
 - **Keying the website's strict buckets on the session cookie (#1354, option 1).**
   Not done: the address is the key everywhere else, and a cookie-derived key needs its own forgery analysis.
 
+## Open follow-ups, and where the verification gate stands (2026-10-12)
+
+The change that carries this decision filed these follow-ups, none built:
+
+- **#1712: downgrade the site-caller identity line** to a counter, or remove it, once production keying is confirmed.
+  Its done-when is that "How to verify after the first deploy" above says the gate was passed, and when.
+- **#1716: a Worker-side canary** that logs when a counted site request did not persist.
+  Today the only detector of a counter that does not persist is on the website side (pull request #450).
+- **#1717: send forwarded non-public addresses to the unattributed bucket.**
+  Decision 2 refuses only the placeholders and loopback, so an RFC 1918, CGNAT, link-local or unique local address still becomes a `site:` key and would pool the visitors behind it.
+- **#1718: a coarse counter for the whole class of site callers,** so that a forward that minted unlimited fresh `site:` keys would trip a visible limit.
+  It is an owner decision, filed and not built, and its cap is a judgment about the website's headroom.
+
+#1713 and #1715, filed with them, are settled by the two amendments below.
+
+**The verification gate has not been run.**
+The check in "How to verify after the first deploy" (the count falling across calls for one visitor, and two visitors that each read `site-ip` and start at 1999) needs the change released to production and the website promoted to call the binding, and neither has happened.
+Until it is run, that a service-binding call carries no `CF-Connecting-IP`, and that the counter persists for one, are the hypotheses this ADR says they are.
+The gate closes with #1712, after the release and the website promotion, and this ADR then says it was passed and when.
+
 ## Receipts
 
 - Issue #1709 (the 429s on `/discover`) and #1354 (the strict bucket shared by every visitor).
@@ -221,12 +252,29 @@ The bound remembered nothing, so while the cache stayed stalled every request pa
    The calls behind it keep skipping until it reports, so a recovering cache is not met by a crowd of waits.
    A probe that answers, with a value or with a fast error, closes the breaker and forgets the stalls; one that stalls opens it for another 10 seconds.
    A probe that never reports is replaced after one cool-down.
-5. **Fail-open is unchanged.**
+5. **Fail-open is unchanged for a fault and is new for a stall.**
+   A call that throws failed open before this release: the request was served and not counted.
+   A call that never answered did not: the counter's lookup was awaited without a bound, so the request waited on the stall.
+   Now every call is bounded at 500 ms and then fails open, and an open breaker skips the cache at once.
+   So while a stall lasts every bucket fails open, and counting is off on the isolate for 10 seconds at a time.
    A skipped call is treated exactly as a stalled call was, without the wait:
    the request is served and not counted, with the headers a stalled call would have left it (see "What an absent header means" above),
    the admin-flag lookup answers "not an admin", and the miss and private-grant budgets allow.
    The breaker never refuses a request and never counts one.
    The price is that counting stays off on an isolate for up to 10 seconds after the cache recovers.
+   **That includes the strict `auth-ip` bucket,** ten a window per address on the `AUTH_PATHS` family, whose purpose is to bound email and GitHub spend.
+   A caller can see it happen, because the responses lack the `X-RateLimit-*` headers while it lasts.
+   What bounds that spend meanwhile is what each handler enforces, and not every strict path has a bound:
+   - The emailed-code requests count `auth_codes` rows per email (`PER_MINUTE_LIMIT` of 1 and `PER_HOUR_LIMIT` of 5 in `services/auth-code.ts`), with a per-account count on the two session-bound ones (the header of `routes/auth-web.ts`).
+   - A wrong code is counted per code: the fifth wrong guess consumes it (`MAX_CODE_ATTEMPTS`, `recordFailedAttempt` in `routes/auth-web.ts`).
+   - `POST /auth/request-key-regeneration` has no limit of its own: each call mails the address and replaces the stored token.
+   - `POST /users/me/upload-access/request` has none this amendment could verify.
+     An attempt that is refused after the GitHub lookup writes nothing, so it is replayable, which is why `AUTH_PATHS` lists it.
+     Once a request is stored and the admins have been told, a repeat is answered without mailing or looking anything up.
+
+   Whether the strict buckets should fail closed during a stall instead was considered and is not decided here.
+   The options (keep failing open and record the compensating limits, fail the strict buckets closed while the breaker is open, or fail closed only on the routes that spend money or send email) are tracked in #1745.
+   No production stall has been recorded, so the risk is unmeasured.
 6. **The state is one record per isolate:** at most three timestamps and an end time, never per caller or per bucket, because a stall is a property of the platform.
    Isolates and data centers do not share it, as they do not share the counters.
    An evicted isolate's replacement starts closed and pays its own stalls before it opens,

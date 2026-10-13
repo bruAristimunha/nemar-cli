@@ -176,8 +176,13 @@ decide" cannot be expressed with either.
 
 1. Subscribe the NEMAR App to Pull request events, and grant Pull requests: write (for the comment).
    Until then no event arrives, so the feature is inert whatever `PR_REVIEW_ENABLED` says.
+   **Done (2026-10-12):** the trial in the amendment of that date received the `pull_request` delivery
+   and published both the check and the comment.
 2. Set the four `ANTHROPIC_*` organization variables on `nemarDatasets`, and check the federation
    rule accepts only `repo:nemarDatasets/.github:ref:refs/heads/main` for this workflow.
+   **Done (2026-10-12):** the variables are set and the trial's identity exchange succeeded under that
+   subject. Whether the rule also pins `job_workflow_ref` to this workflow file on `main` is not
+   something the trial shows; confirm it in the Anthropic console before the production flag.
 3. Deploy `run-pr-review.yml`, then add it to the `unit-pure` sparse checkout with
    `NEMAR_PR_REVIEW_WORKFLOW_LIVE` so the parity test stops skipping. **Done (2026-10-12):** the
    workflow is on `nemarDatasets/.github` `main` (commit `fe7f821a`), byte-identical to the
@@ -187,7 +192,7 @@ decide" cannot be expressed with either.
    `unit-pure` red.
 4. Release this change to production. The flag is already on in `[env.dev.vars]` of
    `backend/wrangler-sccn.toml` (the soak target) and absent from `[vars]`, so production is dark. Once
-   the soak below has passed, add `PR_REVIEW_ENABLED = "1"` to `[vars]`; that is a change to the file, so
+   the soak has passed (what that must mean is proposed in the amendment of 2026-10-12 below), add `PR_REVIEW_ENABLED = "1"` to `[vars]`; that is a change to the file, so
    it ships in the next release. The variable lives in that file and not in the dashboard, so a deploy
    never drops it and turning the review on is a reviewed change. The flag stops new reviews only: the
    watchdog and the republish pass run regardless, so switching it off never strands a check that is
@@ -200,7 +205,8 @@ decide" cannot be expressed with either.
    production's, so neither is ever reviewed. With the workflow deployed and the App subscribed, a
    throwaway pull request to such an exemplar exercises the claim, the federated identity, the model call
    and the check, and production stays dark. Read the Actions log of that run (`nemarDatasets/.github` is
-   public) before turning anything on for real datasets.
+   public) before turning anything on for real datasets. **Done (2026-10-12), once:** see the amendment of
+   that date.
 6. A pull request that is already open when the review is switched on produces no event, so the Worker
    never sees it until its author pushes again. `nemar admin pr-reviews start --all` starts those (and
    `start <dataset> <pr>` one), see the amendment below. Run it once, after the trial has passed.
@@ -212,7 +218,8 @@ None blocks shipping the review switched off. Decide the first two before it is 
 - **The administrator's merge refuses a pull request this check holds.** ADR 0093 attempts a merge only
   when GitHub reports `clean`. The `NEMAR PR Review` check is not required, and a non-required check
   that is not passing is expected to be reported as `unstable` (from GitHub's definition of the state;
-  not yet observed). So for an `uncertain`, `declined` or `errored` review, `approve --merge` and `y`
+  observed once, on 2026-10-12, on a pull request whose review check was red, see the amendment of that
+  date). So for an `uncertain`, `declined` or `errored` review, `approve --merge` and `y`
   in `next` would record the approval and then print "Not merged: GitHub says it cannot be merged
   cleanly (a check is failing). The approval stands." Either accept `unstable` when both required checks
   pass (the merge call still enforces the ruleset, and no bypass is used) or say in ADR 0093 that these
@@ -265,6 +272,55 @@ call), and starts them one at a time. A paused contributor's pull request is dec
 like any other and said so in the output; `allow` lifts the pause and the same command then starts it.
 It stops when the daily pool is spent and exits 1, so a script knows some were not tried.
 Run it once, in the environment where the review is on, after the trial has passed.
+
+## Amendment 2026-10-12: the trial on dev, and what the soak must mean
+
+On 2026-10-12 a throwaway pull request to the published exemplar `xx099900` ran the whole chain on dev.
+It has since been closed unmerged and its branch deleted, and the base `main` was not touched.
+Each of these was observed:
+
+- GitHub delivered `pull_request` to the production Worker through the NEMAR App.
+- The production Worker forwarded the delivery to the dev Worker (`DEV_WEBHOOK_MIRROR_URL`).
+- The dev Worker's gate accepted it and published the check and the comment.
+- It dispatched `run-pr-review` (`repository_dispatch`) to `run-pr-review.yml` in `nemarDatasets/.github`.
+- The job exchanged its GitHub identity for an Anthropic one by workload identity federation.
+- The model (Haiku 5.5, `claude-haiku-5-5`) answered, and the review reported a real verdict.
+
+The verdict was "Needs changes", a `fail`, because the revision advanced the version and `CHANGES` but did
+not materially improve the dataset: nothing lost, yes; revision advances, yes; materially better, no.
+The pull request was a one-line `CHANGES` edit and then a version bump with a matching `CHANGES` entry.
+The `version-check` required check failed on the first push, because the version had not advanced, and
+passed after the bump; the review does not depend on it.
+GitHub's `mergeable_state` for the pull request, read once it was closed, was `unstable`.
+That is the one observation of that state so far, on a pull request whose review check was red.
+
+One pull request with one verdict is the whole of the evidence.
+The verdict was a fail, so a pass has not been observed, and no model error or superseded commit has
+been exercised on purpose.
+
+**What "the soak has passed" must mean.**
+Item 4 above said the production flag follows the soak and did not say what the soak is.
+This is a proposal for the maintainer to confirm or change before the flag is set, and it is deliberately
+conservative.
+On the dev Worker, against a published exemplar, throwaway pull requests (each closed unmerged, its
+branch deleted afterwards) show between them each of:
+
+1. **A pass.** A pull request that really is better, ending in a `success` check and a comment edited in
+   place when a later commit is pushed.
+2. **A fail.** The trial of 2026-10-12 counts once.
+3. **A model error.** A review whose model call is made to fail on purpose on dev, by a means the
+   maintainer chooses, ending as a check that needs a person and never as a pass.
+4. **A stale commit.** A second push while the first review is pending or running, ending with the first
+   recorded as `stale_head` at no cost and the check showing the newer commit's review.
+
+And for every one of them the Actions log of the run was read and held no pull-request text, dataset
+content, token or model output.
+A change to the Worker's review code or to `run-pr-review.yml` after a case was observed restarts that
+case, because the case no longer describes what would be released.
+
+Issue #1743 tracks the production flip and the decisions still open, including whether `unstable` is
+accepted when both required checks pass: the observation above informs that decision and does not settle
+it.
 
 ## Receipts
 

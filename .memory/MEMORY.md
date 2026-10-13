@@ -63,3 +63,5 @@
 - [Repeated channel labels collapse stores](repeated-channel-labels-collapse-stores.md) — before biosigio 1.2.9 a repeated EDF label dropped a channel; only the file header can vouch for the count; never key channels by label
 - [Dataset workflow is byte-pinned](dataset-workflow-is-byte-pinned.md): editing onboard-openneuro.yml here fails unit-pure until nemarDatasets/.github carries the same bytes; ship as a pair or make the CLI fit
 - [curl --retry with -o /dev/null](curl-retry-with-devnull-fails-23.md) — exits 23 on a retried transfer and masks the status; loop in bash, and test the step with Bun.spawn (not spawnSync) against a Bun.serve stand-in
+- [PR review: three faults behind no review](pr-review-three-faults-behind-no-review.md): dev showed nothing for three reasons: webhook secrets differed (a signed ping is the oracle), ANTHROPIC_* must be org variables not secrets, and the federation rule must accept the main-branch subject
+- [Debug the PR review chain with two tails](debug-pr-review-chain-with-two-tails.md): tail production and dev filtered by x-github-event, then read the public workflow run log; each link answers 2xx so check them in order
