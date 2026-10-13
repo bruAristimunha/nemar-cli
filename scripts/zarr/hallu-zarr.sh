@@ -30,10 +30,21 @@
 #         moves, so a merged driver change reaches the node on the next tick
 #         instead of waiting out the backfill (#1129).
 #
+#         SLOTS (ADR 0101). A tick no longer drains the queue itself: it starts
+#         one drain per FREE slot (ZARR_SLOTS, default 4), each under its own
+#         lock, with its own scratch directory and log, claiming its own dataset
+#         and converting it ZARR_JOBS_PER_SLOT (default 4) recordings at a time. A
+#         dataset that takes days (nm000276: 40 recordings of 100 to 145 GiB)
+#         then occupies one slot instead of the whole node. The slots share one
+#         RAM and scratch budget through the admission ledger (ZARR_LEDGER_DIR), so
+#         several big datasets cannot fill the disk between them, and a heartbeat
+#         keeps a long conversion from looking abandoned to another slot.
+#
 # Usage:
 #   ./hallu-zarr.sh                      # reconcile + drain the queue
 #   ./hallu-zarr.sh --limit 20           # cap datasets per run (paced)
-#   ./hallu-zarr.sh --dataset nm000132   # one dataset now (bypasses the queue)
+#   ./hallu-zarr.sh --dataset nm000132   # one dataset now, in the first free slot
+#   ZARR_SLOT=2 ./hallu-zarr.sh          # drain as slot 2 only (what a tick starts)
 #   ./hallu-zarr.sh --stats              # print queue status and exit
 #   ./hallu-zarr.sh --requeue failed     # dry-run: what a requeue would revive
 #   ./hallu-zarr.sh --requeue all --execute   # revive failed + data_failed
@@ -150,6 +161,11 @@ for _pretest_arg in "$@"; do
     export ZARR_WORK_DIR="${ZARR_WORK_DIR:-${ZARR_BASE:-/mnt/local}/zarr-scratch-test}"
     export ZARR_DRIVER_REF="${ZARR_DRIVER_REF:-dev}"
     export ZARR_JOBS="${ZARR_JOBS:-4}"
+    # One slot: the nightly staging run is a single drain beside the production
+    # slots, and must not take a share of the node of its own accord. It still
+    # registers in the node-wide admission ledger (ZARR_LEDGER_DIR below), so the
+    # production slots see what it has reserved.
+    export ZARR_SLOTS="${ZARR_SLOTS:-1}"
     break
   fi
 done
@@ -210,7 +226,36 @@ unset _work_dir_overridden _state_dir_overridden
 # high worker count adds CPU parallelism WITHOUT OOM risk or shrinking the
 # per-recording budget (small EEG packs many-wide; large MEG self-limits). Override
 # with ZARR_JOBS.
-JOBS="${ZARR_JOBS:-$(nproc 2>/dev/null || echo 8)}"
+#
+# With more than one slot (below) ZARR_JOBS is a ceiling per drain, not the node's
+# total: the default is ZARR_JOBS_PER_SLOT (4), and ZARR_JOBS can lower it but never
+# raise it, so a crontab that still says ZARR_JOBS=24 from the single-drain days does
+# not give every slot 24.
+SLOTS="${ZARR_SLOTS:-4}"
+if ! [[ "$SLOTS" =~ ^[0-9]+$ ]] || ((SLOTS < 1 || SLOTS > 16)); then
+  echo "FATAL: ZARR_SLOTS must be an integer from 1 to 16 (got '$SLOTS')." >&2
+  exit 1
+fi
+if ((SLOTS > 1)); then
+  JOBS="${ZARR_JOBS_PER_SLOT:-4}"
+  if [[ -n "${ZARR_JOBS:-}" ]] && [[ "$ZARR_JOBS" =~ ^[0-9]+$ ]] && ((ZARR_JOBS < JOBS)); then
+    JOBS="$ZARR_JOBS"
+  fi
+else
+  JOBS="${ZARR_JOBS:-$(nproc 2>/dev/null || echo 8)}"
+fi
+if ! [[ "$JOBS" =~ ^[0-9]+$ ]] || ((JOBS < 1)); then
+  echo "FATAL: the worker count must be a positive integer (got '$JOBS')." >&2
+  exit 1
+fi
+# Which slot THIS process is. Unset on a plain invocation, which then starts a drain
+# in every free slot (or, for --dataset, takes the first free one). A tick starts its
+# drains with ZARR_SLOT set.
+SLOT="${ZARR_SLOT:-}"
+if [[ -n "$SLOT" ]] && { ! [[ "$SLOT" =~ ^[0-9]+$ ]] || ((SLOT >= SLOTS)); }; then
+  echo "FATAL: ZARR_SLOT must be an integer from 0 to $((SLOTS - 1)) (got '$SLOT', ZARR_SLOTS=$SLOTS)." >&2
+  exit 1
+fi
 # Anonymous-memory bounds for every conversion worker. Each worker converts under
 # an RLIMIT_DATA budget (generate_zarr.py apply_worker_mem_limit), which counts
 # anonymous memory (VmData), not page cache, and two library defaults grow that
@@ -363,6 +408,34 @@ export AWS_DEFAULT_REGION="$AWS_REGION"
 QUEUE_DB="${ZARR_QUEUE_DB:-${STATE_DIR}/zarr-queue.db}"
 LOG_FILE="${ZARR_LOG_FILE:-${STATE_DIR}/.nm-zarr.log}"
 LOCK_FILE="${ZARR_LOCK_FILE:-${STATE_DIR}/.nm-zarr.lock}"
+# The admission ledger (ADR 0101): what every driver on this NODE has reserved. Under
+# ZARR_BASE rather than STATE_DIR so the nightly --test run, which keeps its own state
+# directory, still shares it with the production slots: they share the machine.
+export ZARR_LEDGER_DIR="${ZARR_LEDGER_DIR:-${ZARR_BASE}/zarr-admission-ledger}"
+# Slot 0 keeps the names the single drain always had, so an upgrade changes nothing
+# for a run that already holds them; slot N adds `.slotN`. The values above are the
+# slot-0 names, kept for use_slot().
+BASE_WORK_DIR="$WORK_DIR"
+BASE_LOCK_FILE="$LOCK_FILE"
+BASE_LOG_FILE="$LOG_FILE"
+slot_work_dir() { if (($1 == 0)); then echo "$BASE_WORK_DIR"; else echo "${BASE_WORK_DIR%/}-slot$1"; fi; }
+slot_lock_file() { if (($1 == 0)); then echo "$BASE_LOCK_FILE"; else echo "${BASE_LOCK_FILE%.lock}.slot$1.lock"; fi; }
+slot_log_file() { if (($1 == 0)); then echo "$BASE_LOG_FILE"; else echo "${BASE_LOG_FILE%.log}.slot$1.log"; fi; }
+# Name slot $1's scratch directory, lock and log (no side effects; --print-config uses
+# this alone).
+select_slot() {
+  SLOT="$1"
+  WORK_DIR="$(slot_work_dir "$1")"
+  LOCK_FILE="$(slot_lock_file "$1")"
+  LOG_FILE="$(slot_log_file "$1")"
+}
+# Point this process at slot $1. TMPDIR follows the scratch directory, so the driver's
+# temporary directories land in it.
+use_slot() {
+  select_slot "$1"
+  mkdir -p "$WORK_DIR"
+  export TMPDIR="$WORK_DIR"
+}
 # --- engine-bump guard (nemarOrg/nemar-cli#1172, ADR 0033) --------------------
 # `setup()` resets the driver clone to origin/$DRIVER_REF on every run, so
 # MERGING a bump of ZARR_ENGINE_VERSION deploys it: without a guard the next
@@ -381,6 +454,8 @@ ENGINE_ACK_FILE="${ZARR_ENGINE_BUMP_ACK_FILE:-${STATE_DIR}/.zarr-engine-bump-ack
 # NEMAR_WEBHOOK_TOKEN is loaded further down, once log()/err() exist -- a missing
 # token has to be able to announce itself.
 
+# The arguments as given, for the drains a tick starts (the parser below consumes them).
+ORIG_ARGS=("$@")
 ONLY_DATASET=""
 LIMIT="${ZARR_LIMIT:-0}"
 STATS_ONLY=""
@@ -443,11 +518,13 @@ done
 log() {
   local prefix=""
   [[ -n "$TEST_MODE" ]] && prefix="[test] "
+  [[ -n "$SLOT" ]] && ((SLOTS > 1)) && prefix="${prefix}[slot $SLOT] "
   echo "${prefix}[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] $*" | tee -a "$LOG_FILE"
 }
 err() {
   local prefix=""
   [[ -n "$TEST_MODE" ]] && prefix="[test] "
+  [[ -n "$SLOT" ]] && ((SLOTS > 1)) && prefix="${prefix}[slot $SLOT] "
   echo "${prefix}[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] ERROR: $*" | tee -a "$LOG_FILE" >&2
 }
 
@@ -573,6 +650,7 @@ fi
 # far), --print-config's whole purpose is to be inspectable with zero side
 # effects, from a temp HOME/ZARR_BASE in a test as much as from a real one.
 if [[ -n "$PRINT_CONFIG" ]]; then
+  [[ -n "$SLOT" ]] && select_slot "$SLOT"
   # Token presence only -- never the value. Resolved the same three-tier way
   # load_secrets() (below) resolves it, but read-only and in a subshell: this
   # must not source into the current process (that WOULD partly duplicate
@@ -617,6 +695,9 @@ WORK_DIR=$WORK_DIR
 STATE_DIR=$STATE_DIR
 SWEEP_SCRATCH=${SWEEP_SCRATCH:-0}
 JOBS=$JOBS
+SLOTS=$SLOTS
+SLOT=$SLOT
+LEDGER_DIR=$ZARR_LEDGER_DIR
 ZARR_ASYNC__CONCURRENCY=$ZARR_ASYNC__CONCURRENCY
 MALLOC_ARENA_MAX=$MALLOC_ARENA_MAX
 DRIVER_REPO=$DRIVER_REPO
@@ -633,9 +714,10 @@ EOF
   exit 0
 fi
 
-mkdir -p "$WORK_DIR" "$STATE_DIR"
+mkdir -p "$WORK_DIR" "$STATE_DIR" "$ZARR_LEDGER_DIR"
 # The driver's tempfile.TemporaryDirectory() (per-recording materialize + store)
-# follows TMPDIR; pin it to the NVMe scratch, not the system default.
+# follows TMPDIR; pin it to the NVMe scratch, not the system default. A drain
+# running as slot N points it at that slot's own directory (use_slot).
 export TMPDIR="$WORK_DIR"
 
 # --- Secrets (NEMAR_WEBHOOK_TOKEN) -------------------------------------------
@@ -803,6 +885,55 @@ DRIVER="$DRIVER_REPO/scripts/zarr/generate_zarr.py"
 QUEUE="$DRIVER_REPO/scripts/zarr/zarr_queue.py"
 qpy() { VIRTUAL_ENV="$VENV_DIR" "$VENV_DIR/bin/python" "$QUEUE" --db "$QUEUE_DB" "$@"; }
 
+# Only one slot at a time may update the shared driver clone and venv: two `git reset`
+# or `uv pip install` runs at once can corrupt either. Blocking, because another
+# slot's setup takes seconds to a minute; the running drains are not affected (they
+# have loaded their code), and a drain that starts while a clone is being rewritten
+# fails fast on an import and is retried by the queue.
+setup_locked() {
+  exec 8>"${STATE_DIR}/.nm-zarr.setup.lock"
+  flock 8
+  setup
+  flock -u 8
+  exec 8>&-
+}
+
+# While a driver converts a dataset, tell the queue so every few minutes. Every slot
+# starts with a reconcile, and a reconcile returns to `pending` any `inprogress` row
+# idle for more than six hours: a dataset that converts for longer (nm000276 has run
+# for days) would be handed to a second slot and converted twice, concurrently, onto
+# the same S3 prefix. The loop ends when its drain does, and on its own if this
+# script is killed (it checks that its parent is still there).
+HEARTBEAT_SECONDS="${ZARR_HEARTBEAT_SECONDS:-300}"
+HEARTBEAT_PID=""
+heartbeat_start() {
+  local id="$1" parent="$$"
+  (
+    # The sleep is a child of this subshell and holds its output open, so it is ended
+    # with the loop instead of being left to run out its interval.
+    sleeper=""
+    trap '[[ -n "$sleeper" ]] && kill "$sleeper" 2>/dev/null; exit 0' TERM
+    while :; do
+      sleep "$HEARTBEAT_SECONDS" &
+      sleeper=$!
+      wait "$sleeper" 2>/dev/null
+      kill -0 "$parent" 2>/dev/null || exit 0
+      touched="$(qpy heartbeat "$id" 2>/dev/null)" || continue
+      if [[ "$touched" == "0" ]]; then
+        err "[$id] the queue no longer lists this dataset as inprogress (another slot's reconcile reclaimed it?); it may now be converted twice"
+        exit 0
+      fi
+    done
+  ) 9>&- &
+  HEARTBEAT_PID=$!
+}
+heartbeat_stop() {
+  [[ -n "$HEARTBEAT_PID" ]] || return 0
+  kill "$HEARTBEAT_PID" 2>/dev/null
+  wait "$HEARTBEAT_PID" 2>/dev/null
+  HEARTBEAT_PID=""
+}
+
 # The driver's exit when this node's biosigIO cannot leave subject information
 # out of a store (generate_zarr.py EXIT_SUBJECT_INFO_UNAVAILABLE, sysexits.h
 # EX_CONFIG; #1626; test_hallu_zarr_config.py holds the two together). It is a
@@ -889,12 +1020,14 @@ convert_dataset() {
   # conversion (ADR 0023); the flag does not mean what its name suggests. With
   # streaming + JOBS-way parallelism a whole-dataset rebuild is cheap enough that
   # we always remake rather than reason about incremental diffs.
+  heartbeat_start "$id"
   VIRTUAL_ENV="$VENV_DIR" "$VENV_DIR/bin/python" "$DRIVER" \
     --dataset-id "$id" --repo-dir "$dir" \
     --bucket "$S3_BUCKET" --region "$AWS_REGION" --clean \
     ${retry_args[@]+"${retry_args[@]}"} \
     --contract-base "$CONTRACT_BASE" --api-base "$API_BASE" \
     --jobs "$JOBS" --callback-out "$cb" >>"$LOG_FILE" 2>&1 || rc=$?
+  heartbeat_stop
 
   # Read the driver's classification BEFORE the scratch is reclaimed. The
   # converter now writes the callback on EVERY outcome (incl. a total failure),
@@ -1046,10 +1179,71 @@ if [[ -n "$REQUEUE" ]]; then
   exit $?
 fi
 
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-  log "another hallu-zarr instance holds the lock; exiting"
-  exit 3
+# --- Slots: who runs what ------------------------------------------------------
+# A plain invocation with several slots is a supervisor: it starts one drain per slot
+# whose lock is free, waits for them, and exits. An invocation that names its slot
+# (ZARR_SLOT, which is how the supervisor starts them) drains as that slot. A one-off
+# `--dataset` takes the first free slot, so it neither waits behind a long drain nor
+# shares a slot's scratch directory with one.
+slot_is_free() (
+  exec 9>"$(slot_lock_file "$1")"
+  flock -n 9
+)
+
+supervise() {
+  local k started=0 pids=() rc=0 pid
+  for ((k = 0; k < SLOTS; k++)); do
+    if slot_is_free "$k"; then
+      log "starting slot $k (of $SLOTS)"
+      ZARR_SLOT="$k" bash "$SCRIPT_PATH" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"} &
+      pids+=("$!")
+      started=$((started + 1))
+    fi
+  done
+  if ((started == 0)); then
+    log "all $SLOTS slot(s) are busy; exiting"
+    return 3
+  fi
+  # A drain that outlives this process would run on without a supervisor, which is
+  # harmless, but one signalled here should be signalled too.
+  trap 'kill "${pids[@]}" 2>/dev/null' TERM INT
+  for pid in "${pids[@]}"; do
+    wait "$pid" || { local r=$?; ((r == 3)) || rc=$r; }
+  done
+  return "$rc"
+}
+
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/$(basename "${BASH_SOURCE[0]}")"
+if [[ -z "$SLOT" && -z "$ONLY_DATASET" ]] && ((SLOTS > 1)); then
+  supervise
+  exit $?
+fi
+if [[ -n "$SLOT" ]]; then
+  use_slot "$SLOT"
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    log "this slot is already running; exiting"
+    exit 3
+  fi
+elif [[ -n "$ONLY_DATASET" ]] && ((SLOTS > 1)); then
+  taken=""
+  for ((k = 0; k < SLOTS; k++)); do
+    use_slot "$k"
+    exec 9>"$LOCK_FILE"
+    if flock -n 9; then taken=1; break; fi
+    exec 9>&-
+  done
+  if [[ -z "$taken" ]]; then
+    use_slot 0
+    err "all $SLOTS slot(s) are busy; not starting ${ONLY_DATASET}. Wait for one to finish, or raise ZARR_SLOTS."
+    exit 3
+  fi
+else
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    log "another hallu-zarr instance holds the lock; exiting"
+    exit 3
+  fi
 fi
 
 # --- Reclaim orphaned scratch -------------------------------------------------
@@ -1096,7 +1290,7 @@ else
       "neither to resume sweeping (nemarOrg/nemar-cli#1121)."
 fi
 
-setup
+setup_locked
 if [[ ! -f "$DRIVER" || ! -f "$QUEUE" ]]; then
   err "driver/queue not found under $DRIVER_REPO after setup"; exit 1
 fi
