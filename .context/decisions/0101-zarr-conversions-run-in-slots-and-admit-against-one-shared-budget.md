@@ -6,7 +6,7 @@
 
 ## Context
 
-On 2026-10-13 a single run of `hallu-zarr.sh` had held the node's one lock for 5.5 days, converting `nm000276`: 40 BrainVision iEEG recordings of 100 to 145 GiB each, float32, 39 channels.
+On 2026-10-13 a single run of `hallu-zarr.sh` had held the node's one lock for 5.5 days, converting `nm000276`: 40 BrainVision iEEG recordings of 100 to 145 GiB each, stored as float32 (sub-48 has 39 channels).
 Every hourly cron tick logged "another hallu-zarr instance holds the lock; exiting", and every dataset behind it in the queue waited (`nm000289` since 2026-10-06).
 The node was almost idle.
 Load average was 1.1 on 32 cores, 54 of 62 GiB of RAM were available, and 474 of 954 GiB of scratch were free.
@@ -19,7 +19,7 @@ The second limit is real for recordings that size.
 The first is not.
 The worker's anonymous memory (`RssAnon`) held at 6.2 GiB while its peak resident size passed 10 GiB, the difference being the scratch memmap's file-backed pages, which the kernel already counts as available.
 The calibration warnings ("needed 48.7 GiB, reserved 39.2 GiB") compared a reserve, which is anonymous memory, with a resident peak, and read as a projection that was too low when it was not.
-One recording (145 GiB) was refused outright as too large for the node: a projected 54 GiB against the 46 GiB budget, from a projection that assumes two bytes per sample for a file that stores four.
+One recording (145 GiB, about 32 channels) was refused outright as too large for the node: a projected 54 GiB against the 46 GiB budget, from a projection that assumes two bytes per sample for a file that stores four.
 
 The single lock was also what made several other things safe.
 `claim_next` documented that it relied on it to keep two drivers off one queue.
@@ -74,7 +74,7 @@ Setup (the clone and the venv) is done by one slot at a time.
 ## Consequences
 
 - A dataset that takes days occupies one slot instead of the node.
-  The recording that was refused as too large now projects at about 30 GiB and fits.
+  The recording that was refused as too large now projects at about 36 GiB and fits.
 - Concurrency follows the budget rather than a worker count: small EEG datasets run four wide in each of four slots, and two 145 GiB recordings cannot be admitted together because their scratch will not fit.
 - The logs are per slot (`.nm-zarr.slotN.log`), so following the whole node means following several files, and the scratch directories are per slot (`zarr-scratch-slotN`).
 - `--limit` caps each slot, not the tick, so an existing crontab with `--limit 20` allows up to 80 datasets per tick at four slots.
@@ -98,7 +98,7 @@ Setup (the clone and the venv) is done by one slot at a time.
 ## Alternatives considered
 
 - **Divide RAM and scratch evenly between the slots.**
-  Simple, and wrong for exactly the case that prompted this: a 145 GiB recording needs about 30 GiB of RAM and 435 GiB of scratch, which no quarter of the node holds.
+  Simple, and wrong for exactly the case that prompted this: a 145 GiB recording needs about 36 GiB of RAM and 435 GiB of scratch, which no quarter of the node holds.
 - **One driver draining several datasets through a shared pool.**
   Avoids a ledger, but is a rewrite of the engine's main loop, and loses the per-dataset process boundary that contains a crash or an out-of-memory kill.
 - **Raise `ZARR_JOBS`.**

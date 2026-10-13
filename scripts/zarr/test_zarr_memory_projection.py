@@ -6,10 +6,11 @@
 * the anonymous-memory peak, which is what a reserve is, measured apart from the
   resident peak that also counts a streamed recording's file-backed scratch.
 
-Real git repositories, real /proc, real memory: nothing is mocked. The numbers in
-the first class are the measured ones from nm000276 on hallu (2026-10-13): a 145 GiB
-float32 recording of 39 channels was refused as "too large" at a projected 54 GiB
-against a 46 GiB budget, while its worker's anonymous memory held at 6.2 GiB.
+Real git repositories, real /proc, real memory: nothing is mocked. The numbers are
+the measured ones from nm000276 on hallu (2026-10-13): a 145 GiB float32 recording
+(about 32 channels) was refused as "too large" at a projected 54 GiB against a 46 GiB
+budget, and sub-48, 39 channels and 122 GB, held 6.2 GiB of anonymous memory while
+its resident size passed 10 GiB.
 
 Run:
     python scripts/zarr/test_zarr_memory_projection.py
@@ -18,9 +19,11 @@ Run:
 
 from __future__ import annotations
 
+import ast
 import json
 import mmap
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -143,8 +146,18 @@ class TestStreamingProjectionUsesTheSampleWidth(unittest.TestCase):
     BUDGET = 46 * GIB  # the node's usable RAM when this was measured
 
     def test_the_recording_that_was_refused_now_fits(self):
+        # 145 GiB over 32 channels is the recording that was refused: 12x one channel's
+        # bytes is 54.4 GiB, over the 46 GiB budget; at four bytes per sample it is 8x,
+        # 36.3 GiB.
+        refused = gz.streaming_peak_bytes(145 * GIB, 32)
+        self.assertAlmostEqual(refused / GIB, 54.4, delta=0.1)
+        self.assertGreater(refused, self.BUDGET)
+        fits = gz.streaming_peak_bytes(145 * GIB, 32, 4)
+        self.assertAlmostEqual(fits / GIB, 36.25, delta=0.1)
+        self.assertLess(fits, self.BUDGET)
+
+    def test_the_arithmetic_at_39_channels(self):
         # 145 GiB over 39 channels: 12x one channel's bytes is 44.6 GiB, 8x is 29.7 GiB.
-        # (The recording that was refused had fewer channels and projected 54 GiB.)
         narrow = gz.streaming_peak_bytes(self.SIZE, self.CHANNELS)
         float32 = gz.streaming_peak_bytes(self.SIZE, self.CHANNELS, 4)
         self.assertGreater(narrow, 40 * GIB)
@@ -227,6 +240,7 @@ class TestAnonPeak(unittest.TestCase):
 
     def sampler(self):
         peak = gz.AnonPeak(interval=0.02)
+        self.addCleanup(peak.close)  # no sampler thread outlives its test
         self.assertTrue(peak.reset())
         return peak
 
@@ -262,7 +276,7 @@ class TestAnonPeak(unittest.TestCase):
             fh.truncate(200 * self.MIB)
             with mmap.mmap(fh.fileno(), 200 * self.MIB) as mm:
                 for i in range(0, len(mm), 4096):
-                    mm[i : i + 1]  # fault the page in  # noqa: B018
+                    _ = mm[i]  # fault the page in
                 time.sleep(0.2)
                 resident_now = gz.peak_rss_bytes()
                 self.assertGreaterEqual(peak.peak(), base_anon)
@@ -274,22 +288,40 @@ class TestAnonPeak(unittest.TestCase):
         self.assertGreater(gz.peak_anon_bytes(), self.MIB)
 
     def test_a_forked_worker_restarts_the_thread_it_did_not_inherit(self):
-        peak = self.sampler()
+        # Not run in the test process's thread pool: the child gets a fresh AnonPeak, as
+        # a pool worker does, and the parent's sampler thread is the one it must not
+        # have inherited. os.fork() warns that the process is multi-threaded; the child
+        # takes no lock the parent's thread could hold.
+        parent = self.sampler()
         pid = os.fork()
         if pid == 0:
             ok = False
             try:
-                ok = peak.reset() and peak._thread is not None and peak._thread.is_alive()
+                child = gz.AnonPeak(interval=0.02)
+                baseline = None
+                ok = child.reset() and child._thread is not None and child._thread.is_alive()
+                ok = ok and parent._thread is not None and not parent._thread.is_alive()
+                baseline = child.peak()
                 block = bytearray(120 * self.MIB)
                 for i in range(0, len(block), 4096):
                     block[i] = 1
                 time.sleep(0.2)
                 del block
                 time.sleep(0.1)
-                ok = ok and peak.peak() >= 100 * self.MIB
+                ok = ok and child.peak() >= baseline + 100 * self.MIB
             finally:
                 os._exit(0 if ok else 1)
-        _, status = os.waitpid(pid, 0)
+        deadline = time.monotonic() + 30
+        status = None
+        while time.monotonic() < deadline:
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                break
+            time.sleep(0.05)
+        else:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            self.fail("the forked child did not finish")
         self.assertEqual(os.WEXITSTATUS(status), 0)
 
 
@@ -301,6 +333,76 @@ class TestAnonPeakWhereItCannotBeRead(unittest.TestCase):
             self.assertFalse(peak.reset())
             self.assertIsNone(peak.peak())
             self.assertIsNone(peak._thread)  # no sampler is started for nothing to sample
+
+
+class TestTheConverterIsWiredToTheseParts(unittest.TestCase):
+    """The behavior above is tested where it lives. These pin that `main` and
+    `convert_one` actually use it: dropping one argument from a call turns a whole
+    feature off without failing any test of the part."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(gz.__file__, encoding="utf-8") as fh:
+            cls.tree = ast.parse(fh.read())
+
+    def function(self, name):
+        return next(
+            n for n in ast.walk(self.tree) if isinstance(n, ast.FunctionDef) and n.name == name
+        )
+
+    def keywords_of_calls(self, function, callee):
+        return [
+            {k.arg for k in call.keywords}
+            for call in ast.walk(function)
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+            and call.func.id == callee
+        ]
+
+    def test_main_gives_the_pool_drain_the_ledger(self):
+        calls = self.keywords_of_calls(self.function("main"), "_drain_with_admission")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("ledger", calls[0])
+
+    def test_main_builds_the_ledger_from_the_environment_and_withdraws_from_it(self):
+        main = self.function("main")
+        callees = {
+            c.func.id for c in ast.walk(main)
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+        }
+        self.assertTrue({"ledger_from_env", "close_ledger", "converts_in_process"} <= callees)
+
+    def test_main_projects_with_the_sample_width_read_from_the_sidecar(self):
+        main = self.function("main")
+        projections = self.keywords_of_calls(main, "projected_peak_bytes")
+        self.assertEqual(len(projections), 1)
+        self.assertIn("sample_bytes", projections[0])
+        callees = {
+            c.func.id for c in ast.walk(main)
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+        }
+        self.assertIn("sample_bytes_from_sidecar", callees)
+
+    def test_a_worker_reports_the_anonymous_peak_on_every_outcome(self):
+        convert_one = self.function("convert_one")
+        reports = [
+            node for node in ast.walk(convert_one)
+            if isinstance(node, ast.Dict)
+            and any(isinstance(k, ast.Constant) and k.value == "peak_anon" for k in node.keys)
+        ]
+        self.assertEqual(len(reports), 1)  # the success result
+        calls = [
+            c for c in ast.walk(convert_one)
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+            and c.func.id == "memory_failure_result"
+        ]
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(len(c.args) == 4 for c in calls))  # primary, exc, rss, anon
+        starts = [
+            c for c in ast.walk(convert_one)
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+            and c.func.id == "reset_peak_anon"
+        ]
+        self.assertEqual(len(starts), 1)
 
 
 if __name__ == "__main__":

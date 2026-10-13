@@ -68,9 +68,11 @@ def _env_seconds(name: str, default: float) -> float:
 # before it asks them to stop admitting. Without it, a recording that needs most of
 # the node would wait behind an endless stream of small ones from the other drivers.
 STARVATION_SECONDS = _env_seconds("ZARR_LEDGER_STARVATION_SECONDS", 1800.0)
-# The exclusive lock is held for a /proc read and a file write, a second at the very
-# most. A wait longer than this means something is wrong, and the caller admits nothing
-# this round instead of admitting without the lock.
+# The exclusive lock is held while a driver reads /proc, reads its peers' files, measures
+# the disk blocks under their reservations' scratch paths (a stat walk: hundreds of files
+# for a recording, a streamed one having a few large ones) and writes its own file, which
+# is milliseconds to a second or two. A wait longer than this means something is wrong,
+# and the caller admits nothing this round instead of admitting without the lock.
 LOCK_TIMEOUT_SECONDS = _env_seconds("ZARR_LEDGER_LOCK_TIMEOUT_SECONDS", 60.0)
 
 FORMAT_VERSION = 1
@@ -413,10 +415,12 @@ class Ledger:
             if ext != "json" or not stem.isdigit():
                 continue
             start = None
-            with contextlib.suppress(OSError, ValueError, TypeError):
-                with open(os.path.join(track_dir, name), encoding="utf-8") as fh:
-                    start = json.load(fh).get("start")
-            if driver_is_alive(int(stem), start if isinstance(start, int) else None, self.proc_root):
+            with contextlib.suppress(OSError, ValueError, TypeError), open(
+                os.path.join(track_dir, name), encoding="utf-8"
+            ) as fh:
+                start = json.load(fh).get("start")
+            known = start if isinstance(start, int) else None
+            if driver_is_alive(int(stem), known, self.proc_root):
                 return True
         return False
 

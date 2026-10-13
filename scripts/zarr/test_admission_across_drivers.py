@@ -108,7 +108,7 @@ class DrainAgainstPeersCase(unittest.TestCase):
                 peer.mark_waiting(True, now=waiting_since, blocked_by=blocked_by)
         return peer
 
-    def drain(self, n=3, ceiling=None, ledger="own", deferred=None, **kwargs):
+    def drain(self, n=3, ceiling=None, ledger="own", deferred=None, ctx=None, **kwargs):
         """Drain ``n`` recordings of RESERVE each; returns their sorted spans."""
         primaries = _primaries(n)
         results = []
@@ -116,7 +116,7 @@ class DrainAgainstPeersCase(unittest.TestCase):
         own = Ledger(self.root) if ledger == "own" else ledger
         try:
             _drain_with_admission(
-                primaries, dict.fromkeys(primaries, self.RESERVE), 3, 10**12, {},
+                primaries, dict.fromkeys(primaries, self.RESERVE), 3, 10**12, ctx or {},
                 lambda r, i: results.append(r), worker=_timed_worker,
                 ceiling=lambda running_peak, track_dir: fixed, ledger=own,
                 deferred=deferred, **kwargs,
@@ -450,30 +450,93 @@ class TestConvertsInProcess(unittest.TestCase):
 
 
 class TestEveryAdmissionIsVisibleToPeers(DrainAgainstPeersCase):
+    """What a real drain publishes, read the way a peer reads it."""
+
+    def watch(self, observer, seen, stop):
+        while not stop.is_set():
+            with observer.exclusive():
+                mine = [d for d in observer.peers() if d["pid"] == os.getpid()]
+            seen.extend(mine)
+            time.sleep(0.02)
+
     def test_reservations_exist_while_recordings_run_and_not_after(self):
         observer_child = self.peer()  # a live peer that only looks
         observer = Ledger(self.root, pid=observer_child.pid)
-        seen: list[int] = []
+        scratch = os.path.join(self._tmp.name, "scratch")
+        os.makedirs(scratch)
+        seen: list[dict] = []
         stop = threading.Event()
-
-        def watch():
-            while not stop.is_set():
-                with observer.exclusive():
-                    mine = [d for d in observer.peers() if d["pid"] == os.getpid()]
-                seen.append(sum(len(d["reservations"]) for d in mine))
-                time.sleep(0.02)
-
-        thread = threading.Thread(target=watch)
+        thread = threading.Thread(target=self.watch, args=(observer, seen, stop))
         thread.start()
+        try:
+            spans = self.drain(ctx={"tmp": scratch})
+        finally:
+            stop.set()
+            thread.join()
+        self.assertEqual(len(spans), 3)
+        self.assertEqual(max(len(d["reservations"]) for d in seen), 3)
+        busiest = max(seen, key=lambda d: len(d["reservations"]))
+        # RAM is what a peer subtracts; the track directory is how it learns how much
+        # of that a worker has already taken.
+        self.assertTrue(busiest["track_dir"])
+        self.assertEqual(
+            sorted(r["ram"] for r in busiest["reservations"].values()), [self.RESERVE] * 3
+        )
+        # Scratch is what a peer subtracts from the budget, and the paths are how it
+        # learns how much of that is already on disk.
+        for reservation in busiest["reservations"].values():
+            self.assertEqual(len(reservation["paths"]), 3)
+            self.assertTrue(all(path.startswith(scratch) for path in reservation["paths"]))
+        with observer.exclusive():
+            self.assertEqual(observer.peers(), [])  # withdrawn at the end
+
+    def test_a_driver_held_up_by_a_peer_says_so_and_names_who_it_waits_for(self):
+        peer = self.peer(ram=300)  # holds the whole ceiling
+        observer_child = self.peer()
+        observer = Ledger(self.root, pid=observer_child.pid)
+        generate_zarr.LEDGER_WAIT_SECONDS = 30.0
+        seen: list[dict] = []
+        stop = threading.Event()
+        thread = threading.Thread(target=self.watch, args=(observer, seen, stop))
+        thread.start()
+        timer = threading.Timer(
+            1.0, lambda: TestRunAloneNeedsTheWholeNodeToBeIdle._release(peer)
+        )
+        timer.start()
+        self.addCleanup(timer.cancel)
         try:
             spans = self.drain()
         finally:
             stop.set()
             thread.join()
-        self.assertEqual(len(spans), 3)
-        self.assertEqual(max(seen), 3)
-        with observer.exclusive():
-            self.assertEqual(observer.peers(), [])  # withdrawn at the end
+        self.assertEqual(len(spans), 3)  # it ran once the peer let go
+        waiting = [d for d in seen if d["waiting_since"] is not None]
+        self.assertTrue(waiting, "it never said it was waiting")
+        self.assertEqual(waiting[0]["blocked_by"], [peer.pid])
+        self.assertEqual(seen[-1]["waiting_since"], None)  # and said so when it stopped
+
+
+class TestDefaultsAreWhatTheDecisionRecordSays(unittest.TestCase):
+    def test_the_waits_in_a_clean_environment(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("ZARR_")}
+        out = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import admission_ledger as a, generate_zarr as g;"
+                    "print(a.STARVATION_SECONDS, g.LEDGER_WAIT_SECONDS,"
+                    " a.LOCK_TIMEOUT_SECONDS, g.ADMISSION_RECHECK_SECONDS)"
+                ),
+            ],
+            cwd=HERE, env=env, capture_output=True, text=True, check=True,
+        ).stdout.split()
+        starvation, wait, lock_timeout, recheck = (float(x) for x in out)
+        self.assertEqual(starvation, 1800.0)  # 30 minutes before a waiter goes first
+        self.assertEqual(wait, 3600.0)  # 60 minutes before a slot gives up
+        self.assertGreater(wait, starvation)  # or the priority could never act
+        self.assertEqual(lock_timeout, 60.0)
+        self.assertEqual(recheck, 15.0)
 
 
 class TestLedgerFromEnv(unittest.TestCase):
@@ -519,10 +582,16 @@ HELPER = textwrap.dedent(
     from admission_ledger import Ledger
 
 
+    SCRATCH_MODE = os.environ.get("LEDGER_TEST_MODE") == "scratch"
+    GIB = 1024**3
+
+
     def worker(primary, peak_bytes=None):
         started = time.time()
         time.sleep(0.4)
-        record = {{"primary": primary, "reserve": peak_bytes,
+        # What is being shared: RAM reserves, or (in scratch mode) the 40 GiB charged
+        # per recording against a volume budget.
+        record = {{"primary": primary, "reserve": 40 * GIB if SCRATCH_MODE else peak_bytes,
                    "start": started, "end": time.time()}}
         name = primary.replace("/", "_") + ".json"
         with open(os.path.join(os.environ["LEDGER_TEST_OUT"], name), "w") as fh:
@@ -537,10 +606,19 @@ HELPER = textwrap.dedent(
         go = os.environ["LEDGER_TEST_GO"]
         while not os.path.exists(go):  # start together, however long the imports took
             time.sleep(0.005)
+        if SCRATCH_MODE:
+            extra = dict(
+                scratch_peaks=dict.fromkeys(primaries, 40 * GIB),
+                scratch_budget=lambda in_flight: 100 * GIB,
+            )
+            reserves, ceiling = dict.fromkeys(primaries, 1), 10**15
+        else:
+            extra = {{}}
+            reserves, ceiling = dict.fromkeys(primaries, 40 * GIB), 100 * GIB
         gz._drain_with_admission(
-            primaries, dict.fromkeys(primaries, 40 * 1024**3), 4, 100 * 1024**3, {{}},
+            primaries, reserves, 4, ceiling, {{}},
             lambda r, i: None, worker=worker,
-            ceiling=lambda running_peak, track_dir: 100 * 1024**3, ledger=ledger,
+            ceiling=lambda running_peak, track_dir: ceiling, ledger=ledger, **extra,
         )
         gz.close_ledger(ledger)
 
@@ -572,12 +650,15 @@ class TestTwoDriversShareTheNode(unittest.TestCase):
         with open(self.helper, "w") as fh:
             fh.write(HELPER.format(here=HERE))
 
-    def run_two(self, use_ledger):
-        out = os.path.join(self._tmp.name, f"out-{use_ledger}")
-        root = os.path.join(self._tmp.name, f"ledger-{use_ledger}")
-        go = os.path.join(self._tmp.name, f"go-{use_ledger}")
+    def run_two(self, use_ledger, mode="ram"):
+        out = os.path.join(self._tmp.name, f"out-{use_ledger}-{mode}")
+        root = os.path.join(self._tmp.name, f"ledger-{use_ledger}-{mode}")
+        go = os.path.join(self._tmp.name, f"go-{use_ledger}-{mode}")
         os.makedirs(out)
-        env = {**os.environ, "LEDGER_TEST_OUT": out, "LEDGER_TEST_GO": go}
+        env = {
+            **os.environ, "LEDGER_TEST_OUT": out, "LEDGER_TEST_GO": go,
+            "LEDGER_TEST_MODE": mode,
+        }
         procs = [
             subprocess.Popen(
                 [sys.executable, self.helper, root, tag, str(self.COUNT), use_ledger], env=env
@@ -626,6 +707,18 @@ class TestTwoDriversShareTheNode(unittest.TestCase):
 
     def test_without_it_each_driver_assumes_the_node_is_its_own(self):
         records, _ = self.run_two("no")
+        self.assertGreater(self.most_reserved_at_once(records), 100 * self.GIB)
+
+    def test_scratch_is_shared_the_same_way(self):
+        # The headline case: two drivers each admitting a recording that needs most of
+        # the volume. Each is told the volume has 100 GiB of budget and charges 40 GiB
+        # per recording, with RAM out of the picture.
+        records, _ = self.run_two("yes", "scratch")
+        self.assertLessEqual(self.most_reserved_at_once(records), 100 * self.GIB)
+        self.assertGreaterEqual(self.most_reserved_at_once(records), 80 * self.GIB)
+
+    def test_scratch_without_the_ledger_is_overcommitted(self):
+        records, _ = self.run_two("no", "scratch")
         self.assertGreater(self.most_reserved_at_once(records), 100 * self.GIB)
 
 

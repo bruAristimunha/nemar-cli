@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -757,6 +758,8 @@ if argv[:1] and argv[0].endswith("generate_zarr.py"):
         fh.write("DRIVER " + " ".join(argv[1:]) + chr(10))
     with open(os.environ["QPY_LOG"] + ".pids", "a") as fh:
         fh.write(str(os.getpid()) + chr(10))
+    with open(os.environ["QPY_LOG"] + ".env", "a") as fh:
+        fh.write("ZARR_LEDGER_DIR=" + os.environ.get("ZARR_LEDGER_DIR", "<unset>") + chr(10))
     if os.environ.get("FAKE_DRIVER_CALLBACK") and "--callback-out" in argv:
         # The callback body the driver writes on every outcome, when a test
         # wants to see what the script does with it.
@@ -778,13 +781,18 @@ if "next" in argv:
     # QPY_NEXT is the queue, one `<id>TAB<version>` per `;`, handed out one per
     # `next` call. Unset (the default) prints nothing: an empty line ends the
     # drain immediately.
+    # Each row is claimed with an exclusive create, as the real queue claims one
+    # inside a transaction, so two slots asking at once can never both be handed it.
     queue = [row for row in os.environ.get("QPY_NEXT", "").split(";") if row]
-    counter = os.environ["QPY_LOG"] + ".next"
-    taken = int(open(counter).read()) if os.path.exists(counter) else 0
-    if taken < len(queue):
-        print(queue[taken])
-    with open(counter, "w") as fh:
-        fh.write(str(taken + 1))
+    claims = os.environ["QPY_LOG"] + ".claims"
+    os.makedirs(claims, exist_ok=True)
+    for i, row in enumerate(queue):
+        try:
+            os.close(os.open(os.path.join(claims, str(i)), os.O_CREAT | os.O_EXCL))
+        except FileExistsError:
+            continue
+        print(row)
+        break
 sys.exit(0)
 """
 
@@ -2017,19 +2025,78 @@ def test_a_one_off_dataset_with_every_slot_busy_says_so_and_runs_nothing(
 
 def test_arguments_reach_the_drains_a_tick_starts(ack_run) -> None:
     run, qpy_calls, _, _ = ack_run
-    proc = run(args=["--limit", "1"], extra_env={"ZARR_SLOTS": "2", "QPY_NEXT": "nm000001\tv1"})
+    rows = "nm000001\tv1;nm000002\tv1;nm000003\tv1"
+    proc = run(args=["--limit", "1"], extra_env={"ZARR_SLOTS": "2", "QPY_NEXT": rows})
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    # Each slot is told --limit 1 and so stops after one dataset; only one row exists.
-    assert len([c for c in qpy_calls() if c.startswith("DRIVER")]) == 1
+    # Each slot is told --limit 1 and stops after one dataset: two drivers, not three.
+    assert len([c for c in qpy_calls() if c.startswith("DRIVER")]) == 2
 
 
-def test_the_driver_gets_the_per_slot_worker_count_and_the_ledger(ack_run) -> None:
+def test_without_a_limit_the_slots_between_them_take_the_whole_queue(ack_run) -> None:
+    run, qpy_calls, _, _ = ack_run
+    rows = "nm000001\tv1;nm000002\tv1;nm000003\tv1"
+    proc = run(extra_env={"ZARR_SLOTS": "2", "QPY_NEXT": rows})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    drivers = [c for c in qpy_calls() if c.startswith("DRIVER")]
+    assert len(drivers) == 3
+    # Each dataset was handed to exactly one slot.
+    assert sorted(re.search(r"--dataset-id (\S+)", c).group(1) for c in drivers) == [
+        "nm000001", "nm000002", "nm000003",
+    ]
+
+
+def test_the_driver_gets_the_per_slot_worker_count(ack_run) -> None:
     run, qpy_calls, _, _ = ack_run
     proc = run(extra_env={"ZARR_SLOTS": "2", "ZARR_JOBS": "24", "QPY_NEXT": "nm000001\tv1"})
     assert proc.returncode == 0, proc.stdout + proc.stderr
     driver = [c for c in qpy_calls() if c.startswith("DRIVER")]
     assert len(driver) == 1
     assert "--jobs 4" in driver[0]
+
+
+def test_the_driver_inherits_the_node_ledger_directory(ack_run) -> None:
+    """Exported, not merely set: --print-config prints a shell variable and cannot
+    tell the difference, and without the export the ledger is silently off."""
+    run, _, ack_file, qpy_log = ack_run
+    zarr_base = ack_file.parent.parent
+    proc = run(extra_env={"ZARR_SLOTS": "2", "QPY_NEXT": "nm000001\tv1"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    recorded = Path(str(qpy_log) + ".env").read_text().splitlines()
+    assert recorded == [f"ZARR_LEDGER_DIR={zarr_base}/zarr-admission-ledger"]
+    other = run(
+        # The first row is already claimed by the run above, so this one gets the second.
+        extra_env={
+            "ZARR_SLOTS": "1",
+            "QPY_NEXT": "nm000001\tv1;nm000002\tv1",
+            "ZARR_LEDGER_DIR": "/x/ledger",
+        }
+    )
+    assert other.returncode == 0, other.stdout + other.stderr
+    assert Path(str(qpy_log) + ".env").read_text().splitlines()[-1] == "ZARR_LEDGER_DIR=/x/ledger"
+
+
+def test_only_one_slot_updates_the_clone_at_a_time(ack_run, holders) -> None:
+    """setup() rewrites the shared clone and venv; a second slot must wait for the
+    first rather than run git and the installer over it."""
+    import time
+
+    run, qpy_calls, ack_file, _ = ack_run
+    lock = _hold(ack_file.parent / ".nm-zarr.setup.lock")
+    holders.append(lock)
+    proc = run(extra_env={"ZARR_SLOTS": "2", "ZARR_SLOT": "0"}, background=True)
+    try:
+        time.sleep(2.0)
+        assert proc.poll() is None, "it did not wait for the setup lock"
+        assert qpy_calls() == []  # nothing past setup has run
+        lock.kill()
+        lock.wait()
+        _wait_until(lambda: proc.poll() is not None, "the slot to proceed", 20)
+        assert proc.returncode == 0
+        assert any("reconcile" in c.split() for c in qpy_calls())
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
 
 
 def test_the_queue_hears_a_heartbeat_while_a_dataset_converts(ack_run) -> None:
@@ -2046,7 +2113,8 @@ def test_the_queue_hears_a_heartbeat_while_a_dataset_converts(ack_run) -> None:
     assert 2 <= len(beats) <= 4, qpy_calls()
     assert all(c.endswith("heartbeat nm000276") for c in beats)
     calls = qpy_calls()
-    assert calls.index(beats[-1]) < max(i for i, c in enumerate(calls) if " done " in c)
+    last_beat = max(i for i, c in enumerate(calls) if c == beats[-1])
+    assert last_beat < max(i for i, c in enumerate(calls) if " done " in c)
 
 
 def test_no_heartbeat_is_sent_outside_a_conversion(ack_run) -> None:

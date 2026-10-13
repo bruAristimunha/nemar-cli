@@ -77,13 +77,30 @@ class LedgerTestCase(unittest.TestCase):
 
 
 class TestLocking(LedgerTestCase):
-    def test_a_second_driver_waits_for_the_lock_and_then_gets_it(self):
+    def test_a_second_driver_times_out_while_the_first_holds_the_lock_and_gets_it_after(self):
         a, b = Ledger(self.root, pid=1001), Ledger(self.root, pid=1002)
-        with a.exclusive():
-            with self.assertRaises(LedgerBusy), b.exclusive(timeout=0.15):
-                pass
+        with a.exclusive(), self.assertRaises(LedgerBusy), b.exclusive(timeout=0.15):
+            pass
         with b.exclusive(timeout=0.15):
             pass
+
+    def test_a_driver_that_waits_gets_the_lock_when_the_holder_lets_go(self):
+        a, b = Ledger(self.root, pid=1001), Ledger(self.root, pid=1002)
+        acquired_after = []
+
+        def waiter():
+            began = time.monotonic()
+            with b.exclusive(timeout=5.0):
+                acquired_after.append(time.monotonic() - began)
+
+        with a.exclusive():
+            thread = threading.Thread(target=waiter)
+            thread.start()
+            time.sleep(0.4)
+            self.assertEqual(acquired_after, [])  # still waiting while a holds it
+        thread.join(timeout=5)
+        self.assertEqual(len(acquired_after), 1)
+        self.assertGreaterEqual(acquired_after[0], 0.35)
 
     def test_the_lock_is_released_when_the_body_raises(self):
         a, b = Ledger(self.root, pid=1001), Ledger(self.root, pid=1002)
@@ -144,16 +161,18 @@ class TestForkedChildrenDoNotKeepTheLock(LedgerTestCase):
         reader, writer = os.pipe()
         driver = os.fork()
         if driver == 0:
-            os.close(reader)
-            ledger = Ledger(self.root, pid=os.getpid())
-            ledger.acquire()
-            worker = os.fork()
-            if worker == 0:
+            try:
+                os.close(reader)
+                ledger = Ledger(self.root, pid=os.getpid())
+                ledger.acquire()
+                worker = os.fork()
+                if worker == 0:
+                    time.sleep(30)
+                    os._exit(0)
+                os.write(writer, f"{worker}\n".encode())
                 time.sleep(30)
-                os._exit(0)
-            os.write(writer, f"{worker}\n".encode())
-            time.sleep(30)
-            os._exit(0)
+            finally:
+                os._exit(0)  # never return into the test runner from a forked child
         os.close(writer)
         with os.fdopen(reader) as fh:
             worker = int(fh.readline())
@@ -217,7 +236,44 @@ class TestSleepUnlocked(LedgerTestCase):
 
 
 class TestOwnFile(LedgerTestCase):
-    def test_reserve_and_release_publish_the_document_atomically(self):
+    def test_a_reader_never_sees_a_half_written_document(self):
+        ledger = Ledger(self.root, pid=os.getpid())
+        path = os.path.join(self.root, f"{os.getpid()}.json")
+        with ledger.exclusive():
+            ledger.reserve(1, 1, [])
+        stop = threading.Event()
+        problems: list[str] = []
+        reads = [0]
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    with open(path) as fh:
+                        doc = json.load(fh)
+                except FileNotFoundError:
+                    problems.append("the file vanished while it was being replaced")
+                    continue
+                except ValueError as exc:
+                    problems.append(f"a half-written document: {exc}")
+                    continue
+                reads[0] += 1
+                if "reservations" not in doc or "pid" not in doc:
+                    problems.append("a document without its fields")
+
+        thread = threading.Thread(target=reader)
+        thread.start()
+        try:
+            with ledger.exclusive():
+                tokens = [ledger.reserve(i, i, [f"/scratch/{i}" * 20]) for i in range(1, 400)]
+                for token in tokens:
+                    ledger.release(token)
+        finally:
+            stop.set()
+            thread.join()
+        self.assertEqual(problems, [])
+        self.assertGreater(reads[0], 10)
+
+    def test_reserve_and_release_publish_the_document(self):
         ledger = Ledger(self.root, pid=os.getpid())
         path = os.path.join(self.root, f"{os.getpid()}.json")
         with ledger.exclusive():
@@ -551,7 +607,14 @@ class TestReadingThePeers(LedgerTestCase):
         track = os.path.join(self._tmp.name, "track")
         os.makedirs(track)
         with open(os.path.join(track, f"{worker.pid}.json"), "w") as fh:
-            json.dump({"reserve": 7, "rss_anon_start": 0, "start": process_start_ticks(worker.pid)}, fh)
+            json.dump(
+                {
+                    "reserve": 7,
+                    "rss_anon_start": 0,
+                    "start": process_start_ticks(worker.pid),
+                },
+                fh,
+            )
         os.makedirs(self.root, exist_ok=True)
         path = os.path.join(self.root, f"{driver.pid}.json")
         with open(path, "w") as fh:

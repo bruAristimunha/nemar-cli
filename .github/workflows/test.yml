@@ -329,7 +329,7 @@ jobs:
       - name: Queue tests
         run: python scripts/zarr/test_zarr_queue.py
 
-      # Admission across drivers (ADR 0102): the ledger, the drain against real peer
+      # Admission across drivers (ADR 0101): the ledger, the drain against real peer
       # processes, and two real driver processes sharing one node. Linux is where the
       # process pool forks, which is the case that held the ledger lock in every worker.
       - name: Admission ledger tests

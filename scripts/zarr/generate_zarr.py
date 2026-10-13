@@ -608,10 +608,10 @@ class AnonPeak:
         self._lock = threading.Lock()
         self._peak: int | None = None
         self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
 
     def _run(self) -> None:
-        while True:
-            time.sleep(self.interval)
+        while not self._stop.wait(self.interval):
             now = anon_rss_bytes(os.getpid(), self.proc_root)
             if now is None:
                 continue
@@ -631,9 +631,17 @@ class AnonPeak:
             self._peak = now
         # A forked worker inherits this object but not its thread.
         if self._thread is None or not self._thread.is_alive():
+            self._stop = threading.Event()
             self._thread = threading.Thread(target=self._run, name="anon-peak", daemon=True)
             self._thread.start()
         return True
+
+    def close(self) -> None:
+        """Stop sampling. A worker never needs to (it ends with its process); tests do."""
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2)
 
     def peak(self) -> int | None:
         now = anon_rss_bytes(os.getpid(), self.proc_root)
