@@ -12,14 +12,13 @@ on:
   workflow_run:
     workflows: ["Publish to npm"]
     types: [completed]
-    # Only a publish that ran on a v* ref starts this workflow. For a tag-triggered
-    # run (and for a dispatch on a tag) GitHub reports the tag name as the run's
-    # head branch, which is what this filter matches and what the job's `if:`
-    # below has always tested. Without it every branch publish created a run here
-    # that skipped its only job: 2,660 skipped runs against 107 that synced.
-    # The job's `if:` stays as the exact check (success, v prefix, push or
-    # dispatch), and its first step still refuses anything but vX.Y.Z.
-    branches: ['v*']
+    # No `branches:` filter, on purpose. A run triggered by a tag reports the tag name
+    # as its head branch, which the job's `if:` below tests, but GitHub documents the
+    # trigger's filter only for branches and nobody has shown it to match a tag-triggered
+    # run. If it did not, the release would start no sync at all: dev would stay at the
+    # old -devN, below the released version, and the next release's auto-tag would
+    # refuse to tag. What the filter bought was fewer skipped runs, which cost no runner
+    # minutes. Restore it only after a throwaway tag has shown that it matches.
 
 permissions:
   contents: write

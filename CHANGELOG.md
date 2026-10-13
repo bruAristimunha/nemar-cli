@@ -18,7 +18,7 @@ earlier releases are described only by their generated notes.
 The Zarr conversion on `hallu` now runs several datasets side by side, so a dataset that takes days no longer holds up everything behind it (#1757, ADR 0101),
 and its memory projection uses what a recording really needs: a 145 GiB float32 recording that was refused as too large now fits.
 A text that names a generic home path before a real one is no longer passed by the identifier screen (#1737).
-The rest is repository process with no runtime effect: CI jobs are bounded and superseded runs are cancelled (#1755), pull-request review is capped at two rounds (#1748), and the review trial is recorded in the ADRs (#1747, with comment-only edits to two backend files).
+The rest is repository process with no change to what the Worker does: CI jobs are bounded, superseded pull-request runs are cancelled while push runs never are, the dev npm publish comes from a dispatch, the dev deploy is a call from `auto-bump-dev.yml`, the production deploy of the strip commit reuses the merge's test gate, and bot version commits skip Tests (#1755, which changes the release pipeline itself); pull-request review is capped at two rounds (#1748); and the review trial is recorded in the ADRs (#1747, with comment-only edits to two backend files).
 There is no migration, no new Worker secret or variable, and no Worker behavior change.
 The conversion changes run on `hallu` from the repository clone, not from the npm package; see Deploy coupling.
 
@@ -67,8 +67,11 @@ The conversion changes run on `hallu` from the repository clone, not from the np
 - The Zarr changes reach `hallu` only when its clone of this repository is updated: the hourly cron runs the clone's `hallu-zarr.sh`, and the clone is refreshed by a run that gets a lock.
   The drain that was converting `nm000276` before this release holds slot 0's lock and runs the old script, so merging does not by itself start the new slots.
   Update the clone by hand (`git -C /mnt/local/zarr-state/nemar-cli fetch origin && git -C /mnt/local/zarr-state/nemar-cli reset --hard origin/main`): that is what its `setup()` does on every run, and the running drain has already loaded its code.
-- Register the old drain in the admission ledger before the next tick, so the new slots leave room for the recording it is converting: a document under `/mnt/local/zarr-admission-ledger/` named for its driver's pid, with that process's start time, a scratch reservation for the largest remaining recording and its scratch paths.
-  The ledger removes it when the driver exits.
+- Register the old drain in the admission ledger before the next tick, so the new slots leave room for the recording it is converting.
+  The file is `/mnt/local/zarr-admission-ledger/<driver pid>.json`:
+  `{"v":1,"pid":<pid>,"start":<field 22 of /proc/<pid>/stat>,"reservations":{"1":{"ram":<bytes>,"scratch":<bytes>,"paths":["<its scratch directories>"]}}}`.
+  The shape matters: a file without `reservations` as an object is taken for debris and deleted by the next driver to look, and the registration silently does nothing.
+  The ledger removes the file when the driver exits.
   Without it the slots read the volume as nearly empty while the recording is still growing towards its peak.
 - No crontab edit is needed: `ZARR_JOBS=24` is now a ceiling, and the default is four slots of four workers.
   `ZARR_SLOTS=1` restores one drain at a time.
