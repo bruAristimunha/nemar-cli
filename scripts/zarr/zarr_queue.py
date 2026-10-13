@@ -39,6 +39,13 @@ Subcommands (all take --db):
     next
         Atomically claim the oldest eligible job -> `inprogress`; print
         "<dataset_id>\t<latest_version>" (nothing if the queue is drained).
+    heartbeat DATASET
+        Say a converter is still working on an `inprogress` job: refreshes its
+        `updated_at`, which is what the stale sweep in `reconcile` judges by.
+        Prints how many rows it touched (0: the job is no longer inprogress).
+        Several converters can run against one queue (hallu-zarr.sh slots), and
+        each one's reconcile would otherwise take a dataset that has been
+        converting for more than `--stale-seconds` away from its converter.
     done DATASET VERSION [--pending-count N] [--not-attempted-count N]
         mark converted at VERSION (stamps the engine). A non-zero --pending-count
         means the run left recordings unconverted for a retryable reason: the row
@@ -774,15 +781,11 @@ def claim_next(conn: sqlite3.Connection) -> sqlite3.Row | None:
     `pending`.
 
     This makes ONE claim atomic between connections to the SAME database
-    file -- it is not a lock against every other way this queue could be
-    driven. It still relies on the CALLER's single-instance flock (held by
-    hallu-zarr.sh around the whole run) to keep two independent DRIVER
-    PROCESSES from running against the same database at all; this function
-    only closes the gap between two connections that are legitimately both
-    open at once, not a substitute for that flock. Every claim is its own
-    one-shot `zarr_queue.py next` subprocess with a fresh connection, so the
-    realistic race is an operator's manual `next` run (which bypasses the
-    flock) against the cron drain's own per-dataset `next`.
+    file. Several drivers may now be draining this queue at once (hallu-zarr.sh
+    runs one per slot, each under its own lock), and this is what keeps two of
+    them from claiming the same row; `heartbeat` is what keeps a long conversion
+    from looking abandoned to another driver's reconcile. Every claim is its own
+    one-shot `zarr_queue.py next` subprocess with a fresh connection.
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -804,6 +807,22 @@ def claim_next(conn: sqlite3.Connection) -> sqlite3.Row | None:
     except BaseException:
         conn.rollback()
         raise
+
+
+def heartbeat(conn: sqlite3.Connection, dataset_id: str) -> int:
+    """Refresh the heartbeat of ``dataset_id`` if a converter holds it: the number of
+    rows touched, 0 when the job is not `inprogress` (it finished, failed, or was
+    reclaimed by a reconcile that judged it stale).
+
+    Only an `inprogress` row is touched. A heartbeat must never revive or re-date a
+    row in any other state, or a late one from a converter that has already been
+    replaced would hide the very condition the stale sweep exists to find."""
+    touched = conn.execute(
+        "UPDATE jobs SET updated_at=? WHERE dataset_id=? AND status='inprogress'",
+        (_now(), dataset_id),
+    ).rowcount
+    conn.commit()
+    return touched
 
 
 def mark_done(
@@ -1651,6 +1670,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("next")
 
+    p = sub.add_parser(
+        "heartbeat",
+        help="mark an inprogress job as still being converted (keeps reconcile's "
+        "stale sweep from reclaiming it)",
+    )
+    p.add_argument("dataset")
+
     p = sub.add_parser("done")
     p.add_argument("dataset")
     p.add_argument("version")
@@ -1868,6 +1894,10 @@ def main() -> int:
         row = claim_next(conn)
         if row is not None:
             print(f"{row['dataset_id']}\t{row['latest_version']}")
+        return 0
+
+    if args.cmd == "heartbeat":
+        print(heartbeat(conn, args.dataset))
         return 0
 
     if args.cmd == "done":
