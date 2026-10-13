@@ -1120,11 +1120,19 @@ const GENERIC_ACCOUNTS = new Set([
   "default",
 ]);
 
-/** Screen text for a local user path such as `C:\Users\<name>` or `/Users/<name>`. */
+/**
+ * Screen text for a local user path such as `C:\Users\<name>` or `/Users/<name>`. EVERY path in
+ * the text is examined, so a generic account (`/home/user`) never hides a real one after it;
+ * the result is still one finding per text, shaped from the first non-generic path.
+ */
 export function scanTextForLocalPaths(text: string): Finding[] {
-  const m = LOCAL_USER_PATH.exec(text);
-  if (!m || GENERIC_ACCOUNTS.has((m[1] as string).toLowerCase())) return [];
-  return [{ kind: "local-user-path", severity: "review", field: "text", shape: shapeOf(m[0]) }];
+  // A fresh global copy per call: the constant has no flags, so it keeps no `lastIndex` and one
+  // call can never change what the next one sees.
+  for (const m of text.matchAll(new RegExp(LOCAL_USER_PATH, "g"))) {
+    if (GENERIC_ACCOUNTS.has((m[1] as string).toLowerCase())) continue;
+    return [{ kind: "local-user-path", severity: "review", field: "text", shape: shapeOf(m[0]) }];
+  }
+  return [];
 }
 
 export interface FormatCoverage {
