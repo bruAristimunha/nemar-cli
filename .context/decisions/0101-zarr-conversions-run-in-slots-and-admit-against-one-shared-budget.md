@@ -66,7 +66,11 @@ The lock descriptor is closed in forked workers and unlocked explicitly, because
 `zarr_queue.py heartbeat <dataset>` refreshes an `inprogress` row, and `hallu-zarr.sh` sends one every five minutes (`ZARR_HEARTBEAT_SECONDS`) while a queue-claimed dataset converts, for as long as the driver lives.
 Each slot starts with a reconcile, and a reconcile returns to `pending` any `inprogress` row idle for six hours.
 Without the heartbeat, a second slot would take `nm000276` after six hours and convert it onto the same S3 prefix twice.
-The driver runs in the background so that the heartbeat can follow it, which makes the script responsible for signals: a TERM or INT to a slot stops its driver and then the slot, without spending an attempt (the row stays `inprogress` and the stale sweep returns it), and the tick forwards a TERM to its slots.
+The driver runs in the background so that the heartbeat can follow it, which makes the script responsible for signals.
+A TERM to a slot (or an INT to one run directly; a slot the tick started inherits an ignored SIGINT, which bash cannot trap) stops its driver and its driver's children and then the slot, without spending an attempt: the row stays `inprogress` and the stale sweep returns it.
+The tick forwards a TERM to its slots and waits for each.
+Every wait in the script is in pieces of five seconds or less, since bash acts on a trapped signal only between commands and `flock` is an external one, so a slot waiting for the setup lock or behind a one-off is stopped within seconds; a slot waiting behind a one-off keeps its claim alive with the same heartbeat.
+A stop that arrives after the driver has finished does not discard the result: the callback, the clean-up and `qpy done` run, then the slot stops.
 
 **Memory anticipated from what is measured.**
 Workers sample `RssAnon`, and the calibration warnings compare the reserve with anonymous memory.

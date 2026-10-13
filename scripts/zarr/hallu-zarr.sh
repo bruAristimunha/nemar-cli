@@ -523,6 +523,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# --limit and ZARR_LIMIT: a plain decimal count, 0 meaning no limit. `08` would be an
+# arithmetic error below that turned a limited run into an unlimited one.
+[[ "$LIMIT" =~ ^(0|[1-9][0-9]*)$ ]] ||
+  fatal_config "--limit / ZARR_LIMIT must be a non-negative integer (got '$LIMIT')."
+
 log() {
   local prefix=""
   [[ -n "$TEST_MODE" ]] && prefix="[test] "
@@ -893,14 +898,41 @@ DRIVER="$DRIVER_REPO/scripts/zarr/generate_zarr.py"
 QUEUE="$DRIVER_REPO/scripts/zarr/zarr_queue.py"
 qpy() { VIRTUAL_ENV="$VENV_DIR" "$VENV_DIR/bin/python" "$QUEUE" --db "$QUEUE_DB" "$@"; }
 
+# Take the lock on descriptor $1 and wait for it as long as it takes, but never in one
+# piece for more than five seconds. Bash runs a trapped signal only between commands, and
+# flock is an external one, so a plain blocking flock would leave a TERM unanswered for as
+# long as the lock is held (a one-off conversion can hold one for days). Any further
+# arguments are a command run about every HEARTBEAT_SECONDS while waiting. Returns the
+# flock status when it is anything but a timeout.
+flock_wait() {
+  local fd="$1" rc waited=$SECONDS
+  shift
+  while :; do
+    flock -w 5 "$fd"
+    rc=$?
+    ((rc == 0)) && return 0
+    ((rc == 1)) || return "$rc"
+    if (($# > 0)) && ((SECONDS - waited >= HEARTBEAT_SECONDS)); then
+      "$@"
+      waited=$SECONDS
+    fi
+  done
+}
+
 # Only one slot at a time may update the shared driver clone and venv: two `git reset`
-# or `uv pip install` runs at once can corrupt either. Blocking, because another
-# slot's setup takes seconds to a minute; the running drains are not affected (they
-# have loaded their code), and a drain that starts while a clone is being rewritten
-# fails fast on an import and is retried by the queue.
+# or `uv pip install` runs at once can corrupt either. Another slot's setup takes seconds
+# to a minute, so this waits; the running drains are not affected (they have loaded their
+# code), and a drain that starts while a clone is being rewritten fails fast on an import
+# and is retried by the queue.
 setup_locked() {
-  exec 8>"${STATE_DIR}/.nm-zarr.setup.lock"
-  flock 8
+  exec 8>"${STATE_DIR}/.nm-zarr.setup.lock" || {
+    err "cannot open ${STATE_DIR}/.nm-zarr.setup.lock"
+    exit 1
+  }
+  flock_wait 8 || {
+    err "cannot take the setup lock"
+    exit 1
+  }
   setup
   flock -u 8
   exec 8>&-
@@ -933,7 +965,7 @@ heartbeat_start() {
         exit 0
       fi
     done
-  ) 9>&- &
+  ) 9>&- 7>&- &
   HEARTBEAT_PID=$!
 }
 heartbeat_stop() {
@@ -946,11 +978,18 @@ heartbeat_stop() {
 # A signal to this script reaches the driver too. The driver runs in the background so
 # that the heartbeat can follow it, and a background job of a non-interactive shell
 # starts with SIGINT ignored, so Ctrl-C and the supervisor's TERM would otherwise stop
-# the script and leave the driver converting with nothing to report its result. The
+# the script and leave the driver converting with nothing to report its result. (A slot
+# the tick started inherits an ignored SIGINT itself, and bash cannot trap what was
+# ignored on entry: stop one of those with TERM, or stop the tick, which forwards it. INT
+# works on a slot run directly.) The
 # driver's workers are its children and go with it. A stop is not a failure of the
 # dataset: its row stays `inprogress` and the stale sweep returns it to `pending`.
 DRIVER_PID=""
 STOP_REQUESTED=""
+# Set while a dataset is being converted, from taking its lock until the caller has its
+# result. A stop that arrives after the driver has finished must not discard what it did:
+# the callback, the scratch clean-up and `qpy done` still have to run.
+CONVERTING=""
 stop_driver() {
   [[ -n "$DRIVER_PID" ]] || return 0
   pkill -TERM -P "$DRIVER_PID" 2>/dev/null
@@ -961,6 +1000,8 @@ on_stop_signal() {
   STOP_REQUESTED=1
   if [[ -n "$DRIVER_PID" ]]; then
     stop_driver  # the conversion returns, and the drain loop sees STOP_REQUESTED
+  elif [[ -n "$CONVERTING" ]]; then
+    :  # between the clone and the result: the caller finishes the bookkeeping, then stops
   else
     heartbeat_stop
     exit 143
@@ -1003,24 +1044,34 @@ report_subject_info_refusal() {
 # descriptor the driver inherits, so it is held for as long as the driver lives.
 DATASET_LOCK_DIR="${STATE_DIR}/dataset-locks"
 convert_dataset_exclusive() {
-  local id="$1" held=0 lock_rc=0
+  local id="$1" lock_rc=0
+  LAST_DETERMINISTIC=false LAST_PENDING_COUNT=0 LAST_NOT_ATTEMPTED=0
   mkdir -p "$DATASET_LOCK_DIR"
-  exec 7>"${DATASET_LOCK_DIR}/${id}.lock"
+  if ! exec 7>"${DATASET_LOCK_DIR}/${id}.lock"; then
+    err "[$id] cannot open its dataset lock in ${DATASET_LOCK_DIR}"
+    return 1
+  fi
   if [[ -n "$ONLY_DATASET" ]]; then
     flock -n 7 || lock_rc=$?
-    if ((lock_rc != 0)); then
-      err "[$id] is being converted by another slot or run; not starting a second conversion of it"
-      exec 7>&-
-      LAST_DETERMINISTIC=false LAST_PENDING_COUNT=0 LAST_NOT_ATTEMPTED=0
-      return 3
-    fi
   else
-    flock 7
+    # A queue-claimed run keeps the claim alive while it waits behind a one-off.
+    flock_wait 7 qpy heartbeat "$id" >/dev/null 2>&1 || lock_rc=$?
   fi
-  held=1
+  if ((lock_rc == 1)); then
+    err "[$id] is being converted by another slot or run; not starting a second conversion of it"
+    exec 7>&-
+    return 3
+  elif ((lock_rc != 0)); then
+    err "[$id] cannot take its dataset lock (flock exited $lock_rc)"
+    exec 7>&-
+    return 1
+  fi
+  CONVERTING=1
   convert_dataset "$@"
   local rc=$?
-  ((held)) && { flock -u 7; exec 7>&-; }
+  CONVERTING=""
+  flock -u 7
+  exec 7>&-
   return "$rc"
 }
 
@@ -1072,6 +1123,13 @@ convert_dataset() {
     err "[$id] metadata clone failed"
     safe_rm "$dir"
     return 1
+  fi
+
+  # A stop that arrived while the clone was being made is acted on here, not after a
+  # conversion it would then have to wait out.
+  if [[ -n "$STOP_REQUESTED" ]]; then
+    safe_rm "$dir"
+    return 143
   fi
 
   local rc=0
@@ -1280,7 +1338,15 @@ supervise() {
   # harmless, but one signalled here should be signalled too.
   trap 'kill "${pids[@]}" 2>/dev/null' TERM INT
   for pid in "${pids[@]}"; do
-    wait "$pid" || { local r=$?; ((r == 3)) || rc=$r; }
+    # A trapped signal interrupts `wait` for the first slot only; keep waiting until each
+    # slot is really gone, so the tick does not exit while a slot is still stopping.
+    local r=0
+    while :; do
+      wait "$pid"
+      r=$?
+      kill -0 "$pid" 2>/dev/null || break
+    done
+    ((r == 3)) || rc=$r
   done
   return "$rc"
 }
@@ -1462,7 +1528,7 @@ if [[ -n "$ONLY_DATASET" ]]; then
         | jq -r '.dataset.latest_version // ""' 2>/dev/null)"
   only_rc=0
   convert_dataset_exclusive "$ONLY_DATASET" "$v" || only_rc=$?
-  if [[ -n "$STOP_REQUESTED" ]]; then
+  if [[ -n "$STOP_REQUESTED" && "$only_rc" -ne 0 ]]; then
     log "[$ONLY_DATASET] stopped by a signal"
     exit 143
   fi
@@ -1539,9 +1605,11 @@ while :; do
   # is attributable, not worth abandoning a backfill mid-queue.
   driver_rc=0
   convert_dataset_exclusive "$id" "$version" retry-pending || driver_rc=$?
-  if [[ -n "$STOP_REQUESTED" ]]; then
+  if [[ "$driver_rc" -ne 0 && -n "$STOP_REQUESTED" ]]; then
     # An operator stop, not a failure of the dataset: no attempt is spent. The row
-    # stays inprogress and the stale sweep returns it to pending after six hours.
+    # stays inprogress and the stale sweep returns it to pending after six hours. (A
+    # conversion that FINISHED before the stop took effect is recorded below first:
+    # days of work are not discarded for a signal that arrived a moment late.)
     log "[$id] stopped by a signal; its queue row stays inprogress until the stale sweep returns it to pending"
     exit 143
   fi
@@ -1561,6 +1629,10 @@ while :; do
     record_conversion_failure "$id"
   fi
   n=$((n + 1))
+  if [[ -n "$STOP_REQUESTED" ]]; then
+    log "[$id] done; stopping on a signal (queue persists; next run continues)"
+    exit 143
+  fi
   if [[ "$LIMIT" -gt 0 && "$n" -ge "$LIMIT" ]]; then
     log "reached --limit $LIMIT; stopping (queue persists; next run continues)"
     break

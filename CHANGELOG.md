@@ -31,7 +31,7 @@ earlier releases are described only by their generated notes.
   so a crontab that still says `ZARR_JOBS=24` does not give every slot 24.
   `zarr_queue.py heartbeat` is new, and the script sends it every five minutes while a queue-claimed dataset converts,
   so a conversion longer than the six-hour stale window is not reclaimed by another slot's reconcile.
-  A TERM or INT to a slot or to the tick stops the drivers it started and spends no attempt.
+  A TERM to a slot or to the tick (or an INT to a slot run directly) stops the drivers it started and spends no attempt, and a stop that arrives just after a driver has finished still records the result.
   A one-off `--dataset` run takes the first free slot and refuses to start on a dataset another slot or run is converting.
   `--stats` no longer takes a slot, `--limit` now caps each slot rather than the tick,
   and counts such as `ZARR_SLOTS` must be plain decimal integers (`08` is refused, not read as octal).
