@@ -46,6 +46,7 @@ from zarr_queue import (  # type: ignore[import-not-found]  # noqa: E402
     fetch_manifest_paths,
     fetch_requeue_requests,
     fetch_zarr_index,
+    heartbeat,
     index_failure_keys,
     index_store_keys,
     main,
@@ -530,6 +531,62 @@ class QueueTest(unittest.TestCase):
         res = reconcile(self.conn, [("nm000001", "1")], 3600)
         self.assertEqual(res["recovered_stale"], 1)
         self.assertEqual(self.status("nm000001"), "pending")
+
+    def stale(self, dataset_id, seconds=99999):
+        self.conn.execute(
+            "UPDATE jobs SET updated_at=? WHERE dataset_id=?",
+            (int(time.time()) - seconds, dataset_id),
+        )
+        self.conn.commit()
+
+    def test_a_heartbeat_keeps_a_long_conversion_from_being_reclaimed(self):
+        """Several drivers drain one queue, and each starts with a reconcile: a
+        dataset that has been converting for longer than the stale window must not be
+        handed to a second driver while its own is still working on it."""
+        reconcile(self.conn, [("nm000001", "1"), ("nm000002", "1")], 3600)
+        claim_next(self.conn)
+        claim_next(self.conn)
+        self.stale("nm000001")
+        self.stale("nm000002")
+        self.assertEqual(heartbeat(self.conn, "nm000001"), 1)  # still converting
+        res = reconcile(self.conn, [("nm000001", "1"), ("nm000002", "1")], 3600)
+        self.assertEqual(res["recovered_stale"], 1)  # only the abandoned one
+        self.assertEqual(self.status("nm000001"), "inprogress")
+        self.assertEqual(self.status("nm000002"), "pending")
+
+    def test_a_heartbeat_touches_nothing_that_is_not_inprogress(self):
+        reconcile(self.conn, [("nm000001", "1"), ("nm000002", "1"), ("nm000003", "1")], 3600)
+        claim_next(self.conn)
+        mark_done(self.conn, "nm000001", "1")
+        claim_next(self.conn)
+        mark_fail(self.conn, "nm000002", "boom", 1, 1800)  # -> failed
+        for dataset_id in ("nm000001", "nm000002", "nm000003", "nm999999"):
+            self.stale(dataset_id)
+            self.assertEqual(heartbeat(self.conn, dataset_id), 0)
+        stamps = {r["dataset_id"]: r["updated_at"] for r in self.conn.execute(
+            "SELECT dataset_id, updated_at FROM jobs")}
+        self.assertTrue(all(t < time.time() - 99000 for t in stamps.values()))
+        self.assertEqual(self.status("nm000001"), "done")
+        self.assertEqual(self.status("nm000002"), "failed")
+        self.assertEqual(self.status("nm000003"), "pending")
+
+    def test_the_heartbeat_command_prints_what_it_touched(self):
+        db = os.path.join(self._tmp.name, "q.db")
+        reconcile(self.conn, [("nm000001", "1")], 3600)
+        claim_next(self.conn)
+        self.stale("nm000001")
+        out = io.StringIO()
+        saved = sys.argv
+        try:
+            with contextlib.redirect_stdout(out):
+                for dataset_id in ("nm000001", "nm000404"):
+                    sys.argv = ["zarr_queue.py", "--db", db, "heartbeat", dataset_id]
+                    self.assertEqual(main(), 0)
+        finally:
+            sys.argv = saved
+        self.assertEqual(out.getvalue().split(), ["1", "0"])
+        row = self.conn.execute("SELECT updated_at FROM jobs").fetchone()
+        self.assertGreater(row["updated_at"], time.time() - 60)
 
     def test_backoff_capped(self):
         self.assertEqual(backoff_seconds(1, 100), 100)

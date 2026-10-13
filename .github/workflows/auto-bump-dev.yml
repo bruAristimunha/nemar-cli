@@ -21,6 +21,25 @@ name: Auto Bump Dev
 #   - Push as nemar-bot. The commit message starts with the standard
 #     "chore: bump version to ..." prefix so this workflow self-filters
 #     on the next push event.
+#
+# THIS WORKFLOW ALSO OWNS THE DEV DEPLOY AND THE DEV PUBLISH. After `bump`,
+# `plan` picks the commit dev ends at: the bump when there is one, else the
+# pushed commit. `deploy` runs deploy-backend.yml on it (a reusable-workflow
+# call) when there was a bump or the push touched backend/**, shared/** or
+# deploy-backend.yml (the paths that used to trigger a dev deploy directly).
+# `publish` dispatches npm-publish.yml once, which builds the head of dev;
+# every push to dev used to publish itself. The bump's own push does neither:
+# the run that made it has. So one merge is one dev deploy, at the bumped
+# version, and one dev publish, where it used to be two of each (see the notes
+# in deploy-backend.yml and npm-publish.yml). Deciding here, after the bump, is
+# what makes that possible: when the merge commit's push arrives nothing yet
+# knows whether a bump will follow.
+#
+# The bump commit keeps no skip-ci marker on purpose. It is always the head of
+# dev, so it is the head of every release pull request (dev -> main), and a
+# marker there would stop that pull request's required checks from ever
+# running. Its push instead starts only cheap jobs: Tests and this workflow
+# recognize it (scripts/ci/classify-push.sh) and skip their work.
 
 on:
   push:
@@ -38,6 +57,11 @@ jobs:
       && !startsWith(github.event.head_commit.message, 'chore: bump version to')
       && !contains(github.event.head_commit.message, '[skip-bump]')
     runs-on: ubuntu-latest
+    # p95 16 s (50 green runs to 2026-10-13); 10 is the floor.
+    timeout-minutes: 10
+    outputs:
+      # The bump commit this run pushed; empty when it pushed none.
+      sha: ${{ steps.push.outputs.sha }}
     steps:
       - name: Checkout dev
         uses: actions/checkout@v4
@@ -96,12 +120,126 @@ jobs:
         run: ./scripts/bump-version.sh "${{ steps.compute.outputs.arg }}"
 
       - name: Push bump commit
+        id: push
         if: steps.compute.outputs.skip == 'false'
         run: |
           # bump-version.sh has already created the commit; push it.
           # If a parallel push raced us, abort: the next push will
-          # trigger this workflow again from the new HEAD.
-          git push origin dev || {
+          # trigger this workflow again from the new HEAD. With no
+          # `sha` output, `plan` picks the pushed commit instead.
+          if git push origin dev; then
+            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          else
             echo "::warning::push to dev rejected (likely a concurrent push); skipping"
-            exit 0
-          }
+          fi
+
+  # The one dev deploy and dev publish for this push (see the note at the top).
+  # Runs whatever `bump` did: skipped (a bot or bump commit, [skip-bump]), no
+  # bump (no -devN suffix, push rejected) or failed; only a canceled run
+  # deploys and publishes nothing.
+  plan:
+    needs: bump
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    # New job: a checkout and the classifier; 10 is the floor.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      # The commit to deploy to the dev worker; empty for no deploy.
+      deploy_sha: ${{ steps.plan.outputs.deploy_sha }}
+      # 'true' when this push owes the dev publish.
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - name: Checkout code
+        if: needs.bump.outputs.sha == ''
+        uses: actions/checkout@v4
+
+      - name: Classify the push
+        id: push
+        if: needs.bump.outputs.sha == ''
+        run: scripts/ci/classify-push.sh >> "$GITHUB_OUTPUT"
+
+      # Runs even when the checkout or the classifier failed, and then fails open
+      # like the classifier does: no answer means "not the bot's own bump" and
+      # "touched backend paths", so the push is deployed and published as it
+      # would have been when it triggered both itself.
+      - name: Decide what to deploy and publish
+        id: plan
+        if: ${{ !cancelled() }}
+        env:
+          BUMP_SHA: ${{ needs.bump.outputs.sha }}
+          AUTO_BUMP: ${{ steps.push.outputs.auto_bump }}
+          DEPLOY_PATHS: ${{ steps.push.outputs.deploy_paths }}
+        run: |
+          if [ -n "$BUMP_SHA" ]; then
+            # The bump touches backend/package.json, so a bumped merge always
+            # redeployed dev; it still does, once, at the bump.
+            echo "deploy_sha=$BUMP_SHA" >> "$GITHUB_OUTPUT"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "dev deploy and publish: the bump $BUMP_SHA"
+          elif [ "$AUTO_BUMP" = "true" ]; then
+            # This push IS a bump this workflow made; the run that made it
+            # deployed and published it.
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "dev deploy and publish: none, the run that pushed this bump did both"
+          else
+            # Every other push to dev published before, so it still does.
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            if [ "$DEPLOY_PATHS" != "false" ]; then
+              echo "deploy_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+              echo "dev deploy: the pushed commit $GITHUB_SHA (no bump)"
+            else
+              echo "dev deploy: none, the push touched no backend path"
+            fi
+          fi
+
+  # Its own job so a failed dispatch cannot hold back the deploy, or the reverse.
+  publish:
+    needs: plan
+    if: ${{ !cancelled() && needs.plan.outputs.publish == 'true' }}
+    runs-on: ubuntu-latest
+    # New job: one API call; 10 is the floor.
+    timeout-minutes: 10
+    permissions:
+      actions: write # gh workflow run
+    steps:
+      # Builds the head of dev, like the push run it replaces. A dispatch, not a
+      # call: npm trusts this repository's npm-publish.yml as the publisher, and
+      # main's copy already accepts a dispatch.
+      - name: Dispatch the dev publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          for attempt in 1 2 3; do
+            if gh workflow run npm-publish.yml --ref dev; then
+              echo "::notice::dispatched the dev publish"
+              exit 0
+            fi
+            echo "::warning::dispatch attempt $attempt failed"
+            sleep 10
+          done
+          echo "::error::could not dispatch the dev publish; run: gh workflow run npm-publish.yml --ref dev"
+          exit 1
+
+  # deploy-backend.yml's test-gate, then deploy-dev, on the planned commit.
+  #
+  # One at a time, in the order the pushes planned them, so an older commit
+  # (a merge whose bump push was rejected) cannot finish its gate later and
+  # deploy over a newer bump. The whole call waits, gate included, as the
+  # per-ref group did when a push to dev deployed itself; a newer waiting call
+  # replaces an older waiting one, and the newer commit contains the older.
+  deploy:
+    needs: plan
+    if: ${{ !cancelled() && needs.plan.outputs.deploy_sha != '' }}
+    concurrency:
+      group: auto-bump-dev-deploy
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/deploy-backend.yml
+    with:
+      sha: ${{ needs.plan.outputs.deploy_sha }}
+    secrets: inherit

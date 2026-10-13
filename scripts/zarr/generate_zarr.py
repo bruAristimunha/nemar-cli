@@ -102,6 +102,13 @@ from typing import Any, Literal, NamedTuple, Protocol, TypedDict
 # is run as a script and when the test suite imports it.
 from zarr_queue import ZARR_ENGINE_VERSION
 
+# Several drivers can convert on one node at once (hallu-zarr.sh slots). Each admits
+# against the RAM and scratch the others have reserved and not yet taken, through a
+# ledger they share (ADR 0101). A sibling module for the same reason as the import
+# above.
+from admission_ledger import SETTING_ERRORS as LEDGER_SETTING_ERRORS
+from admission_ledger import Ledger, LedgerBusy, process_start_ticks
+
 # --- Path classification -------------------------------------------------
 
 # Primary recording containers biosigIO reads directly. A change to one of
@@ -581,6 +588,82 @@ def reset_peak_rss() -> bool:
         return False
 
 
+class AnonPeak:
+    """The highest ``RssAnon`` this process has held since ``reset``, sampled.
+
+    ``VmHWM`` (``peak_rss_bytes``) counts every resident page, and a streamed
+    recording's scratch memmap is resident too: file-backed, reclaimable, and already
+    counted as available by ``MemAvailable``. Admission reserves anonymous memory, the
+    RLIMIT_DATA backstop limits anonymous memory, and the ledger credits anonymous
+    memory, so comparing a reserve with ``VmHWM`` called a recording that took 6 GiB
+    "under-reserved" at 48 (measured on nm000276, 2026-10-13: ``RssAnon`` held at
+    6.2 GiB while ``VmHWM`` rose past 10 GiB with the memmap). The kernel keeps no
+    high-water mark for ``RssAnon``, so a thread reads it a few times a second; an
+    allocation that lives for less than the interval can be missed, which is why this
+    is a measurement to calibrate with and not a bound to enforce."""
+
+    def __init__(self, interval: float = 0.25, proc_root: str = "/proc") -> None:
+        self.interval = interval
+        self.proc_root = proc_root
+        self._lock = threading.Lock()
+        self._peak: int | None = None
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            now = anon_rss_bytes(os.getpid(), self.proc_root)
+            if now is None:
+                continue
+            with self._lock:
+                if self._peak is not None and now > self._peak:
+                    self._peak = now
+
+    def reset(self) -> bool:
+        """Start measuring afresh from the memory held now; False where it cannot be
+        read (off Linux, or a kernel older than 4.5)."""
+        now = anon_rss_bytes(os.getpid(), self.proc_root)
+        if now is None:
+            with self._lock:
+                self._peak = None
+            return False
+        with self._lock:
+            self._peak = now
+        # A forked worker inherits this object but not its thread.
+        if self._thread is None or not self._thread.is_alive():
+            self._stop = threading.Event()
+            self._thread = threading.Thread(target=self._run, name="anon-peak", daemon=True)
+            self._thread.start()
+        return True
+
+    def close(self) -> None:
+        """Stop sampling. A worker never needs to (it ends with its process); tests do."""
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2)
+
+    def peak(self) -> int | None:
+        now = anon_rss_bytes(os.getpid(), self.proc_root)
+        with self._lock:
+            if self._peak is None:
+                return None
+            if now is not None and now > self._peak:
+                self._peak = now
+            return self._peak
+
+
+_ANON_PEAK = AnonPeak()
+
+
+def reset_peak_anon() -> bool:
+    return _ANON_PEAK.reset()
+
+
+def peak_anon_bytes() -> int | None:
+    return _ANON_PEAK.peak()
+
+
 def peak_rss_bytes() -> int | None:
     """This process's peak RSS since the last `reset_peak_rss`, or None where that
     cannot be read. Prefers /proc (bytes we can trust the units of); falls back to
@@ -785,7 +868,10 @@ def note_measurement(result: dict, projections: dict, measured: dict) -> str | N
     untrustworthily) and must be dropped, while a genuine 0 would be a real
     reading and must not be silently conflated with it.
     """
-    rss = result.get("peak_rss")
+    # Anonymous memory when it was measured: that is what a reserve is, and the
+    # resident figure also counts the scratch memmap's file-backed pages.
+    anon = result.get("peak_anon")
+    rss = anon if anon is not None else result.get("peak_rss")
     primary = result.get("primary")
     proj = projections.get(primary)
     if rss is None or not proj:
@@ -799,8 +885,12 @@ def note_measurement(result: dict, projections: dict, measured: dict) -> str | N
     # "reserved" means the slack-inflated charge, matching admission's vocabulary.
     reserved = proj * MEM_LIMIT_SLACK
     if rss > reserved:
+        what = (
+            f"{rss / 1024**3:.1f} GiB of anonymous memory"
+            if anon is not None else f"{rss / 1024**3:.1f} GiB"
+        )
         return (
-            f"::warning::under-reserved {primary}: needed {rss / 1024**3:.1f} GiB, "
+            f"::warning::under-reserved {primary}: needed {what}, "
             f"reserved {reserved / 1024**3:.1f} GiB ({rss / proj:.1f}x its "
             f"projection) -- see INMEM_MEM_FACTOR_BY_EXT (#1111)"
         )
@@ -975,7 +1065,8 @@ STORAGE_STATE_CODES = frozenset({"annex_object_missing"})
 
 
 def memory_failure_result(
-    primary: str, exc: BaseException, peak_rss: int | None = None
+    primary: str, exc: BaseException, peak_rss: int | None = None,
+    peak_anon: int | None = None,
 ) -> dict:
     """The `convert_one` result for a recording that ran out of memory mid-convert.
 
@@ -992,6 +1083,7 @@ def memory_failure_result(
         "code": RecordingMemoryExceeded.code,
         "detail": failure_detail(exc),
         "peak_rss": peak_rss,
+        "peak_anon": peak_anon,
     }
 
 
@@ -1171,15 +1263,33 @@ class ChannelCountMismatch(Exception):
 # float64, and the multiplier below covers the resampled copy and resample_poly's
 # scratch alongside it.
 STREAM_CHANNEL_EXPANSION = float(os.environ.get("ZARR_STREAM_CHANNEL_EXPANSION", "12"))
+# The 12 above is `8 / 2 * 3`: a float64 sample is four int16 samples, and three such
+# channels can be live at once (the channel, and the temporaries of the int16
+# quantization). It is right for a recording stored in two bytes per sample, which is
+# what admission has to assume when it cannot tell. A recording stored in four bytes per
+# sample (float32 BrainVision, which is what the 100 to 145 GiB iEEG of nm000276 is)
+# holds half as many samples per byte, so the same channel needs half the float64. This
+# is how many float64 channels to provision for in that case: three measured, plus a third
+# of margin. The result is never above STREAM_CHANNEL_EXPANSION.
+STREAM_CHANNEL_COPIES = float(os.environ.get("ZARR_STREAM_CHANNEL_COPIES", "4"))
 
 
-def streaming_peak_bytes(size_bytes: int, n_channels: int | None) -> int:
+def streaming_peak_bytes(
+    size_bytes: int, n_channels: int | None, sample_bytes: int | None = None
+) -> int:
     """Projected peak for the streaming path: the flat floor, raised when one
     channel alone would exceed it. Falls back to the flat value when the channel
-    count is unknown."""
+    count is unknown.
+
+    ``sample_bytes`` is the width the recording is stored at when that is known
+    (``sample_bytes_from_sidecar``); without it the narrowest width is assumed, which
+    is the larger projection."""
     if not n_channels or n_channels <= 0:
         return STREAM_PEAK_BYTES
-    per_channel = int(size_bytes / n_channels * STREAM_CHANNEL_EXPANSION)
+    expansion = STREAM_CHANNEL_EXPANSION
+    if sample_bytes and sample_bytes > 0:
+        expansion = min(expansion, 8.0 / sample_bytes * STREAM_CHANNEL_COPIES)
+    per_channel = int(size_bytes / n_channels * expansion)
     return max(STREAM_PEAK_BYTES, per_channel)
 
 
@@ -1188,6 +1298,7 @@ def projected_peak_bytes(
     size_bytes: int,
     n_channels: int | None = None,
     maxshield: bool = False,
+    sample_bytes: int | None = None,
 ) -> int:
     """Estimated peak RAM to convert this recording: the streaming path's
     channel-aware bound, or the float64 blow-up for the in-memory path. Drives the
@@ -1200,7 +1311,7 @@ def projected_peak_bytes(
     """
     if should_stream(primary_local, size_bytes):
         conversion = max(
-            streaming_peak_bytes(size_bytes, n_channels),
+            streaming_peak_bytes(size_bytes, n_channels, sample_bytes),
             int(size_bytes * stream_factor_for(primary_local)),
         )
     else:
@@ -1328,7 +1439,16 @@ def _tracked_call(worker, primary: str, reserve: int, track_dir: str) -> dict:
     start = anon_rss_bytes(os.getpid())
     try:
         with open(path, "w") as fh:
-            json.dump({"reserve": int(reserve), "rss_anon_start": start}, fh)
+            # `start` lets the ledger tell this worker from a later process that is given
+            # its pid, when it decides whether a killed driver's workers are still running.
+            json.dump(
+                {
+                    "reserve": int(reserve),
+                    "rss_anon_start": start,
+                    "start": process_start_ticks(os.getpid()),
+                },
+                fh,
+            )
     except OSError:
         pass  # untracked: the parent then counts the whole reserve as outstanding
     try:
@@ -1336,6 +1456,41 @@ def _tracked_call(worker, primary: str, reserve: int, track_dir: str) -> dict:
     finally:
         with contextlib.suppress(OSError):
             os.remove(path)
+
+
+def tracked_taken_bytes(
+    track_dir: str | None, in_flight_reserve: int, proc_root: str = "/proc"
+) -> int:
+    """How much of ``in_flight_reserve`` bytes of RAM the workers recorded in
+    ``track_dir`` have already taken: for each, its ``RssAnon`` now minus what it
+    started with, no more than its own reserve, and no more in all than is in flight
+    (a record can outlive its recording by an instant). A worker that is gone, or
+    whose usage cannot be read, has taken nothing as far as this can tell, so its
+    whole reserve stays owed. Shared by a driver's own ceiling and by the ledger, which
+    asks it of its peers' directories."""
+    if in_flight_reserve <= 0 or not track_dir:
+        return 0
+    taken = 0
+    try:
+        names = os.listdir(track_dir)
+    except OSError:
+        names = []
+    for name in names:
+        pid_text, _, ext = name.partition(".")
+        if ext != "json" or not pid_text.isdigit():
+            continue
+        try:
+            with open(os.path.join(track_dir, name)) as fh:
+                rec = json.load(fh)
+            reserve = int(rec["reserve"])
+            start = rec.get("rss_anon_start")
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        now = anon_rss_bytes(int(pid_text), proc_root)
+        if now is None or not isinstance(start, int):
+            continue
+        taken += min(reserve, max(0, now - start))
+    return min(taken, in_flight_reserve)
 
 
 def live_admission_ceiling(
@@ -1373,30 +1528,7 @@ def live_admission_ceiling(
     if avail is None:
         return static_ceiling
     frac = float(os.environ.get("ZARR_MEM_HEADROOM_FRAC", "0.8"))
-    taken = 0
-    if running_peak > 0 and track_dir:
-        try:
-            names = os.listdir(track_dir)
-        except OSError:
-            names = []
-        for name in names:
-            pid_text, _, ext = name.partition(".")
-            if ext != "json" or not pid_text.isdigit():
-                continue
-            try:
-                with open(os.path.join(track_dir, name)) as fh:
-                    rec = json.load(fh)
-                reserve = int(rec["reserve"])
-                start = rec.get("rss_anon_start")
-            except (OSError, ValueError, KeyError, TypeError):
-                continue
-            now = anon_rss_bytes(int(pid_text), proc_root)
-            if now is None or not isinstance(start, int):
-                continue
-            taken += min(reserve, max(0, now - start))
-        # Never credit more than is in flight: a file the worker has not yet
-        # removed can outlive its recording by an instant.
-        taken = min(taken, running_peak)
+    taken = tracked_taken_bytes(track_dir, running_peak, proc_root)
     ceiling = int(avail * frac) + taken
     if hard_ceiling:
         ceiling = min(ceiling, hard_ceiling)
@@ -1455,7 +1587,7 @@ def _scratch_setting(name: str, default: float, *, minimum: float) -> float:
 # loads this module, and an exception here would kill each before it could write a
 # callback, so nothing would say why. The defaults stand and the messages wait here
 # for `main()`, which refuses to run and reports them through the callback.
-SCRATCH_SETTING_ERRORS: list[str] = []
+SCRATCH_SETTING_ERRORS: list[str] = list(LEDGER_SETTING_ERRORS)
 
 
 def _scratch_setting_or_default(name: str, default: float, *, minimum: float) -> float:
@@ -1564,6 +1696,10 @@ class ScratchGate:
         self._usage = usage
         self._last_good: int | None = None
         self._warned = False
+        # The budget before it is raised to zero: negative when the volume is short of the
+        # headroom. Admission across drivers judges a recording "alone" from this, because
+        # adding the peers' written scratch to a clamped zero would credit the headroom.
+        self.last_raw: int | None = None
 
     def volume(self) -> tuple[int, int] | None:
         """``(free, total)`` bytes of the volume right now, or None if unreadable."""
@@ -1590,9 +1726,9 @@ class ScratchGate:
                     flush=True,
                 )
             return self._last_good if self._last_good is not None else 0
-        budget = scratch_budget_bytes(
-            free, held_scratch_bytes(self.run_root, in_flight), self.headroom
-        )
+        held = held_scratch_bytes(self.run_root, in_flight)
+        self.last_raw = free + held - self.headroom
+        budget = scratch_budget_bytes(free, held, self.headroom)
         self._last_good = budget
         self._warned = False
         return budget
@@ -3564,6 +3700,60 @@ def expected_channel_count_for(
         )
         return None
     return channels_tsv_row_count(text) or None
+
+
+# Widths a BrainVision binary file is written in: `INT_16` and `IEEE_FLOAT_32`.
+_BRAINVISION_SAMPLE_BYTES = (2, 4)
+
+
+def snap_sample_width(bytes_per_sample: float) -> int | None:
+    """The BrainVision sample width ``bytes_per_sample`` is within 3% of, or None.
+    The slack covers a header and markers; a figure that is not close to a real width
+    means the duration or the channel count describes something else, and is not used."""
+    if not math.isfinite(bytes_per_sample):
+        return None
+    for width in _BRAINVISION_SAMPLE_BYTES:
+        if abs(bytes_per_sample - width) <= 0.03 * width:
+            return width
+    return None
+
+
+def sample_bytes_from_sidecar(
+    repo_dir: str,
+    primary_path: str,
+    head_files: set[str],
+    head: str,
+    size_bytes: int,
+    n_channels: int | None,
+) -> int | None:
+    """Bytes per sample a BrainVision recording is stored in, worked out from what
+    admission can read without downloading it: the recording's size, its channel count,
+    and the sidecar's ``SamplingFrequency`` and ``RecordingDuration`` (git-tracked text).
+    None when any of them is missing, or when they do not add up to a width a
+    BrainVision file is written in, in which case the narrowest width is assumed.
+
+    Only ``.vhdr``: the header that states the width (``BinaryFormat``) is annexed and
+    is not there to read yet, and BrainVision is the format whose recordings reach
+    hundreds of GiB. An answer of 2 is the default and changes nothing; an answer of 4
+    is what lets a float32 recording be projected at the memory it needs rather than at
+    twice that."""
+    if lower_ext(primary_path) != ".vhdr" or not n_channels or n_channels <= 0 or size_bytes <= 0:
+        return None
+    sidecar = posixpath.splitext(primary_path)[0] + ".json"
+    if sidecar not in head_files:
+        return None
+    text = _read_repo_text(repo_dir, head, sidecar)
+    if text is None:
+        return None
+    try:
+        doc = json.loads(text)
+        rate = float(doc["SamplingFrequency"])
+        seconds = float(doc["RecordingDuration"])
+    except (ValueError, KeyError, TypeError):
+        return None
+    if not (math.isfinite(rate) and math.isfinite(seconds) and rate > 0 and seconds > 0):
+        return None
+    return snap_sample_width(size_bytes / (n_channels * rate * seconds))
 
 
 def channels_tsv_row_count(text: str) -> int:
@@ -8361,6 +8551,7 @@ def convert_one(primary: str, peak_bytes: int | None = None) -> dict:
         # if believed, a pointless factor increase. Mark the sample untrusted
         # rather than blend it into calibration.
         rss_trusted = reset_peak_rss()
+        reset_peak_anon()
         if not rss_trusted and not _WARNED_NO_RESET[0]:
             _WARNED_NO_RESET[0] = True
             print(
@@ -8644,6 +8835,7 @@ def convert_one(primary: str, peak_bytes: int | None = None) -> dict:
                 "size_bytes": annex_key_size(primary_key),
             },
             "peak_rss": peak_rss_bytes() if rss_trusted else None,
+            "peak_anon": peak_anon_bytes() if rss_trusted else None,
         }
     except MemoryError as exc:
         # The RLIMIT_DATA backstop fired (or the allocator genuinely ran out).
@@ -8657,7 +8849,8 @@ def convert_one(primary: str, peak_bytes: int | None = None) -> dict:
         # calibration summary look cleanest exactly where it was most wrong.
         log_memory_failure(primary, exc)
         return memory_failure_result(
-            primary, exc, peak_rss_bytes() if rss_trusted else None
+            primary, exc, peak_rss_bytes() if rss_trusted else None,
+            peak_anon_bytes() if rss_trusted else None,
         )
     except Exception as exc:  # noqa: BLE001 - isolate one bad recording
         # The backstop does not always surface as MemoryError: see
@@ -8665,7 +8858,8 @@ def convert_one(primary: str, peak_bytes: int | None = None) -> dict:
         if is_memory_exhaustion(exc):
             log_memory_failure(primary, exc)
             return memory_failure_result(
-                primary, exc, peak_rss_bytes() if rss_trusted else None
+                primary, exc, peak_rss_bytes() if rss_trusted else None,
+                peak_anon_bytes() if rss_trusted else None,
             )
         # biosigIO read failures carry a stable `.code` (not_continuous,
         # corrupt_or_truncated, ...) so the index can tell the viewer WHY a
@@ -8736,6 +8930,92 @@ def _gib(n: float) -> str:
 def deferral_message(charge: int, budget: int) -> str:
     """What the index's ``last_error`` says about a deferred recording."""
     return f"deferred: needs {_gib(charge)} GiB of scratch, {_gib(budget)} GiB available"
+
+
+# --- Admission across drivers (ADR 0101) -----------------------------------------
+# How long a driver with nothing in flight waits, held up only by what its peers have
+# reserved, before it hands its queue back and lets this slot move to another
+# dataset. Longer than the ledger's starvation threshold on purpose: the driver that
+# has waited longest is let in first, and only a wait that outlives that priority
+# is given up.
+LEDGER_WAIT_SECONDS = _scratch_setting_or_default("ZARR_LEDGER_WAIT_SECONDS", 3600.0, minimum=0.0)
+
+# Constant text, no counts: the index is left untouched when a run defers everything it
+# was asked to and the index already carries a note starting with ``deferred:``, so a
+# note that changed every tick would rewrite the index every tick.
+PEER_DEFERRAL_MESSAGE = (
+    "deferred: the node's memory and scratch are reserved by other conversions; "
+    "retried automatically"
+)
+LEDGER_UNUSABLE_MESSAGE = (
+    "deferred: the node's admission ledger could not be used; retried automatically"
+)
+
+
+def ledger_from_env() -> Ledger | None:
+    """The shared admission ledger named by ``ZARR_LEDGER_DIR``, or None to admit
+    against this driver's own measurements alone (the behavior before ADR 0101, and
+    the right one when this is the only driver on the node)."""
+    root = os.environ.get("ZARR_LEDGER_DIR", "").strip()
+    if not root:
+        return None
+    try:
+        return Ledger(root)
+    except OSError as exc:
+        print(
+            f"::error::cannot use the admission ledger at {root} ({exc}); this driver "
+            "admits without regard to other conversions on the node, which can "
+            "overcommit it when several run at once",
+            flush=True,
+        )
+        return None
+
+
+def converts_in_process(cpu_cap: int, ledger: Ledger | None, convert: list) -> bool:
+    """Whether the recordings are converted in this process (``--jobs 1`` with no
+    ledger, or nothing to convert) rather than through the pool."""
+    return (cpu_cap == 1 and ledger is None) or not convert
+
+
+def close_ledger(ledger: Ledger | None) -> None:
+    """Withdraw this driver from the ledger. Best effort: a peer prunes the file of a
+    driver that is gone, so failing to remove it costs a few seconds of stale
+    reservations, never correctness."""
+    if ledger is None:
+        return
+    try:
+        with ledger.exclusive():
+            ledger.close()
+    except (LedgerBusy, OSError) as exc:
+        print(f"::warning::could not withdraw from the admission ledger: {exc}", flush=True)
+
+
+def _ledger_held(paths: list[str]) -> int:
+    return sum(allocated_bytes(path) for path in paths)
+
+
+def defer_for_peers(
+    queue, sink, waited_seconds: float, unusable: bool = False, cause: str = ""
+) -> None:
+    """Hand ``queue`` back unreported: it fits this node, but other conversions on it
+    hold what it needs (or, with ``unusable``, the ledger that says what they hold could
+    not be used for as long). The scratch deferral's sibling (``defer_unfit``) and
+    recorded the same way, so the recordings stay pending, spend no attempt, and are
+    retried at the shortest delay."""
+    for primary in queue:
+        if sink is not None:
+            sink[primary] = LEDGER_UNUSABLE_MESSAGE if unusable else PEER_DEFERRAL_MESSAGE
+    why = (
+        "the admission ledger could not be used" + (f" ({cause})" if cause else "")
+        if unusable
+        else "memory and scratch that other conversions on this node had reserved"
+    )
+    print(
+        f"::warning::deferring {len(queue)} recording(s): waited "
+        f"{waited_seconds / 60:.0f} min; {why}; they stay pending without spending "
+        "an attempt",
+        flush=True,
+    )
 
 
 def defer_unfit(queue, scratch_peaks, budget, volume, sink) -> None:
@@ -8830,7 +9110,7 @@ def _next_admission(
     pending_peaks: list[int], in_flight_count: int, running_peak: int,
     cpu_cap: int, ram_ceiling: int,
     *, pending_scratch: list[int] | None = None, running_scratch: int = 0,
-    scratch_budget: int | None = None,
+    scratch_budget: int | None = None, others_in_flight: bool = False,
 ) -> int | None:
     """Index into ``pending_peaks`` of the next recording to dispatch, or ``None``
     to wait for a running one to finish. Admittable when a worker slot is free AND
@@ -8843,10 +9123,15 @@ def _next_admission(
     reported by the worker's own preflight, but a recording that does not fit the
     disk would spend hours downloading before it hit ENOSPC, so scratch is checked
     even when nothing is in flight: a ``None`` with nothing running means what is
-    left cannot be admitted at all (see ``_drain_with_admission``)."""
+    left cannot be admitted at all (see ``_drain_with_admission``).
+
+    With ``others_in_flight`` (another driver on this node holds a reservation) the
+    run-alone exception is withdrawn: this driver being idle does not make the NODE
+    idle, and several drivers each running a recording that does not fit would be the
+    overcommit the ledger exists to prevent. The recording waits instead."""
     if in_flight_count >= cpu_cap:
         return None
-    idle = in_flight_count == 0
+    idle = in_flight_count == 0 and not others_in_flight
     gated = pending_scratch is not None and scratch_budget is not None
 
     def fits_scratch(j: int) -> bool:
@@ -8865,7 +9150,7 @@ def _next_admission(
 def _drain_with_admission(
     convert, peaks, cpu_cap, ram_ceiling, ctx, record, worker=None, memory_retry=None,
     ceiling=None, scratch_peaks=None, scratch_budget=None, deferred=None,
-    scratch_volume=None,
+    scratch_volume=None, ledger=None,
 ) -> tuple[int, int]:
     """Run ``convert_one`` over ``convert`` in a pool of up to ``cpu_cap`` workers,
     dispatching a recording only while the SUM of in-flight projected peaks stays
@@ -8921,6 +9206,17 @@ def _drain_with_admission(
     since one sample can land in someone else's spike. A memory-failed recording
     held for the serial retry that cannot fit there is reported as the memory
     failure it was, not deferred.
+
+    ``ledger`` (an ``admission_ledger.Ledger``) makes the node shared: before
+    admitting, the RAM ceiling and the scratch budget are reduced by what the OTHER
+    drivers on it have reserved and not yet taken, the run-alone exception applies
+    only when no other driver holds anything, and every admission is recorded for
+    them to read. Deciding and recording happen under the ledger's lock, so two
+    drivers cannot both admit into the same free space. A recording this driver
+    could run if it had the node to itself waits for its peers (and goes first once
+    it has waited longest); after ``LEDGER_WAIT_SECONDS`` of nothing else to do it is
+    handed back like a scratch deferral, so the slot can take another dataset. With
+    no ledger, nothing here applies.
     """
     worker = worker or convert_one
     if ceiling is None:
@@ -8965,6 +9261,7 @@ def _drain_with_admission(
         run_ctx = ctx if run_ctx is None else run_ctx
         run_peaks = peaks if run_peaks is None else run_peaks
         in_flight: dict = {}
+        tokens: dict = {}  # future -> its ledger reservation
         running_peak = 0
         # One pass observes at most one pool death, but it can surface twice (a
         # future resolving with BrokenProcessPool, and again from `submit`). Latch
@@ -8977,41 +9274,115 @@ def _drain_with_admission(
         # here would blame each in-flight sibling for the one crash.
         broken: list = []
 
-        def admit() -> None:
+        def ledger_io(call, *args, **kwargs):
+            """A ledger read or write whose I/O failure means only that the ledger cannot
+            be used this round. Narrow on purpose: the pool's own errors (``ex.submit``
+            failing to fork a worker) are not the ledger's and must propagate."""
+            try:
+                return call(*args, **kwargs)
+            except OSError as exc:
+                raise LedgerBusy(f"admission ledger I/O failed: {exc}") from exc
+
+        def ledger_paths(primary: str) -> list[str]:
+            tmp = run_ctx.get("tmp")
+            if not tmp:
+                return []
+            try:
+                return list(recording_scratch_paths(tmp, primary))
+            except ValueError:
+                return []  # a path that cannot be ours holds nothing of ours
+
+        def admit() -> bool:
+            """Dispatch what fits. True when, with the ledger, this driver has nothing
+            in flight and is held up only by its peers, so the caller waits and looks
+            again; False otherwise."""
             nonlocal running_peak
             # Read once per round, not per recording admitted: what this round
             # submits has not started, so it earns no credit and the ceiling
             # cannot move because of it. No slot, no read.
             limit: int | None = None
             budget: int | None = None
+            # The same two figures before the peers' reserves come off, to tell a
+            # recording that waits for them from one that would not fit alone.
+            limit_alone: int | None = None
+            budget_alone: int | None = None
+            peers_busy = False
+            yield_to_peer = False
             gated = scratch_peaks is not None and scratch_budget is not None
+            blockers: frozenset[int] = frozenset()
 
             def read_scratch() -> int | None:
                 return scratch_budget([p for p, _ in in_flight.values()]) if gated else None
 
-            def pick() -> int | None:
+            def look() -> None:
+                nonlocal limit, budget, limit_alone, budget_alone, peers_busy
+                nonlocal yield_to_peer, blockers
+                limit = ceiling(running_peak, track_dir)
+                budget = read_scratch()
+                limit_alone, budget_alone = limit, budget
+                if ledger is None:
+                    return
+                summary = ledger_io(ledger.others_summary, tracked_taken_bytes, _ledger_held)
+                blockers = summary.pids
+                peers_busy = bool(summary.pids)
+                yield_to_peer = ledger_io(ledger.older_peer_waiting)
+                limit = max(0, limit - summary.ram)
+                if budget is not None:
+                    # Free space already excludes what the peers have written. Were they
+                    # not there it would include it, which is what "alone" is judged on:
+                    # a recording is held up by its peers (and waits) when it would fit
+                    # without them, and does not fit the volume at all otherwise. Built
+                    # from the budget before it was raised to zero, so a volume the
+                    # peers have filled is not credited the headroom as well.
+                    raw = getattr(scratch_budget, "last_raw", None)
+                    base = budget if raw is None else raw
+                    budget_alone = max(0, base + summary.held)
+                    budget = max(0, budget - summary.scratch)
+
+            def pick(alone: bool = False) -> int | None:
+                if yield_to_peer and not alone:
+                    return None
+                lim = limit_alone if alone else limit
+                bud = budget_alone if alone else budget
                 running_scratch = (
                     sum(
                         scratch_peaks.get(q, SCRATCH_UNKNOWN_SIZE_BYTES)
                         for q, _ in in_flight.values()
                     )
-                    if budget is not None else 0
+                    if bud is not None else 0
                 )
                 return _next_admission(
                     [run_peaks[p] for p in queue], len(in_flight), running_peak,
-                    cap, limit,  # type: ignore[arg-type]
+                    cap, lim,  # type: ignore[arg-type]
                     pending_scratch=(
                         [scratch_peaks.get(p, SCRATCH_UNKNOWN_SIZE_BYTES) for p in queue]
-                        if budget is not None else None
+                        if bud is not None else None
                     ),
-                    running_scratch=running_scratch, scratch_budget=budget,
+                    running_scratch=running_scratch, scratch_budget=bud,
+                    others_in_flight=peers_busy and not alone,
                 )
+
+            def held_up_by_peers() -> bool:
+                """Nothing of ours is running, and the first thing that fits the node
+                alone does not fit it with the others on it."""
+                return (
+                    ledger is not None and not in_flight and bool(queue)
+                    and pick(alone=True) is not None
+                )
+
+            def pause() -> None:
+                if ledger is not None:
+                    ledger_io(ledger.sleep_unlocked, ADMISSION_RECHECK_SECONDS)
+                else:
+                    time.sleep(ADMISSION_RECHECK_SECONDS)
 
             while queue and len(in_flight) < cap:
                 if limit is None:
-                    limit = ceiling(running_peak, track_dir)
-                    budget = read_scratch()
+                    look()
                 idx = pick()
+                if idx is None and held_up_by_peers():
+                    last_blockers[0] = blockers
+                    return True
                 if idx is None and not in_flight and budget is not None:
                     # Nothing running will give scratch back, so one more sample is
                     # the only thing that can change the answer. A single statvfs
@@ -9019,17 +9390,20 @@ def _drain_with_admission(
                     # few times, `ADMISSION_RECHECK_SECONDS` apart, before
                     # deferring everything that is left.
                     for _ in range(SCRATCH_DEFER_RESAMPLES):
-                        time.sleep(ADMISSION_RECHECK_SECONDS)
-                        limit = ceiling(running_peak, track_dir)
-                        budget = read_scratch()
+                        pause()
+                        look()
                         idx = pick()
                         if idx is not None:
                             break
+                        if held_up_by_peers():
+                            last_blockers[0] = blockers
+                            return True
                 if idx is None:
                     if not in_flight and queue and budget is not None:
                         # Handed back, not reported: see the docstring.
                         defer_unfit(
-                            queue, scratch_peaks, budget, volume,
+                            queue, scratch_peaks,
+                            budget if budget_alone is None else budget_alone, volume,
                             deferred if defer_to is None else defer_to,
                         )
                         queue.clear()
@@ -9043,13 +9417,95 @@ def _drain_with_admission(
                 queue.pop(idx)
                 in_flight[fut] = (p, run_peaks[p])
                 running_peak += run_peaks[p]
+                if ledger is not None:
+                    tokens[fut] = ledger.reserve(
+                        run_peaks[p],
+                        scratch_peaks.get(p, SCRATCH_UNKNOWN_SIZE_BYTES)
+                        if scratch_peaks is not None else 0,
+                        ledger_paths(p),
+                    )
+                    if ledger.publish_error is not None:
+                        # The recording runs, but the others cannot read that it does.
+                        # Admit nothing more this round, and say why once.
+                        note_ledger_problem(ledger.publish_error)
+                        break
+            return False
+
+        # Which drivers the last ``admit`` found holding what this one waits for.
+        last_blockers: list[frozenset[int]] = [frozenset()]
+        last_problem: list[str] = [""]
+
+        def note_ledger_problem(exc: BaseException) -> None:
+            """Remember why the ledger could not be used, and say so the first time."""
+            text = str(exc) or type(exc).__name__
+            if text != last_problem[0]:
+                last_problem[0] = text
+                print(
+                    f"::warning::the admission ledger cannot be used ({text}); this driver "
+                    "admits nothing new until it can, and keeps what is running",
+                    flush=True,
+                )
+
+        def admit_round() -> None:
+            """``admit`` under the ledger's lock, waiting out the other drivers.
+
+            A round that cannot see the ledger (the lock is not had in time, or a read or
+            write of it fails: a full volume does that) admits nothing and leaves what is
+            running alone; it does not end the drain. With nothing running, a driver that
+            is held up by its peers, or cannot use the ledger, waits and looks again, and
+            gives its queue back after ``LEDGER_WAIT_SECONDS`` of it. Only the ledger's
+            own failures are caught: whatever the pool raises goes on up."""
+            if ledger is None:
+                admit()
+                return
+            blocked_since: float | None = None
+            while True:
+                waiting = unusable = False
+                try:
+                    ledger.acquire()
+                except (LedgerBusy, OSError) as exc:
+                    note_ledger_problem(exc)
+                    unusable = True
+                else:
+                    try:
+                        ledger_io(ledger.flush)
+                        ledger_io(ledger.set_track_dir, track_dir)
+                        waiting = admit()
+                        ledger_io(ledger.mark_waiting, waiting, blocked_by=set(last_blockers[0]))
+                        last_problem[0] = ""  # worked: a later failure is news again
+                    except LedgerBusy as exc:
+                        # Lost the lock during a pause and could not take it back, or
+                        # could not read or write the ledger.
+                        note_ledger_problem(exc)
+                        unusable = True
+                    finally:
+                        ledger.unlock()
+                if in_flight or not queue or not (waiting or unusable):
+                    return  # something is running, or nothing is left, or all is admitted
+                now = time.monotonic()
+                blocked_since = now if blocked_since is None else blocked_since
+                waited = now - blocked_since
+                if waited >= LEDGER_WAIT_SECONDS:
+                    defer_for_peers(
+                        queue, deferred if defer_to is None else defer_to, waited,
+                        unusable=unusable and not waiting, cause=last_problem[0],
+                    )
+                    queue.clear()
+                    # Forget the wait in memory whether or not the lock can be had to say
+                    # so: a later pass of this drain (the suspects, the memory retry) must
+                    # not inherit its clock and look hours old.
+                    ledger.stop_waiting()
+                    with contextlib.suppress(LedgerBusy, OSError), ledger.exclusive():
+                        ledger.flush()
+                    return
+                time.sleep(ADMISSION_RECHECK_SECONDS)
 
         track_dir = tempfile.mkdtemp(prefix="zarr-admission-")
         try:
             with ProcessPoolExecutor(
                 max_workers=cap, initializer=_init_worker, initargs=(run_ctx,)
             ) as ex:
-                admit()
+                admit_round()
                 while in_flight:
                     finished, _ = wait(
                         list(in_flight),
@@ -9059,6 +9515,8 @@ def _drain_with_admission(
                     for fut in finished:
                         p, peak = in_flight.pop(fut)
                         running_peak -= peak
+                        if ledger is not None:
+                            ledger.release(tokens.pop(fut, 0))
                         try:
                             r = fut.result()
                         except BrokenProcessPool:
@@ -9072,11 +9530,25 @@ def _drain_with_admission(
                                 "detail": failure_detail(exc),
                             }
                         report(r)
-                    admit()
+                    admit_round()
         except BrokenProcessPool:
             broke = True
         finally:
             shutil.rmtree(track_dir, ignore_errors=True)
+            if ledger is not None:
+                # Whatever is still reserved belongs to workers that are gone (the
+                # pool is shut down by now), and the track directory just removed
+                # was the one the ledger pointed peers at.
+                ledger.release_all()
+                try:
+                    with ledger.exclusive():
+                        ledger.set_track_dir(None)
+                        ledger.flush()
+                except (LedgerBusy, OSError):
+                    # The next write publishes it; peers see more reserved until then.
+                    # Nothing here may raise: this runs on the way out of a failed pass,
+                    # before the scratch it left behind is reclaimed.
+                    pass
         suspects_now = broken + [p for p, _peak in in_flight.values()]
         if broke or broken:
             pool_breaks += 1
@@ -9665,9 +10137,21 @@ def main() -> int:
         p: lower_ext(p) == ".fif" and maxshield_calibration_for(p, head_set) is not None
         for p in convert
     }
+    # How many bytes each sample of a BrainVision recording takes, from its sidecar,
+    # so a float32 recording is not projected as if it were int16 (twice the memory).
+    # Best-effort like the channel count: the narrowest width is assumed without it.
+    sample_widths: dict[str, int | None] = {}
+    for p in convert:
+        try:
+            sample_widths[p] = sample_bytes_from_sidecar(
+                repo, p, head_set, head, sizes[p], channel_counts.get(p)
+            )
+        except Exception:  # noqa: BLE001 - a projection input must not fail a run
+            sample_widths[p] = None
     projections = {
         p: projected_peak_bytes(
-            p, sizes[p], channel_counts.get(p), maxshield=maxshield_hint[p]
+            p, sizes[p], channel_counts.get(p), maxshield=maxshield_hint[p],
+            sample_bytes=sample_widths.get(p),
         )
         for p in convert
     }
@@ -9732,6 +10216,17 @@ def main() -> int:
         f"goes (#1483); a recording projected above it alone is skipped (#909)",
         flush=True,
     )
+    # Only the pool admits through the ledger. A bare `--jobs 1` run converts in this
+    # process and is not registered with the others, but a node that has a ledger gets the
+    # pool even at one worker: a slot told to run one recording at a time must still be
+    # seen by its peers (and by the serial memory retry, which only the pool has).
+    ledger = ledger_from_env() if convert else None
+    if ledger is not None:
+        print(
+            f"[zarr] admission ledger {ledger.root}: this run admits against what other "
+            "conversions on this node have reserved and not yet taken (ADR 0101)",
+            flush=True,
+        )
     # Per-dataset provenance for the stores' `nemar` root attribute (#1064).
     # Skipped when there is nothing to convert, so a no-op run makes no request.
     if early_row is not None:
@@ -9760,8 +10255,10 @@ def main() -> int:
         # --jobs 1 converts in this process, as an operator asked for. Anything
         # else, a single recording included, goes through the pool: it is the
         # only path with the serial memory retry, and a single-recording run is
-        # where a large recording most often trips its reserve (#1483).
-        if cpu_cap == 1 or not convert:
+        # where a large recording most often trips its reserve (#1483). A node with
+        # an admission ledger always uses the pool, so a slot told to run one
+        # recording at a time is still seen by the others.
+        if converts_in_process(cpu_cap, ledger, convert):
             _init_worker(ctx)
             scratch_gate = ScratchGate(tmp)
             # One at a time still has to fit: a recording that cannot is deferred
@@ -9774,11 +10271,15 @@ def main() -> int:
             def memory_retry() -> tuple[dict, int]:
                 return memory_retry_context(ctx)
 
-            pool_breaks, _max_suspects = _drain_with_admission(
-                convert, peaks, cpu_cap, ram_ceiling, ctx, record,
-                memory_retry=memory_retry,
-                scratch_peaks=scratch_peaks, deferred=deferred,
-            )
+            try:
+                pool_breaks, _max_suspects = _drain_with_admission(
+                    convert, peaks, cpu_cap, ram_ceiling, ctx, record,
+                    memory_retry=memory_retry,
+                    scratch_peaks=scratch_peaks, deferred=deferred,
+                    ledger=ledger,
+                )
+            finally:
+                close_ledger(ledger)
 
     calibration = calibration_summary(measured, projections, streamed_paths)
     if calibration:

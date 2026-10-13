@@ -62,8 +62,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -754,11 +756,37 @@ if argv[:1] and argv[0].endswith("generate_zarr.py"):
     # test, so the code comes from the test (FAKE_DRIVER_RC, default 0).
     with open(os.environ["QPY_LOG"], "a") as fh:
         fh.write("DRIVER " + " ".join(argv[1:]) + chr(10))
+    with open(os.environ["QPY_LOG"] + ".pids", "a") as fh:
+        fh.write(str(os.getpid()) + chr(10))
+    with open(os.environ["QPY_LOG"] + ".env", "a") as fh:
+        fh.write("ZARR_LEDGER_DIR=" + os.environ.get("ZARR_LEDGER_DIR", "<unset>") + chr(10))
     if os.environ.get("FAKE_DRIVER_CALLBACK") and "--callback-out" in argv:
         # The callback body the driver writes on every outcome, when a test
         # wants to see what the script does with it.
         with open(argv[argv.index("--callback-out") + 1], "w") as fh:
             fh.write(os.environ["FAKE_DRIVER_CALLBACK"])
+    import time
+
+    if os.environ.get("FAKE_DRIVER_CHILD"):
+        # A worker of the driver's: it must go with the driver when the driver is stopped.
+        import subprocess
+
+        child = subprocess.Popen(["sleep", "60"])
+        with open(os.environ["QPY_LOG"] + ".childpids", "a") as fh:
+            fh.write(str(child.pid) + chr(10))
+    delay = os.environ.get("FAKE_DRIVER_TERM_DELAY")
+    if delay:
+        # A driver that takes its time to stop, and says when it has.
+        import signal
+
+        def _stop(signum, frame):
+            time.sleep(float(delay))
+            with open(os.environ["QPY_LOG"] + ".exited", "w") as fh:
+                fh.write("exited")
+            sys.exit(143)
+
+        signal.signal(signal.SIGTERM, _stop)
+    time.sleep(float(os.environ.get("FAKE_DRIVER_SLEEP", "0")))
     sys.exit(int(os.environ.get("FAKE_DRIVER_RC", "0")))
 
 with open(os.environ["QPY_LOG"], "a") as fh:
@@ -766,17 +794,24 @@ with open(os.environ["QPY_LOG"], "a") as fh:
 
 if "reconcile" in argv:
     print(os.environ.get("QPY_RECONCILE_OUT", "queued=0 parked=0"))
+if "heartbeat" in argv:
+    print(os.environ.get("QPY_HEARTBEAT_OUT", "1"))
 if "next" in argv:
     # QPY_NEXT is the queue, one `<id>TAB<version>` per `;`, handed out one per
     # `next` call. Unset (the default) prints nothing: an empty line ends the
     # drain immediately.
+    # Each row is claimed with an exclusive create, as the real queue claims one
+    # inside a transaction, so two slots asking at once can never both be handed it.
     queue = [row for row in os.environ.get("QPY_NEXT", "").split(";") if row]
-    counter = os.environ["QPY_LOG"] + ".next"
-    taken = int(open(counter).read()) if os.path.exists(counter) else 0
-    if taken < len(queue):
-        print(queue[taken])
-    with open(counter, "w") as fh:
-        fh.write(str(taken + 1))
+    claims = os.environ["QPY_LOG"] + ".claims"
+    os.makedirs(claims, exist_ok=True)
+    for i, row in enumerate(queue):
+        try:
+            os.close(os.open(os.path.join(claims, str(i)), os.O_CREAT | os.O_EXCL))
+        except FileExistsError:
+            continue
+        print(row)
+        break
 sys.exit(0)
 """
 
@@ -799,10 +834,33 @@ FAKE_UV = """#!/bin/sh
 exit 0
 """
 
-FAKE_FLOCK = """#!/bin/sh
-# util-linux flock, absent on macOS. The single-instance lock is not what these
-# cases are about, and each runs against its own temp state dir.
-exit 0
+FLOCK_SHIM = """#!/usr/bin/env python3
+# util-linux flock, absent on macOS: `flock [-n] [-u] FD`, the only forms
+# hallu-zarr.sh uses. It locks the descriptor bash opened and passed down, so two
+# processes contend exactly as they do under the real tool.
+import fcntl
+import sys
+import time
+
+args = sys.argv[1:]
+fd = int(args[-1])
+try:
+    if "-u" in args:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    elif "-w" in args:  # wait up to N seconds, then exit 1, as util-linux does
+        deadline = time.monotonic() + float(args[args.index("-w") + 1])
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    sys.exit(1)
+                time.sleep(0.02)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_EX | (fcntl.LOCK_NB if "-n" in args else 0))
+except BlockingIOError:
+    sys.exit(1)
 """
 
 
@@ -860,7 +918,7 @@ def ack_run(tmp_path: Path):
     _write_exec(fake_bin / "uv", FAKE_UV)
     _write_exec(fake_bin / "nemar", FAKE_NEMAR)
     if shutil.which("flock") is None:
-        _write_exec(fake_bin / "flock", FAKE_FLOCK)
+        _write_exec(fake_bin / "flock", FLOCK_SHIM)
 
     qpy_log = tmp_path / "qpy.log"
     ack_file = state / ".zarr-engine-bump-ack"
@@ -873,6 +931,7 @@ def ack_run(tmp_path: Path):
         # In range for the two-sided check in setup(): [BIOSIGIO_FLOOR, BIOSIGIO_CAP).
         biosigio_version: str = "1.2.11",
         packaging_importable: bool = True,
+        background: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         # The venv's `biosigio`: a package that is only a version, which is all
         # setup()'s floor check reads. `packaging_importable=False` shadows
@@ -890,6 +949,9 @@ def ack_run(tmp_path: Path):
         env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
         env.update(
             {
+                # These cases are about one drain's handling of the queue; the slots
+                # have their own cases below.
+                "ZARR_SLOTS": "1",
                 "ZARR_DRIVER_REF": "main",
                 "ZARR_DRIVER_REPO": str(driver_repo),
                 "ZARR_VENV_DIR": str(venv_bin.parent),
@@ -901,6 +963,16 @@ def ack_run(tmp_path: Path):
         )
         if extra_env:
             env.update(extra_env)
+        if background:  # the running process, for a test that signals it
+            return subprocess.Popen(  # type: ignore[return-value]
+                ["bash", str(SCRIPT), *(args or [])],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                # Run from a shell as a background job, pytest itself starts with SIGINT
+                # ignored, and a child inherits that; a slot run directly does not.
+                preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL),
+            )
         return subprocess.run(
             ["bash", str(SCRIPT), *(args or [])],
             env=env,
@@ -1592,6 +1664,7 @@ def _driver_argv(tmp_path: Path, *call_args: str) -> list[str]:
             "log() { :; }; err() { :; }",
             'safe_rm() { rm -rf "$1"; }',
             'nemar() { mkdir -p "${@: -1}"; }',
+            'DRIVER_PID=""; STOP_REQUESTED=""; heartbeat_start() { :; }; heartbeat_stop() { :; }',
             _function_source("convert_dataset"),
             "convert_dataset " + " ".join(shlex.quote(a) for a in call_args),
         ]
@@ -1623,10 +1696,17 @@ def test_only_the_drain_loop_passes_the_retry_scope():
     calls = [
         line.strip()
         for line in SCRIPT.read_text().splitlines()
-        if "convert_dataset " in line and not line.lstrip().startswith("#")
+        if "convert_dataset_exclusive " in line and not line.lstrip().startswith("#")
     ]
-    assert 'convert_dataset "$id" "$version" retry-pending || driver_rc=$?' in calls
-    assert 'convert_dataset "$ONLY_DATASET" "$v" || only_rc=$?' in calls
+    assert 'convert_dataset_exclusive "$id" "$version" retry-pending || driver_rc=$?' in calls
+    assert 'convert_dataset_exclusive "$ONLY_DATASET" "$v" || only_rc=$?' in calls
+    # ...and the lock wrapper is the only thing that calls convert_dataset itself.
+    inner = [
+        line.strip()
+        for line in SCRIPT.read_text().splitlines()
+        if line.strip().startswith('convert_dataset "') and not line.lstrip().startswith("#")
+    ]
+    assert inner == ['convert_dataset "$@"'], inner
     assert len(calls) == 2, calls
 
 
@@ -1672,6 +1752,7 @@ def _failure_verdict(tmp_path: Path, callback: dict, rc: int = 1) -> list[str]:
             'safe_rm() { rm -rf "$1"; }',
             'nemar() { mkdir -p "${@: -1}"; }',
             f'qpy() {{ local IFS=$\'\\t\'; printf "%s\\n" "$*" >> {shlex.quote(str(record))}; }}',
+            'DRIVER_PID=""; STOP_REQUESTED=""; heartbeat_start() { :; }; heartbeat_stop() { :; }',
             _function_source("convert_dataset"),
             _function_source("record_conversion_failure"),
             'convert_dataset nm000276 v1.0.0 retry-pending || record_conversion_failure nm000276',
@@ -1743,7 +1824,860 @@ def test_a_run_without_a_callback_gets_the_generic_retryable_fail(tmp_path):
 
 def test_the_drain_loop_routes_every_failure_through_the_verdict():
     text = SCRIPT.read_text()
-    drain = text[text.index('convert_dataset "$id" "$version" retry-pending || driver_rc=$?') :]
-    drain = drain[: drain.index("\n  fi\n")]
+    drain = text[text.index('convert_dataset_exclusive "$id" "$version" retry-pending || driver_rc=$?') :]
+    drain = drain[: drain.index("n=$((n + 1))")]
     assert 'record_conversion_failure "$id"' in drain
     assert "qpy fail" not in drain
+
+
+# ---------------------------------------------------------------------------
+# Slots (ADR 0101): several drains side by side, each with its own lock
+# ---------------------------------------------------------------------------
+
+
+def _config(dirs: tuple[Path, Path], *args: str, env: dict[str, str] | None = None) -> dict[str, str]:
+    zarr_base, home = dirs
+    proc = run_script([*args, "--print-config"], zarr_base, home, env)
+    assert proc.returncode == 0, proc.stderr
+    return parse_config(proc.stdout)
+
+
+def test_four_slots_of_four_workers_are_the_default(dirs: tuple[Path, Path]) -> None:
+    cfg = _config(dirs)
+    assert cfg["SLOTS"] == "4"
+    assert cfg["JOBS"] == "4"
+    assert cfg["SLOT"] == ""
+
+
+def test_zarr_jobs_lowers_the_per_slot_workers_but_never_raises_them(
+    dirs: tuple[Path, Path],
+) -> None:
+    # The crontab of the single-drain days says ZARR_JOBS=24; four slots of 24 is not
+    # what anyone meant by it.
+    assert _config(dirs, env={"ZARR_JOBS": "24"})["JOBS"] == "4"
+    assert _config(dirs, env={"ZARR_JOBS": "2"})["JOBS"] == "2"
+    assert _config(dirs, env={"ZARR_JOBS_PER_SLOT": "3", "ZARR_JOBS": "24"})["JOBS"] == "3"
+    assert _config(dirs, env={"ZARR_JOBS_PER_SLOT": "6", "ZARR_JOBS": "24"})["JOBS"] == "6"
+    assert _config(dirs, env={"ZARR_JOBS_PER_SLOT": "6", "ZARR_JOBS": "2"})["JOBS"] == "2"
+
+
+def test_one_slot_keeps_zarr_jobs_as_the_worker_count(dirs: tuple[Path, Path]) -> None:
+    cfg = _config(dirs, env={"ZARR_SLOTS": "1", "ZARR_JOBS": "24"})
+    assert cfg["SLOTS"] == "1"
+    assert cfg["JOBS"] == "24"
+
+
+@pytest.mark.parametrize("value", ["0", "17", "two", "-1", "2.5"])
+def test_a_bad_slot_count_stops_the_script(dirs: tuple[Path, Path], value: str) -> None:
+    zarr_base, home = dirs
+    proc = run_script(["--print-config"], zarr_base, home, {"ZARR_SLOTS": value})
+    assert proc.returncode == 1
+    assert "ZARR_SLOTS must be an integer from 1 to 16" in proc.stderr
+    assert proc.stdout == ""
+
+
+@pytest.mark.parametrize("value", ["4", "x", "-1"])
+def test_a_slot_outside_the_slot_count_stops_the_script(
+    dirs: tuple[Path, Path], value: str
+) -> None:
+    zarr_base, home = dirs
+    proc = run_script(["--print-config"], zarr_base, home, {"ZARR_SLOT": value})
+    assert proc.returncode == 1
+    assert "ZARR_SLOT must be an integer from 0 to 3" in proc.stderr
+
+
+def test_slot_zero_keeps_the_names_the_single_drain_always_had(
+    dirs: tuple[Path, Path],
+) -> None:
+    zarr_base, _ = dirs
+    plain = _config(dirs)
+    zero = _config(dirs, env={"ZARR_SLOT": "0"})
+    for key in ("WORK_DIR", "LOCK_FILE", "LOG_FILE"):
+        assert zero[key] == plain[key]
+    assert plain["WORK_DIR"] == f"{zarr_base}/zarr-scratch"
+    assert plain["LOCK_FILE"] == f"{zarr_base}/zarr-state/.nm-zarr.lock"
+    assert plain["LOG_FILE"] == f"{zarr_base}/zarr-state/.nm-zarr.log"
+
+
+def test_a_later_slot_has_a_lock_scratch_directory_and_log_of_its_own(
+    dirs: tuple[Path, Path],
+) -> None:
+    zarr_base, _ = dirs
+    cfg = _config(dirs, env={"ZARR_SLOT": "2"})
+    assert cfg["SLOT"] == "2"
+    assert cfg["WORK_DIR"] == f"{zarr_base}/zarr-scratch-slot2"
+    assert cfg["LOCK_FILE"] == f"{zarr_base}/zarr-state/.nm-zarr.slot2.lock"
+    assert cfg["LOG_FILE"] == f"{zarr_base}/zarr-state/.nm-zarr.slot2.log"
+    # The queue, the clone and the venv are what the slots share.
+    assert cfg["QUEUE_DB"] == f"{zarr_base}/zarr-state/zarr-queue.db"
+    assert cfg["DRIVER_REPO"] == f"{zarr_base}/zarr-state/nemar-cli"
+
+
+def test_the_staging_run_is_one_slot_that_shares_the_nodes_ledger(
+    dirs: tuple[Path, Path],
+) -> None:
+    zarr_base, _ = dirs
+    staging = _config(dirs, "--test")
+    production = _config(dirs)
+    assert staging["SLOTS"] == "1"
+    assert staging["LEDGER_DIR"] == production["LEDGER_DIR"] == f"{zarr_base}/zarr-admission-ledger"
+    assert _config(dirs, env={"ZARR_LEDGER_DIR": "/x/ledger"})["LEDGER_DIR"] == "/x/ledger"
+
+
+def test_print_config_for_a_slot_creates_no_files(dirs: tuple[Path, Path]) -> None:
+    zarr_base, home = dirs
+    proc = run_script(["--print-config"], zarr_base, home, {"ZARR_SLOT": "3"})
+    assert proc.returncode == 0, proc.stderr
+    assert tree_entries(zarr_base) == []
+
+
+def _hold(lock: Path) -> subprocess.Popen[str]:
+    """A process that holds ``lock`` the way a running drain does."""
+    code = (
+        "import fcntl, sys, time\n"
+        "fh = open(sys.argv[1], 'w')\n"
+        "fcntl.flock(fh, fcntl.LOCK_EX)\n"
+        "print('held', flush=True)\n"
+        "time.sleep(120)\n"
+    )
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code, str(lock)], stdout=subprocess.PIPE, text=True
+    )
+    assert proc.stdout is not None and proc.stdout.readline().strip() == "held"
+    return proc
+
+
+@pytest.fixture
+def holders():
+    held: list[subprocess.Popen[str]] = []
+    yield held
+    for proc in held:
+        proc.kill()
+        proc.wait()
+
+
+def _reconciles(qpy_calls) -> int:
+    return sum(1 for c in qpy_calls() if "reconcile" in c.split())
+
+
+def _heartbeats(qpy_calls) -> list[str]:
+    # By word: the temporary directory of a test is part of every call's path.
+    return [c for c in qpy_calls() if "heartbeat" in c.split()]
+
+
+def test_a_tick_starts_one_drain_in_every_free_slot(ack_run) -> None:
+    run, qpy_calls, ack_file, _ = ack_run
+    state = ack_file.parent
+    proc = run(extra_env={"ZARR_SLOTS": "3"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _reconciles(qpy_calls) == 3
+    for k in range(3):
+        assert f"starting slot {k} (of 3)" in proc.stdout
+    assert (state.parent / "zarr-scratch").is_dir()
+    assert (state.parent / "zarr-scratch-slot1").is_dir()
+    assert (state.parent / "zarr-scratch-slot2").is_dir()
+    for k in (1, 2):
+        text = (state / f".nm-zarr.slot{k}.log").read_text()
+        assert f"[slot {k}]" in text and "run complete" in text
+
+
+def test_a_slot_that_is_already_draining_is_left_alone(ack_run, holders) -> None:
+    run, qpy_calls, ack_file, _ = ack_run
+    state = ack_file.parent
+    holders.append(_hold(state / ".nm-zarr.slot1.lock"))
+    proc = run(extra_env={"ZARR_SLOTS": "3"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _reconciles(qpy_calls) == 2
+    assert "starting slot 1" not in proc.stdout
+    assert not (state.parent / "zarr-scratch-slot1").exists()
+
+
+def test_slot_zero_holds_the_lock_a_single_drain_always_took(ack_run, holders) -> None:
+    # A drain started before this change holds .nm-zarr.lock; the new tick must treat
+    # that as slot 0 being busy rather than start a second drain on it.
+    run, qpy_calls, ack_file, _ = ack_run
+    holders.append(_hold(ack_file.parent / ".nm-zarr.lock"))
+    proc = run(extra_env={"ZARR_SLOTS": "2"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _reconciles(qpy_calls) == 1
+    assert "starting slot 0" not in proc.stdout
+    assert "starting slot 1 (of 2)" in proc.stdout
+
+
+def test_a_tick_with_every_slot_busy_exits_3_and_touches_nothing(ack_run, holders) -> None:
+    run, qpy_calls, ack_file, _ = ack_run
+    state = ack_file.parent
+    holders.append(_hold(state / ".nm-zarr.lock"))
+    holders.append(_hold(state / ".nm-zarr.slot1.lock"))
+    proc = run(extra_env={"ZARR_SLOTS": "2"})
+    assert proc.returncode == 3
+    assert "all 2 slot(s) are busy" in proc.stdout
+    assert qpy_calls() == []
+
+
+def test_a_named_slot_that_is_busy_exits_3(ack_run, holders) -> None:
+    run, qpy_calls, ack_file, _ = ack_run
+    holders.append(_hold(ack_file.parent / ".nm-zarr.slot2.lock"))
+    proc = run(extra_env={"ZARR_SLOTS": "3", "ZARR_SLOT": "2"})
+    assert proc.returncode == 3
+    assert "this slot is already running" in proc.stdout
+    assert qpy_calls() == []
+
+
+def test_a_one_off_dataset_takes_the_first_free_slot(ack_run, holders) -> None:
+    run, qpy_calls, ack_file, _ = ack_run
+    state = ack_file.parent
+    holders.append(_hold(state / ".nm-zarr.lock"))
+    proc = run(
+        args=["--dataset", "nm000276"],
+        extra_env={"ZARR_SLOTS": "3", "API_BASE": "http://127.0.0.1:9"},
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    driver = [c for c in qpy_calls() if c.startswith("DRIVER")]
+    assert len(driver) == 1
+    assert f"{state.parent}/zarr-scratch-slot1/nm000276" in driver[0]
+    assert "[slot 1]" in proc.stdout
+
+
+def test_a_one_off_dataset_with_every_slot_busy_says_so_and_runs_nothing(
+    ack_run, holders
+) -> None:
+    run, qpy_calls, ack_file, _ = ack_run
+    state = ack_file.parent
+    holders.append(_hold(state / ".nm-zarr.lock"))
+    holders.append(_hold(state / ".nm-zarr.slot1.lock"))
+    proc = run(
+        args=["--dataset", "nm000276"],
+        extra_env={"ZARR_SLOTS": "2", "API_BASE": "http://127.0.0.1:9"},
+    )
+    assert proc.returncode == 3
+    assert "all 2 slot(s) are busy; not starting nm000276" in proc.stderr
+    assert [c for c in qpy_calls() if c.startswith("DRIVER")] == []
+
+
+def test_arguments_reach_the_drains_a_tick_starts(ack_run) -> None:
+    run, qpy_calls, _, _ = ack_run
+    rows = "nm000001\tv1;nm000002\tv1;nm000003\tv1"
+    proc = run(args=["--limit", "1"], extra_env={"ZARR_SLOTS": "2", "QPY_NEXT": rows})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    # Each slot is told --limit 1 and stops after one dataset: two drivers, not three.
+    assert len([c for c in qpy_calls() if c.startswith("DRIVER")]) == 2
+
+
+def test_without_a_limit_the_slots_between_them_take_the_whole_queue(ack_run) -> None:
+    run, qpy_calls, _, _ = ack_run
+    rows = "nm000001\tv1;nm000002\tv1;nm000003\tv1"
+    proc = run(extra_env={"ZARR_SLOTS": "2", "QPY_NEXT": rows})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    drivers = [c for c in qpy_calls() if c.startswith("DRIVER")]
+    assert len(drivers) == 3
+    # Each dataset was handed to exactly one slot.
+    assert sorted(re.search(r"--dataset-id (\S+)", c).group(1) for c in drivers) == [
+        "nm000001", "nm000002", "nm000003",
+    ]
+
+
+def test_the_driver_gets_the_per_slot_worker_count(ack_run) -> None:
+    run, qpy_calls, _, _ = ack_run
+    proc = run(extra_env={"ZARR_SLOTS": "2", "ZARR_JOBS": "24", "QPY_NEXT": "nm000001\tv1"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    driver = [c for c in qpy_calls() if c.startswith("DRIVER")]
+    assert len(driver) == 1
+    assert "--jobs 4" in driver[0]
+
+
+def test_the_driver_inherits_the_node_ledger_directory(ack_run) -> None:
+    """Exported, not merely set: --print-config prints a shell variable and cannot
+    tell the difference, and without the export the ledger is silently off."""
+    run, _, ack_file, qpy_log = ack_run
+    zarr_base = ack_file.parent.parent
+    proc = run(extra_env={"ZARR_SLOTS": "2", "QPY_NEXT": "nm000001\tv1"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    recorded = Path(str(qpy_log) + ".env").read_text().splitlines()
+    assert recorded == [f"ZARR_LEDGER_DIR={zarr_base}/zarr-admission-ledger"]
+    other = run(
+        # The first row is already claimed by the run above, so this one gets the second.
+        extra_env={
+            "ZARR_SLOTS": "1",
+            "QPY_NEXT": "nm000001\tv1;nm000002\tv1",
+            "ZARR_LEDGER_DIR": "/x/ledger",
+        }
+    )
+    assert other.returncode == 0, other.stdout + other.stderr
+    assert Path(str(qpy_log) + ".env").read_text().splitlines()[-1] == "ZARR_LEDGER_DIR=/x/ledger"
+
+
+def test_only_one_slot_updates_the_clone_at_a_time(ack_run, holders) -> None:
+    """setup() rewrites the shared clone and venv; a second slot must wait for the
+    first rather than run git and the installer over it."""
+    import time
+
+    run, qpy_calls, ack_file, _ = ack_run
+    lock = _hold(ack_file.parent / ".nm-zarr.setup.lock")
+    holders.append(lock)
+    proc = run(extra_env={"ZARR_SLOTS": "2", "ZARR_SLOT": "0"}, background=True)
+    try:
+        time.sleep(2.0)
+        assert proc.poll() is None, "it did not wait for the setup lock"
+        assert qpy_calls() == []  # nothing past setup has run
+        lock.kill()
+        lock.wait()
+        _wait_until(lambda: proc.poll() is not None, "the slot to proceed", 20)
+        assert proc.returncode == 0
+        assert any("reconcile" in c.split() for c in qpy_calls())
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_the_queue_hears_a_heartbeat_while_a_dataset_converts(ack_run) -> None:
+    run, qpy_calls, _, _ = ack_run
+    proc = run(
+        extra_env={
+            "QPY_NEXT": "nm000276\tv1",
+            "ZARR_HEARTBEAT_SECONDS": "1",
+            "FAKE_DRIVER_SLEEP": "3.5",
+        }
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    beats = _heartbeats(qpy_calls)
+    assert 2 <= len(beats) <= 4, qpy_calls()
+    assert all(c.endswith("heartbeat nm000276") for c in beats)
+    calls = qpy_calls()
+    last_beat = max(i for i, c in enumerate(calls) if c == beats[-1])
+    assert last_beat < max(i for i, c in enumerate(calls) if " done " in c)
+
+
+def test_no_heartbeat_is_sent_outside_a_conversion(ack_run) -> None:
+    run, qpy_calls, _, _ = ack_run
+    proc = run(extra_env={"ZARR_HEARTBEAT_SECONDS": "1"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _heartbeats(qpy_calls) == []
+
+
+def test_a_dataset_the_queue_took_back_is_reported(ack_run) -> None:
+    run, _, _, _ = ack_run
+    proc = run(
+        extra_env={
+            "QPY_NEXT": "nm000276\tv1",
+            "ZARR_HEARTBEAT_SECONDS": "1",
+            "FAKE_DRIVER_SLEEP": "2.5",
+            "QPY_HEARTBEAT_OUT": "0",
+        }
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "no longer lists this dataset as inprogress" in proc.stderr
+
+
+def _driver_pids(qpy_log: Path) -> list[int]:
+    path = Path(str(qpy_log) + ".pids")
+    return [int(x) for x in path.read_text().split()] if path.exists() else []
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _wait_until(predicate, what: str, seconds: float = 20.0) -> None:
+    import time
+
+    deadline = time.monotonic() + seconds
+    while not predicate():
+        assert time.monotonic() < deadline, f"timed out waiting for {what}"
+        time.sleep(0.05)
+
+
+@pytest.fixture
+def stray_drivers():
+    """Fake drivers a test may leave running; killed afterwards."""
+    pids: list[int] = []
+    yield pids
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_the_heartbeat_follows_the_driver_not_the_script(ack_run, stray_drivers) -> None:
+    """A script killed with SIGKILL leaves its driver converting, and the driver is
+    what the queue row is for: the heartbeat goes on while the driver lives and stops
+    when it ends, so the row neither looks abandoned early nor vouches for nothing."""
+    import time
+
+    run, qpy_calls, _, qpy_log = ack_run
+    proc = run(
+        extra_env={
+            "QPY_NEXT": "nm000276\tv1",
+            "ZARR_HEARTBEAT_SECONDS": "1",
+            "FAKE_DRIVER_SLEEP": "6",
+        },
+        background=True,
+    )
+    try:
+        _wait_until(lambda: _heartbeats(qpy_calls), "the first heartbeat")
+        stray_drivers.extend(_driver_pids(qpy_log))
+        proc.kill()  # SIGKILL: the script cannot clean up after itself
+        proc.wait()
+        seen = len(_heartbeats(qpy_calls))
+        time.sleep(2.5)
+        assert len(_heartbeats(qpy_calls)) > seen, "the heartbeat stopped with the script"
+        _wait_until(lambda: not any(_alive(p) for p in stray_drivers), "the driver to end", 15)
+        time.sleep(1.5)
+        settled = len(_heartbeats(qpy_calls))
+        time.sleep(2.5)
+        assert len(_heartbeats(qpy_calls)) <= settled + 1, "it kept beating for a dead driver"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+def test_a_signal_to_a_slot_stops_its_driver_and_spends_no_attempt(
+    ack_run, stray_drivers, sig
+) -> None:
+    run, qpy_calls, _, qpy_log = ack_run
+    proc = run(
+        extra_env={
+            "ZARR_SLOTS": "2",
+            "ZARR_SLOT": "0",
+            "QPY_NEXT": "nm000276\tv1",
+            "FAKE_DRIVER_SLEEP": "60",
+        },
+        background=True,
+    )
+    try:
+        _wait_until(lambda: _driver_pids(qpy_log), "the driver to start")
+        drivers = _driver_pids(qpy_log)
+        stray_drivers.extend(drivers)
+        os.kill(proc.pid, sig)
+        _wait_until(lambda: proc.poll() is not None, "the script to exit", 15)
+        assert proc.returncode == 143
+        _wait_until(lambda: not any(_alive(p) for p in drivers), "the driver to be stopped", 15)
+        calls = qpy_calls()
+        assert [c for c in calls if " fail " in c or c.split()[-3:-2] == ["fail"]] == []
+        assert not any(" done " in c for c in calls)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_stopping_the_tick_stops_every_slots_driver(ack_run, stray_drivers) -> None:
+    run, qpy_calls, _, qpy_log = ack_run
+    proc = run(
+        extra_env={
+            "ZARR_SLOTS": "2",
+            "QPY_NEXT": "nm000276\tv1;nm000277\tv1",
+            "FAKE_DRIVER_SLEEP": "60",
+        },
+        background=True,
+    )
+    try:
+        _wait_until(lambda: len(_driver_pids(qpy_log)) >= 2, "both slots' drivers to start")
+        drivers = _driver_pids(qpy_log)
+        stray_drivers.extend(drivers)
+        os.kill(proc.pid, signal.SIGTERM)
+        _wait_until(lambda: proc.poll() is not None, "the tick to exit", 20)
+        _wait_until(lambda: not any(_alive(p) for p in drivers), "the drivers to be stopped", 20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_a_one_off_run_sends_no_heartbeat(ack_run) -> None:
+    run, qpy_calls, _, _ = ack_run
+    proc = run(
+        args=["--dataset", "nm000276"],
+        extra_env={
+            "API_BASE": "http://127.0.0.1:9",
+            "ZARR_HEARTBEAT_SECONDS": "1",
+            "FAKE_DRIVER_SLEEP": "2.5",
+        },
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _heartbeats(qpy_calls) == []
+    assert "inprogress" not in proc.stderr
+
+
+def test_a_dataset_is_converted_by_one_run_at_a_time(ack_run, holders) -> None:
+    run, qpy_calls, ack_file, _ = ack_run
+    state = ack_file.parent
+    holders.append(_hold(state / "dataset-locks" / "nm000276.lock"))
+    refused = run(
+        args=["--dataset", "nm000276"],
+        extra_env={"ZARR_SLOTS": "2", "API_BASE": "http://127.0.0.1:9"},
+    )
+    assert refused.returncode == 3
+    assert "is being converted by another slot or run" in refused.stderr
+    assert [c for c in qpy_calls() if c.startswith("DRIVER")] == []
+    other = run(
+        args=["--dataset", "nm000277"],
+        extra_env={"ZARR_SLOTS": "2", "API_BASE": "http://127.0.0.1:9"},
+    )
+    assert other.returncode == 0, other.stdout + other.stderr
+    assert len([c for c in qpy_calls() if c.startswith("DRIVER")]) == 1
+
+
+def test_a_slot_handed_a_dataset_a_one_off_holds_waits_for_it(ack_run, holders) -> None:
+    import time
+
+    run, qpy_calls, ack_file, _ = ack_run
+    lock = ack_file.parent / "dataset-locks" / "nm000276.lock"
+    holder = _hold(lock)
+    holders.append(holder)
+    proc = run(
+        extra_env={"ZARR_SLOTS": "2", "ZARR_SLOT": "0", "QPY_NEXT": "nm000276\tv1"},
+        background=True,
+    )
+    try:
+        time.sleep(2.0)
+        assert proc.poll() is None, "it did not wait for the lock"
+        assert [c for c in qpy_calls() if c.startswith("DRIVER")] == []
+        holder.kill()
+        holder.wait()
+        _wait_until(lambda: proc.poll() is not None, "the slot to proceed", 20)
+        assert proc.returncode == 0
+        assert len([c for c in qpy_calls() if c.startswith("DRIVER")]) == 1
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_stats_does_not_start_slots_or_touch_the_clone(ack_run, holders) -> None:
+    run, qpy_calls, ack_file, _ = ack_run
+    holders.append(_hold(ack_file.parent / ".nm-zarr.lock"))
+    proc = run(args=["--stats"], extra_env={"ZARR_SLOTS": "3"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    calls = qpy_calls()
+    assert [c for c in calls if c.endswith(" stats")] != []
+    assert not any("reconcile" in c.split() for c in calls)
+    assert "starting slot" not in proc.stdout
+    assert "[setup]" not in proc.stdout
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("ZARR_SLOTS", "08", "ZARR_SLOTS must be an integer from 1 to 16"),
+        ("ZARR_SLOTS", "010", "ZARR_SLOTS must be an integer from 1 to 16"),
+        ("ZARR_SLOT", "01", "ZARR_SLOT must be an integer from 0 to 3"),
+        ("ZARR_SLOT", "09", "ZARR_SLOT must be an integer from 0 to 3"),
+        ("ZARR_JOBS", "08", "ZARR_JOBS must be a positive integer"),
+        ("ZARR_JOBS", "0", "ZARR_JOBS must be a positive integer"),
+        ("ZARR_JOBS", "many", "ZARR_JOBS must be a positive integer"),
+        ("ZARR_JOBS_PER_SLOT", "x", "ZARR_JOBS_PER_SLOT must be a positive integer"),
+        ("ZARR_HEARTBEAT_SECONDS", "0", "ZARR_HEARTBEAT_SECONDS must be a positive integer"),
+        ("ZARR_HEARTBEAT_SECONDS", "abc", "ZARR_HEARTBEAT_SECONDS must be a positive integer"),
+        ("ZARR_HEARTBEAT_SECONDS", "05", "ZARR_HEARTBEAT_SECONDS must be a positive integer"),
+    ],
+)
+def test_a_count_that_is_not_a_plain_decimal_stops_the_script(
+    dirs: tuple[Path, Path], name: str, value: str, message: str
+) -> None:
+    zarr_base, home = dirs
+    proc = run_script(["--print-config"], zarr_base, home, {name: value})
+    assert proc.returncode == 1
+    assert message in proc.stderr
+    assert proc.stdout == ""
+    assert tree_entries(zarr_base) == []
+
+
+def test_the_slots_are_started_with_the_bash_that_started_the_tick() -> None:
+    # `bash` from PATH could be an older one that fails the version check in every
+    # child; the running interpreter is known to pass it.
+    assert '"${BASH:-bash}" "$SCRIPT_PATH"' in SCRIPT.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Stopping a slot: every wait it can be in, and what a stop must not throw away
+# ---------------------------------------------------------------------------
+
+SLOW_TERMINAL_CURL = """#!/bin/sh
+# The terminal callback posts its body from a file (`--data @file`); that one is slow, so a
+# test can stop the script while it is in it. The "converting" post, with an inline body,
+# is not.
+for a in "$@"; do
+  case "$a" in @*) touch "$CURL_SLOW_MARK"; sleep 4 ;; esac
+done
+exit 0
+"""
+
+
+def _stop_and_wait(proc: subprocess.Popen, sig=signal.SIGTERM, seconds: float = 20.0) -> None:
+    os.kill(proc.pid, sig)
+    _wait_until(lambda: proc.poll() is not None, "the slot to exit", seconds)
+
+
+def test_a_stop_reaches_the_drivers_children_too(ack_run, stray_drivers) -> None:
+    run, _, _, qpy_log = ack_run
+    proc = run(
+        extra_env={
+            "ZARR_SLOTS": "2", "ZARR_SLOT": "0", "QPY_NEXT": "nm000276\tv1",
+            "FAKE_DRIVER_SLEEP": "60", "FAKE_DRIVER_CHILD": "1",
+        },
+        background=True,
+    )
+    children_file = Path(str(qpy_log) + ".childpids")
+    try:
+        _wait_until(lambda: children_file.exists() and children_file.read_text().strip(),
+                    "the driver's child")
+        children = [int(x) for x in children_file.read_text().split()]
+        stray_drivers.extend(children)
+        stray_drivers.extend(_driver_pids(qpy_log))
+        _stop_and_wait(proc)
+        _wait_until(lambda: not any(_alive(p) for p in children), "the child to stop", 10)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_the_slot_waits_for_a_driver_that_is_slow_to_stop(ack_run, stray_drivers) -> None:
+    """`wait` returns early when the signal is trapped; the slot must wait again until
+    the driver is really gone, or it moves on (and exits) while it is still running."""
+    run, _, _, qpy_log = ack_run
+    proc = run(
+        extra_env={
+            "ZARR_SLOTS": "2", "ZARR_SLOT": "0", "QPY_NEXT": "nm000276\tv1",
+            "FAKE_DRIVER_SLEEP": "60", "FAKE_DRIVER_TERM_DELAY": "1.5",
+        },
+        background=True,
+    )
+    try:
+        _wait_until(lambda: _driver_pids(qpy_log), "the driver to start")
+        stray_drivers.extend(_driver_pids(qpy_log))
+        import time
+
+        time.sleep(0.5)  # let the fake driver install its handler
+        _stop_and_wait(proc)
+        assert Path(str(qpy_log) + ".exited").exists(), "the slot exited before its driver had"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_a_driver_outlives_a_killed_script_and_keeps_its_dataset_locked(
+    ack_run, stray_drivers
+) -> None:
+    """The lock is on a descriptor the driver inherits: kill -9 the script and the dataset
+    stays locked for as long as the driver converts, and not a moment longer (the
+    heartbeat that outlives the script must not hold it)."""
+    run, _, _, qpy_log = ack_run
+    common = {"ZARR_SLOTS": "2", "API_BASE": "http://127.0.0.1:9"}
+    proc = run(
+        extra_env={**common, "ZARR_SLOT": "0", "QPY_NEXT": "nm000276\tv1",
+                   "FAKE_DRIVER_SLEEP": "5", "ZARR_HEARTBEAT_SECONDS": "300"},
+        background=True,
+    )
+    try:
+        _wait_until(lambda: _driver_pids(qpy_log), "the driver to start")
+        drivers = _driver_pids(qpy_log)
+        stray_drivers.extend(drivers)
+        proc.kill()
+        proc.wait()
+        assert any(_alive(p) for p in drivers)
+        refused = run(args=["--dataset", "nm000276"], extra_env={**common, "FAKE_DRIVER_SLEEP": "0"})
+        assert refused.returncode == 3, refused.stdout + refused.stderr
+        assert "is being converted by another slot or run" in refused.stderr
+        _wait_until(lambda: not any(_alive(p) for p in drivers), "the driver to finish", 15)
+        free = run(args=["--dataset", "nm000276"], extra_env={**common, "FAKE_DRIVER_SLEEP": "0"})
+        assert free.returncode == 0, free.stdout + free.stderr
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_a_stop_is_answered_while_waiting_for_the_setup_lock(ack_run, holders) -> None:
+    import time
+
+    run, qpy_calls, ack_file, _ = ack_run
+    holders.append(_hold(ack_file.parent / ".nm-zarr.setup.lock"))
+    proc = run(extra_env={"ZARR_SLOTS": "2", "ZARR_SLOT": "0"}, background=True)
+    try:
+        time.sleep(1.5)
+        assert proc.poll() is None
+        _stop_and_wait(proc, seconds=15)
+        assert proc.returncode == 143
+        assert qpy_calls() == []
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_a_stop_is_answered_while_waiting_behind_a_one_off(ack_run, holders) -> None:
+    import time
+
+    run, qpy_calls, ack_file, _ = ack_run
+    holders.append(_hold(ack_file.parent / "dataset-locks" / "nm000276.lock"))
+    proc = run(
+        extra_env={"ZARR_SLOTS": "2", "ZARR_SLOT": "0", "QPY_NEXT": "nm000276\tv1"},
+        background=True,
+    )
+    try:
+        _wait_until(lambda: any("reconcile" in c.split() for c in qpy_calls()), "the drain")
+        time.sleep(1.5)
+        assert proc.poll() is None
+        _stop_and_wait(proc, seconds=15)
+        assert proc.returncode == 143
+        assert [c for c in qpy_calls() if c.startswith("DRIVER")] == []
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_a_slot_waiting_behind_a_one_off_keeps_its_claim_alive(ack_run, holders) -> None:
+    run, qpy_calls, ack_file, _ = ack_run
+    holder = _hold(ack_file.parent / "dataset-locks" / "nm000276.lock")
+    holders.append(holder)
+    proc = run(
+        extra_env={
+            "ZARR_SLOTS": "2", "ZARR_SLOT": "0", "QPY_NEXT": "nm000276\tv1",
+            "ZARR_HEARTBEAT_SECONDS": "1",
+        },
+        background=True,
+    )
+    try:
+        _wait_until(lambda: _heartbeats(qpy_calls), "a heartbeat while it waits", 25)
+        assert [c for c in qpy_calls() if c.startswith("DRIVER")] == []
+        holder.kill()
+        holder.wait()
+        _wait_until(lambda: proc.poll() is not None, "the slot to finish", 25)
+        assert proc.returncode == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_a_stop_after_the_driver_has_finished_loses_nothing(ack_run, tmp_path: Path) -> None:
+    """The terminal callback is the slow part: a stop that lands in it must not abandon
+    the bookkeeping (`qpy done`, the scratch clean-up) of days of conversion."""
+    run, qpy_calls, ack_file, _ = ack_run
+    slow = tmp_path / "slowbin"
+    slow.mkdir()
+    _write_exec(slow / "curl", SLOW_TERMINAL_CURL)
+    mark = tmp_path / "curl-slow-mark"
+    path = os.pathsep.join([str(slow), str(tmp_path / "fakebin"), os.environ.get("PATH", "")])
+    proc = run(
+        extra_env={
+            "PATH": path, "CURL_SLOW_MARK": str(mark), "NEMAR_WEBHOOK_TOKEN": "t",
+            "ZARR_CALLBACK_URL": WEBHOOK_URL, "QPY_NEXT": "nm000276\tv1",
+            "FAKE_DRIVER_CALLBACK": json.dumps({"dataset_id": "nm000276", "status": "ready"}),
+        },
+        background=True,
+    )
+    try:
+        _wait_until(mark.exists, "the terminal callback to start")
+        _stop_and_wait(proc, seconds=20)
+        assert proc.returncode == 143
+        calls = qpy_calls()
+        assert any(c.split()[-4:-3] == ["done"] or " done " in c for c in calls), calls
+        scratch = ack_file.parent.parent / "zarr-scratch"
+        assert not (scratch / "nm000276").exists()
+        assert not (scratch / "nm000276.callback.json").exists()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_a_slot_stops_for_a_new_origin_commit_recorded_when_it_started(ack_run) -> None:
+    """Another slot's setup moves the shared clone; comparing with the clone would tell
+    this drain it is current while it runs the old shell logic against the new driver."""
+    run, qpy_calls, ack_file, qpy_log = ack_run
+    state = ack_file.parent
+    upstream = state.parent.parent / "nemarOrg" / "nemar-cli"
+    clone = state / "nemar-cli"
+    proc = run(
+        extra_env={
+            "ZARR_SLOTS": "2", "ZARR_SLOT": "0", "FAKE_DRIVER_SLEEP": "3",
+            "QPY_NEXT": "nm000001\tv1;nm000002\tv1",
+        },
+        background=True,
+    )
+    try:
+        _wait_until(lambda: _driver_pids(qpy_log), "the first driver to start")
+        (upstream / "NEWS").write_text("a new commit on origin/main\n")
+        for args in (["add", "-A"], ["commit", "-q", "-m", "origin moves on"]):
+            subprocess.run(["git", "-C", str(upstream), *args], check=True)
+        # ...and another slot's setup() brings the shared clone up to it.
+        subprocess.run(["git", "-C", str(clone), "fetch", "-q", "origin"], check=True)
+        subprocess.run(["git", "-C", str(clone), "reset", "-q", "--hard", "origin/main"], check=True)
+        _wait_until(lambda: proc.poll() is not None, "the slot to finish", 30)
+        assert proc.returncode == 0
+        assert len([c for c in qpy_calls() if c.startswith("DRIVER")]) == 1, qpy_calls()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_the_slots_are_started_with_the_bash_that_started_the_tick(ack_run, tmp_path: Path) -> None:
+    """`bash` from PATH could be an older one that fails the version check in every child.
+    A stand-in first on PATH runs the tick itself and fails any slot that reaches it."""
+    run, qpy_calls, _, _ = ack_run
+    real = shutil.which("bash")
+    bin_dir = tmp_path / "wrongbash"
+    bin_dir.mkdir()
+    log = tmp_path / "wrong-bash.log"
+    stand_in = (
+        "#!/bin/sh\n"
+        'if [ -n "$ZARR_SLOT" ]; then echo "$ZARR_SLOT" >> {log}; exit 97; fi\n'
+        'exec {real} "$@"\n'
+    ).format(log=shlex.quote(str(log)), real=shlex.quote(str(real)))
+    _write_exec(bin_dir / "bash", stand_in)
+    path = os.pathsep.join([str(bin_dir), str(tmp_path / "fakebin"), os.environ.get("PATH", "")])
+    proc = run(extra_env={"PATH": path, "ZARR_SLOTS": "2"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not log.exists(), "a slot was started with `bash` from PATH"
+    assert _reconciles(qpy_calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("args", "env"),
+    [(["--limit", "08"], {}), (["--limit", "abc"], {}), ([], {"ZARR_LIMIT": "010"}),
+     (["--limit", "-1"], {})],
+)
+def test_a_limit_that_is_not_a_plain_count_stops_the_script(
+    dirs: tuple[Path, Path], args: list[str], env: dict[str, str]
+) -> None:
+    zarr_base, home = dirs
+    proc = run_script([*args, "--print-config"], zarr_base, home, env)
+    assert proc.returncode == 1
+    assert "must be a non-negative integer" in proc.stderr
+    assert tree_entries(zarr_base) == []
+
+
+def test_a_zero_limit_still_means_no_limit(dirs: tuple[Path, Path]) -> None:
+    assert _config(dirs, "--limit", "0")["LIMIT"] == "0"
+    assert _config(dirs, "--limit", "12")["LIMIT"] == "12"
+
+
+def test_a_dataset_lock_that_cannot_be_opened_is_reported_as_that(ack_run) -> None:
+    run, qpy_calls, ack_file, _ = ack_run
+    state = ack_file.parent
+    (state / "dataset-locks").parent.mkdir(parents=True, exist_ok=True)
+    # A file where the lock directory should be: mkdir -p and the open both fail.
+    (state / "dataset-locks").write_text("not a directory")
+    proc = run(
+        args=["--dataset", "nm000276"],
+        extra_env={"ZARR_SLOTS": "2", "API_BASE": "http://127.0.0.1:9"},
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "cannot open its dataset lock" in proc.stderr
+    assert "is being converted" not in proc.stderr
+    assert [c for c in qpy_calls() if c.startswith("DRIVER")] == []

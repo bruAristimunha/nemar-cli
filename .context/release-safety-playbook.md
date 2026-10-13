@@ -29,7 +29,7 @@ The gaps are documented at the end.
 1. **Feature branch -> PR to `dev`.**
    `test.yml` runs: `lint` + `unit-pure` (required) and `integration-dev` (soft on dev, drives the live dev worker), plus `e2e-sandbox`, `api-test`, `publish`.
    Merge is squash.
-2. **Merge to `dev`** triggers `deploy-backend.yml` (on `backend/**` changes): applies migrations to `nemar-db-dev`, deploys `nemar-api-dev`, then the new **/health smoke** asserts the deployed version is serving.
+2. **Merge to `dev`** runs `auto-bump-dev.yml`, which bumps the `-devN` version and then calls `deploy-backend.yml` once on the bump (every bumped merge, as the bump touches `backend/package.json`; an unbumped push only on `backend/**`, `shared/**` or a change to `deploy-backend.yml` itself): applies migrations to `nemar-db-dev`, deploys `nemar-api-dev`, then the new **/health smoke** asserts the deployed version is serving.
    Website: push to the `staging` branch triggers `deploy-test.yml` -> `test.nemar.org`.
 3. **Exercise on staging** (see next section) before promoting.
 4. **`dev -> main` PR** runs `test.yml` with `integration-dev` now **required**.
@@ -72,8 +72,13 @@ Do NOT merge until every box is checked.
 
 1. Watch `deploy-backend.yml` on `main`: `gh run list --workflow=deploy-backend.yml --branch main`.
    The release deploys TWICE (pre-strip `-devN`, then the stripped tag) — both must reach the /health smoke green.
+   The second run (the strip commit's) shows `test-gate` as skipped when it reused the merge's passing gate; that is expected, and a skipped gate with no reuse is not.
+   If the first run (the merge's) fails, do not re-run it: the strip commit's run starts anyway, runs a full gate and deploys the stripped build, and a later re-run of the merge's run would put the pre-strip `-devN` build back over it (its smoke expects `-devN`, so it would pass).
+   A gate failure from the `Install git-annex` step (it is capped at 10 minutes) is an apt mirror stalling; the recovery is a re-run of that job.
 2. Confirm `api.nemar.org/health` reports the new `X.Y.Z`.
 3. Confirm `auto-tag.yml` created `vX.Y.Z`, `npm-publish.yml` published, `sync-dev.yml` bumped dev to the next `-dev0`.
+   If `sync-dev.yml` did not run, dev is stuck at the old `-devN`, below the released version: merge `main` into `dev` and bump by hand before anything else lands on `dev`.
+   The merge's push run of `Tests` also runs on `main` now (push runs are never cancelled); `passwordless-auth-test` in it signs in as one address capped at 5 code requests an hour, so a 429 at `signIn` there is that budget (see `.memory/release-pr-reruns-exhaust-email-budget.md`), not a regression, and it does not block the deploy.
 4. Spot-check a real catalog read (`/datasets`) and a dataset landing page on `ww2.nemar.org`.
 5. If the /health smoke goes RED: prod may be on old code (or half-deployed). Investigate immediately; roll back.
 

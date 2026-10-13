@@ -31,15 +31,25 @@ permissions:
   contents: read
   pull-requests: read
 
-# Cancel in-progress runs on new push
+# A pull request keeps only its newest run: a push to the branch cancels the run
+# it supersedes, which is what keeps a release pull request (dev -> main) from
+# stacking a full suite per merge into dev. Grouped by pull request number.
+#
+# A push run is never canceled. Its group is its own commit, so it neither
+# cancels nor waits for another. The old per-branch group canceled the run of
+# every merge into dev 14 s later, when auto-bump-dev.yml pushed its version
+# commit (109 of 109 merges, 2026-09-15 to 2026-10-13), so the commit carrying the
+# code never finished a run and the version commit re-ran the suite instead.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('{0}-{1}', github.ref, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # Check what files changed to determine which tests to run
   changes:
     runs-on: ubuntu-latest
+    # p95 10 s (50 green runs to 2026-10-13); 10 is the floor.
+    timeout-minutes: 10
     outputs:
       cli: ${{ steps.filter.outputs.cli }}
       backend: ${{ steps.filter.outputs.backend }}
@@ -61,9 +71,45 @@ jobs:
       scrub_suites: ${{ steps.filter.outputs.scrub }}
     steps:
       - uses: actions/checkout@v4
+      # THE RELEASE BOT'S VERSION COMMITS RUN NOTHING. auto-bump-dev.yml pushes one on
+      # top of every merge into dev, auto-tag.yml one on main per release, and
+      # sync-dev.yml one with its merge of main into dev. Each changes nothing but the
+      # `version` field of package.json and backend/package.json, so its code is the code
+      # of the commit before it, which its own push run already tested; yet package.json
+      # matched `cli` and backend/package.json `backend`, so each one re-ran lint,
+      # unit-pure, integration-dev and the sandbox jobs (23% of this workflow's runner
+      # time, 2026-09-15 to 2026-10-13). Skipping the filter leaves every output empty,
+      # every job below is skipped by its `if:`, and a skipped job still reports its
+      # required check (`lint`, `unit-pure`, `integration-dev`) as passing.
+      #
+      # Push events only: on a pull request the filter sees the whole PR diff, and a
+      # release pull request's head is always such a commit. The script also checks the
+      # diff, not only the author and subject, and falls back to running everything
+      # whenever it cannot tell.
+      - name: Classify the push
+        id: push
+        if: github.event_name == 'push'
+        run: scripts/ci/classify-push.sh >> "$GITHUB_OUTPUT"
       - uses: dorny/paths-filter@v3
         id: filter
+        if: steps.push.outputs.version_bump != 'true'
         with:
+          # A PUSH TO DEV IS COMPARED WITH THE COMMIT BEFORE IT. With no `base`, the
+          # filter compares a push to any branch but the default (`main`) with its merge
+          # base on main ("Changes will be detected between main and dev" in the log), so
+          # every push to dev saw every change since the last release and ran nearly every
+          # job: 116 of 152 runs on a docs-only commit ran real jobs (3,155 runner
+          # minutes, 2026-09-15 to 2026-10-13). Naming the pushed branch makes the filter
+          # diff the push itself (`github.event.before` to the head). What the push did
+          # not change, earlier pushes' runs already tested. A docs-only push now runs
+          # only what reads docs: `agentdocs` and `decisions` still start lint and
+          # unit-pure for the docs-links and ADR-index tests.
+          #
+          # Empty, which means the default, everywhere else: a pull request always sees
+          # its whole diff (the filter ignores `base` there), main is the default branch
+          # and already compares with the commit before, and an epic branch keeps its
+          # comparison with main.
+          base: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' && 'dev' || '' }}
           filters: |
             cli:
               - 'src/**'
@@ -243,6 +289,8 @@ jobs:
       # Its argument parser shipped an infinite loop and a silent scope-widening
       # bug during this epic, both found by hand-testing on the production node.
       - name: Shellcheck the driver script
+        # An apt install, which can stall on the Ubuntu mirror like git-annex does.
+        timeout-minutes: 10
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
           bash -n scripts/zarr/hallu-zarr.sh
@@ -280,6 +328,18 @@ jobs:
 
       - name: Queue tests
         run: python scripts/zarr/test_zarr_queue.py
+
+      # Admission across drivers (ADR 0101): the ledger, the drain against real peer
+      # processes, and two real driver processes sharing one node. Linux is where the
+      # process pool forks, which is the case that held the ledger lock in every worker.
+      - name: Admission ledger tests
+        run: python scripts/zarr/test_admission_ledger.py
+
+      - name: Admission across drivers tests
+        run: python scripts/zarr/test_admission_across_drivers.py
+
+      - name: Memory projection tests
+        run: python scripts/zarr/test_zarr_memory_projection.py
 
       - name: Non-raw store purge tests
         run: python scripts/zarr/test_purge_non_raw_stores.py
@@ -361,7 +421,9 @@ jobs:
           pytest -q -rs --junit-xml=/tmp/zarr-tests.xml \
             test_generate_zarr.py test_zarr_queue.py \
             test_purge_non_raw_stores.py test_hallu_zarr_config.py \
-            test_find_collapsed_channel_stores.py
+            test_find_collapsed_channel_stores.py \
+            test_admission_ledger.py test_admission_across_drivers.py \
+            test_zarr_memory_projection.py
 
       # A skip is invisible in a green job, and that is exactly how 43 tests
       # went unrun for the life of this epic. Only two KINDS of skip are
@@ -516,7 +578,10 @@ jobs:
           path: ~/annex-debs
           key: git-annex-debs-${{ runner.arch }}-${{ steps.ubuntu.outputs.release }}-v1
 
+      # The last mirror attempt below may take 30 minutes by design; this step limit
+      # still stops it at 20 so the failure names this step, not the whole job.
       - name: Install git-annex
+        timeout-minutes: 20
         run: |
           if compgen -G "$HOME/annex-debs/git-annex_*.deb" > /dev/null \
             && sudo dpkg -i "$HOME"/annex-debs/*.deb && git annex version > /dev/null; then
@@ -635,7 +700,8 @@ jobs:
   # when the suites were not due, which is what the single job did.
   scrub-tools:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # p95 7 s (12 green runs to 2026-10-13); 10 is the floor.
+    timeout-minutes: 10
     needs: [changes, scrub-tools-shard]
     if: always() && needs.changes.outputs.scrub_suites == 'true'
     steps:
@@ -698,6 +764,8 @@ jobs:
   # Type check and lint - always runs on code changes
   lint:
     runs-on: ubuntu-latest
+    # p95 0.5 min (44 green runs to 2026-10-13); 10 is the floor.
+    timeout-minutes: 10
     needs: changes
     # Kept identical to unit-pure's trigger so the two jobs run on the same changes.
     # (A job skipped by its `if:` reports Success and does not block a required check.
@@ -749,6 +817,9 @@ jobs:
   # into dev. See https://docs.nemar.org/admin/operations/access-policies/ for the tiering rationale.
   unit-pure:
     runs-on: ubuntu-latest
+    # p95 21.7 min (44 green runs to 2026-10-13), so twice that. #1667: this job once
+    # hung for an hour installing git-annex; that step has its own limit below.
+    timeout-minutes: 44
     needs: changes
     # `decisions` is here, not only on `lint`: test/adr-index.unit.test.ts is the
     # thing that checks an ADR against the index, and `unit-pure` is the only job
@@ -770,7 +841,10 @@ jobs:
         with:
           deno-version: v2.x
 
+      # Under 30 s at p95, but the Ubuntu mirror can stall on this one package for minutes
+      # (see scrub-tools-shard), and #1667 saw it hang for an hour.
       - name: Install git-annex
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y git-annex
@@ -938,6 +1012,8 @@ jobs:
   # required, and nightly-tests.yml provides scheduled hard coverage + issue.
   integration-dev:
     runs-on: ubuntu-latest
+    # p95 11.5 min (42 green runs to 2026-10-13), so twice that.
+    timeout-minutes: 24
     needs: changes
     if: needs.changes.outputs.cli == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.shared == 'true'
     env:
@@ -960,7 +1036,10 @@ jobs:
         with:
           deno-version: v2.x
 
+      # Under 30 s at p95, but the Ubuntu mirror can stall on this one package for minutes
+      # (see scrub-tools-shard), and #1667 saw it hang for an hour.
       - name: Install git-annex
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y git-annex
@@ -1005,6 +1084,8 @@ jobs:
   # API integration tests - uses dev environment (no rate limiting)
   api-test:
     runs-on: ubuntu-latest
+    # p95 0.9 min (42 green runs to 2026-10-13); 10 is the floor.
+    timeout-minutes: 10
     needs: changes
     if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.tests == 'true'
     steps:
@@ -1040,7 +1121,12 @@ jobs:
   # Runs on PRs to dev (basic) and main (comprehensive)
   e2e-sandbox:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # p95 5.7 min (21 green runs to 2026-10-13). 15, not twice that: the npm wait
+    # below makes 30 tries of up to 20 s each, so it can take 10 minutes before it
+    # falls back to `dev`, and the install and the tests still follow. It has no
+    # step limit of its own, because cutting it short would turn that fallback
+    # into a failure.
+    timeout-minutes: 15
     needs: changes
     if: |
       github.event_name == 'pull_request' &&
@@ -1095,6 +1181,7 @@ jobs:
         run: bun install
 
       - name: Run E2E sandbox tests
+        timeout-minutes: 10
         env:
           TEST_API_URL: https://nemar-api-dev.sccn-org.workers.dev
           TEST_USER_API_KEY: ${{ secrets.TEST_USER_API_KEY }}
@@ -1140,7 +1227,9 @@ jobs:
         with:
           deno-version: v2.x
 
+      # Same mirror stall as git-annex elsewhere; inside this job's 10-minute limit.
       - name: Install DataLad and git-annex
+        timeout-minutes: 8
         run: |
           sudo apt-get update
           sudo apt-get install -y git-annex
@@ -1170,6 +1259,7 @@ jobs:
             --issue 1321
 
       - name: Run E2E upload tests against dev environment
+        timeout-minutes: 8
         env:
           TEST_API_URL: https://nemar-api-dev.sccn-org.workers.dev
           TEST_ADMIN_API_KEY: ${{ secrets.TEST_ADMIN_API_KEY }}
@@ -1182,6 +1272,8 @@ jobs:
   # Zenodo sandbox tests - verifies DOI creation workflows
   zenodo-sandbox-test:
     runs-on: ubuntu-latest
+    # p95 0.3 min (42 green runs to 2026-10-13); 10 is the floor.
+    timeout-minutes: 10
     needs: changes
     if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.tests == 'true'
     steps:
@@ -1223,6 +1315,8 @@ jobs:
   # a second backstop.
   passwordless-auth-test:
     runs-on: ubuntu-latest
+    # p95 0.5 min (2 green runs to 2026-10-13); 10 is the floor.
+    timeout-minutes: 10
     needs: changes
     if: |
       needs.changes.outputs.email == 'true' &&

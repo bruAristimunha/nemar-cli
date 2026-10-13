@@ -36,6 +36,8 @@ jobs:
     # filter, the bot's push would re-trigger this workflow forever.
     if: github.event.head_commit.author.email != 'nemar-bot@users.noreply.github.com'
     runs-on: ubuntu-latest
+    # p95 21 s (50 green runs to 2026-10-13); 10 is the floor.
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

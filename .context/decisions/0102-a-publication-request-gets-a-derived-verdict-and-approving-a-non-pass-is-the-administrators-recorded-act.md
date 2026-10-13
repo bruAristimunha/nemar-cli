@@ -1,4 +1,4 @@
-# ADR 0101: A publication request gets a derived verdict, and approving over a non-pass is the administrator's recorded act
+# ADR 0102: A publication request gets a derived verdict, and approving over a non-pass is the administrator's recorded act
 
 **Status:** proposed
 **Date:** 2026-10-12

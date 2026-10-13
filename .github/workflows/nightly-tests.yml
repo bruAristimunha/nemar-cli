@@ -31,7 +31,9 @@ jobs:
   nightly:
     name: Full suite against dev
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # p95 24.5 min and the slowest green run 29.5 (50 green runs to 2026-10-13), so a
+    # 30-minute limit was cutting it close; twice the p95.
+    timeout-minutes: 50
     env:
       TEST_API_URL: https://nemar-api-dev.sccn-org.workers.dev
       TEST_ADMIN_API_KEY: ${{ secrets.TEST_ADMIN_API_KEY }}
@@ -54,7 +56,10 @@ jobs:
         with:
           deno-version: v2.x
 
+      # Under 30 s at p95, but the Ubuntu mirror can stall on this one package for minutes,
+      # and #1667 saw the same install hang for an hour.
       - name: Install git-annex
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y git-annex

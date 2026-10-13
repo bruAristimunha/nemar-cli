@@ -66,7 +66,7 @@ here, since an index that misses a document cannot classify it either.
 | [draft-anonymous-deposit-analysis.md](draft-anonymous-deposit-analysis.md) | Pseudonymous deposit for double-blind review: the leak inventory, and what the chosen design (public data, private repository) requires. ADR still to be written. | public |
 | [draft-eegdash-zarr-issues.sh](draft-eegdash-zarr-issues.sh) | Script drafting the EEGDash Zarr issues. The one non-markdown document here, which is why a markdown-only sweep missed it. | public |
 | [plans/spec-pr1.md](plans/spec-pr1.md) | Column-budget rebuild spec (issue #1182). In `plans/`, which a top-level sweep missed. | public |
-| [publication-review-design.md](publication-review-design.md) | The analysis behind ADR 0101 (epic #1726): what was read, the pull-request review compared with the publication review, the data flow, the screen-first options, the cost arithmetic, the calibration plan, the initial vocabularies, the refined phase plan and the risks. Analysis, not a ruling. | public |
+| [publication-review-design.md](publication-review-design.md) | The analysis behind ADR 0102 (epic #1726): what was read, the pull-request review compared with the publication review, the data flow, the screen-first options, the cost arithmetic, the calibration plan, the initial vocabularies, the refined phase plan and the risks. Analysis, not a ruling. | public |
 
 ## Research — point-in-time findings
 

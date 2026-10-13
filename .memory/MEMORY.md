@@ -26,7 +26,7 @@
 - [OSA NEMAR assistant state](osa-nemar-assistant-state.md) — its nemar assistant is the LEGACY one and the replacement is unbuilt epic work; dead against legacy API; no MCP runtime; OSA at api.osc.earth/osa, api.osc.earth/nemar is gone
 - [Python-urllib UA gets 403](api-hosts-block-python-urllib-ua.md) — api and zarr hosts block only the urllib UA; send a named UA when probing from Python
 - [Wrangler via cfman](wrangler-via-cfman.md) — `bunx cfman wrangler --account sccn ...` is how wrangler runs here; bare wrangler "Not logged in" is not a lack of access
-- [Release PR needs its own review](release-pr-needs-own-review.md) — review the full main...dev diff before promoting; follow-ups reviewed alone still leave seams
+- [Release PR needs its own review](release-pr-needs-own-review.md): one integration-scoped review of the full main...dev diff before promoting; one fix PR into dev per round, accepted findings never ship in the next release
 - [Website release: prepare first](website-release-prepare-first.md) — run prepare-release.yml on staging before the staging->main PR; nemar-cli strips on main, the website strips on staging
 - [New tooling repos are MIT](new-tooling-repos-mit.md) — public reusable tools under nemarOrg get MIT; nemar-cli CC BY-NC-ND is the exception
 - [orcid-mock project](orcid-mock-project.md) — charter-only repo for the mock ORCID server; decisions, open questions, how to start it
