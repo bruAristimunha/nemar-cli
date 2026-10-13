@@ -13,7 +13,16 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
-## Unreleased
+## 0.10.17 - 2026-10-13
+
+The website's server-side requests are counted per visitor instead of as one client, which is
+the fix for the `/discover` 429 errors (#1709), together with a rate limiter whose windows no
+longer slide, a modality filter that matches a whole token, a corrected check before an
+administrator approves a pull request, and a weekly drift check that can finally file its
+issue. The automated review of dataset pull requests stays off in production, as in 0.10.16.
+There is no migration and no new secret. The `/discover` fix needs a second deploy to take
+effect for visitors: the website must be promoted to production after this release (see Deploy
+coupling).
 
 ### Changed
 
@@ -26,8 +35,53 @@ earlier releases are described only by their generated notes.
   A change to either copy now has to be deployed to the other in the same step, as it already
   had to be for the onboarding workflow. Step 3 of ADR 0092's "Before it is switched on" is done.
 
+- **The anonymous per-IP cap is 1000 per window, up from 500 (ADR 0098).** It stays at 1000
+  because the authenticated token cap is 1000 and a token holder must not be limited more
+  strictly than an anonymous caller. `/mcp` shares this bucket, so its ceiling doubles with it.
+- **Rate-limit counters are fixed windows (ADR 0099).** The counter used to rewrite its record
+  with a fresh full minute on every allowed request, so the window slid, and a pool that never
+  went quiet for a minute was refused for about a minute after every `cap / rate` seconds,
+  whatever the cap; that is most of the 40 percent in #1709. The record now carries the window's
+  end, a block ends where the window does, `Retry-After` is the seconds left and
+  `X-RateLimit-Reset` is the window's end. One read, write and refuse path serves every bucket,
+  including the data-plane miss budget, the private-grant budget and the observe-only path.
+- **Every answer says how the caller was identified, and browsers can read the headers (ADR
+  0098).** `X-RateLimit-Caller` is `edge`, `site` or `unattributed` on every answer, including
+  the admin-bypass answer and the private-grant refusal; `X-RateLimit-Bucket` values are
+  unchanged. The rate-limit headers are exposed to browser callers on the nemar.org hosts and
+  are kept on handler responses.
+- **Limiter logs name who and where, once per window (ADR 0098).** Cache-fault lines are keyed
+  by bucket kind, phase and error class, say how long ago the previous line was, and speak again
+  at the 11th, 101st and 1001st call so a burst shows its size. Refusals are logged once per
+  window per caller source, a caller identified by an address is named by source and reason and
+  never by value, and token buckets write no identity line.
+
 ### Fixed
 
+- **The website's server-side requests are counted per visitor, not as one client (#1709, ADR
+  0098).** The website renders `/discover` and dataset pages on the server, so every visitor
+  reached the API from the same few Cloudflare addresses and one per-address bucket was shared
+  by all of them; when it filled, visitors saw "Could not load datasets" for minutes. The website
+  will now call the Worker through a service binding and send the visitor's address in
+  `X-Forwarded-For`. The limiter counts a request that has no `CF-Connecting-IP` and a valid
+  first `X-Forwarded-For` address in a new `site-ip` bucket of 2000 per window, under a key a
+  public caller can never produce, and `X-Forwarded-For` is never read when `CF-Connecting-IP` is
+  present. A binding call with neither header now shares one `site-unattributed` bucket of
+  20,000 per window instead of getting a fresh random bucket per request, which was no limit at
+  all. The Worker's own in-process requests (an MCP tool reading `index.json`, the Neurobagel
+  gatherer) are not counted by the data-plane counter or its miss budget, and are counted by
+  their headers everywhere else. A forwarded visitor also gets their own ten sign-in requests
+  (the address half of #1354). The strict, data, token and Neurobagel caps, the admin bypass
+  and the development bypass are unchanged. To be honest about the number: a default Discover
+  page costs 11 API calls (about 180 views per window) and the largest page the website can
+  render costs about 101 (about 19 views), so capping what one page hydrates is the website's
+  to decide. **Nothing changes for the website's visitors until the website is promoted to
+  production.**
+- **A stalled Cache API can no longer hang a request, and a failed cache write no longer demotes
+  an admin (ADR 0098).** Every wait on the cache is bounded at 500 ms and fails open, including
+  deferred writes and body reads. An admin the database had just confirmed keeps the admin
+  bypass when the cache write fails or stalls, and a damaged cached admin flag is read again
+  from the database and logged once per window.
 - **The weekly summary.json drift check can file its issue.** The job has no checkout, so `gh`
   had no repository to act on. Of the 20 scheduled runs on record (the first on 2026-06-01), 19
   failed in the step that opens the issue and 1 in the step that reports a broken coverage
@@ -104,6 +158,25 @@ earlier releases are described only by their generated notes.
   its name; its values change, so a pseudonym logged before this release does not match one
   logged after. No new secret, no migration and no deploy coupling. The same unkeyed hash is
   still stored with sessions and the device sign-in audit; that is tracked in #1733.
+
+### Deploy coupling
+
+- No migration, no new Worker secret or variable, and the automated pull-request review stays
+  off in production. The keyed log pseudonym derives from the existing `ENCRYPTION_KEY`.
+- **Release the Worker first, then promote the website.** Until the website calls through the
+  service binding with `X-Forwarded-For` (nemarOrg/website, merged to `staging`), its
+  visitors keep arriving from shared addresses and the `/discover` errors continue to depend on
+  the 1000 cap and the fixed windows alone. Releasing the website first would send binding calls
+  to a Worker that would count them as unattributed.
+- After the website is in production: two calls for one visitor should read
+  `X-RateLimit-Bucket: site-ip` with `X-RateLimit-Remaining` at 1999 then 1998 and a second
+  visitor should start at 1999. The `[rate-limit] counting a request without CF-Connecting-IP by
+  its forwarded visitor` line should appear and no "request with neither" warning. #1712 (demote
+  that line) stays open until this has been observed.
+- The weekly summary.json drift check runs from `main`, so its first corrected run is the Monday
+  after this release.
+- Watch how often the `[rate-limit] the cache keeps stalling` line appears after deploy; the
+  breaker's three constants are the knob, and production stall rates are unknown.
 
 ## 0.10.16 - 2026-10-11
 
