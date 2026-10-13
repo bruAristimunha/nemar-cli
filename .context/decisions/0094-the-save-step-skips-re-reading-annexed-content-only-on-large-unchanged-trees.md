@@ -60,7 +60,7 @@ Measured on local disk, that first `git status` took about 0.35 to 0.45 s agains
   The total work is unchanged: 9.4 s for the plain save against 5.3 s plus 4.3 s for the skip save and the first status, at 10,000 annexed files plus 5,000 JSON files (local disk).
 - The save fails on a changed file, on an annexed file that disappeared, and on a git that cannot report or clear its flags.
   Each message says what to do.
-- Index stat data is still not primed, so the cost above is paid on a later command rather than avoided.
+- Index stat data is still not primed, so the cost above is paid on a later command rather than avoided (amended below: ADR 0100 primes data files of 1 GiB or more).
 
 ## The check of recorded files that precedes the save
 
@@ -125,3 +125,13 @@ with SIGKILL or lost power. A flag left that way, an edit to the same annexed fi
 reads "No changes detected" or leaves the edit out of the pull request. Run `nemar dataset commit` (or the
 upload again) in that directory first; both clear stale flags. Routing `update` through the same clear is
 the fix.
+
+## Amendment (issue #1704, 2026-10-12)
+
+The alternative "prime the index's stat data so the read never happens" was rejected above because both ways tried re-read the content.
+Both were tried with `filter.annex.process` set.
+Without it, git uses git-annex's per-file clean filter, which answers from the inode cache from the path alone, and `git update-index --refresh` recorded the stat data of 1.26 GB of annexed files after piping 0.8 MB, where it piped 1,258 MB with the filter process set.
+[ADR 0100](0100-tracking-records-index-stat-data-for-large-files-through-the-per-file-clean-filter.md) does that in the tracking step for data files of 1 GiB or more, taking the filter process out of the configuration only for the refresh.
+For those files the save's `git add -A` and the first `git status` afterwards no longer read the content, so the deferred cost described above remains only for annexed files under 1 GiB.
+For those smaller files it is larger than the deferred `git status` read described above: when no `git status` runs between two uploads, the next upload's add checks every previously tracked file and reads each one twice (2,517 MB for a 1.26 GB dataset of 200 MiB files, measured), because a completed upload clears its progress and hands every data file to the add again.
+The skip itself is unchanged: it still marks every annexed file that matches the plan, which costs a primed file nothing.

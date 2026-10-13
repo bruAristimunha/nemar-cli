@@ -18,12 +18,13 @@ earlier releases are described only by their generated notes.
 The website's server-side requests are counted per visitor instead of as one client, which is
 the fix for the `/discover` 429 errors (#1709), together with a rate limiter whose windows no
 longer slide, a modality filter that matches a whole token, a corrected check before an
-administrator approves a pull request, and a weekly drift check that can finally file its
-issue. The automated review of dataset pull requests stays off in production, as in 0.10.16;
-its first live run passed on dev on 2026-10-12, with a throwaway pull request to an exemplar
-dataset. There is no migration and no new secret. Counting per visitor needs a second deploy: the
-website must be promoted to production after this release (see Deploy coupling), while the
-fixed windows and the higher cap help the shared pool at once.
+administrator approves a pull request, a weekly drift check that can finally file its
+issue, and an upload step that no longer re-reads tracked files of 1 GiB or more through
+git-annex's filter process. The automated review of dataset pull requests stays off in
+production, as in 0.10.16; its first live run passed on dev on 2026-10-12, with a throwaway
+pull request to an exemplar dataset. There is no migration and no new secret. Counting per
+visitor needs a second deploy: the website must be promoted to production after this release
+(see Deploy coupling), while the fixed windows and the higher cap help the shared pool at once.
 
 ### Changed
 
@@ -168,6 +169,23 @@ fixed windows and the higher cap help the shared pool at once.
   its name; its values change, so a pseudonym logged before this release does not match one
   logged after. No new secret, no migration and no deploy coupling. The same unkeyed hash is
   still stored with sessions and the device sign-in audit; that is tracked in #1733.
+- **Tracking no longer leaves data files of 1 GiB or more for git to re-read through
+  git-annex filter-process (#1704, ADR 0100).** `git annex add` stages an unlocked file without
+  stat data, so the save, the first `git status` afterwards and the next upload's add each
+  streamed it through `git-annex filter-process` again, and the add's check of files already in
+  the index read each one twice. For data files of 1 GiB or more the tracking step now records
+  the stat data with `git add --refresh` through git-annex's per-file clean filter, which
+  answers from its inode cache without the file's content being sent. `filter.annex.process` is
+  out of the repository's configuration only for one chunk of 100 paths at a time, under
+  git-annex's own `filter.annex.process-temp-disabled` marker, and only when no other filter
+  process (an empty one included) is set in any scope; it is put back after each chunk, on
+  SIGINT, SIGTERM and SIGHUP, and at the start of the next upload, and a configuration that
+  cannot be put back fails the step. Files under 1 GiB are tracked as before, so after a save
+  that took the 1 GiB skip, the next upload still reads each of them twice; trees of many
+  smaller files, the common EEG case, keep that cost. Measured locally with the threshold
+  lowered to 100 MB so that 200 MiB files were primed, the bytes piped into the filter on a
+  second upload to a 1.26 GB dataset fell from 2,517 MB to 1.1 MB; at the shipped threshold
+  those files are not primed. Not measured on CephFS.
 
 ### Deploy coupling
 
