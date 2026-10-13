@@ -30,7 +30,7 @@
 #         moves, so a merged driver change reaches the node on the next tick
 #         instead of waiting out the backfill (#1129).
 #
-#         SLOTS (ADR 0102). A tick no longer drains the queue itself: it starts
+#         SLOTS (ADR 0101). A tick no longer drains the queue itself: it starts
 #         one drain per FREE slot (ZARR_SLOTS, default 4), each under its own
 #         lock, with its own scratch directory and log, claiming its own dataset
 #         and converting it ZARR_JOBS_PER_SLOT (default 4) recordings at a time. A
@@ -42,7 +42,7 @@
 #
 # Usage:
 #   ./hallu-zarr.sh                      # reconcile + drain the queue
-#   ./hallu-zarr.sh --limit 20           # cap datasets per run (paced)
+#   ./hallu-zarr.sh --limit 20           # cap datasets per run (paced); each slot has its own cap
 #   ./hallu-zarr.sh --dataset nm000132   # one dataset now, in the first free slot
 #   ZARR_SLOT=2 ./hallu-zarr.sh          # drain as slot 2 only (what a tick starts)
 #   ./hallu-zarr.sh --stats              # print queue status and exit
@@ -231,30 +231,38 @@ unset _work_dir_overridden _state_dir_overridden
 # total: the default is ZARR_JOBS_PER_SLOT (4), and ZARR_JOBS can lower it but never
 # raise it, so a crontab that still says ZARR_JOBS=24 from the single-drain days does
 # not give every slot 24.
+#
+# Counts are plain decimal integers: a leading zero would be read as octal by the
+# arithmetic below ("08" is an error, "010" is 8) and would name a different lock and
+# scratch directory than the same number without it.
+is_posint() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
+fatal_config() { echo "FATAL: $*" >&2; exit 1; }
 SLOTS="${ZARR_SLOTS:-4}"
-if ! [[ "$SLOTS" =~ ^[0-9]+$ ]] || ((SLOTS < 1 || SLOTS > 16)); then
-  echo "FATAL: ZARR_SLOTS must be an integer from 1 to 16 (got '$SLOTS')." >&2
-  exit 1
-fi
+{ is_posint "$SLOTS" && ((SLOTS <= 16)); } ||
+  fatal_config "ZARR_SLOTS must be an integer from 1 to 16 (got '$SLOTS')."
+[[ -z "${ZARR_JOBS:-}" ]] || is_posint "$ZARR_JOBS" ||
+  fatal_config "ZARR_JOBS must be a positive integer (got '$ZARR_JOBS')."
+[[ -z "${ZARR_JOBS_PER_SLOT:-}" ]] || is_posint "$ZARR_JOBS_PER_SLOT" ||
+  fatal_config "ZARR_JOBS_PER_SLOT must be a positive integer (got '$ZARR_JOBS_PER_SLOT')."
 if ((SLOTS > 1)); then
   JOBS="${ZARR_JOBS_PER_SLOT:-4}"
-  if [[ -n "${ZARR_JOBS:-}" ]] && [[ "$ZARR_JOBS" =~ ^[0-9]+$ ]] && ((ZARR_JOBS < JOBS)); then
+  if [[ -n "${ZARR_JOBS:-}" ]] && ((ZARR_JOBS < JOBS)); then
     JOBS="$ZARR_JOBS"
   fi
 else
   JOBS="${ZARR_JOBS:-$(nproc 2>/dev/null || echo 8)}"
 fi
-if ! [[ "$JOBS" =~ ^[0-9]+$ ]] || ((JOBS < 1)); then
-  echo "FATAL: the worker count must be a positive integer (got '$JOBS')." >&2
-  exit 1
-fi
+is_posint "$JOBS" || fatal_config "the worker count must be a positive integer (got '$JOBS')."
+# How often a running conversion tells the queue it is alive (see heartbeat_start).
+HEARTBEAT_SECONDS="${ZARR_HEARTBEAT_SECONDS:-300}"
+is_posint "$HEARTBEAT_SECONDS" ||
+  fatal_config "ZARR_HEARTBEAT_SECONDS must be a positive integer (got '$HEARTBEAT_SECONDS')."
 # Which slot THIS process is. Unset on a plain invocation, which then starts a drain
 # in every free slot (or, for --dataset, takes the first free one). A tick starts its
 # drains with ZARR_SLOT set.
 SLOT="${ZARR_SLOT:-}"
-if [[ -n "$SLOT" ]] && { ! [[ "$SLOT" =~ ^[0-9]+$ ]] || ((SLOT >= SLOTS)); }; then
-  echo "FATAL: ZARR_SLOT must be an integer from 0 to $((SLOTS - 1)) (got '$SLOT', ZARR_SLOTS=$SLOTS)." >&2
-  exit 1
+if [[ -n "$SLOT" ]] && { ! [[ "$SLOT" =~ ^(0|[1-9][0-9]*)$ ]] || ((SLOT >= SLOTS)); }; then
+  fatal_config "ZARR_SLOT must be an integer from 0 to $((SLOTS - 1)) (got '$SLOT', ZARR_SLOTS=$SLOTS)."
 fi
 # Anonymous-memory bounds for every conversion worker. Each worker converts under
 # an RLIMIT_DATA budget (generate_zarr.py apply_worker_mem_limit), which counts
@@ -408,7 +416,7 @@ export AWS_DEFAULT_REGION="$AWS_REGION"
 QUEUE_DB="${ZARR_QUEUE_DB:-${STATE_DIR}/zarr-queue.db}"
 LOG_FILE="${ZARR_LOG_FILE:-${STATE_DIR}/.nm-zarr.log}"
 LOCK_FILE="${ZARR_LOCK_FILE:-${STATE_DIR}/.nm-zarr.lock}"
-# The admission ledger (ADR 0102): what every driver on this NODE has reserved. Under
+# The admission ledger (ADR 0101): what every driver on this NODE has reserved. Under
 # ZARR_BASE rather than STATE_DIR so the nightly --test run, which keeps its own state
 # directory, still shares it with the production slots: they share the machine.
 export ZARR_LEDGER_DIR="${ZARR_LEDGER_DIR:-${ZARR_BASE}/zarr-admission-ledger}"
@@ -902,12 +910,13 @@ setup_locked() {
 # starts with a reconcile, and a reconcile returns to `pending` any `inprogress` row
 # idle for more than six hours: a dataset that converts for longer (nm000276 has run
 # for days) would be handed to a second slot and converted twice, concurrently, onto
-# the same S3 prefix. The loop ends when its drain does, and on its own if this
-# script is killed (it checks that its parent is still there).
-HEARTBEAT_SECONDS="${ZARR_HEARTBEAT_SECONDS:-300}"
+# the same S3 prefix. The loop follows the DRIVER, not this script: a script killed
+# with SIGKILL leaves its driver running, and the driver is what is converting.
+# Started for a dataset the queue handed out (a one-off run has no `inprogress` row to
+# keep, and would report the missing one as a problem).
 HEARTBEAT_PID=""
 heartbeat_start() {
-  local id="$1" parent="$$"
+  local id="$1" driver="$2"
   (
     # The sleep is a child of this subshell and holds its output open, so it is ended
     # with the loop instead of being left to run out its interval.
@@ -917,7 +926,7 @@ heartbeat_start() {
       sleep "$HEARTBEAT_SECONDS" &
       sleeper=$!
       wait "$sleeper" 2>/dev/null
-      kill -0 "$parent" 2>/dev/null || exit 0
+      kill -0 "$driver" 2>/dev/null || exit 0
       touched="$(qpy heartbeat "$id" 2>/dev/null)" || continue
       if [[ "$touched" == "0" ]]; then
         err "[$id] the queue no longer lists this dataset as inprogress (another slot's reconcile reclaimed it?); it may now be converted twice"
@@ -932,6 +941,30 @@ heartbeat_stop() {
   kill "$HEARTBEAT_PID" 2>/dev/null
   wait "$HEARTBEAT_PID" 2>/dev/null
   HEARTBEAT_PID=""
+}
+
+# A signal to this script reaches the driver too. The driver runs in the background so
+# that the heartbeat can follow it, and a background job of a non-interactive shell
+# starts with SIGINT ignored, so Ctrl-C and the supervisor's TERM would otherwise stop
+# the script and leave the driver converting with nothing to report its result. The
+# driver's workers are its children and go with it. A stop is not a failure of the
+# dataset: its row stays `inprogress` and the stale sweep returns it to `pending`.
+DRIVER_PID=""
+STOP_REQUESTED=""
+stop_driver() {
+  [[ -n "$DRIVER_PID" ]] || return 0
+  pkill -TERM -P "$DRIVER_PID" 2>/dev/null
+  kill -TERM "$DRIVER_PID" 2>/dev/null
+  return 0
+}
+on_stop_signal() {
+  STOP_REQUESTED=1
+  if [[ -n "$DRIVER_PID" ]]; then
+    stop_driver  # the conversion returns, and the drain loop sees STOP_REQUESTED
+  else
+    heartbeat_stop
+    exit 143
+  fi
 }
 
 # The driver's exit when this node's biosigIO cannot leave subject information
@@ -961,6 +994,36 @@ report_subject_info_refusal() {
 
 # --- Per-dataset: download -> convert -> push -> CLEANUP -----------------------
 # Returns 0 on success. The store is on S3; the scratch copy is always deleted.
+# One conversion of a dataset at a time, across every slot and every one-off run. The
+# queue hands a dataset to one slot, but a one-off `--dataset X` bypasses the queue, and
+# with the single lock gone nothing else stops it running X onto the same S3 prefix as
+# a slot that is converting X (`--clean` syncs with --delete: two at once undo each
+# other). A one-off refuses to start on a dataset that is being converted (exit 3); a
+# slot that is handed one a one-off holds waits for it to finish. The lock is on a
+# descriptor the driver inherits, so it is held for as long as the driver lives.
+DATASET_LOCK_DIR="${STATE_DIR}/dataset-locks"
+convert_dataset_exclusive() {
+  local id="$1" held=0 lock_rc=0
+  mkdir -p "$DATASET_LOCK_DIR"
+  exec 7>"${DATASET_LOCK_DIR}/${id}.lock"
+  if [[ -n "$ONLY_DATASET" ]]; then
+    flock -n 7 || lock_rc=$?
+    if ((lock_rc != 0)); then
+      err "[$id] is being converted by another slot or run; not starting a second conversion of it"
+      exec 7>&-
+      LAST_DETERMINISTIC=false LAST_PENDING_COUNT=0 LAST_NOT_ATTEMPTED=0
+      return 3
+    fi
+  else
+    flock 7
+  fi
+  held=1
+  convert_dataset "$@"
+  local rc=$?
+  ((held)) && { flock -u 7; exec 7>&-; }
+  return "$rc"
+}
+
 convert_dataset() {
   # $3 = "retry-pending" from the queue drain only (#1483): the driver then
   # converts just the recordings the published index lists as pending, when that
@@ -1020,13 +1083,22 @@ convert_dataset() {
   # conversion (ADR 0023); the flag does not mean what its name suggests. With
   # streaming + JOBS-way parallelism a whole-dataset rebuild is cheap enough that
   # we always remake rather than reason about incremental diffs.
-  heartbeat_start "$id"
   VIRTUAL_ENV="$VENV_DIR" "$VENV_DIR/bin/python" "$DRIVER" \
     --dataset-id "$id" --repo-dir "$dir" \
     --bucket "$S3_BUCKET" --region "$AWS_REGION" --clean \
     ${retry_args[@]+"${retry_args[@]}"} \
     --contract-base "$CONTRACT_BASE" --api-base "$API_BASE" \
-    --jobs "$JOBS" --callback-out "$cb" >>"$LOG_FILE" 2>&1 || rc=$?
+    --jobs "$JOBS" --callback-out "$cb" >>"$LOG_FILE" 2>&1 &
+  DRIVER_PID=$!
+  [[ "$scope" == "retry-pending" ]] && heartbeat_start "$id" "$DRIVER_PID"
+  # A trapped signal interrupts `wait` without ending the child, so wait again until
+  # the driver is really gone (it is, once stop_driver has signalled it).
+  while :; do
+    wait "$DRIVER_PID"
+    rc=$?
+    kill -0 "$DRIVER_PID" 2>/dev/null || break
+  done
+  DRIVER_PID=""
   heartbeat_stop
 
   # Read the driver's classification BEFORE the scratch is reclaimed. The
@@ -1195,7 +1267,7 @@ supervise() {
   for ((k = 0; k < SLOTS; k++)); do
     if slot_is_free "$k"; then
       log "starting slot $k (of $SLOTS)"
-      ZARR_SLOT="$k" bash "$SCRIPT_PATH" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"} &
+      ZARR_SLOT="$k" "${BASH:-bash}" "$SCRIPT_PATH" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"} &
       pids+=("$!")
       started=$((started + 1))
     fi
@@ -1213,8 +1285,17 @@ supervise() {
   return "$rc"
 }
 
+# --stats reads the queue and nothing else, so like --requeue it runs before any slot is
+# taken and before setup(): a slot per question would rewrite the shared clone and hold
+# every idle slot's lock to print one line. Where the clone or the venv does not exist
+# yet (a new node) it falls through to the path that builds them.
+if [[ -n "$STATS_ONLY" && -f "$QUEUE" && -x "$VENV_DIR/bin/python" ]]; then
+  qpy stats
+  exit $?
+fi
+
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/$(basename "${BASH_SOURCE[0]}")"
-if [[ -z "$SLOT" && -z "$ONLY_DATASET" ]] && ((SLOTS > 1)); then
+if [[ -z "$SLOT" && -z "$ONLY_DATASET" && -z "$STATS_ONLY" ]] && ((SLOTS > 1)); then
   supervise
   exit $?
 fi
@@ -1245,6 +1326,10 @@ else
     exit 3
   fi
 fi
+
+# From here this process owns a slot: a TERM or INT stops its driver and then it
+# (see stop_driver).
+trap on_stop_signal TERM INT
 
 # --- Reclaim orphaned scratch -------------------------------------------------
 # The driver's per-recording `tempfile.TemporaryDirectory()` unwinds on a normal
@@ -1291,6 +1376,7 @@ else
 fi
 
 setup_locked
+START_HEAD="$(git -C "$DRIVER_REPO" rev-parse HEAD 2>/dev/null)"
 if [[ ! -f "$DRIVER" || ! -f "$QUEUE" ]]; then
   err "driver/queue not found under $DRIVER_REPO after setup"; exit 1
 fi
@@ -1337,7 +1423,10 @@ ref_moved() {
   local remote_head local_head
   remote_head="$(git -C "$DRIVER_REPO" ls-remote origin "$DRIVER_REF" 2>/dev/null | cut -f1)"
   [[ -z "$remote_head" ]] && return 1
-  local_head="$(git -C "$DRIVER_REPO" rev-parse HEAD 2>/dev/null)"
+  # The commit THIS drain started on, not whatever the shared clone is at now: another
+  # slot's setup() moves the clone, and comparing with that would tell this drain it is
+  # current while it runs the old shell logic against the new driver.
+  local_head="${START_HEAD:-$(git -C "$DRIVER_REPO" rev-parse HEAD 2>/dev/null)}"
   [[ -z "$local_head" ]] && return 1
   [[ "$remote_head" != "$local_head" ]]
 }
@@ -1372,7 +1461,11 @@ if [[ -n "$ONLY_DATASET" ]]; then
   v="$(curl -sS --max-time 30 "${API_BASE}/datasets/${ONLY_DATASET}" 2>/dev/null \
         | jq -r '.dataset.latest_version // ""' 2>/dev/null)"
   only_rc=0
-  convert_dataset "$ONLY_DATASET" "$v" || only_rc=$?
+  convert_dataset_exclusive "$ONLY_DATASET" "$v" || only_rc=$?
+  if [[ -n "$STOP_REQUESTED" ]]; then
+    log "[$ONLY_DATASET] stopped by a signal"
+    exit 143
+  fi
   if [[ "$only_rc" -eq "$DRIVER_EXIT_SUBJECT_INFO_UNAVAILABLE" ]]; then
     report_subject_info_refusal "$ONLY_DATASET"
   fi
@@ -1445,7 +1538,13 @@ while :; do
   # does not lose data or stall the drain. Worth a loud line so the wasted work
   # is attributable, not worth abandoning a backfill mid-queue.
   driver_rc=0
-  convert_dataset "$id" "$version" retry-pending || driver_rc=$?
+  convert_dataset_exclusive "$id" "$version" retry-pending || driver_rc=$?
+  if [[ -n "$STOP_REQUESTED" ]]; then
+    # An operator stop, not a failure of the dataset: no attempt is spent. The row
+    # stays inprogress and the stale sweep returns it to pending after six hours.
+    log "[$id] stopped by a signal; its queue row stays inprogress until the stale sweep returns it to pending"
+    exit 143
+  fi
   if [[ "$driver_rc" -eq 0 ]]; then
     # shellcheck disable=SC1010  # `done` is the queue subcommand, not the keyword
     qpy done "$id" "$version" --pending-count "${LAST_PENDING_COUNT:-0}" \

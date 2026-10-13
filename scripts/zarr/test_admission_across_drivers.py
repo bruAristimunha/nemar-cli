@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for admission across drivers (ADR 0102): `_drain_with_admission` with a
+"""Tests for admission across drivers (ADR 0101): `_drain_with_admission` with a
 shared `admission_ledger.Ledger`.
 
 A "peer driver" is a live child process whose reservations the ledger reads, the way
@@ -21,6 +21,7 @@ import io
 import itertools
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -87,7 +88,9 @@ class DrainAgainstPeersCase(unittest.TestCase):
                 child.kill()
             child.wait()
 
-    def peer(self, ram=0, scratch=0, paths=(), track_dir=None, waiting_since=None):
+    def peer(
+        self, ram=0, scratch=0, paths=(), track_dir=None, waiting_since=None, blocked_by=None
+    ):
         """A live peer driver that holds one reservation (when ``ram`` or ``scratch``)."""
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
         self._children.append(child)
@@ -102,7 +105,7 @@ class DrainAgainstPeersCase(unittest.TestCase):
             if ram or scratch:
                 peer.reserve(ram, scratch, list(paths))
             if waiting_since is not None:
-                peer.mark_waiting(True, now=waiting_since)
+                peer.mark_waiting(True, now=waiting_since, blocked_by=blocked_by)
         return peer
 
     def drain(self, n=3, ceiling=None, ledger="own", deferred=None, **kwargs):
@@ -276,7 +279,8 @@ class TestWaitingEndsInADeferral(DrainAgainstPeersCase):
     def test_a_peer_waiting_longer_goes_first(self):
         admission_ledger.STARVATION_SECONDS = 60.0
         generate_zarr.LEDGER_WAIT_SECONDS = 0.3
-        peer = self.peer(waiting_since=time.time() - 3600)  # holds nothing, waits longest
+        # Holds nothing, waits longest, and is waiting for this process.
+        peer = self.peer(waiting_since=time.time() - 3600, blocked_by={os.getpid()})
         deferred: dict = {}
         spans = self.drain(deferred=deferred)
         self.assertEqual(spans, [])
@@ -289,6 +293,160 @@ class TestWaitingEndsInADeferral(DrainAgainstPeersCase):
         admission_ledger.STARVATION_SECONDS = 3600.0
         self.peer(waiting_since=time.time() - 5)
         self.assertEqual(len(self.drain()), 3)
+
+
+class TestOnlyTheDriversInTheWaitersWayStop(DrainAgainstPeersCase):
+    def test_a_driver_the_waiter_is_not_waiting_for_keeps_admitting(self):
+        admission_ledger.STARVATION_SECONDS = 60.0
+        generate_zarr.LEDGER_WAIT_SECONDS = 5.0
+        self.peer(ram=100)  # holds a share of the ceiling, as the real blocker would
+        self.peer(waiting_since=time.time() - 3600, blocked_by={1})  # waits for pid 1
+        deferred: dict = {}
+        spans = self.drain(deferred=deferred)
+        self.assertEqual(len(spans), 3)
+        self.assertEqual(deferred, {})
+
+    def test_the_driver_the_waiter_is_waiting_for_stops_so_the_waiter_can_run(self):
+        admission_ledger.STARVATION_SECONDS = 60.0
+        generate_zarr.LEDGER_WAIT_SECONDS = 0.3
+        self.peer(waiting_since=time.time() - 3600, blocked_by={os.getpid()})
+        deferred: dict = {}
+        spans = self.drain(deferred=deferred)
+        self.assertEqual(spans, [])
+        self.assertEqual(len(deferred), 3)
+
+
+class TestAloneMeansWithoutThePeersDisk(DrainAgainstPeersCase):
+    """The free space of the volume already excludes what the peers have written. A
+    recording that would fit if they were gone is held up by them, not unfit."""
+
+    MIB = 1 << 20
+
+    def test_a_recording_that_fits_once_the_peers_are_gone_waits_instead_of_deferring(self):
+        primaries = _primaries(1)
+        held_dir = os.path.join(self._tmp.name, "peer-recording")
+        os.makedirs(held_dir)
+        with open(os.path.join(held_dir, "blob"), "wb") as fh:
+            fh.write(os.urandom(self.MIB))
+        total = int(5.75 * self.MIB)
+
+        def free_now(in_flight):  # the volume: what the peer holds is not free
+            return total - generate_zarr.allocated_bytes(held_dir)
+
+        # Free is ~4.75 MiB, the recording is charged 5. The peer reserved 3 and holds 1,
+        # so 2 are still owed: with it there are 2.75 to admit into, without it 5.75.
+        peer = self.peer(ram=1, scratch=3 * self.MIB, paths=[held_dir])
+
+        def peer_finishes():
+            with peer.exclusive():
+                peer.release_all()
+            shutil.rmtree(held_dir)
+
+        timer = threading.Timer(0.5, peer_finishes)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        results: list = []
+        deferred: dict = {}
+        own = Ledger(self.root)
+        _drain_with_admission(
+            primaries, dict.fromkeys(primaries, 1), 3, 10**12, {},
+            lambda r, i: results.append(r), worker=_timed_worker,
+            ceiling=lambda running_peak, track_dir: 10**12, ledger=own,
+            scratch_peaks={primaries[0]: 5 * self.MIB}, scratch_budget=free_now,
+            deferred=deferred,
+        )
+        close_ledger(own)
+        self.assertEqual(deferred, {})
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0]["ok"])
+
+    def test_a_recording_that_does_not_fit_even_alone_is_still_deferred(self):
+        primaries = _primaries(1)
+        deferred: dict = {}
+        own = Ledger(self.root)
+        self.peer(ram=1, scratch=1, paths=[])
+        _drain_with_admission(
+            primaries, dict.fromkeys(primaries, 1), 3, 10**12, {}, lambda r, i: None,
+            worker=_timed_worker, ceiling=lambda running_peak, track_dir: 10**12,
+            ledger=own, scratch_peaks={primaries[0]: 5 * self.MIB},
+            scratch_budget=lambda in_flight: self.MIB, deferred=deferred,
+        )
+        close_ledger(own)
+        self.assertEqual(set(deferred), set(primaries))
+        self.assertTrue(deferred[primaries[0]].startswith("deferred: needs "))
+        self.assertNotEqual(deferred[primaries[0]], PEER_DEFERRAL_MESSAGE)
+
+
+class TestALedgerThatCannotBeUsed(DrainAgainstPeersCase):
+    def test_one_that_stops_working_mid_run_ends_the_wait_in_a_deferral_not_a_traceback(self):
+        generate_zarr.LEDGER_WAIT_SECONDS = 0.4
+        lock = os.path.join(self.root, ".lock")
+
+        def break_it():
+            os.remove(lock)
+            os.makedirs(lock)  # opening a directory fails the way EMFILE or EIO would
+
+        timer = threading.Timer(0.2, break_it)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        deferred: dict = {}
+        # Room for one recording at a time: the first runs, the rest wait their turn.
+        spans = self.drain(ceiling=150, deferred=deferred)
+        self.assertEqual(len(spans), 1)  # the one in flight when it broke was reported
+        self.assertEqual(len(deferred), 2)
+        self.assertTrue(all(m == generate_zarr.LEDGER_UNUSABLE_MESSAGE for m in deferred.values()))
+
+    def test_one_that_cannot_be_written_from_the_start_defers_instead_of_raising(self):
+        generate_zarr.LEDGER_WAIT_SECONDS = 0.3
+        own = Ledger(self.root)
+        os.makedirs(os.path.join(own._path, "x"))  # os.replace onto this fails
+        deferred: dict = {}
+        spans = self.drain(ledger=own, deferred=deferred)
+        self.assertEqual(spans, [])
+        self.assertEqual(len(deferred), 3)
+        self.assertTrue(PEER_DEFERRAL_MESSAGE != generate_zarr.LEDGER_UNUSABLE_MESSAGE)
+        self.assertTrue(all(m == generate_zarr.LEDGER_UNUSABLE_MESSAGE for m in deferred.values()))
+
+    def test_a_lock_a_live_peer_holds_for_good_ends_in_a_deferral(self):
+        for name in ("LOCK_TIMEOUT_SECONDS",):
+            self.addCleanup(setattr, admission_ledger, name, getattr(admission_ledger, name))
+        admission_ledger.LOCK_TIMEOUT_SECONDS = 0.1
+        generate_zarr.LEDGER_WAIT_SECONDS = 0.5
+        os.makedirs(self.root, exist_ok=True)
+        code = (
+            "import fcntl, sys, time\n"
+            "fh = open(sys.argv[1], 'w')\n"
+            "fcntl.flock(fh, fcntl.LOCK_EX)\n"
+            "print('held', flush=True)\n"
+            "time.sleep(120)\n"
+        )
+        holder = subprocess.Popen(
+            [sys.executable, "-c", code, os.path.join(self.root, ".lock")],
+            stdout=subprocess.PIPE, text=True,
+        )
+        self._children.append(holder)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        deferred: dict = {}
+        began = time.monotonic()
+        spans = self.drain(deferred=deferred)
+        self.assertEqual(spans, [])
+        self.assertEqual(len(deferred), 3)
+        self.assertLess(time.monotonic() - began, 10)
+
+
+class TestConvertsInProcess(unittest.TestCase):
+    def test_one_worker_without_a_ledger_converts_here(self):
+        self.assertTrue(generate_zarr.converts_in_process(1, None, ["a"]))
+
+    def test_one_worker_with_a_ledger_goes_through_the_pool_so_its_peers_see_it(self):
+        ledger = Ledger(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, ledger.root, ignore_errors=True)
+        self.assertFalse(generate_zarr.converts_in_process(1, ledger, ["a"]))
+
+    def test_several_workers_always_use_the_pool_and_nothing_to_convert_never_does(self):
+        self.assertFalse(generate_zarr.converts_in_process(4, None, ["a"]))
+        self.assertTrue(generate_zarr.converts_in_process(4, None, []))
+        self.assertTrue(generate_zarr.converts_in_process(1, Ledger(tempfile.mkdtemp()), []))
 
 
 class TestEveryAdmissionIsVisibleToPeers(DrainAgainstPeersCase):

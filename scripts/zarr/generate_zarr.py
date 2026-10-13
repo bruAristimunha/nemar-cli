@@ -104,9 +104,10 @@ from zarr_queue import ZARR_ENGINE_VERSION
 
 # Several drivers can convert on one node at once (hallu-zarr.sh slots). Each admits
 # against the RAM and scratch the others have reserved and not yet taken, through a
-# ledger they share (ADR 0102). A sibling module for the same reason as the import
+# ledger they share (ADR 0101). A sibling module for the same reason as the import
 # above.
-from admission_ledger import Ledger, LedgerBusy
+from admission_ledger import SETTING_ERRORS as LEDGER_SETTING_ERRORS
+from admission_ledger import Ledger, LedgerBusy, process_start_ticks
 
 # --- Path classification -------------------------------------------------
 
@@ -601,8 +602,9 @@ class AnonPeak:
     allocation that lives for less than the interval can be missed, which is why this
     is a measurement to calibrate with and not a bound to enforce."""
 
-    def __init__(self, interval: float = 0.25) -> None:
+    def __init__(self, interval: float = 0.25, proc_root: str = "/proc") -> None:
         self.interval = interval
+        self.proc_root = proc_root
         self._lock = threading.Lock()
         self._peak: int | None = None
         self._thread: threading.Thread | None = None
@@ -610,7 +612,7 @@ class AnonPeak:
     def _run(self) -> None:
         while True:
             time.sleep(self.interval)
-            now = anon_rss_bytes(os.getpid())
+            now = anon_rss_bytes(os.getpid(), self.proc_root)
             if now is None:
                 continue
             with self._lock:
@@ -620,7 +622,7 @@ class AnonPeak:
     def reset(self) -> bool:
         """Start measuring afresh from the memory held now; False where it cannot be
         read (off Linux, or a kernel older than 4.5)."""
-        now = anon_rss_bytes(os.getpid())
+        now = anon_rss_bytes(os.getpid(), self.proc_root)
         if now is None:
             with self._lock:
                 self._peak = None
@@ -634,7 +636,7 @@ class AnonPeak:
         return True
 
     def peak(self) -> int | None:
-        now = anon_rss_bytes(os.getpid())
+        now = anon_rss_bytes(os.getpid(), self.proc_root)
         with self._lock:
             if self._peak is None:
                 return None
@@ -1429,7 +1431,16 @@ def _tracked_call(worker, primary: str, reserve: int, track_dir: str) -> dict:
     start = anon_rss_bytes(os.getpid())
     try:
         with open(path, "w") as fh:
-            json.dump({"reserve": int(reserve), "rss_anon_start": start}, fh)
+            # `start` lets the ledger tell this worker from a later process that is given
+            # its pid, when it decides whether a killed driver's workers are still running.
+            json.dump(
+                {
+                    "reserve": int(reserve),
+                    "rss_anon_start": start,
+                    "start": process_start_ticks(os.getpid()),
+                },
+                fh,
+            )
     except OSError:
         pass  # untracked: the parent then counts the whole reserve as outstanding
     try:
@@ -1568,7 +1579,7 @@ def _scratch_setting(name: str, default: float, *, minimum: float) -> float:
 # loads this module, and an exception here would kill each before it could write a
 # callback, so nothing would say why. The defaults stand and the messages wait here
 # for `main()`, which refuses to run and reports them through the callback.
-SCRATCH_SETTING_ERRORS: list[str] = []
+SCRATCH_SETTING_ERRORS: list[str] = list(LEDGER_SETTING_ERRORS)
 
 
 def _scratch_setting_or_default(name: str, default: float, *, minimum: float) -> float:
@@ -8909,7 +8920,7 @@ def deferral_message(charge: int, budget: int) -> str:
     return f"deferred: needs {_gib(charge)} GiB of scratch, {_gib(budget)} GiB available"
 
 
-# --- Admission across drivers (ADR 0102) -----------------------------------------
+# --- Admission across drivers (ADR 0101) -----------------------------------------
 # How long a driver with nothing in flight waits, held up only by what its peers have
 # reserved, before it hands its queue back and lets this slot move to another
 # dataset. Longer than the ledger's starvation threshold on purpose: the driver that
@@ -8924,11 +8935,14 @@ PEER_DEFERRAL_MESSAGE = (
     "deferred: the node's memory and scratch are reserved by other conversions; "
     "retried automatically"
 )
+LEDGER_UNUSABLE_MESSAGE = (
+    "deferred: the node's admission ledger could not be used; retried automatically"
+)
 
 
 def ledger_from_env() -> Ledger | None:
     """The shared admission ledger named by ``ZARR_LEDGER_DIR``, or None to admit
-    against this driver's own measurements alone (the behavior before ADR 0102, and
+    against this driver's own measurements alone (the behavior before ADR 0101, and
     the right one when this is the only driver on the node)."""
     root = os.environ.get("ZARR_LEDGER_DIR", "").strip()
     if not root:
@@ -8943,6 +8957,12 @@ def ledger_from_env() -> Ledger | None:
             flush=True,
         )
         return None
+
+
+def converts_in_process(cpu_cap: int, ledger: Ledger | None, convert: list) -> bool:
+    """Whether the recordings are converted in this process (``--jobs 1`` with no
+    ledger, or nothing to convert) rather than through the pool."""
+    return (cpu_cap == 1 and ledger is None) or not convert
 
 
 def close_ledger(ledger: Ledger | None) -> None:
@@ -8962,18 +8982,24 @@ def _ledger_held(paths: list[str]) -> int:
     return sum(allocated_bytes(path) for path in paths)
 
 
-def defer_for_peers(queue, sink, waited_seconds: float) -> None:
+def defer_for_peers(queue, sink, waited_seconds: float, unusable: bool = False) -> None:
     """Hand ``queue`` back unreported: it fits this node, but other conversions on it
-    hold what it needs. The scratch deferral's sibling (``defer_unfit``) and recorded
-    the same way, so the recordings stay pending, spend no attempt, and are retried at
-    the shortest delay."""
+    hold what it needs (or, with ``unusable``, the ledger that says what they hold could
+    not be used for as long). The scratch deferral's sibling (``defer_unfit``) and
+    recorded the same way, so the recordings stay pending, spend no attempt, and are
+    retried at the shortest delay."""
     for primary in queue:
         if sink is not None:
-            sink[primary] = PEER_DEFERRAL_MESSAGE
+            sink[primary] = LEDGER_UNUSABLE_MESSAGE if unusable else PEER_DEFERRAL_MESSAGE
+    why = (
+        "the admission ledger could not be used"
+        if unusable
+        else "memory and scratch that other conversions on this node had reserved"
+    )
     print(
         f"::warning::deferring {len(queue)} recording(s): waited "
-        f"{waited_seconds / 60:.0f} min for memory and scratch that other conversions on "
-        "this node had reserved; they stay pending without spending an attempt",
+        f"{waited_seconds / 60:.0f} min; {why}; they stay pending without spending "
+        "an attempt",
         flush=True,
     )
 
@@ -9260,25 +9286,31 @@ def _drain_with_admission(
             peers_busy = False
             yield_to_peer = False
             gated = scratch_peaks is not None and scratch_budget is not None
+            blockers: frozenset[int] = frozenset()
 
             def read_scratch() -> int | None:
                 return scratch_budget([p for p, _ in in_flight.values()]) if gated else None
 
             def look() -> None:
-                nonlocal limit, budget, limit_alone, budget_alone, peers_busy, yield_to_peer
+                nonlocal limit, budget, limit_alone, budget_alone, peers_busy
+                nonlocal yield_to_peer, blockers
                 limit = ceiling(running_peak, track_dir)
                 budget = read_scratch()
                 limit_alone, budget_alone = limit, budget
                 if ledger is None:
                     return
-                owed_ram, owed_scratch = ledger.others_outstanding(
-                    tracked_taken_bytes, _ledger_held
-                )
-                peers_busy = ledger.others_in_flight()
+                summary = ledger.others_summary(tracked_taken_bytes, _ledger_held)
+                blockers = summary.pids
+                peers_busy = bool(summary.pids)
                 yield_to_peer = ledger.older_peer_waiting()
-                limit = max(0, limit - owed_ram)
+                limit = max(0, limit - summary.ram)
                 if budget is not None:
-                    budget = max(0, budget - owed_scratch)
+                    # Free space already excludes what the peers have written. Were they
+                    # not there it would include it, which is what "alone" is judged on:
+                    # a recording is held up by its peers (and waits) when it would fit
+                    # without them, and does not fit the volume at all otherwise.
+                    budget_alone = budget + summary.held
+                    budget = max(0, budget - summary.scratch)
 
             def pick(alone: bool = False) -> int | None:
                 if yield_to_peer and not alone:
@@ -9322,6 +9354,7 @@ def _drain_with_admission(
                     look()
                 idx = pick()
                 if idx is None and held_up_by_peers():
+                    last_blockers[0] = blockers
                     return True
                 if idx is None and not in_flight and budget is not None:
                     # Nothing running will give scratch back, so one more sample is
@@ -9336,12 +9369,14 @@ def _drain_with_admission(
                         if idx is not None:
                             break
                         if held_up_by_peers():
+                            last_blockers[0] = blockers
                             return True
                 if idx is None:
                     if not in_flight and queue and budget is not None:
                         # Handed back, not reported: see the docstring.
                         defer_unfit(
-                            queue, scratch_peaks, budget, volume,
+                            queue, scratch_peaks,
+                            budget if budget_alone is None else budget_alone, volume,
                             deferred if defer_to is None else defer_to,
                         )
                         queue.clear()
@@ -9364,44 +9399,52 @@ def _drain_with_admission(
                     )
             return False
 
+        # Which drivers the last ``admit`` found holding what this one waits for.
+        last_blockers: list[frozenset[int]] = [frozenset()]
+
         def admit_round() -> None:
-            """``admit`` under the ledger's lock, waiting out the other drivers."""
+            """``admit`` under the ledger's lock, waiting out the other drivers.
+
+            A round that cannot see the ledger (the lock is not had in time, or a read or
+            write of it fails: a full volume does that) admits nothing and leaves what is
+            running alone; it does not end the drain. With nothing running, a driver that
+            is held up by its peers, or cannot use the ledger, waits and looks again, and
+            gives its queue back after ``LEDGER_WAIT_SECONDS`` of it."""
             if ledger is None:
                 admit()
                 return
-            waiting_since: float | None = None
+            blocked_since: float | None = None
             while True:
+                waiting = unusable = False
                 try:
                     ledger.acquire()
-                except LedgerBusy:
-                    # Cannot see the others, so admit nothing. If something of ours
-                    # is running the next recheck comes soon enough; if not, retry.
-                    if in_flight or not queue:
-                        return
-                    time.sleep(ADMISSION_RECHECK_SECONDS)
-                    continue
-                waiting = False
-                try:
-                    ledger.flush()
-                    ledger.set_track_dir(track_dir)
-                    waiting = admit()
-                    ledger.mark_waiting(waiting)
-                    if waiting:
-                        waiting_since = time.monotonic() if waiting_since is None else waiting_since
-                        waited = time.monotonic() - waiting_since
-                        if waited >= LEDGER_WAIT_SECONDS:
-                            defer_for_peers(
-                                queue, deferred if defer_to is None else defer_to, waited
-                            )
-                            queue.clear()
-                            ledger.mark_waiting(False)
-                            return
-                except LedgerBusy:
-                    # Lost the lock during a pause and could not take it back.
-                    waiting = not in_flight and bool(queue)
-                finally:
-                    ledger.unlock()
-                if not waiting:
+                except (LedgerBusy, OSError):
+                    unusable = True
+                else:
+                    try:
+                        ledger.flush()
+                        ledger.set_track_dir(track_dir)
+                        waiting = admit()
+                        ledger.mark_waiting(waiting, blocked_by=set(last_blockers[0]))
+                    except (LedgerBusy, OSError):
+                        # Lost the lock during a pause and could not take it back, or
+                        # could not write the ledger.
+                        unusable = True
+                    finally:
+                        ledger.unlock()
+                if in_flight or not queue or not (waiting or unusable):
+                    return  # something is running, or nothing is left, or all is admitted
+                now = time.monotonic()
+                blocked_since = now if blocked_since is None else blocked_since
+                waited = now - blocked_since
+                if waited >= LEDGER_WAIT_SECONDS:
+                    defer_for_peers(
+                        queue, deferred if defer_to is None else defer_to, waited,
+                        unusable=unusable and not waiting,
+                    )
+                    queue.clear()
+                    with contextlib.suppress(LedgerBusy, OSError), ledger.exclusive():
+                        ledger.mark_waiting(False)
                     return
                 time.sleep(ADMISSION_RECHECK_SECONDS)
 
@@ -9449,8 +9492,11 @@ def _drain_with_admission(
                     with ledger.exclusive():
                         ledger.set_track_dir(None)
                         ledger.flush()
-                except LedgerBusy:
-                    pass  # the next write publishes it; peers see more reserved until then
+                except (LedgerBusy, OSError):
+                    # The next write publishes it; peers see more reserved until then.
+                    # Nothing here may raise: this runs on the way out of a failed pass,
+                    # before the scratch it left behind is reclaimed.
+                    pass
         suspects_now = broken + [p for p, _peak in in_flight.values()]
         if broke or broken:
             pool_breaks += 1
@@ -10118,13 +10164,15 @@ def main() -> int:
         f"goes (#1483); a recording projected above it alone is skipped (#909)",
         flush=True,
     )
-    # Only the pool admits through the ledger. A `--jobs 1` run converts in this
-    # process, one recording at a time, and is not registered with the others.
-    ledger = ledger_from_env() if cpu_cap > 1 and convert else None
+    # Only the pool admits through the ledger. A bare `--jobs 1` run converts in this
+    # process and is not registered with the others, but a node that has a ledger gets the
+    # pool even at one worker: a slot told to run one recording at a time must still be
+    # seen by its peers (and by the serial memory retry, which only the pool has).
+    ledger = ledger_from_env() if convert else None
     if ledger is not None:
         print(
             f"[zarr] admission ledger {ledger.root}: this run admits against what other "
-            "conversions on this node have reserved and not yet taken (ADR 0102)",
+            "conversions on this node have reserved and not yet taken (ADR 0101)",
             flush=True,
         )
     # Per-dataset provenance for the stores' `nemar` root attribute (#1064).
@@ -10155,8 +10203,10 @@ def main() -> int:
         # --jobs 1 converts in this process, as an operator asked for. Anything
         # else, a single recording included, goes through the pool: it is the
         # only path with the serial memory retry, and a single-recording run is
-        # where a large recording most often trips its reserve (#1483).
-        if cpu_cap == 1 or not convert:
+        # where a large recording most often trips its reserve (#1483). A node with
+        # an admission ledger always uses the pool, so a slot told to run one
+        # recording at a time is still seen by the others.
+        if converts_in_process(cpu_cap, ledger, convert):
             _init_worker(ctx)
             scratch_gate = ScratchGate(tmp)
             # One at a time still has to fit: a recording that cannot is deferred

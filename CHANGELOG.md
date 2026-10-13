@@ -18,7 +18,7 @@ earlier releases are described only by their generated notes.
 ### Changed
 
 - **Zarr conversions on `hallu` run in parallel slots instead of one dataset at a time
-  (#1757, ADR 0102).** A cron tick now starts one drain per free slot (`ZARR_SLOTS`, default 4),
+  (#1757, ADR 0101).** A cron tick now starts one drain per free slot (`ZARR_SLOTS`, default 4),
   each with its own lock, scratch directory and log and four workers (`ZARR_JOBS_PER_SLOT`), so a
   dataset that takes days, such as `nm000276` (40 recordings of 100 to 145 GiB, which held the
   only lock for 5.5 days while the node sat at a load of 1.1), occupies one slot instead of
@@ -30,8 +30,11 @@ earlier releases are described only by their generated notes.
   `ZARR_JOBS` now lowers the per-slot worker count and never raises it, so a crontab that still
   says `ZARR_JOBS=24` does not give every slot 24. `zarr_queue.py heartbeat` is new, and the
   script sends it every five minutes while a dataset converts, so a conversion longer than
-  the six-hour stale window is not reclaimed by another slot's reconcile. Set `ZARR_SLOTS=1`
-  to get the previous behavior.
+  the six-hour stale window is not reclaimed by another slot's reconcile. A one-off
+  `--dataset` run takes the first free slot and refuses to start on a dataset another slot or
+  run is converting, `--limit` now caps each slot rather than the tick, and counts such as
+  `ZARR_SLOTS` must be plain decimal integers (`08` is refused, not read as octal). Set
+  `ZARR_SLOTS=1` to get the previous behavior.
 - **The Zarr converter projects a float32 BrainVision recording at the memory it needs and
   measures anonymous memory (#1757).** When a recording's sidecar (sampling frequency and duration)
   and channel count show it is stored at four bytes per sample, the streaming projection

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for how the converter anticipates and measures memory (ADR 0102):
+"""Tests for how the converter anticipates and measures memory (ADR 0101):
 
 * a BrainVision recording's sample width, read off what admission can see without a
   download, so a float32 recording is not projected as if it were int16;
@@ -294,11 +294,13 @@ class TestAnonPeak(unittest.TestCase):
 
 
 class TestAnonPeakWhereItCannotBeRead(unittest.TestCase):
-    @unittest.skipIf(LINUX, "RssAnon is readable here")
     def test_nothing_is_reported_and_nothing_breaks(self):
-        peak = gz.AnonPeak()
-        self.assertFalse(peak.reset())
-        self.assertIsNone(peak.peak())
+        # An empty /proc, which is what macOS and a kernel older than 4.5 look like to it.
+        with tempfile.TemporaryDirectory() as proc_root:
+            peak = gz.AnonPeak(proc_root=proc_root)
+            self.assertFalse(peak.reset())
+            self.assertIsNone(peak.peak())
+            self.assertIsNone(peak._thread)  # no sampler is started for nothing to sample
 
 
 if __name__ == "__main__":

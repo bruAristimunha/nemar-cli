@@ -1,4 +1,4 @@
-# ADR 0102: Zarr conversions run side by side in slots and admit against one shared budget
+# ADR 0101: Zarr conversions run side by side in slots and admit against one shared budget
 
 **Status:** accepted
 **Date:** 2026-10-13
@@ -33,9 +33,12 @@ Two drivers each admitting a 145 GiB recording into 474 GiB of free scratch woul
 A cron tick starts one drain per free slot (`ZARR_SLOTS`, default 4), each holding its own lock, with its own scratch directory and log, claiming its own dataset and converting `ZARR_JOBS_PER_SLOT` (default 4) recordings at a time.
 Slot 0 keeps the lock, scratch directory and log the single drain always had, so a drain started before this change counts as slot 0.
 `ZARR_JOBS` can lower the per-slot count and never raise it, so a crontab that still says `ZARR_JOBS=24` does not give every slot 24.
-A one-off `--dataset` run takes the first free slot.
+A one-off `--dataset` run takes the first free slot, and refuses to start on a dataset that a slot or another one-off is converting (a lock per dataset, held by the driver for as long as it lives; a slot handed a dataset a one-off holds waits for it).
 The nightly staging run is one slot.
 `ZARR_SLOT=n` runs a single slot, which is how the tick starts them.
+`--stats` and `--requeue` read the queue and nothing else, so they run before any slot is taken.
+`--limit` is a cap per slot.
+Counts are plain decimal integers; a leading zero is refused rather than read as octal.
 
 **One ledger per node.**
 Every driver publishes its reservations in a file under `ZARR_LEDGER_DIR` (default `$ZARR_BASE/zarr-admission-ledger`, shared by production and staging because they share the machine).
@@ -46,17 +49,20 @@ Before admitting, a driver takes the ledger's `flock` and subtracts what its pee
 
 Deciding and recording happen under that lock, so two drivers cannot both read the same free space.
 The run-alone exception (a recording larger than the ceiling runs when nothing else does) applies only when no other driver holds anything.
-A recording that would run if the node were its own waits for its peers.
-After 30 minutes of waiting with nothing in flight, the driver that has waited longest is let in first, and the others stop admitting.
+A recording that would run if the node were its own, judged with the peers' written scratch given back (the free space already excludes it), waits for its peers.
+After 30 minutes of waiting with nothing in flight, the driver that has waited longest is let in first, and the drivers it is waiting for (the ones holding reservations, which it names in its file) stop admitting; the others carry on.
 After 60 minutes (`ZARR_LEDGER_WAIT_SECONDS`) the driver hands its queue back the way a scratch deferral does: the recordings stay pending, no attempt is spent, and the slot takes another dataset.
-Without `ZARR_LEDGER_DIR` nothing changes.
-A file whose driver is gone is removed by the next driver to look, keyed on the pid and the process start time.
+Without `ZARR_LEDGER_DIR` nothing changes, and with one even `--jobs 1` goes through the pool so that the other slots see it.
+A ledger that cannot be used (the lock is not had in time, or a read or write of it fails, which a full volume does) makes a round admit nothing and leaves what is running alone; with nothing running the driver waits, and after the same 60 minutes defers with a note that says so.
+A file whose driver is gone is removed by the next driver to look, keyed on the pid and the process start time, unless a worker the driver recorded is still running: a killed driver's workers finish the recording they have, and its reservations stand until they do.
+A file that cannot be read this time is left alone.
 The lock descriptor is closed in forked workers and unlocked explicitly, because `flock` belongs to the open file description and the process pool forks its workers while the driver holds the lock.
 
 **A heartbeat for long conversions.**
-`zarr_queue.py heartbeat <dataset>` refreshes an `inprogress` row, and `hallu-zarr.sh` sends one every five minutes while a dataset converts, stopping with the script.
+`zarr_queue.py heartbeat <dataset>` refreshes an `inprogress` row, and `hallu-zarr.sh` sends one every five minutes (`ZARR_HEARTBEAT_SECONDS`) while a queue-claimed dataset converts, for as long as the driver lives.
 Each slot starts with a reconcile, and a reconcile returns to `pending` any `inprogress` row idle for six hours.
 Without the heartbeat, a second slot would take `nm000276` after six hours and convert it onto the same S3 prefix twice.
+The driver runs in the background so that the heartbeat can follow it, which makes the script responsible for signals: a TERM or INT to a slot stops its driver and then the slot, without spending an attempt (the row stays `inprogress` and the stale sweep returns it), and the tick forwards a TERM to its slots.
 
 **Memory anticipated from what is measured.**
 Workers sample `RssAnon`, and the calibration warnings compare the reserve with anonymous memory.
@@ -71,11 +77,17 @@ Setup (the clone and the venv) is done by one slot at a time.
   The recording that was refused as too large now projects at about 30 GiB and fits.
 - Concurrency follows the budget rather than a worker count: small EEG datasets run four wide in each of four slots, and two 145 GiB recordings cannot be admitted together because their scratch will not fit.
 - The logs are per slot (`.nm-zarr.slotN.log`), so following the whole node means following several files, and the scratch directories are per slot (`zarr-scratch-slotN`).
+- `--limit` caps each slot, not the tick, so an existing crontab with `--limit 20` allows up to 80 datasets per tick at four slots.
 - A driver outside the ledger is visible to the others only through `MemAvailable` and the volume's free space.
   That covers a `--jobs 1` run, and a drain started by the previous version.
   The second is a transition problem, and the deploy note for this change registers it by hand.
-- A peer that is alive but hung holds its reservations until it dies.
+- A peer that is alive but hung holds its reservations until it dies, and one that holds the lock itself is waited out the same way.
   The others wait out the limit and defer, which is slow and not wrong.
+- The serial memory retry (a recording that exceeded its reserve is run again alone with the node's whole budget) needs the node, and with other slots busy it waits for them like any large recording.
+  If they do not give way within the limit it is deferred and reported as the memory failure it was, so under heavy load a retry usually fails where it used to run after the pool drained.
+- A wait limit set below the starvation threshold (`ZARR_LEDGER_STARVATION_SECONDS`, 30 minutes) turns the waiting driver's priority off, because the driver gives up first.
+- The ledger reads the disk blocks of every peer reservation's scratch tree under the lock.
+  That is cost, not correctness, and it grows with the number of files a recording has written.
 - The sample width is inferred, not read.
   A sidecar whose duration is wrong in a way that lands exactly on 4 bytes would under-project an int16 recording, and the worker's `RLIMIT_DATA` backstop turns that into the existing serial memory retry rather than a killed node.
 - Updating the driver clone while another slot is starting a driver can fail that start on an import.

@@ -41,15 +41,37 @@ import json
 import os
 import time
 from collections.abc import Callable, Iterator
+from typing import NamedTuple
+
+# Messages for settings that could not be read, for the converter to report with its own
+# (`--check-env`). A typo in the environment must not make `import generate_zarr` raise
+# on every dataset; the default stands until the run is stopped by name.
+SETTING_ERRORS: list[str] = []
+
+
+def _env_seconds(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        SETTING_ERRORS.append(f"{name}={raw!r} is not a number")
+        return default
+    if not (value >= 0 and value != float("inf")):
+        SETTING_ERRORS.append(f"{name}={raw!r} must be a finite number of at least 0")
+        return default
+    return value
+
 
 # How long a driver waits on nothing in flight, blocked only by what its peers hold,
 # before it asks them to stop admitting. Without it, a recording that needs most of
 # the node would wait behind an endless stream of small ones from the other drivers.
-STARVATION_SECONDS = float(os.environ.get("ZARR_LEDGER_STARVATION_SECONDS", "1800"))
+STARVATION_SECONDS = _env_seconds("ZARR_LEDGER_STARVATION_SECONDS", 1800.0)
 # The exclusive lock is held for a /proc read and a file write, a second at the very
 # most. A wait longer than this means something is wrong, and the caller admits nothing
 # this round instead of admitting without the lock.
-LOCK_TIMEOUT_SECONDS = float(os.environ.get("ZARR_LEDGER_LOCK_TIMEOUT_SECONDS", "60"))
+LOCK_TIMEOUT_SECONDS = _env_seconds("ZARR_LEDGER_LOCK_TIMEOUT_SECONDS", 60.0)
 
 FORMAT_VERSION = 1
 
@@ -76,6 +98,21 @@ if hasattr(os, "register_at_fork"):
 
 class LedgerBusy(RuntimeError):
     """The exclusive lock could not be taken in time."""
+
+
+class Outstanding(NamedTuple):
+    """What the other drivers on the node hold, as a driver deciding to admit needs it.
+
+    ``ram`` and ``scratch`` are what they have reserved and not yet taken. ``held`` is
+    the disk they hold now: the free space is short by that, and it comes back when they
+    finish, so it is what a driver that would have the node to itself would also have.
+    ``pids`` are the drivers with something in flight, the ones a waiting driver is
+    waiting for."""
+
+    ram: int
+    scratch: int
+    held: int
+    pids: frozenset[int]
 
 
 def process_start_ticks(pid: int, proc_root: str = "/proc") -> int | None:
@@ -129,11 +166,13 @@ class Ledger:
         self.start = process_start_ticks(self.pid, proc_root)
         self.track_dir: str | None = None
         self.waiting_since: float | None = None
+        self.blocked_by: set[int] = set()
         self._reservations: dict[int, dict] = {}
         self._next_token = 1
         self._locked = False
         self._fd: int | None = None
         self._dirty = False
+        self.publish_error: OSError | None = None
         os.makedirs(root, exist_ok=True)
         self._lock_path = os.path.join(root, ".lock")
         self._path = os.path.join(root, f"{self.pid}.json")
@@ -211,13 +250,19 @@ class Ledger:
             "start": self.start,
             "track_dir": self.track_dir,
             "waiting_since": self.waiting_since,
+            "blocked_by": sorted(self.blocked_by),
             "reservations": {str(t): r for t, r in self._reservations.items()},
         }
+        # Dirty until the file is replaced: whatever state was just changed is not what
+        # the others can read if this fails, and `flush` must say so on the next round
+        # rather than find nothing to do.
+        self._dirty = True
         tmp = f"{self._path}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(doc, fh)
         os.replace(tmp, self._path)  # a reader sees the old file or the new, never half
         self._dirty = False
+        self.publish_error = None
 
     def flush(self) -> None:
         """Publish a change made while the lock could not be had (see ``release``)."""
@@ -240,7 +285,15 @@ class Ledger:
         token = self._next_token
         self._next_token += 1
         self._reservations[token] = {"ram": int(ram), "scratch": int(scratch), "paths": list(paths)}
-        self._publish()
+        try:
+            self._publish()
+        except OSError as exc:
+            # The recording is going to run, so the reservation is real here whether or
+            # not the others can read it yet. Raising would leave a recording in flight
+            # with no token to release. It is published by the next write that works
+            # (`flush`), and `publish_error` says why it has not been.
+            self._dirty = True
+            self.publish_error = exc
         return token
 
     def release(self, token: int) -> None:
@@ -261,16 +314,27 @@ class Ledger:
             if self._locked:
                 self._publish()
 
-    def mark_waiting(self, waiting: bool, now: float | None = None) -> None:
+    def mark_waiting(
+        self, waiting: bool, now: float | None = None, blocked_by: set[int] | None = None
+    ) -> None:
         """Say that this driver has nothing in flight and is held up only by its
         peers (``waiting``), or that it no longer is. The time is kept from the first
-        call, so a long wait is one wait."""
+        call, so a long wait is one wait. ``blocked_by`` names the drivers whose
+        reservations are what it waits for; only those are asked to stop admitting
+        (``older_peer_waiting``), because stopping a driver that holds nothing in the
+        waiter's way costs it throughput and gains the waiter nothing."""
         self._require_lock()
+        names = set(blocked_by or ())
         if waiting and self.waiting_since is None:
             self.waiting_since = time.time() if now is None else now
+            self.blocked_by = names
+            self._publish()
+        elif waiting and names != self.blocked_by:
+            self.blocked_by = names
             self._publish()
         elif not waiting and self.waiting_since is not None:
             self.waiting_since = None
+            self.blocked_by = set()
             self._publish()
 
     def close(self) -> None:
@@ -285,7 +349,10 @@ class Ledger:
 
     def peers(self) -> list[dict]:
         """The live drivers other than this one, as their published documents. A file
-        whose driver is gone, or that cannot be read as a document, is removed."""
+        whose driver is gone (and whose workers are, see ``_workers_alive``), or that is
+        not a document, is removed; one that merely could not be read this time (EMFILE,
+        EIO) is left, because deleting a live driver's file erases its reservations from
+        every peer until it next changes state, hours into a long recording."""
         self._require_lock()
         found: list[dict] = []
         try:
@@ -293,6 +360,14 @@ class Ledger:
         except OSError:
             return found
         for name in sorted(names):
+            if name.endswith(".json.tmp"):  # a write a killed driver never finished
+                stem = name[: -len(".json.tmp")]
+                if stem.isdigit() and int(stem) != self.pid and not driver_is_alive(
+                    int(stem), None, self.proc_root
+                ):
+                    with contextlib.suppress(OSError):
+                        os.remove(os.path.join(self.root, name))
+                continue
             stem, dot, ext = name.partition(".")
             if ext != "json" or not dot or not stem.isdigit() or int(stem) == self.pid:
                 continue
@@ -306,43 +381,86 @@ class Ledger:
                     raise TypeError("reservations is not an object")
             except FileNotFoundError:
                 continue
-            except (OSError, ValueError, KeyError, TypeError):
+            except OSError:
+                continue  # could not be read now; not evidence that the driver is gone
+            except (ValueError, KeyError, TypeError):
                 with contextlib.suppress(OSError):
                     os.remove(path)
                 continue
-            if not driver_is_alive(pid, doc.get("start"), self.proc_root):
+            if not driver_is_alive(pid, doc.get("start"), self.proc_root) and not (
+                reservations and self._workers_alive(doc.get("track_dir"))
+            ):
                 with contextlib.suppress(OSError):
                     os.remove(path)
                 continue
             found.append(doc)
         return found
 
+    def _workers_alive(self, track_dir: str | None) -> bool:
+        """Whether any worker the driver recorded in ``track_dir`` is still running.
+
+        A driver killed with SIGKILL leaves its pool workers, and a worker finishes the
+        recording it was converting before it notices that its parent is gone, which for
+        a large one is hours of writing to scratch. Its reservations stand until then."""
+        if not track_dir:
+            return False
+        try:
+            names = os.listdir(track_dir)
+        except OSError:
+            return False
+        for name in names:
+            stem, _, ext = name.partition(".")
+            if ext != "json" or not stem.isdigit():
+                continue
+            start = None
+            with contextlib.suppress(OSError, ValueError, TypeError):
+                with open(os.path.join(track_dir, name), encoding="utf-8") as fh:
+                    start = json.load(fh).get("start")
+            if driver_is_alive(int(stem), start if isinstance(start, int) else None, self.proc_root):
+                return True
+        return False
+
     def others_in_flight(self) -> bool:
         """Whether any peer holds a reservation."""
         return any(doc["reservations"] for doc in self.peers())
 
-    def others_outstanding(
+    def others_summary(
         self,
         taken: Callable[[str | None, int], int],
         held: Callable[[list[str]], int],
-    ) -> tuple[int, int]:
-        """``(ram, scratch)`` the peers have reserved and not yet taken.
+    ) -> Outstanding:
+        """What the peers have reserved and not yet taken (``ram``, ``scratch``), the
+        disk they hold (``held``), and which of them have anything in flight.
 
         ``taken(track_dir, reserved)`` is how much of ``reserved`` bytes of RAM that
         peer's workers have used (never more than ``reserved``); ``held(paths)`` is
         the disk blocks under ``paths`` right now. What a peer has already taken is
         in ``MemAvailable`` and in the volume's free space, so charging it again
         would count it twice."""
-        ram = scratch = 0
+        ram = scratch = on_disk = 0
+        pids: set[int] = set()
         for doc in self.peers():
             reservations = list(doc["reservations"].values())
+            if not reservations:
+                continue
+            pids.add(int(doc["pid"]))
             reserved = sum(int(r.get("ram", 0)) for r in reservations)
             if reserved:
                 ram += reserved - min(reserved, max(0, taken(doc.get("track_dir"), reserved)))
             for r in reservations:
-                on_disk = max(0, held(list(r.get("paths") or [])))
-                scratch += max(0, int(r.get("scratch", 0)) - on_disk)
-        return ram, scratch
+                now = max(0, held(list(r.get("paths") or [])))
+                on_disk += now
+                scratch += max(0, int(r.get("scratch", 0)) - now)
+        return Outstanding(ram, scratch, on_disk, frozenset(pids))
+
+    def others_outstanding(
+        self,
+        taken: Callable[[str | None, int], int],
+        held: Callable[[list[str]], int],
+    ) -> tuple[int, int]:
+        """``(ram, scratch)`` the peers have reserved and not yet taken."""
+        summary = self.others_summary(taken, held)
+        return summary.ram, summary.scratch
 
     def older_peer_waiting(self, now: float | None = None) -> bool:
         """Whether a peer that has waited longer than ``STARVATION_SECONDS`` is
@@ -353,6 +471,11 @@ class Ledger:
         for doc in self.peers():
             since = doc.get("waiting_since")
             if since is None or current - since < STARVATION_SECONDS:
+                continue
+            # Only a driver the waiter is waiting for is asked to stop. A document that
+            # does not say who (an older writer) is taken to mean everyone.
+            blocked_by = doc.get("blocked_by")
+            if blocked_by is not None and self.pid not in blocked_by:
                 continue
             if (since, int(doc["pid"])) < mine:
                 return True

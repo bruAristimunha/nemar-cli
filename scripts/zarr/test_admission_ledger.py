@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -329,14 +330,14 @@ class TestPeers(LedgerTestCase):
 
     def test_unrelated_files_are_left_alone(self):
         os.makedirs(self.root)
-        for name in ("README", "notes.json", "12.json.tmp"):
+        for name in ("README", "notes.json", "notes.json.tmp"):
             with open(os.path.join(self.root, name), "w") as fh:
                 fh.write("x")
         me = Ledger(self.root, pid=os.getpid())
         with me.exclusive():
             self.assertEqual(me.peers(), [])
         self.assertTrue(all(os.path.exists(os.path.join(self.root, n))
-                            for n in ("README", "notes.json", "12.json.tmp")))
+                            for n in ("README", "notes.json", "notes.json.tmp")))
 
     def test_others_in_flight_means_a_reservation_not_just_a_file(self):
         child = self.live_process()
@@ -405,11 +406,15 @@ class TestStarvation(LedgerTestCase):
                         admission_ledger.STARVATION_SECONDS)
         admission_ledger.STARVATION_SECONDS = 1800.0
 
-    def waiting_peer(self, since):
+    def waiting_peer(self, since, blocked_by=None):
+        """A peer waiting since ``since`` for the drivers in ``blocked_by`` (by default
+        this process, which is who the cases below ask)."""
         child = self.live_process()
         peer = self.peer(child)
         with peer.exclusive():
-            peer.mark_waiting(True, now=since)
+            peer.mark_waiting(
+                True, now=since, blocked_by={os.getpid()} if blocked_by is None else blocked_by
+            )
         return child, peer
 
     def test_a_peer_waiting_long_enough_is_ahead_of_a_driver_that_is_not_waiting(self):
@@ -429,14 +434,49 @@ class TestStarvation(LedgerTestCase):
         _, peer = self.waiting_peer(1000.0)
         me = Ledger(self.root, pid=os.getpid())
         with me.exclusive():
-            me.mark_waiting(True, now=2000.0)
+            me.mark_waiting(True, now=2000.0, blocked_by={peer.pid})
             self.assertTrue(me.older_peer_waiting(now=9000.0))
         with peer.exclusive():
             self.assertFalse(peer.older_peer_waiting(now=9000.0))
 
+    def test_a_driver_that_is_not_in_the_waiters_way_keeps_admitting(self):
+        # The peer waits for someone else (pid 1): stopping this driver would cost it
+        # throughput and bring the waiter nothing.
+        self.waiting_peer(1000.0, blocked_by={1})
+        me = Ledger(self.root, pid=os.getpid())
+        with me.exclusive():
+            self.assertFalse(me.older_peer_waiting(now=9000.0))
+
+    def test_a_document_that_does_not_say_who_it_waits_for_is_taken_to_mean_everyone(self):
+        child = self.live_process()
+        path = os.path.join(self.root, f"{child.pid}.json")
+        peer = self.peer(child)
+        with peer.exclusive():
+            peer.mark_waiting(True, now=1000.0)
+        with open(path) as fh:
+            doc = json.load(fh)
+        del doc["blocked_by"]
+        with open(path, "w") as fh:
+            json.dump(doc, fh)
+        me = Ledger(self.root, pid=os.getpid())
+        with me.exclusive():
+            self.assertTrue(me.older_peer_waiting(now=9000.0))
+
+    def test_who_a_waiter_waits_for_can_change_without_restarting_its_clock(self):
+        _, peer = self.waiting_peer(1000.0, blocked_by={1})
+        with peer.exclusive():
+            peer.mark_waiting(True, now=5000.0, blocked_by={os.getpid()})
+            self.assertEqual(peer.waiting_since, 1000.0)
+        me = Ledger(self.root, pid=os.getpid())
+        with me.exclusive():
+            self.assertTrue(me.older_peer_waiting(now=9000.0))
+
     def test_equal_times_break_toward_the_lower_pid(self):
         _, peer_a = self.waiting_peer(1000.0)
         _, peer_b = self.waiting_peer(1000.0)
+        for peer in (peer_a, peer_b):  # each waits for the other
+            with peer.exclusive():
+                peer.mark_waiting(True, blocked_by={peer_a.pid, peer_b.pid})
         low, high = sorted([peer_a, peer_b], key=lambda p: p.pid)
         with low.exclusive():
             self.assertFalse(low.older_peer_waiting(now=9000.0))
@@ -473,6 +513,148 @@ class TestProcessIdentity(LedgerTestCase):
         with open(os.path.join(proc, "77", "stat"), "w") as fh:
             fh.write("77 (python) S 1 2\n")  # truncated
         self.assertIsNone(process_start_ticks(77, proc))
+
+
+class TestReadingThePeers(LedgerTestCase):
+    def test_a_file_that_cannot_be_read_now_is_left_for_a_later_look(self):
+        # A directory where a document should be: opening it fails, as EMFILE or EIO
+        # would, and says nothing about whether the driver is alive.
+        os.makedirs(os.path.join(self.root, "4001.json"))
+        me = Ledger(self.root, pid=os.getpid())
+        with me.exclusive():
+            self.assertEqual(me.peers(), [])
+        self.assertTrue(os.path.isdir(os.path.join(self.root, "4001.json")))
+
+    def test_a_write_a_killed_driver_never_finished_is_removed(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        stale = os.path.join(self.root, f"{child.pid}.json.tmp")
+        os.makedirs(self.root, exist_ok=True)
+        with open(stale, "w") as fh:
+            fh.write("{")
+        live = self.live_process()
+        kept = os.path.join(self.root, f"{live.pid}.json.tmp")
+        with open(kept, "w") as fh:
+            fh.write("{")
+        me = Ledger(self.root, pid=os.getpid())
+        with me.exclusive():
+            me.peers()
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.exists(kept))  # its writer is alive and may be mid-write
+
+    def test_a_killed_drivers_reservations_stand_while_its_workers_run(self):
+        # The driver is gone; its pool workers are not, and a worker finishes the
+        # recording it has before it notices (hours, for a large one).
+        driver = subprocess.Popen([sys.executable, "-c", "pass"])
+        driver.wait()
+        worker = self.live_process()
+        track = os.path.join(self._tmp.name, "track")
+        os.makedirs(track)
+        with open(os.path.join(track, f"{worker.pid}.json"), "w") as fh:
+            json.dump({"reserve": 7, "rss_anon_start": 0, "start": process_start_ticks(worker.pid)}, fh)
+        os.makedirs(self.root, exist_ok=True)
+        path = os.path.join(self.root, f"{driver.pid}.json")
+        with open(path, "w") as fh:
+            json.dump(
+                {
+                    "v": 1, "pid": driver.pid, "start": None, "track_dir": track,
+                    "waiting_since": None, "blocked_by": [],
+                    "reservations": {"1": {"ram": 7, "scratch": 9, "paths": []}},
+                },
+                fh,
+            )
+        me = Ledger(self.root, pid=os.getpid())
+        with me.exclusive():
+            self.assertEqual([d["pid"] for d in me.peers()], [driver.pid])
+            self.assertEqual(me.others_outstanding(_no_credit, _no_held), (7, 9))
+        worker.kill()
+        worker.wait()
+        with me.exclusive():
+            self.assertEqual(me.peers(), [])
+        self.assertFalse(os.path.exists(path))
+
+    def test_a_dead_driver_with_nothing_reserved_is_gone_whatever_its_track_dir(self):
+        driver = subprocess.Popen([sys.executable, "-c", "pass"])
+        driver.wait()
+        worker = self.live_process()
+        track = os.path.join(self._tmp.name, "track")
+        os.makedirs(track)
+        with open(os.path.join(track, f"{worker.pid}.json"), "w") as fh:
+            json.dump({"reserve": 7, "rss_anon_start": 0, "start": None}, fh)
+        os.makedirs(self.root, exist_ok=True)
+        with open(os.path.join(self.root, f"{driver.pid}.json"), "w") as fh:
+            json.dump(
+                {"v": 1, "pid": driver.pid, "start": None, "track_dir": track,
+                 "waiting_since": None, "reservations": {}},
+                fh,
+            )
+        me = Ledger(self.root, pid=os.getpid())
+        with me.exclusive():
+            self.assertEqual(me.peers(), [])
+
+
+class TestReserveSurvivesAWriteThatFails(LedgerTestCase):
+    def block_the_file(self):
+        path = os.path.join(self.root, f"{os.getpid()}.json")
+        os.makedirs(os.path.join(path, "x"))  # os.replace onto a non-empty directory fails
+        return path
+
+    def test_the_reservation_is_kept_and_published_by_the_next_write_that_works(self):
+        ledger = Ledger(self.root, pid=os.getpid())
+        path = self.block_the_file()
+        with ledger.exclusive():
+            token = ledger.reserve(5, 6, ["/x"])  # does not raise: the recording runs
+            self.assertIsNotNone(ledger.publish_error)
+            with self.assertRaises(OSError):
+                ledger.flush()
+        shutil.rmtree(path)
+        with ledger.exclusive():
+            ledger.flush()
+            self.assertIsNone(ledger.publish_error)
+        with open(path) as fh:
+            self.assertEqual(list(json.load(fh)["reservations"]), [str(token)])
+
+
+class TestSettings(unittest.TestCase):
+    def setUp(self):
+        self._saved = list(admission_ledger.SETTING_ERRORS)
+        self.addCleanup(self._restore)
+        self.addCleanup(os.environ.pop, "ZARR_TEST_SECONDS", None)
+
+    def _restore(self):
+        admission_ledger.SETTING_ERRORS[:] = self._saved
+
+    def test_a_bad_value_keeps_the_default_and_is_reported_instead_of_raising(self):
+        for raw in ("soon", "-5", "inf", "nan"):
+            with self.subTest(raw=raw):
+                os.environ["ZARR_TEST_SECONDS"] = raw
+                self.assertEqual(admission_ledger._env_seconds("ZARR_TEST_SECONDS", 12.5), 12.5)
+        self.assertEqual(len(admission_ledger.SETTING_ERRORS) - len(self._saved), 4)
+        self.assertTrue(all("ZARR_TEST_SECONDS" in m for m in admission_ledger.SETTING_ERRORS[-4:]))
+
+    def test_a_good_or_missing_value_is_used_quietly(self):
+        os.environ.pop("ZARR_TEST_SECONDS", None)
+        self.assertEqual(admission_ledger._env_seconds("ZARR_TEST_SECONDS", 3.0), 3.0)
+        os.environ["ZARR_TEST_SECONDS"] = " 7.5 "
+        self.assertEqual(admission_ledger._env_seconds("ZARR_TEST_SECONDS", 3.0), 7.5)
+        os.environ["ZARR_TEST_SECONDS"] = "0"
+        self.assertEqual(admission_ledger._env_seconds("ZARR_TEST_SECONDS", 3.0), 0.0)
+        self.assertEqual(admission_ledger.SETTING_ERRORS, self._saved)
+
+
+class TestSummary(LedgerTestCase):
+    def test_the_summary_names_who_holds_what_and_how_much_is_on_disk(self):
+        a, b = self.live_process(), self.live_process()
+        pa, pb = self.peer(a), self.peer(b)
+        with pa.exclusive():
+            pa.reserve(10, 100, ["/s/a"])
+        with pb.exclusive():
+            pb.mark_waiting(True)  # waiting holds nothing: not a blocker
+        me = Ledger(self.root, pid=os.getpid())
+        with me.exclusive():
+            summary = me.others_summary(_no_credit, lambda paths: 30)
+        self.assertEqual(summary.pids, frozenset({a.pid}))
+        self.assertEqual((summary.ram, summary.scratch, summary.held), (10, 70, 30))
 
 
 class TestSeveralDriversShareOneBudget(LedgerTestCase):
