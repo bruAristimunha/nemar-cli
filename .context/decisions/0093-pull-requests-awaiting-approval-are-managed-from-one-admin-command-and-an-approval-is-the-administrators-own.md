@@ -211,7 +211,8 @@ and only then read GitHub's state and declined to merge it. The state was read a
 and `y` was offered for every state but `dirty` and `behind`, so a pull request the automated
 review holds was approved and then refused the merge. GitHub's `unstable` is a check or status that
 is not required and is not passing or has not reported; the review's check is not required, so a held
-review is expected to produce it (not yet observed on GitHub). The administrator was left with an
+review is expected to produce it (observed once, on 2026-10-12, on a pull request whose review check
+was red; see the next amendment). The administrator was left with an
 approval they asked for only as the first half of a pair. ADR 0092 recorded this as an open item.
 
 The rule above does not change: a merge is attempted only when GitHub reports `clean`. What moves
@@ -261,3 +262,15 @@ read `blocked` before the administrator's approval and `clean` after it, so `--m
 now refuse it where they used to approve and merge. The ruleset applied to a published dataset
 requires none (`required_approving_review_count: 0`, ADR 0001), and the four legacy repositories use
 classic branch protection that requires none, so nothing is refused today for this reason.
+
+## Amendment 2026-10-12 (trial): `unstable` was observed once
+
+The trial pull request recorded in ADR 0092's amendment of this date read `unstable` on GitHub's
+`mergeable_state`, once it was closed.
+That replaces "expected, not yet observed", here and in ADR 0092's open item, with one observation,
+made on a pull request whose review check was red.
+`unstable` is not `clean`, so it is a state `approve --merge` and `y` in `next` refuse before they write
+anything.
+The observation does not say what the state is for the held verdicts (`uncertain`, `declined`,
+`errored`, which are `action_required`), and it does not settle whether `unstable` should be accepted
+when both required checks pass: that stays the maintainer's decision, tracked in issue #1743.

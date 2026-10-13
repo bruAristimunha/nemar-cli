@@ -12,6 +12,13 @@ on:
   workflow_run:
     workflows: ["Publish to npm"]
     types: [completed]
+    # No `branches:` filter, on purpose. A run triggered by a tag reports the tag name
+    # as its head branch, which the job's `if:` below tests, but GitHub documents the
+    # trigger's filter only for branches and nobody has shown it to match a tag-triggered
+    # run. If it did not, the release would start no sync at all: dev would stay at the
+    # old -devN, below the released version, and the next release's auto-tag would
+    # refuse to tag. What the filter bought was fewer skipped runs, which cost no runner
+    # minutes. Restore it only after a throwaway tag has shown that it matches.
 
 permissions:
   contents: write
@@ -29,6 +36,8 @@ jobs:
       startsWith(github.event.workflow_run.head_branch, 'v') &&
       (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    # p95 16 s (50 green runs to 2026-10-13); 10 is the floor.
+    timeout-minutes: 10
     steps:
       - name: Checkout dev
         uses: actions/checkout@v4

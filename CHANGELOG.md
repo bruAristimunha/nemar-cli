@@ -13,6 +13,70 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
+## 0.10.18 - 2026-10-13
+
+The Zarr conversion on `hallu` now runs several datasets side by side, so a dataset that takes days no longer holds up everything behind it (#1757, ADR 0101),
+and its memory projection uses what a recording really needs: a 145 GiB float32 recording that was refused as too large now fits.
+A text that names a generic home path before a real one is no longer passed by the identifier screen (#1737).
+The rest is repository process with no change to what the Worker does: CI jobs are bounded, superseded pull-request runs are cancelled while push runs never are, the dev npm publish comes from a dispatch, the dev deploy is a call from `auto-bump-dev.yml`, the production deploy of the strip commit reuses the merge's test gate, and bot version commits skip Tests (#1755, which changes the release pipeline itself); pull-request review is capped at two rounds (#1748); and the review trial is recorded in the ADRs (#1747, with comment-only edits to two backend files).
+There is no migration, no new Worker secret or variable, and no Worker behavior change.
+The conversion changes run on `hallu` from the repository clone, not from the npm package; see Deploy coupling.
+
+### Changed
+
+- **Zarr conversions on `hallu` run in parallel slots instead of one dataset at a time (#1757, ADR 0101).**
+  A cron tick now starts one drain per free slot (`ZARR_SLOTS`, default 4),
+  each with its own lock, scratch directory and log, and four workers (`ZARR_JOBS_PER_SLOT`).
+  A dataset that takes days, such as `nm000276` (40 recordings of 100 to 145 GiB, which held the only lock for 5.5 days while the node sat at a load of 1.1),
+  now occupies one slot instead of the node.
+  Slot 0 keeps the old lock and scratch names, so a drain already running counts as slot 0.
+  The slots share one RAM and scratch budget through an admission ledger (`ZARR_LEDGER_DIR`, default `$ZARR_BASE/zarr-admission-ledger`):
+  a peer's unspent reserves come off the ceiling and the budget,
+  the run-alone exception applies only to an idle node,
+  and a slot that waits an hour for its peers hands its queue back without spending an attempt.
+  `ZARR_JOBS` now lowers the per-slot worker count and never raises it,
+  so a crontab that still says `ZARR_JOBS=24` does not give every slot 24.
+  `zarr_queue.py heartbeat` is new, and the script sends it every five minutes while a queue-claimed dataset converts,
+  so a conversion longer than the six-hour stale window is not reclaimed by another slot's reconcile.
+  A TERM to a slot or to the tick (or an INT to a slot run directly) stops the drivers it started and spends no attempt, and a stop that arrives just after a driver has finished still records the result.
+  A one-off `--dataset` run takes the first free slot and refuses to start on a dataset another slot or run is converting.
+  `--stats` no longer takes a slot, `--limit` now caps each slot rather than the tick,
+  and counts such as `ZARR_SLOTS` must be plain decimal integers (`08` is refused, not read as octal).
+  Set `ZARR_SLOTS=1` to run one drain at a time as before; the ledger, the heartbeat and the sample-width projection below stay in force.
+- **The Zarr converter projects a float32 BrainVision recording at the memory it needs and measures anonymous memory (#1757).**
+  When a recording's sidecar (sampling frequency and duration) and channel count show it is stored at four bytes per sample,
+  the streaming projection is 8 times one channel's bytes instead of 12; every other recording projects as before.
+  The 145 GiB `nm000276` recording that was refused as too large (about 32 channels, a projected 54 GiB against a 46 GiB budget) now projects at about 36 GiB and fits.
+  Workers also sample `RssAnon`,
+  and the "under-reserved" warnings compare the reserve with anonymous memory instead of resident size,
+  which includes the scratch memmap's file-backed pages
+  (on `nm000276` sub-48 the anonymous memory held at 6.2 GiB while the resident size passed 10 GiB).
+  A recording refused before this change stays refused until it is converted again.
+
+### Fixed
+
+- **A real local account later in a text is now found even when a generic one comes first
+  (#1737).** The local-user-path rule examined only the first home path in a text, so
+  `/home/user/project` before `/Users/erin/data.csv` ended the check at the generic account and
+  the real one went unseen. Every path is now examined, with the same single `review` finding
+  per text. The upload preflight, the fleet scan and the identifier screen all share the rule, so
+  a dataset that was reported clean only because of that ordering can now carry a finding.
+
+### Deploy coupling
+
+- The Zarr changes reach `hallu` only when its clone of this repository is updated: the hourly cron runs the clone's `hallu-zarr.sh`, and the clone is refreshed by a run that gets a lock.
+  The drain that was converting `nm000276` before this release holds slot 0's lock and runs the old script, so merging does not by itself start the new slots.
+  Update the clone by hand (`git -C /mnt/local/zarr-state/nemar-cli fetch origin && git -C /mnt/local/zarr-state/nemar-cli reset --hard origin/main`): that is what its `setup()` does on every run, and the running drain has already loaded its code.
+- Register the old drain in the admission ledger before the next tick, so the new slots leave room for the recording it is converting.
+  The file is `/mnt/local/zarr-admission-ledger/<driver pid>.json`:
+  `{"v":1,"pid":<pid>,"start":<field 22 of /proc/<pid>/stat>,"reservations":{"1":{"ram":<bytes>,"scratch":<bytes>,"paths":["<its scratch directories>"]}}}`.
+  The shape matters: a file without `reservations` as an object is taken for debris and deleted by the next driver to look, and the registration silently does nothing.
+  The ledger removes the file when the driver exits.
+  Without it the slots read the volume as nearly empty while the recording is still growing towards its peak.
+- No crontab edit is needed: `ZARR_JOBS=24` is now a ceiling, and the default is four slots of four workers.
+  `ZARR_SLOTS=1` restores one drain at a time.
+- The ADR number 0101 is also claimed on the publication-review epic branch (`feature/issue-1726-epic-publication-review`), which renumbers when it merges.
+
 ## 0.10.17 - 2026-10-13
 
 The website's server-side requests are counted per visitor instead of as one client, which is

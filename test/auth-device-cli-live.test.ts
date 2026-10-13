@@ -7,7 +7,7 @@
  *
  * Targets a deployed backend (set TEST_API_URL; defaults to api.nemar.org
  * per test/setup.ts). The dev worker deploys only from `dev`
- * (.github/workflows/deploy-backend.yml's push trigger), so this phase's
+ * (a call from .github/workflows/auto-bump-dev.yml to deploy-backend.yml), so this phase's
  * CLI-facing wiring is not guaranteed to
  * be live on whatever backend TEST_API_URL points at until the epic branch
  * reaches dev. This file probes `POST /auth/device/start` first; a 404
@@ -158,8 +158,8 @@ beforeAll(async () => {
   if (!deviceRoutesDeployed) {
     console.warn(
       "[auth-device-cli-live] SKIPPING every case: POST /auth/device/start answered 404. " +
-        "The dev worker deploys only from `dev` (.github/workflows/deploy-backend.yml's " +
-        "push trigger), so this phase's routes are not live on the backend TEST_API_URL " +
+        "The dev worker deploys only from `dev` (a call from .github/workflows/auto-bump-dev.yml " +
+        "to deploy-backend.yml), so this phase's routes are not live on the backend TEST_API_URL " +
         "points at yet -- expected until the epic branch reaches dev.",
     );
   }

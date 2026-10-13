@@ -168,11 +168,19 @@ more than 10 percent of their decided ones).
 0093 (`nemar admin pr-reviews` lists the open dataset pull requests with the automated review: a verdict
 belongs to the commit it read, an approval is the administrator's OWN act from their machine with their
 own GitHub login and no Worker code path approves, a failing, running or unreadable review needs
-`--force`, nothing merges without `--merge` or a `y` in `nemar admin pr-reviews next`, and each
-Worker lists only the datasets it owns).
+`--force`, nothing merges without `--merge` or a `y` in `nemar admin pr-reviews next`, both of which
+read GitHub's state before approving and need `clean`, and each Worker lists only the datasets it
+owns).
 0094 (the upload save step skips re-reading annexed content only once recorded annexed bytes reach
 1 GiB, only for files whose size and mtime still match the upload plan, and only while it can clear
-`assume-unchanged` safely; failures to verify or clear the state fail the save).
+`assume-unchanged` safely; failures to verify or clear the state fail the save),
+0097 (password sign-in is retired and its stored hashes are cleared; the hourly backup still holds
+them),
+0098 (a request without `CF-Connecting-IP` is counted by the first valid `X-Forwarded-For` address
+under a `site:` key, `X-Forwarded-For` is never read when `CF-Connecting-IP` is present, the caller
+must set it from its own `CF-Connecting-IP` and never pass a visitor's header through, and the
+Cloudflare account is the trust boundary),
+0099 (counters are fixed windows and a refusal writes nothing).
 
 **Account copy and the profile-gap matrix are declared once, in
 [`shared/contract/account-copy.ts`](shared/contract/account-copy.ts) and
@@ -447,6 +455,9 @@ squash-merge cycle, and the `.claude/epic.local.md` state file that tracks `curr
 
 Never let GitHub issues/PRs and `.claude/epic.local.md` drift.
 Phase PRs squash-merge into the epic branch; the epic branch merges into `dev`.
+`/review-pr` in that cycle runs at most two rounds per PR, and review fixes ride on the PR's own
+branch, not in a new PR, except for a large fix or a head branch that bars direct commits (a release
+PR, the final epic PR); see `.rules/code_review.md` and `.rules/git.md`.
 
 ---
 

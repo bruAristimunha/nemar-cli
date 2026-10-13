@@ -307,8 +307,12 @@ fragment; they are a separate decision if the same complaint is made of them. Mo
 `modality` into the facet table as a token-list kind remains possible, but it would change
 `FACETS.length`, the `search_datasets` filter cap that is sized from it, and the generated
 MCP and CLI flags, for no change in behavior. The admin sweep selector that reads
-`modalities LIKE '%eeg%'` is not this filter: it is a substring match on purpose, because
-the channel-montage probe also takes `ieeg`, and the sweep's remaining-count statement
-carries a note to keep the two in step.
+`modalities LIKE '%eeg%'` is not this filter: it stays a substring match because it must be the
+same predicate as the sweep's remaining-count statement, so that `remaining` converges, and the
+extra `ieeg`-only candidates are harmless: the channel-montage probe reads only the `eeg/`
+datatype directory, so it finds nothing for them and stamps them checked. Moving both to a
+whole-token match would stop spending a GitHub tree walk on `ieeg`-only datasets, and is a
+separate decision. (Corrected 2026-10-12: this paragraph said the probe also takes `ieeg`; it
+does not, and the substring is tolerated, not wanted.)
 
 Receipt: `backend/test/modality-exact-token.test.ts`.

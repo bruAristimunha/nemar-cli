@@ -191,9 +191,12 @@ bucket_name = "nemar-news-media"
 # shared with [env.dev]: the dev worker has its own bucket below.
 # The bucket must exist before the next deploy that carries this binding
 # (`wrangler r2 bucket create nemar-neurobagel`), or that deploy fails (ADR 0076).
-# Everything is OFF until the owner sets NEUROBAGEL_WRITER_ENABLED = "1" in [vars]
-# (deliberately absent here) and creates the NEUROBAGEL_READ_TOKEN secret; with the
-# variable absent the writer, the hooks and the reconcile do nothing at all.
+# Everything is OFF unless NEUROBAGEL_WRITER_ENABLED is "1" (and the NEUROBAGEL_READ_TOKEN
+# secret exists); with the variable absent the writer, the hooks and the reconcile do
+# nothing at all. The variable is deliberately absent from [vars] here, and a test pins
+# that, but production holds a Worker secret named NEUROBAGEL_WRITER_ENABLED (name
+# checked 2026-10-12), so this file cannot say whether the writer is on there:
+# `nemar admin neurobagel status` does.
 # The daily verification sweep (phase 6) needs no switch and writes only its heartbeat. Two
 # OPTIONAL variables, deliberately absent from this file, turn on its network checks: set
 # NEUROBAGEL_NODE_URL (the node's address) to probe the node, and NEUROBAGEL_FEDERATION_URL
@@ -548,10 +551,12 @@ MANIFEST_VIA_CENTRAL_WORKFLOW = "false"
 # present only for binding consistency.
 AUTO_IMPORT_ENABLED = "false"
 AUTO_IMPORT_MIN_INTERVAL_MIN = "25"
-# Automated publication pre-screen (#666). Enabled on SCCN dev as the soak
-# target: a publish request that passes BIDS readiness dispatches
-# run-prescreen on nemarDatasets/.github. Requires the PRESCREEN_CALLBACK_SECRET
-# Worker secret (set on dev). Prod stays unset (dark) until promoted.
+# Automated publication pre-screen (#666). Enabled on SCCN dev, as a var here: a publish
+# request that passes BIDS readiness dispatches run-prescreen on nemarDatasets/.github.
+# Requires the PRESCREEN_CALLBACK_SECRET Worker secret (set on dev and on production).
+# Production is NOT dark. It is enabled there by a Worker secret named PRESCREEN_ENABLED
+# (name checked 2026-10-12), which this file does not record: the top-level [vars] sets
+# nothing for it, so reading this file alone shows production as off when it is on.
 PRESCREEN_ENABLED = "true"
 # Dataset pull-request review (ADR 0092). On here, as the trial: the production Worker forwards
 # pull_request events for the datasets dev owns (xx09* and the fixture nm099998) to this Worker
@@ -559,8 +564,10 @@ PRESCREEN_ENABLED = "true"
 # and publishes the NEMAR PR Review check. A dataset is reviewed only while it is public, named
 # and first-published, so an anonymous deposit such as nm099998, and production's private
 # nm099999, never are. It does nothing until the NEMAR App is subscribed to Pull request events
-# and that workflow is deployed; it needs PRESCREEN_CALLBACK_SECRET (set on dev). Production
-# leaves the variable unset (dark): add PR_REVIEW_ENABLED = "1" to [vars] to turn it on there.
+# and that workflow is deployed (both done on 2026-10-12); it needs PRESCREEN_CALLBACK_SECRET
+# (set on dev and on production). Production is dark: PR_REVIEW_ENABLED is neither in [vars] nor
+# a Worker secret there (checked 2026-10-12). Add PR_REVIEW_ENABLED = "1" to [vars] to turn it on
+# there.
 # The variable lives in this file and not in the dashboard because `wrangler deploy` replaces
 # the Worker's variables with the ones in this file (no keep_vars), so a dashboard-only value
 # is dropped by the next deploy.

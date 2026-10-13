@@ -17,6 +17,10 @@ permissions:
 jobs:
   bump:
     runs-on: ubuntu-latest
+    # The 21 green runs to 2026-10-13 all found the pin current (p95 11 s). A run that
+    # bumps also runs `bun test` over the whole tree, which takes about as long as
+    # unit-pure (p95 21.7 min), so this is sized for that path, not the common one.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
