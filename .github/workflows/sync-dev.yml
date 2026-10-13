@@ -12,6 +12,14 @@ on:
   workflow_run:
     workflows: ["Publish to npm"]
     types: [completed]
+    # Only a publish that ran on a v* ref starts this workflow. For a tag-triggered
+    # run (and for a dispatch on a tag) GitHub reports the tag name as the run's
+    # head branch, which is what this filter matches and what the job's `if:`
+    # below has always tested. Without it every branch publish created a run here
+    # that skipped its only job: 2,660 skipped runs against 107 that synced.
+    # The job's `if:` stays as the exact check (success, v prefix, push or
+    # dispatch), and its first step still refuses anything but vX.Y.Z.
+    branches: ['v*']
 
 permissions:
   contents: write
@@ -29,6 +37,8 @@ jobs:
       startsWith(github.event.workflow_run.head_branch, 'v') &&
       (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    # p95 16 s (50 green runs to 2026-10-13); 10 is the floor.
+    timeout-minutes: 10
     steps:
       - name: Checkout dev
         uses: actions/checkout@v4

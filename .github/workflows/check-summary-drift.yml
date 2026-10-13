@@ -23,7 +23,8 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # No green run on record to measure (see the GH_REPO note below); 10 is the floor.
+    timeout-minutes: 10
     permissions:
       issues: write
     env:

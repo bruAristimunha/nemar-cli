@@ -1,14 +1,40 @@
 name: Deploy Backend
 
 on:
+  # Production: every push to main that touches the backend.
   push:
     branches:
-      - dev
       - main
     paths:
       - 'backend/**'
       - 'shared/**'
       - '.github/workflows/deploy-backend.yml'
+  # The dev worker: called by auto-bump-dev.yml, ONCE per push to dev, after it has
+  # pushed the version bump, with the commit to deploy (the bump). Until 2026-10, a
+  # push to dev deployed itself here, so a merge touching backend/ or shared/
+  # deployed twice: the merge commit at -devN, then 14 s later the bump at -devN+1,
+  # each behind its own 18-minute test-gate (152 of 235 deploy runs were bump
+  # commits, 2026-09-15 to 2026-10-13). The dev worker now ends at the same bumped
+  # version from one deploy. auto-bump-dev.yml still deploys a push it does not
+  # bump, when that push touched the paths above.
+  #
+  # A call, not a dispatch: a reusable workflow runs from the caller's own commit,
+  # so it does not depend on what main's copy of this file declares.
+  workflow_call:
+    inputs:
+      sha:
+        description: "Commit on dev to deploy"
+        type: string
+        required: true
+  # By hand, to redeploy dev: gh workflow run deploy-backend.yml --ref dev
+  # [-f sha=<commit on dev>]. A call or dispatch from any other ref deploys nothing
+  # (see detect-environment), so neither adds a way to reach production.
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit on dev to deploy (default: the head of dev)"
+        required: false
+        default: ""
 
 # Serialize deploys per ref (#897). The release pipeline pushes TWO commits to
 # main that both match backend/** (the dev->main merge commit writes
@@ -18,6 +44,10 @@ on:
 # so a queued deploy WAITS for the in-flight one to finish its migrate+deploy
 # rather than cancelling it mid-migration (a cancelled prod migration is worse
 # than a slightly stale deploy; the queued run then deploys the newer commit).
+# A dispatched dev deploy runs on ref dev and takes the dev group. A call from
+# auto-bump-dev.yml evaluates this group in its caller's context (also dev);
+# whether it then applies to the call is not documented, which is why the
+# caller serializes its calls and deploy-dev takes a job-level lock as well.
 concurrency:
   group: deploy-backend-${{ github.ref }}
   cancel-in-progress: false
@@ -26,16 +56,94 @@ jobs:
   # Detect which environment to deploy to
   detect-environment:
     runs-on: ubuntu-latest
+    # p95 4 s (50 green runs to 2026-10-13); 10 is the floor.
+    timeout-minutes: 10
+    permissions:
+      actions: read # the release merge commit's deploy run, below
+      contents: read
     outputs:
       environment: ${{ steps.detect.outputs.environment }}
+      # The commit every job below checks out: the pushed commit on main, the
+      # given `sha` (or the head of dev) for the dev worker.
+      sha: ${{ steps.detect.outputs.sha }}
+      # 'true' when test-gate is skipped because the commit before passed it.
+      gate_reused: ${{ steps.reuse.outputs.gate_reused }}
     steps:
+      # A called run carries its caller's event (a push to dev), hence the ref test.
+      - name: Checkout code
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/checkout@v4
+
+      - name: Classify the push
+        id: push
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: scripts/ci/classify-push.sh >> "$GITHUB_OUTPUT"
+
       - name: Detect environment
         id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          INPUT_SHA: ${{ inputs.sha }}
         run: |
-          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            echo "environment=production" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.ref }}" == "refs/heads/dev" ]]; then
-            echo "environment=dev" >> $GITHUB_OUTPUT
+          # A call from auto-bump-dev.yml always passes `sha`; a dispatch may not.
+          if [[ -n "$INPUT_SHA" || "$EVENT" == "workflow_dispatch" ]]; then
+            if [[ "$REF" != "refs/heads/dev" ]]; then
+              echo "::notice::a deploy called or dispatched from $REF deploys nothing; only dev's is the dev worker"
+              exit 0
+            fi
+            SHA="${INPUT_SHA:-$GITHUB_SHA}"
+            if [[ ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::sha '$SHA' is not a full commit id"
+              exit 1
+            fi
+            # Only a commit dev already holds: the dev worker deploys only from dev.
+            STATUS=$(gh api "repos/$GH_REPO/compare/$SHA...dev" --jq .status)
+            if [[ "$STATUS" != "ahead" && "$STATUS" != "identical" ]]; then
+              echo "::error::$SHA is not on dev (compare status '$STATUS'); refusing to deploy it"
+              exit 1
+            fi
+            echo "environment=dev" >> "$GITHUB_OUTPUT"
+            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          elif [[ "$EVENT" == "push" && "$REF" == "refs/heads/main" ]]; then
+            echo "environment=production" >> "$GITHUB_OUTPUT"
+            echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::$EVENT on $REF deploys nothing: production deploys on a push to main, dev when auto-bump-dev.yml calls this"
+          fi
+
+      # THE RELEASE STRIP COMMIT REUSES THE RELEASE MERGE'S GATE. A release pushes
+      # two commits to main: the dev -> main merge, then auto-tag.yml's commit that
+      # only strips -devN from the version. Both deploy (see the note on concurrency
+      # above), and each ran the full 18-minute test-gate over the same code. When
+      # this push is that strip commit (the bot's single version-only commit on top
+      # of the previous head, scripts/ci/classify-push.sh) and the previous head's
+      # own deploy run passed test-gate, this run skips it. The concurrency group
+      # means that run has finished by the time this one starts. In every other
+      # case, including any doubt or API failure, test-gate runs as before.
+      - name: Reuse the previous commit's gate
+        id: reuse
+        if: steps.detect.outputs.environment == 'production' && steps.push.outputs.auto_bump == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          run_id=$(gh api "repos/$GH_REPO/actions/workflows/deploy-backend.yml/runs?head_sha=$BEFORE&event=push&branch=main&status=completed&per_page=1" \
+            --jq '.workflow_runs[0].id // empty') || run_id=""
+          gate=""
+          if [ -n "$run_id" ]; then
+            gate=$(gh api "repos/$GH_REPO/actions/runs/$run_id/jobs?per_page=100" \
+              --jq '[.jobs[] | select(.name == "test-gate")][0].conclusion // empty') || gate=""
+          fi
+          if [ "$gate" = "success" ]; then
+            echo "gate_reused=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::test-gate skipped: $BEFORE passed it in run $run_id, and this push only changes the version"
+          else
+            echo "gate_reused=false" >> "$GITHUB_OUTPUT"
+            echo "test-gate runs: the deploy run of $BEFORE is '${run_id:-not found}', its test-gate '${gate:-unknown}'"
           fi
 
   # Gate (#897): the exact commit being deployed must pass the same required
@@ -46,11 +154,15 @@ jobs:
   # failing gate blocks the deploy instead of racing it.
   test-gate:
     needs: detect-environment
-    if: needs.detect-environment.outputs.environment != ''
+    if: needs.detect-environment.outputs.environment != '' && needs.detect-environment.outputs.gate_reused != 'true'
     runs-on: ubuntu-latest
+    # p95 21.8 min (50 green runs to 2026-10-13), so twice that.
+    timeout-minutes: 44
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.detect-environment.outputs.sha }}
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -62,7 +174,10 @@ jobs:
         with:
           deno-version: v2.x
 
+      # Under 30 s at p95, but the Ubuntu mirror can stall on this one package for minutes,
+      # and #1667 saw the same install hang for an hour.
       - name: Install git-annex
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y git-annex
@@ -108,10 +223,22 @@ jobs:
     # would not block the deploy (the whole point of #897).
     if: needs.detect-environment.outputs.environment == 'dev' && needs.test-gate.result == 'success'
     runs-on: ubuntu-latest
+    # p95 0.9 min (42 green runs to 2026-10-13). 20, not the 10 floor: the two smoke
+    # loops below can take 7 minutes on their own, and a limit that cancels a D1
+    # migration midway is worse than a slow deploy (see the concurrency note above).
+    timeout-minutes: 20
+    # A lock on the dev migrate and deploy themselves, whatever started them (a
+    # call from auto-bump-dev.yml or a dispatch), with the same never-cancel-midway
+    # rule as the workflow-level group above.
+    concurrency:
+      group: deploy-backend-dev-worker
+      cancel-in-progress: false
     environment: development
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.detect-environment.outputs.sha }}
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -235,14 +362,24 @@ jobs:
     needs: [detect-environment, test-gate]
     # Explicit test-gate.result check (see deploy-dev): a custom `if:` drops the
     # implicit needs-success gate, so this is what actually blocks a prod deploy
-    # on a red build.
-    if: needs.detect-environment.outputs.environment == 'production' && needs.test-gate.result == 'success'
+    # on a red build. `!cancelled()` lets this job run when test-gate was skipped,
+    # which it is only when detect-environment found the gate already passed for
+    # this exact code (the release strip commit, see "Reuse the previous commit's
+    # gate"); any other skip, a failure or a cancellation still blocks the deploy.
+    if: >-
+      !cancelled()
+      && needs.detect-environment.outputs.environment == 'production'
+      && (needs.test-gate.result == 'success'
+          || (needs.test-gate.result == 'skipped' && needs.detect-environment.outputs.gate_reused == 'true'))
     runs-on: ubuntu-latest
+    # p95 0.7 min (8 green runs to 2026-10-13); 20 for the same reasons as deploy-dev.
+    timeout-minutes: 20
     environment: production
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          ref: ${{ needs.detect-environment.outputs.sha }}
           # Full history + tags so the drift check below can resolve whether the
           # deployed commit is a tagged release.
           fetch-depth: 0

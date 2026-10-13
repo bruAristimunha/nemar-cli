@@ -2,21 +2,34 @@ name: Publish to npm
 
 # Handles both tag-based releases and branch-based pre-releases:
 # - Tags (v*): Stable releases with version from tag
-# - dev branch: dev tag with build number
-# - All non-main branches: PR{number} tag with SHA in version (only if PR exists; skipped otherwise)
+# - dev branch: dev tag with build number, dispatched by auto-bump-dev.yml
+# - All other non-main branches: PR{number} tag with SHA in version (only if PR exists; skipped otherwise)
 
 on:
   push:
     tags:
       - 'v*'
+    # Every branch but main and dev. The PR{number} preview is relied on for any
+    # branch with an open pull request, whatever its name: Tests' e2e-sandbox job
+    # installs nemar-cli@PR<n> and checks it carries the head commit, and PR heads use
+    # many prefixes (feature/, fix/, docs/, chore/, feat/, claude/, none at all), so
+    # no narrower pattern keeps that working.
+    #
+    # dev is not here: auto-bump-dev.yml dispatches this workflow once per push to
+    # dev, after the version bump. A push to dev used to publish itself, so every
+    # merge started two publishes 14 s apart, and the second (the bump's) canceled
+    # the first (128 of 132 merge publishes canceled, 2026-09-15 to 2026-10-13). The
+    # one that survived built the bump, and the dispatched one still does, so `dev`
+    # on npm ends at the same build from one run.
     branches:
-      - dev
       - '**'
       - '!main'
-  # Manual escape hatch: re-run the publish for an existing tag when the
-  # automatic push trigger was missed (e.g. a [skip ci] marker on the
-  # head commit blocked it). Trigger via:
+      - '!dev'
+  # The dev publish (dispatched by auto-bump-dev.yml), and the manual escape hatch:
+  # re-run the publish for an existing tag when the automatic push trigger was
+  # missed (e.g. a skip-ci marker on the head commit blocked it). Trigger via:
   #   gh workflow run npm-publish.yml --ref v0.8.2
+  #   gh workflow run npm-publish.yml --ref dev
   workflow_dispatch:
 
 # Serialize publishes per branch/tag ref. Multiple rapid pushes to the
@@ -31,6 +44,8 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # p95 0.5 min (50 green runs to 2026-10-13); 10 is the floor.
+    timeout-minutes: 10
     environment: npm
     permissions:
       contents: read
@@ -41,31 +56,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.4.3
-
-      - name: Install dependencies
-        run: bun install
-
-      - name: Build
-        run: bun run build
-
-      - name: Setup Node.js for npm publish
-        # Node 22 (was 20): `npm install -g npm@latest` below now requires
-        # Node ^22.22.2 || ^24.15.0 || >=26.0.0, so npm@latest EBADENGINE-fails
-        # on Node 20. Keep this at an npm@latest-compatible LTS.
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Upgrade npm for OIDC support
-        run: |
-          npm install -g npm@latest
-          npm --version
-
+      # Decided first: a branch with no open pull request publishes nothing, so it
+      # skips the install, build and npm upgrade below (203 of 543 branch runs had no
+      # pull request, 2026-09-15 to 2026-10-13). Needs only the checkout, jq and gh.
       - name: Determine version and tag
         id: version
         env:
@@ -130,6 +123,36 @@ jobs:
             echo "version=$VERSION" >> $GITHUB_OUTPUT
             echo "tag=$TAG" >> $GITHUB_OUTPUT
           fi
+
+      - name: Setup Bun
+        if: steps.version.outputs.skip_publish != 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+
+      - name: Install dependencies
+        if: steps.version.outputs.skip_publish != 'true'
+        run: bun install
+
+      - name: Build
+        if: steps.version.outputs.skip_publish != 'true'
+        run: bun run build
+
+      - name: Setup Node.js for npm publish
+        if: steps.version.outputs.skip_publish != 'true'
+        # Node 22 (was 20): `npm install -g npm@latest` below now requires
+        # Node ^22.22.2 || ^24.15.0 || >=26.0.0, so npm@latest EBADENGINE-fails
+        # on Node 20. Keep this at an npm@latest-compatible LTS.
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Upgrade npm for OIDC support
+        if: steps.version.outputs.skip_publish != 'true'
+        run: |
+          npm install -g npm@latest
+          npm --version
 
       - name: Verify version matches (tag releases only)
         if: steps.version.outputs.is_tag == 'true'
