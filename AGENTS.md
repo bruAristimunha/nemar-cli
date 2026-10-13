@@ -455,6 +455,9 @@ squash-merge cycle, and the `.claude/epic.local.md` state file that tracks `curr
 
 Never let GitHub issues/PRs and `.claude/epic.local.md` drift.
 Phase PRs squash-merge into the epic branch; the epic branch merges into `dev`.
+`/review-pr` in that cycle runs at most two rounds per PR, and review fixes ride on the PR's own
+branch, not in a new PR, except for a large fix or a head branch that bars direct commits (a release
+PR, the final epic PR); see `.rules/code_review.md` and `.rules/git.md`.
 
 ---
 
