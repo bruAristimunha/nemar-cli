@@ -587,6 +587,73 @@ def reset_peak_rss() -> bool:
         return False
 
 
+class AnonPeak:
+    """The highest ``RssAnon`` this process has held since ``reset``, sampled.
+
+    ``VmHWM`` (``peak_rss_bytes``) counts every resident page, and a streamed
+    recording's scratch memmap is resident too: file-backed, reclaimable, and already
+    counted as available by ``MemAvailable``. Admission reserves anonymous memory, the
+    RLIMIT_DATA backstop limits anonymous memory, and the ledger credits anonymous
+    memory, so comparing a reserve with ``VmHWM`` called a recording that took 6 GiB
+    "under-reserved" at 48 (measured on nm000276, 2026-10-13: ``RssAnon`` held at
+    6.2 GiB while ``VmHWM`` rose past 10 GiB with the memmap). The kernel keeps no
+    high-water mark for ``RssAnon``, so a thread reads it a few times a second; an
+    allocation that lives for less than the interval can be missed, which is why this
+    is a measurement to calibrate with and not a bound to enforce."""
+
+    def __init__(self, interval: float = 0.25) -> None:
+        self.interval = interval
+        self._lock = threading.Lock()
+        self._peak: int | None = None
+        self._thread: threading.Thread | None = None
+
+    def _run(self) -> None:
+        while True:
+            time.sleep(self.interval)
+            now = anon_rss_bytes(os.getpid())
+            if now is None:
+                continue
+            with self._lock:
+                if self._peak is not None and now > self._peak:
+                    self._peak = now
+
+    def reset(self) -> bool:
+        """Start measuring afresh from the memory held now; False where it cannot be
+        read (off Linux, or a kernel older than 4.5)."""
+        now = anon_rss_bytes(os.getpid())
+        if now is None:
+            with self._lock:
+                self._peak = None
+            return False
+        with self._lock:
+            self._peak = now
+        # A forked worker inherits this object but not its thread.
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(target=self._run, name="anon-peak", daemon=True)
+            self._thread.start()
+        return True
+
+    def peak(self) -> int | None:
+        now = anon_rss_bytes(os.getpid())
+        with self._lock:
+            if self._peak is None:
+                return None
+            if now is not None and now > self._peak:
+                self._peak = now
+            return self._peak
+
+
+_ANON_PEAK = AnonPeak()
+
+
+def reset_peak_anon() -> bool:
+    return _ANON_PEAK.reset()
+
+
+def peak_anon_bytes() -> int | None:
+    return _ANON_PEAK.peak()
+
+
 def peak_rss_bytes() -> int | None:
     """This process's peak RSS since the last `reset_peak_rss`, or None where that
     cannot be read. Prefers /proc (bytes we can trust the units of); falls back to
@@ -791,7 +858,10 @@ def note_measurement(result: dict, projections: dict, measured: dict) -> str | N
     untrustworthily) and must be dropped, while a genuine 0 would be a real
     reading and must not be silently conflated with it.
     """
-    rss = result.get("peak_rss")
+    # Anonymous memory when it was measured: that is what a reserve is, and the
+    # resident figure also counts the scratch memmap's file-backed pages.
+    anon = result.get("peak_anon")
+    rss = anon if anon is not None else result.get("peak_rss")
     primary = result.get("primary")
     proj = projections.get(primary)
     if rss is None or not proj:
@@ -805,8 +875,12 @@ def note_measurement(result: dict, projections: dict, measured: dict) -> str | N
     # "reserved" means the slack-inflated charge, matching admission's vocabulary.
     reserved = proj * MEM_LIMIT_SLACK
     if rss > reserved:
+        what = (
+            f"{rss / 1024**3:.1f} GiB of anonymous memory"
+            if anon is not None else f"{rss / 1024**3:.1f} GiB"
+        )
         return (
-            f"::warning::under-reserved {primary}: needed {rss / 1024**3:.1f} GiB, "
+            f"::warning::under-reserved {primary}: needed {what}, "
             f"reserved {reserved / 1024**3:.1f} GiB ({rss / proj:.1f}x its "
             f"projection) -- see INMEM_MEM_FACTOR_BY_EXT (#1111)"
         )
@@ -981,7 +1055,8 @@ STORAGE_STATE_CODES = frozenset({"annex_object_missing"})
 
 
 def memory_failure_result(
-    primary: str, exc: BaseException, peak_rss: int | None = None
+    primary: str, exc: BaseException, peak_rss: int | None = None,
+    peak_anon: int | None = None,
 ) -> dict:
     """The `convert_one` result for a recording that ran out of memory mid-convert.
 
@@ -998,6 +1073,7 @@ def memory_failure_result(
         "code": RecordingMemoryExceeded.code,
         "detail": failure_detail(exc),
         "peak_rss": peak_rss,
+        "peak_anon": peak_anon,
     }
 
 
@@ -1177,15 +1253,33 @@ class ChannelCountMismatch(Exception):
 # float64, and the multiplier below covers the resampled copy and resample_poly's
 # scratch alongside it.
 STREAM_CHANNEL_EXPANSION = float(os.environ.get("ZARR_STREAM_CHANNEL_EXPANSION", "12"))
+# The 12 above is `8 / 2 * 3`: a float64 sample is four int16 samples, and three such
+# channels can be live at once (the channel, and the temporaries of the int16
+# quantization). It is right for a recording stored in two bytes per sample, which is
+# what admission has to assume when it cannot tell. A recording stored in four bytes per
+# sample (float32 BrainVision, which is what the 100 to 145 GiB iEEG of nm000276 is)
+# holds half as many samples per byte, so the same channel needs half the float64. This
+# is how many float64 channels to provision for in that case: three measured, plus a third
+# of margin. The result is never above STREAM_CHANNEL_EXPANSION.
+STREAM_CHANNEL_COPIES = float(os.environ.get("ZARR_STREAM_CHANNEL_COPIES", "4"))
 
 
-def streaming_peak_bytes(size_bytes: int, n_channels: int | None) -> int:
+def streaming_peak_bytes(
+    size_bytes: int, n_channels: int | None, sample_bytes: int | None = None
+) -> int:
     """Projected peak for the streaming path: the flat floor, raised when one
     channel alone would exceed it. Falls back to the flat value when the channel
-    count is unknown."""
+    count is unknown.
+
+    ``sample_bytes`` is the width the recording is stored at when that is known
+    (``sample_bytes_from_sidecar``); without it the narrowest width is assumed, which
+    is the larger projection."""
     if not n_channels or n_channels <= 0:
         return STREAM_PEAK_BYTES
-    per_channel = int(size_bytes / n_channels * STREAM_CHANNEL_EXPANSION)
+    expansion = STREAM_CHANNEL_EXPANSION
+    if sample_bytes and sample_bytes > 0:
+        expansion = min(expansion, 8.0 / sample_bytes * STREAM_CHANNEL_COPIES)
+    per_channel = int(size_bytes / n_channels * expansion)
     return max(STREAM_PEAK_BYTES, per_channel)
 
 
@@ -1194,6 +1288,7 @@ def projected_peak_bytes(
     size_bytes: int,
     n_channels: int | None = None,
     maxshield: bool = False,
+    sample_bytes: int | None = None,
 ) -> int:
     """Estimated peak RAM to convert this recording: the streaming path's
     channel-aware bound, or the float64 blow-up for the in-memory path. Drives the
@@ -1206,7 +1301,7 @@ def projected_peak_bytes(
     """
     if should_stream(primary_local, size_bytes):
         conversion = max(
-            streaming_peak_bytes(size_bytes, n_channels),
+            streaming_peak_bytes(size_bytes, n_channels, sample_bytes),
             int(size_bytes * stream_factor_for(primary_local)),
         )
     else:
@@ -3582,6 +3677,60 @@ def expected_channel_count_for(
         )
         return None
     return channels_tsv_row_count(text) or None
+
+
+# Widths a BrainVision binary file is written in: `INT_16` and `IEEE_FLOAT_32`.
+_BRAINVISION_SAMPLE_BYTES = (2, 4)
+
+
+def snap_sample_width(bytes_per_sample: float) -> int | None:
+    """The BrainVision sample width ``bytes_per_sample`` is within 3% of, or None.
+    The slack covers a header and markers; a figure that is not close to a real width
+    means the duration or the channel count describes something else, and is not used."""
+    if not math.isfinite(bytes_per_sample):
+        return None
+    for width in _BRAINVISION_SAMPLE_BYTES:
+        if abs(bytes_per_sample - width) <= 0.03 * width:
+            return width
+    return None
+
+
+def sample_bytes_from_sidecar(
+    repo_dir: str,
+    primary_path: str,
+    head_files: set[str],
+    head: str,
+    size_bytes: int,
+    n_channels: int | None,
+) -> int | None:
+    """Bytes per sample a BrainVision recording is stored in, worked out from what
+    admission can read without downloading it: the recording's size, its channel count,
+    and the sidecar's ``SamplingFrequency`` and ``RecordingDuration`` (git-tracked text).
+    None when any of them is missing, or when they do not add up to a width a
+    BrainVision file is written in, in which case the narrowest width is assumed.
+
+    Only ``.vhdr``: the header that states the width (``BinaryFormat``) is annexed and
+    is not there to read yet, and BrainVision is the format whose recordings reach
+    hundreds of GiB. An answer of 2 is the default and changes nothing; an answer of 4
+    is what lets a float32 recording be projected at the memory it needs rather than at
+    twice that."""
+    if lower_ext(primary_path) != ".vhdr" or not n_channels or n_channels <= 0 or size_bytes <= 0:
+        return None
+    sidecar = posixpath.splitext(primary_path)[0] + ".json"
+    if sidecar not in head_files:
+        return None
+    text = _read_repo_text(repo_dir, head, sidecar)
+    if text is None:
+        return None
+    try:
+        doc = json.loads(text)
+        rate = float(doc["SamplingFrequency"])
+        seconds = float(doc["RecordingDuration"])
+    except (ValueError, KeyError, TypeError):
+        return None
+    if not (math.isfinite(rate) and math.isfinite(seconds) and rate > 0 and seconds > 0):
+        return None
+    return snap_sample_width(size_bytes / (n_channels * rate * seconds))
 
 
 def channels_tsv_row_count(text: str) -> int:
@@ -8379,6 +8528,7 @@ def convert_one(primary: str, peak_bytes: int | None = None) -> dict:
         # if believed, a pointless factor increase. Mark the sample untrusted
         # rather than blend it into calibration.
         rss_trusted = reset_peak_rss()
+        reset_peak_anon()
         if not rss_trusted and not _WARNED_NO_RESET[0]:
             _WARNED_NO_RESET[0] = True
             print(
@@ -8662,6 +8812,7 @@ def convert_one(primary: str, peak_bytes: int | None = None) -> dict:
                 "size_bytes": annex_key_size(primary_key),
             },
             "peak_rss": peak_rss_bytes() if rss_trusted else None,
+            "peak_anon": peak_anon_bytes() if rss_trusted else None,
         }
     except MemoryError as exc:
         # The RLIMIT_DATA backstop fired (or the allocator genuinely ran out).
@@ -8675,7 +8826,8 @@ def convert_one(primary: str, peak_bytes: int | None = None) -> dict:
         # calibration summary look cleanest exactly where it was most wrong.
         log_memory_failure(primary, exc)
         return memory_failure_result(
-            primary, exc, peak_rss_bytes() if rss_trusted else None
+            primary, exc, peak_rss_bytes() if rss_trusted else None,
+            peak_anon_bytes() if rss_trusted else None,
         )
     except Exception as exc:  # noqa: BLE001 - isolate one bad recording
         # The backstop does not always surface as MemoryError: see
@@ -8683,7 +8835,8 @@ def convert_one(primary: str, peak_bytes: int | None = None) -> dict:
         if is_memory_exhaustion(exc):
             log_memory_failure(primary, exc)
             return memory_failure_result(
-                primary, exc, peak_rss_bytes() if rss_trusted else None
+                primary, exc, peak_rss_bytes() if rss_trusted else None,
+                peak_anon_bytes() if rss_trusted else None,
             )
         # biosigIO read failures carry a stable `.code` (not_continuous,
         # corrupt_or_truncated, ...) so the index can tell the viewer WHY a
@@ -9886,9 +10039,21 @@ def main() -> int:
         p: lower_ext(p) == ".fif" and maxshield_calibration_for(p, head_set) is not None
         for p in convert
     }
+    # How many bytes each sample of a BrainVision recording takes, from its sidecar,
+    # so a float32 recording is not projected as if it were int16 (twice the memory).
+    # Best-effort like the channel count: the narrowest width is assumed without it.
+    sample_widths: dict[str, int | None] = {}
+    for p in convert:
+        try:
+            sample_widths[p] = sample_bytes_from_sidecar(
+                repo, p, head_set, head, sizes[p], channel_counts.get(p)
+            )
+        except Exception:  # noqa: BLE001 - a projection input must not fail a run
+            sample_widths[p] = None
     projections = {
         p: projected_peak_bytes(
-            p, sizes[p], channel_counts.get(p), maxshield=maxshield_hint[p]
+            p, sizes[p], channel_counts.get(p), maxshield=maxshield_hint[p],
+            sample_bytes=sample_widths.get(p),
         )
         for p in convert
     }
