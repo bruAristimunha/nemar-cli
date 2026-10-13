@@ -104,7 +104,7 @@ from zarr_queue import ZARR_ENGINE_VERSION
 
 # Several drivers can convert on one node at once (hallu-zarr.sh slots). Each admits
 # against the RAM and scratch the others have reserved and not yet taken, through a
-# ledger they share (ADR 0101). A sibling module for the same reason as the import
+# ledger they share (ADR 0102). A sibling module for the same reason as the import
 # above.
 from admission_ledger import Ledger, LedgerBusy
 
@@ -8909,7 +8909,7 @@ def deferral_message(charge: int, budget: int) -> str:
     return f"deferred: needs {_gib(charge)} GiB of scratch, {_gib(budget)} GiB available"
 
 
-# --- Admission across drivers (ADR 0101) -----------------------------------------
+# --- Admission across drivers (ADR 0102) -----------------------------------------
 # How long a driver with nothing in flight waits, held up only by what its peers have
 # reserved, before it hands its queue back and lets this slot move to another
 # dataset. Longer than the ledger's starvation threshold on purpose: the driver that
@@ -8928,7 +8928,7 @@ PEER_DEFERRAL_MESSAGE = (
 
 def ledger_from_env() -> Ledger | None:
     """The shared admission ledger named by ``ZARR_LEDGER_DIR``, or None to admit
-    against this driver's own measurements alone (the behavior before ADR 0101, and
+    against this driver's own measurements alone (the behavior before ADR 0102, and
     the right one when this is the only driver on the node)."""
     root = os.environ.get("ZARR_LEDGER_DIR", "").strip()
     if not root:
@@ -10124,7 +10124,7 @@ def main() -> int:
     if ledger is not None:
         print(
             f"[zarr] admission ledger {ledger.root}: this run admits against what other "
-            "conversions on this node have reserved and not yet taken (ADR 0101)",
+            "conversions on this node have reserved and not yet taken (ADR 0102)",
             flush=True,
         )
     # Per-dataset provenance for the stores' `nemar` root attribute (#1064).

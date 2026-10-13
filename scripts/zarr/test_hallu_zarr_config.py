@@ -1778,7 +1778,7 @@ def test_the_drain_loop_routes_every_failure_through_the_verdict():
 
 
 # ---------------------------------------------------------------------------
-# Slots (ADR 0101): several drains side by side, each with its own lock
+# Slots (ADR 0102): several drains side by side, each with its own lock
 # ---------------------------------------------------------------------------
 
 

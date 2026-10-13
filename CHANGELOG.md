@@ -15,6 +15,33 @@ earlier releases are described only by their generated notes.
 
 ## Unreleased
 
+### Changed
+
+- **Zarr conversions on `hallu` run in parallel slots instead of one dataset at a time
+  (#1757, ADR 0102).** A cron tick now starts one drain per free slot (`ZARR_SLOTS`, default 4),
+  each with its own lock, scratch directory and log and four workers (`ZARR_JOBS_PER_SLOT`), so a
+  dataset that takes days, such as `nm000276` (40 recordings of 100 to 145 GiB, which held the
+  only lock for 5.5 days while the node sat at a load of 1.1), occupies one slot instead of
+  the node. Slot 0 keeps the old lock and scratch names, so a drain already running counts as
+  slot 0. The slots share one RAM and scratch budget through an admission ledger
+  (`ZARR_LEDGER_DIR`, default `$ZARR_BASE/zarr-admission-ledger`): a peer's unspent reserves come
+  off the ceiling and the budget, the run-alone exception applies only to an idle node, and a
+  slot that waits an hour for its peers hands its queue back without spending an attempt.
+  `ZARR_JOBS` now lowers the per-slot worker count and never raises it, so a crontab that still
+  says `ZARR_JOBS=24` does not give every slot 24. `zarr_queue.py heartbeat` is new, and the
+  script sends it every five minutes while a dataset converts, so a conversion longer than
+  the six-hour stale window is not reclaimed by another slot's reconcile. Set `ZARR_SLOTS=1`
+  to get the previous behavior.
+- **The Zarr converter projects a float32 BrainVision recording at the memory it needs and
+  measures anonymous memory (#1757).** When a recording's sidecar (sampling frequency and duration)
+  and channel count show it is stored at four bytes per sample, the streaming projection
+  is 8 times one channel's bytes instead of 12; every other recording projects as before.
+  The 145 GiB `nm000276` recording that was refused as too large (a projected 54 GiB against a
+  46 GiB budget) now fits. Workers also sample `RssAnon`, and the "under-reserved" warnings
+  compare the reserve with anonymous memory instead of resident size, which includes the scratch
+  memmap's file-backed pages (48 GiB resident against 6 GiB anonymous on `nm000276`). A recording
+  refused before this change stays refused until it is converted again.
+
 ### Fixed
 
 - **A real local account later in a text is now found even when a generic one comes first

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for how the converter anticipates and measures memory (ADR 0101):
+"""Tests for how the converter anticipates and measures memory (ADR 0102):
 
 * a BrainVision recording's sample width, read off what admission can see without a
   download, so a float32 recording is not projected as if it were int16;

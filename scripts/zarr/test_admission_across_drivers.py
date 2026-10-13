@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for admission across drivers (ADR 0101): `_drain_with_admission` with a
+"""Tests for admission across drivers (ADR 0102): `_drain_with_admission` with a
 shared `admission_ledger.Ledger`.
 
 A "peer driver" is a live child process whose reservations the ledger reads, the way

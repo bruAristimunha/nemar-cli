@@ -30,7 +30,7 @@
 #         moves, so a merged driver change reaches the node on the next tick
 #         instead of waiting out the backfill (#1129).
 #
-#         SLOTS (ADR 0101). A tick no longer drains the queue itself: it starts
+#         SLOTS (ADR 0102). A tick no longer drains the queue itself: it starts
 #         one drain per FREE slot (ZARR_SLOTS, default 4), each under its own
 #         lock, with its own scratch directory and log, claiming its own dataset
 #         and converting it ZARR_JOBS_PER_SLOT (default 4) recordings at a time. A
@@ -408,7 +408,7 @@ export AWS_DEFAULT_REGION="$AWS_REGION"
 QUEUE_DB="${ZARR_QUEUE_DB:-${STATE_DIR}/zarr-queue.db}"
 LOG_FILE="${ZARR_LOG_FILE:-${STATE_DIR}/.nm-zarr.log}"
 LOCK_FILE="${ZARR_LOCK_FILE:-${STATE_DIR}/.nm-zarr.lock}"
-# The admission ledger (ADR 0101): what every driver on this NODE has reserved. Under
+# The admission ledger (ADR 0102): what every driver on this NODE has reserved. Under
 # ZARR_BASE rather than STATE_DIR so the nightly --test run, which keeps its own state
 # directory, still shares it with the production slots: they share the machine.
 export ZARR_LEDGER_DIR="${ZARR_LEDGER_DIR:-${ZARR_BASE}/zarr-admission-ledger}"

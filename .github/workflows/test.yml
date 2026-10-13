@@ -329,6 +329,18 @@ jobs:
       - name: Queue tests
         run: python scripts/zarr/test_zarr_queue.py
 
+      # Admission across drivers (ADR 0102): the ledger, the drain against real peer
+      # processes, and two real driver processes sharing one node. Linux is where the
+      # process pool forks, which is the case that held the ledger lock in every worker.
+      - name: Admission ledger tests
+        run: python scripts/zarr/test_admission_ledger.py
+
+      - name: Admission across drivers tests
+        run: python scripts/zarr/test_admission_across_drivers.py
+
+      - name: Memory projection tests
+        run: python scripts/zarr/test_zarr_memory_projection.py
+
       - name: Non-raw store purge tests
         run: python scripts/zarr/test_purge_non_raw_stores.py
 
@@ -409,7 +421,9 @@ jobs:
           pytest -q -rs --junit-xml=/tmp/zarr-tests.xml \
             test_generate_zarr.py test_zarr_queue.py \
             test_purge_non_raw_stores.py test_hallu_zarr_config.py \
-            test_find_collapsed_channel_stores.py
+            test_find_collapsed_channel_stores.py \
+            test_admission_ledger.py test_admission_across_drivers.py \
+            test_zarr_memory_projection.py
 
       # A skip is invisible in a green job, and that is exactly how 43 tests
       # went unrun for the life of this epic. Only two KINDS of skip are
