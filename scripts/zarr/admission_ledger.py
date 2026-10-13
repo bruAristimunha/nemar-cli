@@ -53,6 +53,26 @@ LOCK_TIMEOUT_SECONDS = float(os.environ.get("ZARR_LEDGER_LOCK_TIMEOUT_SECONDS", 
 
 FORMAT_VERSION = 1
 
+# Lock descriptors this process holds right now. A flock belongs to the open file
+# DESCRIPTION, not to the descriptor, and a forked child shares the parent's
+# description: the converter's process pool forks its workers lazily, while a driver
+# holds the lock (it submits a recording under it), and without the hook below each
+# worker would keep the lock held for as long as it lived. A killed driver would leave
+# it held by its orphans, and every other driver would wait on a lock nobody could
+# release.
+_HELD_FDS: set[int] = set()
+
+
+def _close_inherited_lock_fds() -> None:
+    for fd in list(_HELD_FDS):
+        with contextlib.suppress(OSError):
+            os.close(fd)  # the child's reference only; the parent's lock is untouched
+    _HELD_FDS.clear()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_close_inherited_lock_fds)
+
 
 class LedgerBusy(RuntimeError):
     """The exclusive lock could not be taken in time."""
@@ -96,10 +116,11 @@ def driver_is_alive(pid: int, start: int | None, proc_root: str = "/proc") -> bo
 class Ledger:
     """One driver's view of the node's reservations, rooted at a shared directory.
 
-    ``reserve``, ``release``, ``set_track_dir``, ``mark_waiting`` and ``close``
+    ``reserve``, ``set_track_dir``, ``mark_waiting``, ``flush`` and ``close``
     publish this driver's file, and ``peers`` may delete a dead one's, so all of
     them must run inside ``exclusive()``. ``AssertionError`` otherwise: an
-    unlocked write is the race the module exists to prevent."""
+    unlocked write is the race the module exists to prevent. ``release`` is the one
+    exception, for the reason it gives."""
 
     def __init__(self, root: str, *, pid: int | None = None, proc_root: str = "/proc") -> None:
         self.root = root
@@ -111,37 +132,71 @@ class Ledger:
         self._reservations: dict[int, dict] = {}
         self._next_token = 1
         self._locked = False
+        self._fd: int | None = None
+        self._dirty = False
         os.makedirs(root, exist_ok=True)
         self._lock_path = os.path.join(root, ".lock")
         self._path = os.path.join(root, f"{self.pid}.json")
 
     # --- locking -----------------------------------------------------------------
 
-    @contextlib.contextmanager
-    def exclusive(self, timeout: float | None = None) -> Iterator[None]:
-        """Hold the node-wide lock. Not reentrant, and a second thread of this process
-        blocks like another process would (each call opens its own descriptor)."""
+    def acquire(self, timeout: float | None = None) -> None:
+        """Take the node-wide lock, waiting up to ``timeout`` seconds (default
+        ``LOCK_TIMEOUT_SECONDS``). Not reentrant: a second thread of this process
+        blocks like another process would, because each acquire opens its own
+        descriptor. Prefer ``exclusive()``."""
+        assert self._fd is None, "the admission ledger lock is not reentrant"
         limit = LOCK_TIMEOUT_SECONDS if timeout is None else timeout
         fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o666)
-        try:
-            deadline = time.monotonic() + limit
-            while True:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    if time.monotonic() >= deadline:
-                        raise LedgerBusy(
-                            f"admission ledger {self.root} busy for {limit:g}s"
-                        ) from None
-                    time.sleep(0.02)
-            self._locked = True
+        deadline = time.monotonic() + limit
+        while True:
             try:
-                yield
-            finally:
-                self._locked = False
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    os.close(fd)
+                    raise LedgerBusy(
+                        f"admission ledger {self.root} busy for {limit:g}s"
+                    ) from None
+                time.sleep(0.02)
+            except BaseException:
+                os.close(fd)
+                raise
+        self._fd = fd
+        _HELD_FDS.add(fd)
+        self._locked = True
+
+    def unlock(self) -> None:
+        """Release the lock taken by ``acquire``."""
+        fd, self._fd = self._fd, None
+        self._locked = False
+        if fd is not None:
+            _HELD_FDS.discard(fd)
+            # Unlock explicitly as well as closing: a child forked while the lock was
+            # held (on a platform without register_at_fork) shares the description, and
+            # only an explicit LOCK_UN releases it for them.
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    @contextlib.contextmanager
+    def exclusive(self, timeout: float | None = None) -> Iterator[None]:
+        """Hold the node-wide lock for the body."""
+        self.acquire(timeout)
+        try:
+            yield
         finally:
-            os.close(fd)  # closing the descriptor releases the lock
+            self.unlock()
+
+    def sleep_unlocked(self, seconds: float, timeout: float | None = None) -> None:
+        """Sleep without holding the lock, then take it again. For a driver that has
+        decided to wait and must not keep its peers waiting with it."""
+        self.unlock()
+        try:
+            time.sleep(seconds)
+        finally:
+            self.acquire(timeout)
 
     def _require_lock(self) -> None:
         assert self._locked, "the admission ledger is written only under exclusive()"
@@ -162,6 +217,13 @@ class Ledger:
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(doc, fh)
         os.replace(tmp, self._path)  # a reader sees the old file or the new, never half
+        self._dirty = False
+
+    def flush(self) -> None:
+        """Publish a change made while the lock could not be had (see ``release``)."""
+        self._require_lock()
+        if self._dirty:
+            self._publish()
 
     def set_track_dir(self, track_dir: str | None) -> None:
         """Where this driver's workers record what they have started with, so a peer
@@ -182,15 +244,22 @@ class Ledger:
         return token
 
     def release(self, token: int) -> None:
-        self._require_lock()
+        """Give a reservation back. Allowed without the lock: a driver that cannot get
+        it in time still must not keep a recording that has finished, so the change is
+        made here at once and published by the next ``flush`` (or any other write).
+        Until then peers see more reserved than is, which is the safe direction."""
         if self._reservations.pop(token, None) is not None:
-            self._publish()
+            self._dirty = True
+            if self._locked:
+                self._publish()
 
     def release_all(self) -> None:
-        self._require_lock()
+        """Give every reservation back; see ``release`` for the unlocked case."""
         if self._reservations:
             self._reservations.clear()
-            self._publish()
+            self._dirty = True
+            if self._locked:
+                self._publish()
 
     def mark_waiting(self, waiting: bool, now: float | None = None) -> None:
         """Say that this driver has nothing in flight and is held up only by its

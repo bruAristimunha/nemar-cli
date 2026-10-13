@@ -14,6 +14,7 @@ Run:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import signal
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 
@@ -93,8 +95,7 @@ class TestLocking(LedgerTestCase):
         ledger = Ledger(self.root, pid=1001)
         for write in (
             lambda: ledger.reserve(1, 1, []),
-            lambda: ledger.release(1),
-            lambda: ledger.release_all(),
+            lambda: ledger.flush(),
             lambda: ledger.set_track_dir("/x"),
             lambda: ledger.mark_waiting(True),
             lambda: ledger.close(),
@@ -103,6 +104,115 @@ class TestLocking(LedgerTestCase):
             with self.assertRaises(AssertionError):
                 write()
         self.assertEqual([n for n in os.listdir(self.root) if n.endswith(".json")], [])
+
+
+@unittest.skipUnless(hasattr(os, "fork"), "needs fork")
+class TestForkedChildrenDoNotKeepTheLock(LedgerTestCase):
+    """The converter forks its pool workers while the driver holds the lock."""
+
+    def test_a_forked_child_does_not_inherit_the_lock_descriptor(self):
+        ledger = Ledger(self.root, pid=1001)
+        with ledger.exclusive():
+            fd = ledger._fd
+            pid = os.fork()
+            if pid == 0:  # the child: is the lock descriptor still open here?
+                try:
+                    os.fstat(fd)
+                except OSError:
+                    os._exit(0)
+                os._exit(1)
+            _, status = os.waitpid(pid, 0)
+            self.assertEqual(os.WEXITSTATUS(status), 0, "the child kept the lock descriptor")
+
+    def test_the_lock_is_free_once_the_parent_unlocks_though_a_child_lives_on(self):
+        ledger, other = Ledger(self.root, pid=1001), Ledger(self.root, pid=1002)
+        with ledger.exclusive():
+            pid = os.fork()
+            if pid == 0:
+                time.sleep(30)
+                os._exit(0)
+        try:
+            with other.exclusive(timeout=2.0):
+                pass
+        finally:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+
+    def test_a_driver_killed_while_it_holds_the_lock_frees_it_for_the_others(self):
+        # The driver forks a worker under the lock, then dies without unlocking.
+        reader, writer = os.pipe()
+        driver = os.fork()
+        if driver == 0:
+            os.close(reader)
+            ledger = Ledger(self.root, pid=os.getpid())
+            ledger.acquire()
+            worker = os.fork()
+            if worker == 0:
+                time.sleep(30)
+                os._exit(0)
+            os.write(writer, f"{worker}\n".encode())
+            time.sleep(30)
+            os._exit(0)
+        os.close(writer)
+        with os.fdopen(reader) as fh:
+            worker = int(fh.readline())
+        try:
+            os.kill(driver, signal.SIGKILL)
+            os.waitpid(driver, 0)
+            with Ledger(self.root, pid=1002).exclusive(timeout=2.0):
+                pass  # the orphaned worker is still alive and does not hold it
+        finally:
+            os.kill(worker, signal.SIGKILL)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(worker, 0)
+
+
+class TestReleaseWithoutTheLock(LedgerTestCase):
+    def test_a_release_made_without_the_lock_is_published_by_the_next_flush(self):
+        ledger = Ledger(self.root, pid=os.getpid())
+        path = os.path.join(self.root, f"{os.getpid()}.json")
+        with ledger.exclusive():
+            token = ledger.reserve(5, 5, [])
+        ledger.release(token)  # the lock could not be had; the state changes anyway
+        with open(path) as fh:
+            self.assertEqual(len(json.load(fh)["reservations"]), 1)  # peers still see it
+        with ledger.exclusive():
+            ledger.flush()
+        with open(path) as fh:
+            self.assertEqual(json.load(fh)["reservations"], {})
+
+    def test_release_all_without_the_lock_is_published_by_the_next_write(self):
+        ledger = Ledger(self.root, pid=os.getpid())
+        path = os.path.join(self.root, f"{os.getpid()}.json")
+        with ledger.exclusive():
+            ledger.reserve(5, 5, [])
+            ledger.reserve(6, 6, [])
+        ledger.release_all()
+        with ledger.exclusive():
+            ledger.reserve(7, 7, [])
+        with open(path) as fh:
+            self.assertEqual([r["ram"] for r in json.load(fh)["reservations"].values()], [7])
+
+
+class TestSleepUnlocked(LedgerTestCase):
+    def test_peers_get_the_lock_while_a_driver_sleeps_and_it_is_retaken_after(self):
+        a, b = Ledger(self.root, pid=1001), Ledger(self.root, pid=1002)
+        took = []
+        with a.exclusive():
+            def other():
+                with b.exclusive(timeout=2.0):
+                    took.append(time.monotonic())
+
+            thread = threading.Thread(target=other)
+            thread.start()
+            a.sleep_unlocked(0.3)
+            thread.join(timeout=5)
+            self.assertEqual(len(took), 1)
+            # a holds the lock again: b cannot take it now.
+            with self.assertRaises(LedgerBusy), b.exclusive(timeout=0.1):
+                pass
+        with b.exclusive(timeout=0.1):
+            pass
 
 
 class TestOwnFile(LedgerTestCase):
