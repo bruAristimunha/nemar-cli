@@ -1696,6 +1696,10 @@ class ScratchGate:
         self._usage = usage
         self._last_good: int | None = None
         self._warned = False
+        # The budget before it is raised to zero: negative when the volume is short of the
+        # headroom. Admission across drivers judges a recording "alone" from this, because
+        # adding the peers' written scratch to a clamped zero would credit the headroom.
+        self.last_raw: int | None = None
 
     def volume(self) -> tuple[int, int] | None:
         """``(free, total)`` bytes of the volume right now, or None if unreadable."""
@@ -1722,9 +1726,9 @@ class ScratchGate:
                     flush=True,
                 )
             return self._last_good if self._last_good is not None else 0
-        budget = scratch_budget_bytes(
-            free, held_scratch_bytes(self.run_root, in_flight), self.headroom
-        )
+        held = held_scratch_bytes(self.run_root, in_flight)
+        self.last_raw = free + held - self.headroom
+        budget = scratch_budget_bytes(free, held, self.headroom)
         self._last_good = budget
         self._warned = False
         return budget
@@ -8990,7 +8994,9 @@ def _ledger_held(paths: list[str]) -> int:
     return sum(allocated_bytes(path) for path in paths)
 
 
-def defer_for_peers(queue, sink, waited_seconds: float, unusable: bool = False) -> None:
+def defer_for_peers(
+    queue, sink, waited_seconds: float, unusable: bool = False, cause: str = ""
+) -> None:
     """Hand ``queue`` back unreported: it fits this node, but other conversions on it
     hold what it needs (or, with ``unusable``, the ledger that says what they hold could
     not be used for as long). The scratch deferral's sibling (``defer_unfit``) and
@@ -9000,7 +9006,7 @@ def defer_for_peers(queue, sink, waited_seconds: float, unusable: bool = False) 
         if sink is not None:
             sink[primary] = LEDGER_UNUSABLE_MESSAGE if unusable else PEER_DEFERRAL_MESSAGE
     why = (
-        "the admission ledger could not be used"
+        "the admission ledger could not be used" + (f" ({cause})" if cause else "")
         if unusable
         else "memory and scratch that other conversions on this node had reserved"
     )
@@ -9268,6 +9274,15 @@ def _drain_with_admission(
         # here would blame each in-flight sibling for the one crash.
         broken: list = []
 
+        def ledger_io(call, *args, **kwargs):
+            """A ledger read or write whose I/O failure means only that the ledger cannot
+            be used this round. Narrow on purpose: the pool's own errors (``ex.submit``
+            failing to fork a worker) are not the ledger's and must propagate."""
+            try:
+                return call(*args, **kwargs)
+            except OSError as exc:
+                raise LedgerBusy(f"admission ledger I/O failed: {exc}") from exc
+
         def ledger_paths(primary: str) -> list[str]:
             tmp = run_ctx.get("tmp")
             if not tmp:
@@ -9307,17 +9322,21 @@ def _drain_with_admission(
                 limit_alone, budget_alone = limit, budget
                 if ledger is None:
                     return
-                summary = ledger.others_summary(tracked_taken_bytes, _ledger_held)
+                summary = ledger_io(ledger.others_summary, tracked_taken_bytes, _ledger_held)
                 blockers = summary.pids
                 peers_busy = bool(summary.pids)
-                yield_to_peer = ledger.older_peer_waiting()
+                yield_to_peer = ledger_io(ledger.older_peer_waiting)
                 limit = max(0, limit - summary.ram)
                 if budget is not None:
                     # Free space already excludes what the peers have written. Were they
                     # not there it would include it, which is what "alone" is judged on:
                     # a recording is held up by its peers (and waits) when it would fit
-                    # without them, and does not fit the volume at all otherwise.
-                    budget_alone = budget + summary.held
+                    # without them, and does not fit the volume at all otherwise. Built
+                    # from the budget before it was raised to zero, so a volume the
+                    # peers have filled is not credited the headroom as well.
+                    raw = getattr(scratch_budget, "last_raw", None)
+                    base = budget if raw is None else raw
+                    budget_alone = max(0, base + summary.held)
                     budget = max(0, budget - summary.scratch)
 
             def pick(alone: bool = False) -> int | None:
@@ -9353,7 +9372,7 @@ def _drain_with_admission(
 
             def pause() -> None:
                 if ledger is not None:
-                    ledger.sleep_unlocked(ADMISSION_RECHECK_SECONDS)
+                    ledger_io(ledger.sleep_unlocked, ADMISSION_RECHECK_SECONDS)
                 else:
                     time.sleep(ADMISSION_RECHECK_SECONDS)
 
@@ -9405,10 +9424,27 @@ def _drain_with_admission(
                         if scratch_peaks is not None else 0,
                         ledger_paths(p),
                     )
+                    if ledger.publish_error is not None:
+                        # The recording runs, but the others cannot read that it does.
+                        # Admit nothing more this round, and say why once.
+                        note_ledger_problem(ledger.publish_error)
+                        break
             return False
 
         # Which drivers the last ``admit`` found holding what this one waits for.
         last_blockers: list[frozenset[int]] = [frozenset()]
+        last_problem: list[str] = [""]
+
+        def note_ledger_problem(exc: BaseException) -> None:
+            """Remember why the ledger could not be used, and say so the first time."""
+            text = str(exc) or type(exc).__name__
+            if text != last_problem[0]:
+                last_problem[0] = text
+                print(
+                    f"::warning::the admission ledger cannot be used ({text}); this driver "
+                    "admits nothing new until it can, and keeps what is running",
+                    flush=True,
+                )
 
         def admit_round() -> None:
             """``admit`` under the ledger's lock, waiting out the other drivers.
@@ -9417,7 +9453,8 @@ def _drain_with_admission(
             write of it fails: a full volume does that) admits nothing and leaves what is
             running alone; it does not end the drain. With nothing running, a driver that
             is held up by its peers, or cannot use the ledger, waits and looks again, and
-            gives its queue back after ``LEDGER_WAIT_SECONDS`` of it."""
+            gives its queue back after ``LEDGER_WAIT_SECONDS`` of it. Only the ledger's
+            own failures are caught: whatever the pool raises goes on up."""
             if ledger is None:
                 admit()
                 return
@@ -9426,17 +9463,20 @@ def _drain_with_admission(
                 waiting = unusable = False
                 try:
                     ledger.acquire()
-                except (LedgerBusy, OSError):
+                except (LedgerBusy, OSError) as exc:
+                    note_ledger_problem(exc)
                     unusable = True
                 else:
                     try:
-                        ledger.flush()
-                        ledger.set_track_dir(track_dir)
+                        ledger_io(ledger.flush)
+                        ledger_io(ledger.set_track_dir, track_dir)
                         waiting = admit()
-                        ledger.mark_waiting(waiting, blocked_by=set(last_blockers[0]))
-                    except (LedgerBusy, OSError):
+                        ledger_io(ledger.mark_waiting, waiting, blocked_by=set(last_blockers[0]))
+                        last_problem[0] = ""  # worked: a later failure is news again
+                    except LedgerBusy as exc:
                         # Lost the lock during a pause and could not take it back, or
-                        # could not write the ledger.
+                        # could not read or write the ledger.
+                        note_ledger_problem(exc)
                         unusable = True
                     finally:
                         ledger.unlock()
@@ -9448,11 +9488,15 @@ def _drain_with_admission(
                 if waited >= LEDGER_WAIT_SECONDS:
                     defer_for_peers(
                         queue, deferred if defer_to is None else defer_to, waited,
-                        unusable=unusable and not waiting,
+                        unusable=unusable and not waiting, cause=last_problem[0],
                     )
                     queue.clear()
+                    # Forget the wait in memory whether or not the lock can be had to say
+                    # so: a later pass of this drain (the suspects, the memory retry) must
+                    # not inherit its clock and look hours old.
+                    ledger.stop_waiting()
                     with contextlib.suppress(LedgerBusy, OSError), ledger.exclusive():
-                        ledger.mark_waiting(False)
+                        ledger.flush()
                     return
                 time.sleep(ADMISSION_RECHECK_SECONDS)
 

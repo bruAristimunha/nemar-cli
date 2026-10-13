@@ -102,6 +102,12 @@ class LedgerBusy(RuntimeError):
     """The exclusive lock could not be taken in time."""
 
 
+class LedgerUnreadable(OSError):
+    """A peer's document (or the directory of them) could not be read. Ignoring it
+    would drop that peer's reservations from the sum and admit into memory and disk it
+    has promised itself, so a round that meets one cannot decide and admits nothing."""
+
+
 class Outstanding(NamedTuple):
     """What the other drivers on the node hold, as a driver deciding to admit needs it.
 
@@ -188,7 +194,13 @@ class Ledger:
         descriptor. Prefer ``exclusive()``."""
         assert self._fd is None, "the admission ledger lock is not reentrant"
         limit = LOCK_TIMEOUT_SECONDS if timeout is None else timeout
-        fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+        try:
+            fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+        except FileNotFoundError:
+            # The directory was removed under a running driver: make it again rather than
+            # fail every round until the driver ends.
+            os.makedirs(self.root, exist_ok=True)
+            fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o666)
         deadline = time.monotonic() + limit
         while True:
             try:
@@ -339,6 +351,17 @@ class Ledger:
             self.blocked_by = set()
             self._publish()
 
+    def stop_waiting(self) -> None:
+        """Say this driver is no longer waiting, without needing the lock: the local
+        state is cleared at once (a later pass must not inherit the old clock), and the
+        document is published by the next write that works, or now if the lock is held."""
+        if self.waiting_since is not None or self.blocked_by:
+            self.waiting_since = None
+            self.blocked_by = set()
+            self._dirty = True
+            if self._locked:
+                self._publish()
+
     def close(self) -> None:
         """Withdraw this driver from the ledger."""
         self._require_lock()
@@ -352,15 +375,19 @@ class Ledger:
     def peers(self) -> list[dict]:
         """The live drivers other than this one, as their published documents. A file
         whose driver is gone (and whose workers are, see ``_workers_alive``), or that is
-        not a document, is removed; one that merely could not be read this time (EMFILE,
-        EIO) is left, because deleting a live driver's file erases its reservations from
-        every peer until it next changes state, hours into a long recording."""
+        not a document, is removed. One that could not be read this time (EMFILE, EIO,
+        EACCES) is left, because deleting a live driver's file erases its reservations
+        from every peer until it next changes state, hours into a long recording, and
+        ``LedgerUnreadable`` is raised, because skipping it would drop them from the sum."""
         self._require_lock()
         found: list[dict] = []
         try:
             names = os.listdir(self.root)
-        except OSError:
+        except FileNotFoundError:
+            os.makedirs(self.root, exist_ok=True)
             return found
+        except OSError as exc:
+            raise LedgerUnreadable(f"cannot list {self.root}: {exc}") from exc
         for name in sorted(names):
             if name.endswith(".json.tmp"):  # a write a killed driver never finished
                 stem = name[: -len(".json.tmp")]
@@ -383,8 +410,11 @@ class Ledger:
                     raise TypeError("reservations is not an object")
             except FileNotFoundError:
                 continue
-            except OSError:
-                continue  # could not be read now; not evidence that the driver is gone
+            except OSError as exc:
+                # Not evidence that the driver is gone, so the file stays; but its
+                # reservations cannot be summed either, and leaving them out would admit
+                # into what the driver has promised itself.
+                raise LedgerUnreadable(f"cannot read {path}: {exc}") from exc
             except (ValueError, KeyError, TypeError):
                 with contextlib.suppress(OSError):
                     os.remove(path)
@@ -476,10 +506,18 @@ class Ledger:
             since = doc.get("waiting_since")
             if since is None or current - since < STARVATION_SECONDS:
                 continue
-            # Only a driver the waiter is waiting for is asked to stop. A document that
-            # does not say who (an older writer) is taken to mean everyone.
+            # A driver with something in flight stops only if the waiter is waiting for it
+            # (a document that does not say who is taken to mean everyone): the rest keep
+            # their throughput. A driver with nothing in flight stops for any starved
+            # waiter. It is not in anyone's way yet, but admitting would put it there, and
+            # each slot starts a new process, with a new pid, for every dataset, so the
+            # successor of a listed blocker would otherwise walk straight past the waiter.
             blocked_by = doc.get("blocked_by")
-            if blocked_by is not None and self.pid not in blocked_by:
+            if (
+                self._reservations
+                and blocked_by is not None
+                and self.pid not in blocked_by
+            ):
                 continue
             if (since, int(doc["pid"])) < mine:
                 return True

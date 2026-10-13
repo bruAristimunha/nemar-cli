@@ -16,6 +16,7 @@ Run:
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import io
 import itertools
@@ -296,15 +297,16 @@ class TestWaitingEndsInADeferral(DrainAgainstPeersCase):
 
 
 class TestOnlyTheDriversInTheWaitersWayStop(DrainAgainstPeersCase):
-    def test_a_driver_the_waiter_is_not_waiting_for_keeps_admitting(self):
+    def test_a_driver_with_nothing_running_stops_for_a_starved_waiter_it_is_not_blocking(self):
+        # A new process (each dataset starts one) is nobody's listed blocker, and would
+        # otherwise be the one to take what the waiter is waiting for.
         admission_ledger.STARVATION_SECONDS = 60.0
-        generate_zarr.LEDGER_WAIT_SECONDS = 5.0
-        self.peer(ram=100)  # holds a share of the ceiling, as the real blocker would
+        generate_zarr.LEDGER_WAIT_SECONDS = 0.3
         self.peer(waiting_since=time.time() - 3600, blocked_by={1})  # waits for pid 1
         deferred: dict = {}
         spans = self.drain(deferred=deferred)
-        self.assertEqual(len(spans), 3)
-        self.assertEqual(deferred, {})
+        self.assertEqual(spans, [])
+        self.assertEqual(len(deferred), 3)
 
     def test_the_driver_the_waiter_is_waiting_for_stops_so_the_waiter_can_run(self):
         admission_ledger.STARVATION_SECONDS = 60.0
@@ -432,6 +434,99 @@ class TestALedgerThatCannotBeUsed(DrainAgainstPeersCase):
         self.assertEqual(spans, [])
         self.assertEqual(len(deferred), 3)
         self.assertLess(time.monotonic() - began, 10)
+
+
+class TestWhatTheLedgerCatchesIsTheLedgers(DrainAgainstPeersCase):
+    def test_a_failure_to_start_a_worker_is_not_taken_for_a_ledger_failure(self):
+        """`ex.submit` queues the work item before it starts the worker, so catching its
+        OSError as "the ledger is unusable" would leave the recording queued, and the
+        next round would submit it again and run it twice."""
+        tree = ast.parse(open(generate_zarr.__file__, encoding="utf-8").read())
+        admit_round = next(
+            n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "admit_round"
+        )
+        guarded = [
+            t for t in ast.walk(admit_round)
+            if isinstance(t, ast.Try)
+            and any(
+                isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id == "admit"
+                for b in t.body for c in ast.walk(b)
+            )
+        ]
+        self.assertEqual(len(guarded), 1)
+        caught = [
+            ast.unparse(h.type) for h in guarded[0].handlers if h.type is not None
+        ]
+        self.assertEqual(caught, ["LedgerBusy"])  # not OSError
+
+    def test_a_peers_document_that_cannot_be_read_stops_the_round_with_the_reason(self):
+        generate_zarr.LEDGER_WAIT_SECONDS = 0.3
+        os.makedirs(os.path.join(self.root, "4001.json"))  # opening a directory fails
+        deferred: dict = {}
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            spans = self.drain(deferred=deferred)
+        self.assertEqual(spans, [])  # not admitted past a peer it cannot see
+        self.assertEqual(len(deferred), 3)
+        self.assertIn("cannot read", captured.getvalue())
+        self.assertIn("4001.json", captured.getvalue())
+        self.assertEqual(captured.getvalue().count("the admission ledger cannot be used"), 1)
+
+    def test_a_reservation_that_cannot_be_published_stops_admission_for_the_round(self):
+        generate_zarr.LEDGER_WAIT_SECONDS = 0.3
+        own = Ledger(self.root)
+        path = own._path
+        sabotaged = []
+
+        def ceiling(running_peak, track_dir):
+            # Called while the round decides, after the ledger file was first written:
+            # from here on the next write of it fails (a file onto a directory).
+            if not sabotaged:
+                sabotaged.append(True)
+                os.remove(path)
+                os.makedirs(os.path.join(path, "x"))
+            return self.CEILING
+
+        primaries = _primaries(3)
+        results: list = []
+        deferred: dict = {}
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            _drain_with_admission(
+                primaries, dict.fromkeys(primaries, self.RESERVE), 3, 10**12, {},
+                lambda r, i: results.append(r), worker=_timed_worker, ceiling=ceiling,
+                ledger=own, deferred=deferred,
+            )
+        close_ledger(own)
+        # Without the stop all three would have been admitted into a ledger nobody can
+        # read; with it, one runs and the rest wait, and are handed back.
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(deferred), 2)
+        self.assertIn("the admission ledger cannot be used", captured.getvalue())
+
+
+class TestScratchGateReportsTheBudgetBeforeItIsRaisedToZero(unittest.TestCase):
+    def test_a_volume_short_of_the_headroom_has_a_negative_raw_budget(self):
+        from collections import namedtuple
+
+        usage = namedtuple("usage", "total used free")
+        gate = generate_zarr.ScratchGate(
+            tempfile.gettempdir(), headroom=10 * 1024**3,
+            usage=lambda _root: usage(100 * 1024**3, 98 * 1024**3, 2 * 1024**3),
+        )
+        self.assertEqual(gate([]), 0)  # nothing is admitted into it
+        self.assertEqual(gate.last_raw, -8 * 1024**3)  # and by how much it falls short
+
+    def test_a_volume_with_room_reports_the_same_figure_both_ways(self):
+        from collections import namedtuple
+
+        usage = namedtuple("usage", "total used free")
+        gate = generate_zarr.ScratchGate(
+            tempfile.gettempdir(), headroom=10 * 1024**3,
+            usage=lambda _root: usage(100 * 1024**3, 20 * 1024**3, 80 * 1024**3),
+        )
+        self.assertEqual(gate([]), 70 * 1024**3)
+        self.assertEqual(gate.last_raw, 70 * 1024**3)
 
 
 class TestConvertsInProcess(unittest.TestCase):

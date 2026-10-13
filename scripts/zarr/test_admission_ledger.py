@@ -33,6 +33,7 @@ import admission_ledger
 from admission_ledger import (
     Ledger,
     LedgerBusy,
+    LedgerUnreadable,
     driver_is_alive,
     process_start_ticks,
 )
@@ -495,13 +496,24 @@ class TestStarvation(LedgerTestCase):
         with peer.exclusive():
             self.assertFalse(peer.older_peer_waiting(now=9000.0))
 
-    def test_a_driver_that_is_not_in_the_waiters_way_keeps_admitting(self):
+    def test_a_driver_with_work_running_that_is_not_in_the_waiters_way_keeps_admitting(self):
         # The peer waits for someone else (pid 1): stopping this driver would cost it
         # throughput and bring the waiter nothing.
         self.waiting_peer(1000.0, blocked_by={1})
         me = Ledger(self.root, pid=os.getpid())
         with me.exclusive():
+            me.reserve(1, 1, [])
             self.assertFalse(me.older_peer_waiting(now=9000.0))
+
+    def test_a_driver_with_nothing_running_stops_for_any_starved_waiter(self):
+        # Each slot starts a new process, with a new pid, for every dataset, so the
+        # successor of a listed blocker is not listed. If it were free to admit it would
+        # walk straight past the waiter.
+        self.waiting_peer(1000.0, blocked_by={1})
+        me = Ledger(self.root, pid=os.getpid())
+        with me.exclusive():
+            self.assertTrue(me.older_peer_waiting(now=9000.0))
+            self.assertFalse(me.older_peer_waiting(now=1000.0 + 60))  # not yet starved
 
     def test_a_document_that_does_not_say_who_it_waits_for_is_taken_to_mean_everyone(self):
         child = self.live_process()
@@ -572,13 +584,14 @@ class TestProcessIdentity(LedgerTestCase):
 
 
 class TestReadingThePeers(LedgerTestCase):
-    def test_a_file_that_cannot_be_read_now_is_left_for_a_later_look(self):
+    def test_a_file_that_cannot_be_read_now_is_left_and_stops_the_round(self):
         # A directory where a document should be: opening it fails, as EMFILE or EIO
-        # would, and says nothing about whether the driver is alive.
+        # would, and says nothing about whether the driver is alive. It stays; and a
+        # sum that left its reservations out would be wrong, so the round cannot decide.
         os.makedirs(os.path.join(self.root, "4001.json"))
         me = Ledger(self.root, pid=os.getpid())
-        with me.exclusive():
-            self.assertEqual(me.peers(), [])
+        with me.exclusive(), self.assertRaises(LedgerUnreadable):
+            me.peers()
         self.assertTrue(os.path.isdir(os.path.join(self.root, "4001.json")))
 
     def test_a_write_a_killed_driver_never_finished_is_removed(self):
@@ -654,6 +667,36 @@ class TestReadingThePeers(LedgerTestCase):
         me = Ledger(self.root, pid=os.getpid())
         with me.exclusive():
             self.assertEqual(me.peers(), [])
+
+
+class TestRecovery(LedgerTestCase):
+    def test_a_directory_removed_under_a_running_driver_is_made_again(self):
+        ledger = Ledger(self.root, pid=os.getpid())
+        shutil.rmtree(self.root)
+        with ledger.exclusive():
+            token = ledger.reserve(3, 4, [])
+        self.assertTrue(os.path.exists(os.path.join(self.root, f"{os.getpid()}.json")))
+        self.assertIsNotNone(token)
+
+    def test_stopping_waiting_clears_the_clock_without_the_lock_and_publishes_later(self):
+        ledger = Ledger(self.root, pid=os.getpid())
+        path = os.path.join(self.root, f"{os.getpid()}.json")
+        with ledger.exclusive():
+            ledger.mark_waiting(True, now=100.0, blocked_by={7})
+        ledger.stop_waiting()  # the lock could not be had
+        self.assertIsNone(ledger.waiting_since)
+        self.assertEqual(ledger.blocked_by, set())
+        with open(path) as fh:
+            self.assertEqual(json.load(fh)["waiting_since"], 100.0)  # peers still see it
+        with ledger.exclusive():
+            ledger.flush()
+        with open(path) as fh:
+            doc = json.load(fh)
+        self.assertIsNone(doc["waiting_since"])
+        self.assertEqual(doc["blocked_by"], [])
+        with ledger.exclusive():
+            ledger.mark_waiting(True, now=900.0)
+        self.assertEqual(ledger.waiting_since, 900.0)  # a later wait is a new wait
 
 
 class TestReserveSurvivesAWriteThatFails(LedgerTestCase):

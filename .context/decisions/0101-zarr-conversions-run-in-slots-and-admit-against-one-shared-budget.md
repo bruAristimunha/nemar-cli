@@ -50,10 +50,14 @@ Before admitting, a driver takes the ledger's `flock` and subtracts what its pee
 Deciding and recording happen under that lock, so two drivers cannot both read the same free space.
 The run-alone exception (a recording larger than the ceiling runs when nothing else does) applies only when no other driver holds anything.
 A recording that would run if the node were its own, judged with the peers' written scratch given back (the free space already excludes it), waits for its peers.
-After 30 minutes of waiting with nothing in flight, the driver that has waited longest is let in first, and the drivers it is waiting for (the ones holding reservations, which it names in its file) stop admitting; the others carry on.
+After 30 minutes of waiting with nothing in flight, the driver that has waited longest is let in first.
+The drivers it is waiting for (the ones holding reservations, which it names in its file) stop admitting, and so does any driver with nothing in flight, because each slot starts a new process for every dataset and a newcomer would otherwise pass the waiter at once; a driver with other work running that the waiter is not waiting for carries on.
 After 60 minutes (`ZARR_LEDGER_WAIT_SECONDS`) the driver hands its queue back the way a scratch deferral does: the recordings stay pending, no attempt is spent, and the slot takes another dataset.
 Without `ZARR_LEDGER_DIR` nothing changes, and with one even `--jobs 1` goes through the pool so that the other slots see it.
-A ledger that cannot be used (the lock is not had in time, or a read or write of it fails, which a full volume does) makes a round admit nothing and leaves what is running alone; with nothing running the driver waits, and after the same 60 minutes defers with a note that says so.
+A ledger that cannot be used (the lock is not had in time, a peer's document cannot be read, or a write of the driver's own file fails, which a full volume does) makes a round admit nothing and leaves what is running alone; with nothing running the driver waits, and after the same 60 minutes defers with a note that says so.
+The cause is printed once.
+A failed write of a reservation also ends the round, since the recording that was just admitted is running where the others cannot see it.
+Only the ledger's own failures are treated this way: an error from the pool (a worker that cannot be started) propagates, because the recording is already queued there and admitting it again would run it twice.
 A file whose driver is gone is removed by the next driver to look, keyed on the pid and the process start time, unless a worker the driver recorded is still running: a killed driver's workers finish the recording they have, and its reservations stand until they do.
 A file that cannot be read this time is left alone.
 The lock descriptor is closed in forked workers and unlocked explicitly, because `flock` belongs to the open file description and the process pool forks its workers while the driver holds the lock.
