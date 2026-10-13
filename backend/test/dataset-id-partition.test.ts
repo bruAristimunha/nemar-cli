@@ -406,6 +406,34 @@ describe("the declared ownership set cannot drift (#1440)", () => {
   });
 });
 
+describe("the soak fixture is declared before it exists (ADR 0102)", () => {
+  // nm099997 is where the publication review is exercised on the dev worker. It is declared
+  // BEFORE the fixture is created, in the release that ships the review, because an undeclared
+  // fixture is invisible to the dev worker and claimed by the production one.
+  const SOAK_FIXTURE = "nm099997";
+
+  test("is declared dev-owned, so the dev worker owns it and production does not", () => {
+    expect(DEV_OWNED_FIXTURE_IDS.has(SOAK_FIXTURE)).toBe(true);
+    expect(isDevOwnedDatasetId(SOAK_FIXTURE)).toBe(true);
+  });
+
+  test("is a reserved fixture id, so the allocator can never return it", () => {
+    expect(isValidDatasetId(SOAK_FIXTURE)).toBe(true);
+    expect(isReservedFixtureId(SOAK_FIXTURE)).toBe(true);
+  });
+
+  test("is neither the absent id nor the never-dev-owned one", () => {
+    expect(SOAK_FIXTURE).not.toBe(ABSENT_DATASET_ID);
+    expect(NEVER_DEV_OWNED_IDS.has(SOAK_FIXTURE)).toBe(false);
+  });
+
+  test("is assigned downward from nm099999 and nm099998, the order ADR 0068 sets", () => {
+    // The next undeclared fixture id is the one after it, and stays refused until declared.
+    expect(isDevOwnedDatasetId("nm099996")).toBe(false);
+    expect(isReservedFixtureId("nm099996")).toBe(true);
+  });
+});
+
 describe("the id a test may rely on being absent (#1434)", () => {
   test("is reserved, so the allocator can never return it", () => {
     // The property that makes it usable at all. Four live tests had picked

@@ -660,3 +660,59 @@ export async function triggerPrReviewRun(
     throw new Error(`PR review dispatch rejected: HTTP ${response.status}`);
   }
 }
+
+/**
+ * The fields the central publication review workflow needs (ADR 0102), and nothing it could use to
+ * choose a target. The workflow reads the dataset's root documents from GitHub itself, at the
+ * commit named here: it is given the review's coordinates, never the dataset's text, and it maps
+ * `environment` to an API origin from a fixed table of its own, so a payload can never steer the
+ * callback to a host it chose. `anonymous` is the release kind the review was started for; the
+ * report echoes it and the Worker refuses a report whose echo differs from the row.
+ */
+export interface PublicationReviewDispatch {
+  datasetId: string;
+  requestId: number;
+  reviewId: number;
+  headSha: string;
+  anonymous: boolean;
+  callbackToken: string;
+  environment: ApprovalDispatchEnvironment;
+}
+
+/**
+ * Trigger the publication review via `repository_dispatch[run-publication-review]` on
+ * `nemarDatasets/.github` (ADR 0102). Throws with the status only: GitHub's body is not ours to
+ * forward, and the caller logs this message. This is the only call the Worker makes to GitHub for
+ * a review; nothing is written to a dataset repository.
+ */
+export async function triggerPublicationReviewRun(
+  d: PublicationReviewDispatch,
+  pat: string,
+  timeoutMs?: number,
+): Promise<void> {
+  const response = await fetch(`${GITHUB_API()}/repos/${CENTRAL_WORKFLOW_REPO}/dispatches`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${pat}`,
+      Accept: "application/vnd.github.v3+json",
+      "User-Agent": "NEMAR-API",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      event_type: "run-publication-review",
+      client_payload: {
+        dataset_id: d.datasetId,
+        request_id: d.requestId,
+        review_id: d.reviewId,
+        head_sha: d.headSha,
+        anonymous: d.anonymous,
+        callback_token: d.callbackToken,
+        environment: d.environment,
+      },
+    }),
+    ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
+  });
+  if (!response.ok) {
+    throw new Error(`Publication review dispatch rejected: HTTP ${response.status}`);
+  }
+}

@@ -97,11 +97,15 @@ export function realD1(db: Database): D1Database {
 }
 
 /**
- * Wrap a D1 so `before(sql)` runs, and is awaited, ahead of every statement
- * executes. Statements built by the wrapper keep `__execForBatch`, so
- * `batch()` still works through it.
+ * Wrap a D1 so `before(sql, binds)` runs, and is awaited, ahead of every
+ * statement executes; `binds` are the values the statement was bound with, so
+ * a fault can be aimed at one row's statement and not at every row's. Statements
+ * built by the wrapper keep `__execForBatch`, so `batch()` still works through it.
  */
-export function wrapD1(d1: D1Database, before: (sql: string) => void | Promise<void>): D1Database {
+export function wrapD1(
+  d1: D1Database,
+  before: (sql: string, binds: readonly unknown[]) => void | Promise<void>,
+): D1Database {
   return {
     prepare(sql: string) {
       const inner = d1.prepare(sql) as unknown as {
@@ -111,21 +115,23 @@ export function wrapD1(d1: D1Database, before: (sql: string) => void | Promise<v
         all(): Promise<unknown>;
         __execForBatch(): unknown;
       };
+      let binds: readonly unknown[] = [];
       const api = {
         bind(...p: unknown[]) {
+          binds = p;
           inner.bind(...p);
           return api;
         },
         async run() {
-          await before(sql);
+          await before(sql, binds);
           return inner.run();
         },
         async first() {
-          await before(sql);
+          await before(sql, binds);
           return inner.first();
         },
         async all() {
-          await before(sql);
+          await before(sql, binds);
           return inner.all();
         },
         __execForBatch() {
@@ -160,7 +166,7 @@ export function yieldingD1(d1: D1Database): D1Database {
  */
 export function interceptingD1(
   d1: D1Database,
-  hook: (sql: string) => void | Promise<void>,
+  hook: (sql: string, binds: readonly unknown[]) => void | Promise<void>,
 ): D1Database {
   return wrapD1(d1, hook);
 }

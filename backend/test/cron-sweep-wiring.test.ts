@@ -118,6 +118,12 @@ const SWEEP_WIRING: Record<
   // outside production on its own. It deliberately ignores PR_REVIEW_ENABLED, so switching the
   // review off does not strand the checks of reviews already in flight.
   sweepStalePrReviews: "tick-prod-only",
+  // ADR 0102: the publication-review watchdog. Its deadline is 30 minutes, so it rides the
+  // 30-minute tick; it mails administrators (the request's mail waits for the review), so it
+  // is production-only there and absent from DEV_CRON_ALLOWLIST. It also refuses outside
+  // production on its own. It deliberately ignores PUBLICATION_REVIEW_ENABLED, so switching
+  // the review off does not strand a request whose mail waits on a review already in flight.
+  sweepPublicationReviews: "tick-prod-only",
   sweepBlockedBidsValidationRequests: "all-envs",
   // Epic #1610 phase 4: the identifier-screen watchdog. Its deadline is 50
   // minutes, so it rides the 30-minute tick; it mails admins, so it is

@@ -1225,12 +1225,50 @@ export interface PublicationScreenSection {
   next?: string;
 }
 
+/**
+ * The publication review's part of the same email (ADR 0102). Built ONLY from the shared
+ * description (shared/publication-review.ts: `describePublicationReview`, or
+ * `describeUnreadableReview` when the review could not be read): the headline, each reason in the
+ * shared words, the next command and the standing line. It never carries the model's summary or
+ * any other text the model wrote: the summary is a field of the description of its own, and the
+ * section is built from `lines` alone.
+ */
+export interface PublicationReviewSection {
+  /** `describePublicationReview`'s headline, e.g. "Publication review: action required". */
+  headline: string;
+  tone: "ok" | "note" | "warn" | "stop";
+  /** The reasons in fixed words and closed words, the standing line last. */
+  lines: string[];
+  /** The command an administrator runs next, when it is theirs to run. */
+  next?: string;
+}
+
 const SCREEN_TONE_COLOR: Record<PublicationScreenSection["tone"], string> = {
   ok: "#16a34a",
   note: "#2563eb",
   warn: "#d97706",
   stop: "#dc2626",
 };
+
+/**
+ * One section of the publication-request email: a headline in its tone's colour, its lines, and
+ * the next step. The identifier screen's section and the review's are the same markup, so they
+ * read as one list.
+ */
+function sectionHtml(section: PublicationScreenSection | PublicationReviewSection): string {
+  return `
+  <div style="border-left: 4px solid ${SCREEN_TONE_COLOR[section.tone]}; background: #f9fafb; padding: 12px 16px; border-radius: 4px; margin: 16px 0;">
+    <strong style="color: ${SCREEN_TONE_COLOR[section.tone]};">${escapeHtml(section.headline)}</strong>
+    ${
+      section.lines.length > 0
+        ? `<ul style="margin: 8px 0 0 0; padding-left: 20px;">${section.lines
+            .map((line) => `<li>${escapeHtml(line)}</li>`)
+            .join("")}</ul>`
+        : ""
+    }
+    ${section.next ? `<p style="margin: 8px 0 0 0;"><strong>${escapeHtml(section.next)}</strong></p>` : ""}
+  </div>`;
+}
 
 /**
  * The verdict as it appears at the end of the subject line:
@@ -1260,7 +1298,11 @@ export async function sendPublicationRequestEmail(
   replyTo?: string,
   isDev?: boolean,
   deliveryEnv?: EmailDeliveryEnv,
-  opts?: { anonymous?: boolean; screen?: PublicationScreenSection },
+  opts?: {
+    anonymous?: boolean;
+    screen?: PublicationScreenSection;
+    review?: PublicationReviewSection;
+  },
 ): Promise<AdminNotificationOutcome> {
   // #1408: an anonymous release and a publication are different runs with
   // different outcomes -- one keeps the repository private and the DOI
@@ -1278,20 +1320,10 @@ export async function sendPublicationRequestEmail(
   </div>`
     : "";
   const screen = opts?.screen;
-  const screenSection = screen
-    ? `
-  <div style="border-left: 4px solid ${SCREEN_TONE_COLOR[screen.tone]}; background: #f9fafb; padding: 12px 16px; border-radius: 4px; margin: 16px 0;">
-    <strong style="color: ${SCREEN_TONE_COLOR[screen.tone]};">${escapeHtml(screen.headline)}</strong>
-    ${
-      screen.lines.length > 0
-        ? `<ul style="margin: 8px 0 0 0; padding-left: 20px;">${screen.lines
-            .map((line) => `<li>${escapeHtml(line)}</li>`)
-            .join("")}</ul>`
-        : ""
-    }
-    ${screen.next ? `<p style="margin: 8px 0 0 0;"><strong>${escapeHtml(screen.next)}</strong></p>` : ""}
-  </div>`
-    : "";
+  const screenSection = screen ? sectionHtml(screen) : "";
+  // Placed on the screen's own line below: with no review the mail is byte for byte what it was
+  // before the review existed.
+  const reviewSection = opts?.review ? sectionHtml(opts.review) : "";
   const html = `
 <!DOCTYPE html>
 <html>
@@ -1304,7 +1336,7 @@ export async function sendPublicationRequestEmail(
 
   <p>User <strong>${escapeHtml(username)}</strong> has requested ${anonymous ? "an anonymous release" : "publication"} of dataset <strong>${escapeHtml(datasetId)}</strong>.</p>
 ${anonymousNotice}
-${screenSection}
+${screenSection}${reviewSection}
 
   <h2 style="color: #333; font-size: 18px; margin-top: 30px;">Action Required</h2>
   <p>Review the dataset and approve or deny the request:</p>

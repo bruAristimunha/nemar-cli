@@ -231,7 +231,8 @@ export interface Bindings {
   // repository_dispatch[run-prescreen] at nemarDatasets/.github, which runs
   // `claude -p` and POSTs a verdict to /webhooks/prescreen-result with an
   // HMAC-signed token. Default (unset/"false") keeps the request flow
-  // unchanged so a deploy does not silently enable screening.
+  // unchanged so a deploy does not silently enable screening. With the publication review on
+  // (PUBLICATION_REVIEW_ENABLED, below) it is not dispatched for a request the review covers.
   PRESCREEN_ENABLED?: string; // "true" enables the dispatch on publish request
   PRESCREEN_CALLBACK_SECRET?: string; // Workers secret; HMAC key for prescreen callback
 
@@ -243,6 +244,18 @@ export interface Bindings {
   // domain tag. Set on the PRODUCTION Worker only unless a staging test is deliberate: the dev
   // Worker answers only for repositories it owns (see the ownership fence in the webhook).
   PR_REVIEW_ENABLED?: string; // "1" enables the review
+
+  // Publication review (ADR 0102). When PUBLICATION_REVIEW_ENABLED is exactly "1", a stored
+  // identifier-screen result whose gate is clear or acknowledge starts a model review of the
+  // screened commit, the claim route accepts new claims, the request's admin mail waits for the
+  // review and gains its section, and the pre-screen of ADR 0014 is not dispatched for a request
+  // the review covers. Any other value (unset included) starts nothing, refuses new claims and
+  // leaves the mail and the pre-screen as they were; a result whose run was already claimed is
+  // still stored, and the production watchdog still closes rows. The mechanical refusals do not
+  // depend on it. The callback token reuses PRESCREEN_CALLBACK_SECRET under its own domain tag.
+  // Set in [env.dev.vars] only; production turns it on by adding it to [vars] in a reviewed
+  // change, once ADR 0102's "Before it is switched on" is done.
+  PUBLICATION_REVIEW_ENABLED?: string; // "1" enables the review
 
   // Import recovery (issue #754). onboard-openneuro.yml POSTs import state to
   // /webhooks/import-state (bearer NEMAR_WEBHOOK_TOKEN). On a terminal failure

@@ -16,11 +16,10 @@
  * the files and decides what a failure to fetch means.
  */
 
+import { README_CANDIDATES } from "../../../shared/readme-candidates.js";
 import { getFileContent } from "./github";
 import { LOOKUP_ONCE } from "./github/contents";
 import { describesEthicsApproval, evaluateSubmissionMinimums } from "./submission-minimums";
-
-const README_CANDIDATES = ["README.md", "README", "README.txt", "README.rst"];
 
 /** Why a gate could not reach a verdict. */
 const UNREADABLE_REASON =

@@ -36,6 +36,7 @@ import {
   approveSchema,
   runPublicationApproval,
 } from "../../services/publication-orchestrator";
+import { publicationReviewSummaries } from "../../services/publication-review-view";
 import { errorMessage } from "../../services/repo-metadata";
 import { applyObjectLockBatch } from "../../services/s3";
 import { isAllowedOrigin } from "../../services/web-session";
@@ -67,6 +68,11 @@ export function registerPublishRoutes(admin: AdminRouter): void {
    * never offers an action the route would refuse and never hard-codes the
    * lease. The new columns `approval_requested_by` and `approval_dispatched_at`
    * ride along in `pr.*`.
+   *
+   * `publication_review` (ADR 0102) is the review of each request, re-derived now from its stored
+   * report and the live facts: the outcome, the headline and the reason codes in the shared
+   * words, and no sentence the model wrote. The dataset's columns it needs are joined in under
+   * names of their own and withheld from the response below, so the wire gains one key.
    */
   admin.get("/publish/requests", async (c) => {
     const db = c.env.DB;
@@ -74,9 +80,14 @@ export function registerPublishRoutes(admin: AdminRouter): void {
 
     let query = `
     SELECT pr.*, u.username as requested_by_username, u.email as requested_by_email,
-           ${approvalInFlightSql("pr.")} AS approval_in_flight
+           ${approvalInFlightSql("pr.")} AS approval_in_flight,
+           d.dataset_id AS review_ds_id, d.source AS review_ds_source,
+           d.is_exemplar AS review_ds_is_exemplar, d.concept_doi AS review_ds_concept_doi,
+           d.ezid_status AS review_ds_ezid_status,
+           d.first_published_at AS review_ds_first_published_at
     FROM publication_requests pr
     JOIN users u ON pr.requested_by = u.id
+    LEFT JOIN datasets d ON d.dataset_id = pr.dataset_id
   `;
     const params: string[] = [];
 
@@ -107,33 +118,79 @@ export function registerPublishRoutes(admin: AdminRouter): void {
         approval_dispatched_at: string | null;
         approval_in_flight: number;
         prescreen_nonce?: string | null;
+        block_reason: string | null;
+        anonymous: number | null;
         identifier_screen_status: string | null;
         identifier_screen_nonce?: string | null;
         identifier_screen_report?: string | null;
+        identifier_screen_ack_by: number | null;
+        review_ds_id: string | null;
+        review_ds_source: string | null;
+        review_ds_is_exemplar: number | null;
+        review_ds_concept_doi: string | null;
+        review_ds_ezid_status: string | null;
+        review_ds_first_published_at: string | null;
       }>();
 
-    return c.json({
-      requests: requests.results.map((r) => {
-        // `pr.*` puts every column on the wire without naming it. The two
-        // callback nonces are credentials (each one verifies a workflow's
-        // callback), and the stored screen report is shown ONLY through
-        // describeScreen's words below, so all three are withheld here, from
-        // everyone (epic #1610 phase 4).
-        const {
-          prescreen_nonce: _prescreenNonce,
-          identifier_screen_nonce: _screenNonce,
-          identifier_screen_report: screenReport,
-          ...rest
-        } = r;
-        return {
-          ...rest,
-          steps_completed: JSON.parse(r.steps_completed || "[]"),
-          approval_in_flight: r.approval_in_flight === 1,
-          identifier_screen: screenView(r.dataset_id, r.identifier_screen_status, screenReport),
-        };
-      }),
-      count: requests.results.length,
+    // One clock for the whole list, so two rows are aged by the same instant.
+    const nowMs = Date.now();
+    // The review of every row, read in a few statements and derived a few rows at a time; a row
+    // whose review cannot be read says so for itself and never fails the list (ADR 0102).
+    const reviews = await publicationReviewSummaries(
+      c.env,
+      requests.results.map((r) => ({
+        request: {
+          id: r.id,
+          dataset_id: r.dataset_id,
+          status: r.status,
+          block_reason: r.block_reason,
+          anonymous: r.anonymous,
+          identifier_screen_status: r.identifier_screen_status,
+          identifier_screen_report: r.identifier_screen_report ?? null,
+          identifier_screen_ack_by: r.identifier_screen_ack_by,
+        },
+        dataset:
+          r.review_ds_id === null
+            ? null
+            : {
+                source: r.review_ds_source,
+                is_exemplar: r.review_ds_is_exemplar,
+                concept_doi: r.review_ds_concept_doi,
+                ezid_status: r.review_ds_ezid_status,
+                first_published_at: r.review_ds_first_published_at,
+              },
+      })),
+      nowMs,
+    );
+    const rows = requests.results.map((r, index) => {
+      // `pr.*` puts every column on the wire without naming it. The two
+      // callback nonces are credentials (each one verifies a workflow's
+      // callback), and the stored screen report is shown ONLY through
+      // describeScreen's words below, so all three are withheld here, from
+      // everyone (epic #1610 phase 4). The dataset columns the review reads
+      // were joined in for it and are not part of the contract either.
+      const {
+        prescreen_nonce: _prescreenNonce,
+        identifier_screen_nonce: _screenNonce,
+        identifier_screen_report: screenReport,
+        review_ds_id: _dsId,
+        review_ds_source: _dsSource,
+        review_ds_is_exemplar: _dsIsExemplar,
+        review_ds_concept_doi: _dsConceptDoi,
+        review_ds_ezid_status: _dsEzidStatus,
+        review_ds_first_published_at: _dsFirstPublishedAt,
+        ...rest
+      } = r;
+      return {
+        ...rest,
+        steps_completed: JSON.parse(r.steps_completed || "[]"),
+        approval_in_flight: r.approval_in_flight === 1,
+        identifier_screen: screenView(r.dataset_id, r.identifier_screen_status, screenReport),
+        publication_review: reviews[index],
+      };
     });
+
+    return c.json({ requests: rows, count: rows.length });
   });
 
   /**

@@ -6,8 +6,11 @@
 > This note keeps what was read, the comparisons, the arithmetic, the initial vocabularies and the refined plan for epic #1726.
 > Written 2026-10-12 for Phase 0 (#1727) against the epic branch at `9cc6586f`,
 > and revised the same day after an independent review of #1735 and the maintainer's amendments (comments on #1726).
-> Pull request #1720 (the 2026-10-12 amendments to ADR 0092 and ADR 0093) has since merged into `dev`;
-> the epic branch is behind `dev` and picks it up when it is next brought up to date.
+> Pull request #1720 (the 2026-10-12 amendments to ADR 0092 and ADR 0093) has since merged into `dev`,
+> and the epic branch was brought up to date with `dev` on 2026-10-13.
+> The Phase 1 sections below keep the plan as written; where the build departed from it, the ADR states what was built
+> (the workflow's step order, the participants file, the normalization before the pre-send rules, the cap accounting,
+> the mail at the deadline).
 
 ## 1. What was read
 
@@ -178,17 +181,19 @@ startPublicationReview(request, H, anonymous)
    |-- a row exists for (request, H, anonymous) --> reuse it
    |-- over a cap --> declined (review_limit_reached) --> admin mail
    v insert the dispatched row, then dispatch
-repository_dispatch[run-publication-review] {dataset_id, request_id, review_id, head_sha, environment, callback_token}
+repository_dispatch[run-publication-review] {dataset_id, request_id, review_id, head_sha, anonymous, environment, callback_token}
    |
    v the workflow (nemarDatasets/.github, main only)
 mask the token -> validate -> POST /webhooks/publication-review-claim (one shot)
    |-- 401 or 409 --> stop green, nothing spent
    v claimed
-check out nemar-cli main -> bun install -> federation check -> read-only token (one repository)
--> git init + shallow, blob-less fetch of main -> fetched main == H, or stale_head
--> read the files at H -> pre-send check (shared rules) -> withhold flagged files -> ClearedText
--> evidence: counts, version, minimums, tag lookup, the BIDS run at H
--> OpenID Connect token -> one model call (no tools, JSON schema)
+federation check -> read-only token (one repository)
+-> git init + shallow, blob-less fetch of main, prefetching the blobs the script reads (token per command, never in the clone)
+-> the BIDS validation runs of the fetched commit
+-> check out nemar-cli main -> set up bun -> install (no install scripts) -> OpenID Connect token
+-> the script: fetched main == H, or stale_head -> read the files at H -> normalize, then the pre-send check (shared rules)
+-> withhold flagged files -> ClearedText -> evidence: counts, version, minimums, tag lookup
+-> one model call (no tools, JSON schema)
 -> assemble and parse the report -> POST /webhooks/publication-review-result
    |                                     (failure after the claim: curl reports workflow_failed)
    v
@@ -237,7 +242,8 @@ and otherwise record `action_required`. Three readings were weighed.
   and Phase 1 widens that summary to the numbers a README states (subjects, sessions, channels, sampling rates, recording formats, modalities),
   so `readme_mismatch` compares prose with facts the platform computed, and the model is shown the numbers and never the values.
   A richer, administrator-run look at a local clone with their own tools stays the administrator's own act (ADR 0093) and is not built here.
-  The maintainer decides whether to reopen this; it would amend ADR 0102's hard constraint and the policy statement, not just the job.
+  The maintainer confirmed on 2026-10-13 that it is not built: the review stays a no-tools call over cleared prose, with the checks moved into code.
+  Reopening it would amend ADR 0102's hard constraint and the policy statement, not just the job.
 
 Under B the ordering still matters:
 a request with direct identifiers in its headers, which the screen blocks, never reaches a model,
@@ -257,6 +263,7 @@ The Haiku to Sonnet ratio of about 1 to 20 is what the page states.
 These are first-party rates; the pull-request review's federation audience is the first-party API, and the publication review uses the same.
 Thinking is billed as output and counts toward `max_tokens`.
 Token counts use four characters per token; nothing here was measured with `count_tokens`.
+Accepted (second adversarial review): rare characters can cost more tokens than four to the character, so an adversarial document may cost more than this estimate and exceed the model's input limit; the API's refusal of an over-long input maps to `model_invalid`, which fails closed, and the daily caps bound the spend.
 
 Input, worst case: the system prompt and schema about 1,500 tokens; the facts about 1,000;
 the README 24,000 characters (6,000 tokens); the description 16,000 (4,000); CHANGES 8,000 (2,000);
@@ -363,11 +370,13 @@ Files:
 - `backend/src/services/github/dispatch.ts`: `triggerPublicationReviewRun`.
 - `backend/src/services/identifier-screen.ts`: the mail lease waits for an in-flight review while the flag is on,
   and a late review report re-arms it; the email gains the review section (`backend/src/services/email.ts`).
-- `backend/src/routes/admin/publish.ts`: `publication_review` on each list row, `GET /admin/publish/:id/review`,
+- `backend/src/routes/admin/publish.ts`: `publication_review` on each list row;
+  `backend/src/routes/admin/publication-review.ts`: `GET /admin/publish/:id/review` and
   `POST /admin/publish/:id/review/start` (with the cookie Origin rule), and its audit row.
 - `backend/src/index.ts`: the watchdog on the 30-minute tick, production only.
 - `backend/wrangler-sccn.toml`: `PUBLICATION_REVIEW_ENABLED = "1"` in `[env.dev.vars]` only.
-- `backend/src/routes/datasets/publication.ts`: the pre-screen dispatched only while the review flag is off.
+- `backend/src/routes/datasets/publication.ts`: the pre-screen skipped only when the review will run for the dataset
+  (the flag is on, the review applies to it and this Worker owns it), and dispatched as before otherwise.
 - `backend/src/services/datasetId.ts`: `nm099997` declared in `DEV_OWNED_FIXTURE_IDS`, with its guard test,
   so that the dark release carries the declaration before the fixture exists.
 - `.github/dataset-workflows/run-publication-review.yml`, `scripts/ci/publication-review.ts` (with a calibration entry point that posts nothing),

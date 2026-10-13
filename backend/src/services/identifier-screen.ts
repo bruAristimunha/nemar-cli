@@ -6,7 +6,9 @@
  * for identifying information (names, birth dates and record numbers in EDF/BDF
  * headers, identifying sidecar columns and keys, identifying file names) and
  * posts a report to `/webhooks/identifier-screen-result`. The admin's
- * publication-request email WAITS for that report and states it.
+ * publication-request email WAITS for that report and states it. While the
+ * publication review is on (ADR 0102) it also waits for a review of the screened
+ * commit that is in flight, and adds the review's section.
  *
  * Every way of not getting a report still reaches the admin, and says so:
  *   - the dispatch was impossible (no credential, callback secret, API base or
@@ -41,7 +43,6 @@ import {
   type ScreenReport,
   type ScreenState,
   describeScreen,
-  isScreenState,
   parseScreenReport,
   screenGate,
   stateOf,
@@ -49,8 +50,8 @@ import {
 import { PUBLICATION_STEPS } from "../../../shared/publication-steps.js";
 import { auditLogStatement } from "../db/audit-log.js";
 import type { Bindings } from "../types/bindings.js";
-import { isSandboxDatasetId } from "./datasetId.js";
 import {
+  type PublicationReviewSection,
   type PublicationScreenSection,
   getAdminEmailsForCategory,
   resolveEmailConfig,
@@ -64,6 +65,14 @@ import {
   signIdentifierScreenCallbackToken,
   triggerIdentifierScreenRun,
 } from "./github.js";
+import { isScreenExempt, readStoredReport, readStoredState } from "./identifier-screen-stored.js";
+import { reviewInFlightSql } from "./publication-review-rows.js";
+import { publicationReviewEmailSection, reviewEnabled } from "./publication-review-view.js";
+
+// The two readers of a stored screen, and the sandbox exemption, live in their own module so the
+// publication review (ADR 0102) can use them without importing this one; re-exported for every
+// existing importer.
+export { isScreenExempt, readStoredReport, readStoredState };
 
 /**
  * A screen still pending this long after its dispatch has not reported, and is
@@ -124,17 +133,6 @@ export const IDENTIFIER_SCREEN_BLOCK_REASON = "identifier_screen_findings";
 /** Where the workflow posts its report, under API_BASE_URL. */
 export const IDENTIFIER_SCREEN_CALLBACK_PATH = "/webhooks/identifier-screen-result";
 
-/**
- * Sandbox (`xx`) datasets are not screened: the band is training and staging
- * exemplars, which never publish real data (ADR 0068's bands). The same rule
- * `isSandboxDatasetId` states, used by name so the exemption reads as a policy.
- */
-export function isScreenExempt(datasetId: string): boolean {
-  // A well-formed `xx` id only: anything else is screened, never waved through
-  // because it happens to start with the letters.
-  return /^xx\d{6}$/.test(datasetId) && isSandboxDatasetId(datasetId);
-}
-
 /** What an exempt dataset's email and status say about the screen. Worker-fixed words. */
 export const EXEMPT_SCREEN_DESCRIPTION: ScreenDescription = {
   headline: "Identifier screen: not applicable (sandbox)",
@@ -175,28 +173,6 @@ export const RERUN_GUARD_SQL = `AND status IN ('requested', 'blocked', 'approvin
 /** A report the Worker writes itself, for a screen that produced none. */
 export function workerErrorReport(error: ScreenError): ScreenReport {
   return parseScreenReport({ version: REPORT_VERSION, scanner: null, head: null, error });
-}
-
-/** The stored status column, read without trusting it: anything that is not a state is null. */
-export function readStoredState(raw: unknown): ScreenState | null {
-  return isScreenState(raw) ? raw : null;
-}
-
-/**
- * The stored report column, re-validated on the way out. The Worker only ever
- * writes a parsed report, so a failure here means the row was edited by hand;
- * it reads as "no report", which every reader treats as not clear.
- */
-export function readStoredReport(raw: unknown): ScreenReport | null {
-  if (typeof raw !== "string") return null;
-  try {
-    return parseScreenReport(JSON.parse(raw));
-  } catch (err) {
-    // The parser's own fixed word, never its input, so a hand-edited row is not silent.
-    const code = err instanceof Error && err.name === "ReportError" ? err.message : "unparseable";
-    console.warn(`[identifier-screen] a stored report does not read back (${code})`);
-    return null;
-  }
 }
 
 /** The screen as a status view shows it. */
@@ -255,7 +231,7 @@ export function screenEmailSection(
 // Mailing the admins
 // ============================================================================
 
-/** Send the publication-request email to the admins, with a screen section. */
+/** Send the publication-request email to the admins, with a screen section and, when there is one, a review section. */
 export async function mailPublicationRequest(
   env: Bindings,
   args: {
@@ -263,6 +239,7 @@ export async function mailPublicationRequest(
     username: string;
     anonymous: boolean;
     screen: PublicationScreenSection;
+    review?: PublicationReviewSection | null;
   },
 ): Promise<{ attempted: number; delivered: number }> {
   const adminEmails = await getAdminEmailsForCategory(env.DB, "publication_request", env);
@@ -277,7 +254,7 @@ export async function mailPublicationRequest(
     replyTo,
     isDev,
     env,
-    { anonymous: args.anonymous, screen: args.screen },
+    { anonymous: args.anonymous, screen: args.screen, review: args.review ?? undefined },
   );
   return { attempted: outcome.attempted, delivered: outcome.delivered };
 }
@@ -290,13 +267,34 @@ const LEASE_NOW_SQL = "strftime('%Y-%m-%d %H:%M:%f', 'now')";
 const LEASE_EXPIRED_SQL = `strftime('%Y-%m-%d %H:%M:%f', 'now', '-${SCREEN_EMAIL_RETRY_AFTER_MINUTES} minutes')`;
 
 /**
+ * What the mail lease and the watchdog's unmailed query add while the publication review is on
+ * (ADR 0102, section 6): the mail WAITS while a review of the screened commit is dispatched and
+ * younger than the review deadline, so the one mail an administrator gets carries the review.
+ * Only a request in `requested` waits, because only such a request is reviewed; a request in
+ * any other status is mailed as before. Two things end the wait, so it can never hold a mail for
+ * good: the review reports (its result tries the mail), or its row passes the deadline, which
+ * `reviewInFlightSql` reads from the row's own age whether or not a watchdog runs.
+ *
+ * Empty while the flag is off, so the statements are then exactly what they were before the
+ * review existed. A module-level function of fixed text, never input. `atMs` decides at an instant
+ * of the caller's instead of the database's clock ({@link reviewInFlightSql}).
+ */
+export function reviewHoldSql(reviewOn: boolean, atMs?: number): string {
+  return reviewOn
+    ? `\n     AND NOT (status = 'requested' AND ${reviewInFlightSql("publication_requests", atMs)})`
+    : "";
+}
+
+/**
  * Mail the admins the publication request with its screen result, at most once
  * per result in the normal case, and never lose it.
  *
  * A LEASE, not a stamp: one conditional UPDATE takes
  * `identifier_screen_mail_claimed_at` only while the mail has not gone out
  * (`emailed_at` NULL), the lease is free or expired, the result is in (not
- * pending, not NULL) and the request is still active. Of two triggers racing for
+ * pending, not NULL), the request is still active and, while the publication
+ * review is on, no review of the screened commit is in flight
+ * ({@link reviewHoldSql}; the mail then carries the review's section). Of two triggers racing for
  * one result (the callback and the watchdog, or two ticks) exactly one holds it.
  * After the send:
  *   - at least one admin accepted it: `emailed_at` is set and the lease cleared;
@@ -314,6 +312,7 @@ export async function notifyAdminsOfScreen(
   requestId: number,
 ): Promise<NotifyOutcome> {
   const db = env.DB;
+  const hold = reviewHoldSql(reviewEnabled(env));
   let claim: {
     claim: string;
     dataset_id: string;
@@ -333,7 +332,7 @@ export async function notifyAdminsOfScreen(
                  OR identifier_screen_mail_claimed_at < ${LEASE_EXPIRED_SQL})
             AND identifier_screen_status IS NOT NULL
             AND identifier_screen_status != 'pending'
-            AND status IN ('requested', 'blocked')
+            AND status IN ('requested', 'blocked')${hold}
           RETURNING identifier_screen_mail_claimed_at AS claim, dataset_id, requested_by,
                     anonymous, identifier_screen_status, identifier_screen_report`,
       )
@@ -362,6 +361,9 @@ export async function notifyAdminsOfScreen(
         claim.identifier_screen_status,
         claim.identifier_screen_report,
       ),
+      // Never throws, and is null when the review is off and has no row: the mail is then what
+      // it was before the review existed.
+      review: await publicationReviewEmailSection(env, requestId),
     });
     delivered = outcome.delivered;
   } catch (err) {
@@ -771,8 +773,13 @@ export const OVERDUE_SCREENS_SQL = `SELECT id FROM publication_requests
 /**
  * Stored results on active requests whose admin email never went out, and whose
  * mail lease is free or expired (a sender that died, or a release that failed).
+ *
+ * While the review is on, a request whose mail is held for a review in flight
+ * ({@link reviewHoldSql}) is left out, so held rows do not fill the ten slots of a tick
+ * and a request that is ready waits behind them.
  */
-export const UNMAILED_SCREENS_SQL = `SELECT id FROM publication_requests
+export function unmailedScreensSql(reviewOn: boolean): string {
+  return `SELECT id FROM publication_requests
    WHERE status IN ('requested', 'blocked')
      AND identifier_screen_status IS NOT NULL
      AND identifier_screen_status != 'pending'
@@ -780,8 +787,9 @@ export const UNMAILED_SCREENS_SQL = `SELECT id FROM publication_requests
      AND (identifier_screen_mail_claimed_at IS NULL
           OR identifier_screen_mail_claimed_at < ${LEASE_EXPIRED_SQL})
      AND COALESCE(identifier_screen_at, identifier_screen_dispatched_at, '')
-         < datetime('now', '-${SCREEN_EMAIL_RETRY_AFTER_MINUTES} minutes')
+         < datetime('now', '-${SCREEN_EMAIL_RETRY_AFTER_MINUTES} minutes')${reviewHoldSql(reviewOn)}
    ORDER BY id LIMIT ?`;
+}
 
 /**
  * The watchdog, run on the 30-minute tick in PRODUCTION ONLY (the call site in
@@ -855,7 +863,10 @@ export async function sweepIdentifierScreens(env: Bindings): Promise<ScreenSweep
   let unmailed: { id: number }[] = [];
   try {
     unmailed = (
-      await db.prepare(UNMAILED_SCREENS_SQL).bind(SCREEN_SWEEP_LIMIT).all<{ id: number }>()
+      await db
+        .prepare(unmailedScreensSql(reviewEnabled(env)))
+        .bind(SCREEN_SWEEP_LIMIT)
+        .all<{ id: number }>()
     ).results;
   } catch (err) {
     result.errors++;

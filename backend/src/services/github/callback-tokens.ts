@@ -343,3 +343,69 @@ export async function verifyPrReviewCallbackToken(
   const expected = await signPrReviewCallbackToken(payload, secret);
   return timingSafeEqual(token, expected);
 }
+
+// ============================================================================
+// Publication-review callback HMAC tokens (ADR 0102)
+// ============================================================================
+//
+// The publication review workflow claims its review at /webhooks/publication-review-claim and
+// posts its report to /webhooks/publication-review-result with one token. Signed with the same
+// secret as every other callback (PRESCREEN_CALLBACK_SECRET, one fewer secret to provision on two
+// Workers) and DOMAIN-SEPARATED the same way: the message begins with a tag line no other kind's
+// message can begin with (`pr-review`, `identifier-screen` and `identifier-sweep` all differ from
+// it, and a pre-screen or manifest message begins with a dataset id), so a token minted for any
+// other callback cannot answer for a publication review, and a review token cannot answer for
+// them.
+//
+// The token binds the dataset, the review row and the attempt's nonce. Single-use is enforced by
+// the row (`state` and `nonce`, cleared when a result is stored), not by the HMAC. It grants
+// nothing beyond posting that one review's report, and joins no revocation list.
+
+/** The first line of every publication-review message. Never shared with another token kind. */
+export const PUBLICATION_REVIEW_TOKEN_DOMAIN = "publication-review";
+
+export interface PublicationReviewCallbackPayload {
+  datasetId: string;
+  reviewId: number;
+  nonce: string;
+}
+
+/** Canonical, domain-tagged payload encoding, pinned so signer and verifier agree. */
+function encodePublicationReviewCallbackPayload(payload: PublicationReviewCallbackPayload): string {
+  return `${PUBLICATION_REVIEW_TOKEN_DOMAIN}\n${payload.datasetId}\n${payload.reviewId}\n${payload.nonce}`;
+}
+
+/** Sign a publication-review callback payload with HMAC-SHA256 (hex digest). */
+export async function signPublicationReviewCallbackToken(
+  payload: PublicationReviewCallbackPayload,
+  secret: string,
+): Promise<string> {
+  if (!secret) {
+    throw new Error("signPublicationReviewCallbackToken: secret is required");
+  }
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    encoder.encode(encodePublicationReviewCallbackPayload(payload)),
+  );
+  return toHex(signature);
+}
+
+/** Verify a publication-review callback token (constant-time). */
+export async function verifyPublicationReviewCallbackToken(
+  token: string,
+  payload: PublicationReviewCallbackPayload,
+  secret: string,
+): Promise<boolean> {
+  if (!token || !secret) return false;
+  const expected = await signPublicationReviewCallbackToken(payload, secret);
+  return timingSafeEqual(token, expected);
+}

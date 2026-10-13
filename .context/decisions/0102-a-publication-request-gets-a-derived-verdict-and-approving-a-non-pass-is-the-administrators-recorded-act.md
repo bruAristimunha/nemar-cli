@@ -115,21 +115,37 @@ This rule is not negotiable, and nothing in this ADR or a later phase may weaken
 - **Every byte sent to the model is examined by the shared mechanical rules immediately before it is sent.**
   Because the screen does not read the files the model reads, screen-first is the ORDERING rule,
   and a pre-send check is the CONTENT rule.
-  The review job applies `scanTextForLocalPaths` to each text file and `scanJsonKeys` to each JSON document,
-  over exactly the bytes it is about to send.
-  A file with any finding, a file it cannot read in full, a file that is not valid UTF-8,
+  The scanned string is the sent string.
+  The job normalizes each document first: default-ignorable and invisible code points (variation selectors, Hangul fillers and the like) and lone surrogates are removed,
+  the text is put into Unicode form NFKC (so a fullwidth slash or letter is seen as the person and the model read it),
+  and the shared `tidy` cleans the rest.
+  The input of that step is bounded, and a document with a run of more than 64 combining marks is withheld,
+  because NFKC is quadratic on such a run and real text never has one.
+  The job then applies `scanTextForLocalPaths` to each text file and `scanJsonKeys` to each JSON document,
+  and for a JSON document to every key and every string one by one, with local rules for a `file:` URL, a drive path and a UNC path,
+  over exactly the normalized bytes it is about to send.
+  A file with any finding, a file it cannot read in full, a file that is not valid UTF-8 (a NUL byte is not text),
+  a JSON document nested deeper than 32 levels,
   and a root document that is an annexed link or pointer rather than text in git
   are withheld from the model whole.
+  A `dataset_description.json` with a NUL byte is the one exception to the NUL rule: it stays present, fails the ADR 0026 minimums as JSON that does not parse,
+  and is not sent, so a depositor still hits the hard refusal and not an overridable one.
   The evidence says which file classes were withheld, and the counts by finding kind in the screen's own vocabulary;
   a question that needs a withheld file cannot be better than unknown.
   Only the pre-send function can produce the input type the prompt builder accepts
-  (a branded `ClearedText`, as ADR 0092 brands a parsed report), and a test keeps casts to it out of every other file.
+  (a branded `ClearedText`, as ADR 0092 brands a parsed report), a test keeps casts to it out of every other file,
+  and the prompt builder also checks at run time that pre-send cleared each document string it is given
+  (pre-send keeps a digest of each string it clears, never the text), because a lexical test cannot see a cast through a type predicate, a generic or `JSON.parse`.
 - **What the pre-send check is, stated without overstatement.**
   The pre-send check applies the shared rules to the bytes sent.
-  For README, CHANGES and LICENSE the only rule today is a local-user-path pattern that examines the first match only (#1737).
+  For README, CHANGES and LICENSE the only rule today is a local-user-path pattern that examines every match (#1737);
+  the `file:`, drive and UNC forms are checked in JSON strings and keys only, so `C:/Users/x` in a README passes.
+  Lookalikes that NFKC does not fold to ASCII (a division slash, a Cyrillic letter) are not seen in any document.
   It is a consistency control, not a privacy control.
   No rule recognizes a name, email address or date in prose.
-  Fixing #1737 is a prerequisite of Phase 1; extending the screen to the root documents is #1736.
+  Extending the screen to the root documents is #1736.
+  The input limit and the cost bound assume about four characters to a token; adversarial text can cost more,
+  the API's refusal of an oversize call is `model_invalid`, and the daily caps bound the cost either way.
 - **Why prose is sent at all.**
   Enrichment and the pre-screen already send this prose to a model in production,
   the depositor has asked for exactly this content to be made public,
@@ -139,18 +155,25 @@ This rule is not negotiable, and nothing in this ADR or a later phase may weaken
 ### 3. What the model is shown
 
 - The root README, at most 24,000 characters, fenced; a longer file is cut and the cut is a fact.
-  The README is the first present of `README.md`, `README`, `README.rst` and `README.txt`, the four forms BIDS allows, in the order `submission-gate.ts` already uses;
+  The README is the first present of `README.md`, `README`, `README.rst` and `README.txt`, the four forms BIDS allows, in that order (one shared list, `shared/readme-candidates.ts`);
   the format makes no difference to the review, and a `.rst` or `.txt` README is read as text like the others.
 - The BIDS-defined top-level keys of `dataset_description.json`, re-serialized, at most 16,000 characters
   (these include `EthicsApprovals`, `License`, `Authors`, `Funding`, `ReferencesAndLinks` and `SourceDatasets`, the fields the questions below turn on);
   any other key is counted and not shown.
 - CHANGES, at most 8,000 characters, and the root LICENSE, at most 4,000, to compare with the `License` field.
-- `participants.json`, the column descriptions, at most 8,000 characters.
+- `participants.json`, the column descriptions only, at most 8,000 characters:
+  a count of columns and, for each column in the file's order, the string fields `LongName`, `Description` and `Units`, each capped,
+  and never a column's name, a `Levels` value or any per-participant value;
+  the system prompt names the block and says it holds column descriptions only.
+  The whole file is withheld when a column name is a study code (`sub01`, `S01`, `P001`, `participant_01`, a pure number), is longer than 64 characters or names an identifier,
+  and as unreadable when it holds more than 200 columns or is not an object of objects (a subject-keyed file).
 - A structural summary the job computes from the tree, in counts and closed words only:
-  subjects, sessions and recordings counted, the datatypes, the file formats folded into the preflight's closed list
-  (`KNOWN_FORMATS`, the rest `.other`), and whether `derivatives/`, `sourcedata/` and `code/` exist.
+  subjects, sessions and recordings counted, the datatypes, the file formats folded into a closed list
+  (the preflight's `KNOWN_FORMATS` plus `.edf` and `.bdf`, which the preflight counts as screened and so leaves out of that list; the rest `.other`),
+  channel counts and sampling rates as deduplicated numbers read from a bounded sample of data sidecars,
+  and whether `derivatives/`, `sourcedata/` and `code/` exist.
   No path, file name, subject label or task label is sent, so no path text reaches the model and a path finding withholds nothing.
-- Never: any `.tsv` file, any sidecar value, recordings, the contents of `sourcedata/`, `derivatives/` or `code/`,
+- Never: any `.tsv` file, any raw sidecar value (a number derived from sidecars, as above, is a fact of the summary), recordings, the contents of `sourcedata/`, `derivatives/` or `code/`,
   any document file, the depositor's NEMAR account, and the screen's result.
 
 For an anonymous release (ADR 0065) the model is told the release is anonymous and that `Authors` is blinded by design;
@@ -160,10 +183,13 @@ the authors half of its question is answered by the fact that ADR 0065's inverte
 
 - **No tools, one call, a schema-constrained answer**, exactly as in ADR 0092.
   Dataset text is untrusted: it sits in blocks fenced by a per-run random nonce,
-  the platform's facts sit outside any fence, and an instruction found in the text sets `steering`.
+  the platform's facts sit outside any fence in a block tagged with the same nonce, and only that exact tag is trusted,
+  so a facts-like block inside a document is text; an instruction found in the text sets `steering`.
   The model writes only a result per question, findings from a closed list, a short summary and the steering flag;
   it cannot write the evidence, the version, the model name, a reason or the verdict.
   Free text is reduced by `sanitizeNote`, and only its start is kept.
+  Every finding the model returns is validated, and the steering and blocker rules apply to all of them before the list is cut to eight,
+  with those findings kept first, so a steering attempt or a blocker buried past the cap still counts, and an invalid finding past the cap still refuses the output.
 - **Four questions, each answered `pass`, `fail` or `unknown`:**
   - `complete_and_honest`: the README says what the data is, how it was collected and how to use it,
     and what it claims agrees with the structural summary;
@@ -191,13 +217,15 @@ the authors half of its question is answered by the fact that ADR 0065's inverte
   Each reason has a class, fail or unknown, which sets the outcome, and says what clears it.
   The table lives in `shared/publication-review.ts` with the words every surface shows.
 - **Hard reasons: nothing clears them, and the approval is refused with the cure named.**
-  They are exactly what an earlier decision already made unconditional, plus one amendment of call 4:
+  They are what an earlier decision already made unconditional, one amendment of call 4, and the pending screen:
   - `request_blocked` (fail): the request's block reason is shown; the depositor fixes it and requests again;
   - `submission_minimum_failed` (fail): ADR 0026's minimums, evaluated by the review at the reviewed commit;
     the Worker then moves the request from `requested` to `blocked` with `min_requirements_failed`,
     the transition the blocked-request sweep already makes, so that the depositor can fix it and request again;
   - `identifier_screen_blocks` (fail): direct identifiers; the request is already blocked by ADR 0086;
   - `identifier_screen_not_run` and `identifier_screen_stale` (unknown): an administrator re-runs the screen;
+  - `identifier_screen_pending` (unknown): the screen is still running; nothing clears it but its result,
+    and the review starts when it reports;
   - `version_kept_after_anonymous_release` (fail): a named publication after an anonymous release of this dataset
     keeps the version the release used; the depositor bumps the version, which is cheap.
 - **The screen's reason: cleared by ADR 0086's recorded acknowledgment, unchanged.**
@@ -207,10 +235,14 @@ the authors half of its question is answered by the fact that ADR 0065's inverte
   - Fail class: `question_failed` (per question, with its findings), `steering_attempt`, `bids_failed_at_review`,
     `version_already_released` (a `dataset_versions` row exists for the version,
     or the tag `v<version>` exists and names a commit other than the reviewed head;
-    a tag naming the reviewed head is a harmless re-run), and `version_malformed` (not `X.Y.Z`).
+    a tag naming the reviewed head is a harmless re-run), `version_malformed` (not `X.Y.Z`),
+    and `stored_verdict_fail` (the stored review concluded `fail` and its report no longer shows why;
+    a person reads the review's record).
   - Unknown class: `review_not_started`, `review_running`, `review_did_not_report`, `review_limit_reached`,
     `review_could_not_run` (with the closed run-error word), `text_withheld`, `question_unknown`,
-    `bids_unconcluded_at_review`, `version_missing` (the orchestrator would publish its default `1.0.0`),
+    `bids_unconcluded_at_review`, `version_missing` (the orchestrator would publish its default `1.0.0`,
+    so the release row, the earlier anonymous release and the tag `v1.0.0` are looked up as for an explicit Version,
+    and only a Version that is malformed has no tag to look up),
     and `doi_state_unexpected` (the row carries a concept Digital Object Identifier (DOI)
     that no earlier anonymous release of this dataset reserved).
 - **Facts overrule the model, and can only lower it.**
@@ -218,13 +250,28 @@ the authors half of its question is answered by the fact that ADR 0065's inverte
   A missing README fails `complete_and_honest`; a missing `License` fails `authors_and_license`;
   a name under 25 characters fails `name_adequate`; a placeholder author on a named release fails `authors_and_license`;
   a summary that counts no recordings makes `complete_and_honest` at best `unknown`.
+  A fact that lowers an answer says so in a closed word and a shared sentence (`readme_absent`, `text_not_seen_in_full`, `no_recordings`,
+  `license_field_missing`, `name_too_short`, `placeholder_author`), shown in the detail view as `fact_notes`,
+  so a failure the model did not give is never worded as the reviewer's own.
   A report agrees with itself in the safe direction, as in ADR 0092:
-  a finding that names a steering attempt sets the flag, and a question passed with a blocker against it becomes `unknown`.
+  a finding that names a steering attempt sets the flag, and a question passed with a blocker against it becomes `unknown`;
+  a failed question keeps at least one finding to read, and parsing a stored report again gives the same report.
 - **The verdict is stored when decided and re-derived when used.**
   The queue, the detail view and the gate re-derive it from the stored report and the live facts
   (the request's state, its screen and acknowledgment, the `dataset_versions` rows, the concept DOI)
   and use the STRICTER of the two, so either can lower a verdict and neither can raise it (ADR 0093's rule).
-  A stored report that no longer parses reads as `review_could_not_run` unless the column says `fail`.
+  A stored report that no longer parses, or whose echoed commit or release kind differs from its row's,
+  reads as `review_could_not_run` (`report_invalid`), and as `stored_verdict_fail` as well when the column says `fail`.
+  Live facts (a release row, a tag, the concept DOI, an earlier anonymous release) are read only for a request that is `requested` or `blocked`:
+  a request that is `approving` has written its own version row and DOI, and a request that is over shows its stored review only.
+  A request that is not assessed (the review is off and no row exists, the request is over and has no row, a mirror or an exemplar)
+  has no outcome and no reasons on any surface.
+  A review that cannot be read says so and is never a pass: with the review on, a list row reads `unreadable` (action required, no reasons, one fixed headline)
+  and the detail view answers 500 with a fixed sentence; with the review off it reads as not assessed.
+  A cure that says to start a review is shown only for a request that is `requested`, because the start refuses any other;
+  for an `approving` or `blocked` request the same reason is worded without it, and the next command is the approval or none.
+  The evidence's tag rule: a Version that is malformed has the tag state `not_applicable` and every other Version has the tag state of the version the approval would publish.
+  A report stored under an earlier rule (a missing Version with `not_applicable`) would now read as `review_could_not_run`; none exists, because the review is dark.
 - **Every rendering of a review carries one standing line:** "Not assessed: whether the text names the depositors."
   ADR 0065 leaves README, Funding, Acknowledgements and EthicsApprovals to the depositor to scrub, and the model is not asked.
 - **Requests the submission gate exempts are not reviewed.**
@@ -237,8 +284,8 @@ the authors half of its question is answered by the fact that ADR 0065's inverte
 
 - **The chain is request, BIDS, screen, review, mail.**
   A request is recorded `requested` only after BIDS validation and the minimums pass;
-  the screen is dispatched then; when its result is stored (`storeScreenResult`) or an administrator's re-run reports,
-  the Worker starts the review for that head if section 2 allows it.
+  the screen is dispatched then; once the screen's callback has stored its result (`storeScreenResult`, in the callback route, which starts the review after the store and before the mail)
+  or an administrator's re-run reports, the Worker starts the review for that head if section 2 allows it.
 - **The admin email waits for the review, as it waits for the screen, and cannot be lost.**
   While the flag is on, ADR 0086's mail lease is taken only when the screen is not pending
   and no review of the screened head is `dispatched` and younger than the review deadline.
@@ -246,7 +293,17 @@ the authors half of its question is answered by the fact that ADR 0065's inverte
   Storing a review result tries the mail.
   A review that never reports is marked `unreported` by the watchdog, which mails it as such,
   and a late report re-arms the mail, as a late screen report does in `storeScreenResult`.
+  The mail reads the review at the deadline, which the other surfaces do not (section 7):
+  the lease frees a request's mail 30 minutes after the dispatch, and the mail it then sends says the review did not report,
+  whether or not the watchdog has marked the row, so a mail never says `running` about a review that is past its deadline
+  and is not mailed again;
+  a report that lands afterwards, on a row still `dispatched` or one the watchdog marked `unreported`, re-arms the mail.
+  An administrator's `start` after a mail has gone sends no second mail:
+  the administrator who started the review reads its result with `show`.
+  The depositor's resend of the reminder carries the same section, and while the mail is held for a review in flight
+  the resend does not mark the mail as sent, so the review's own mail still goes.
   The email gains one section, the review's headline and reasons in the shared words, with the next command.
+  It carries no model-written text: not the summary and not a finding's note, which only the detail view shows.
   The worst case is the screen's 50 minutes, plus the review's 30, plus one 30-minute tick; the expected case is minutes.
 - **A review starts again only from a new screen result, or by an administrator's `start`.**
   `start` restarts a row that was declined, errored, never reported, or is past its deadline,
@@ -272,22 +329,40 @@ the authors half of its question is answered by the fact that ADR 0065's inverte
 - **The reviewer.** `run-publication-review.yml` in `nemarDatasets/.github`,
   authored in this repository and deployed by whole-file copy,
   holds the only federated Anthropic identity for this review.
-  It follows `run-pr-review.yml` step for step:
-  mask the callback token first; validate every payload field; claim before anything is installed, minted or read;
-  check out `nemarOrg/nemar-cli` at `main` for the script;
+  It follows `run-pr-review.yml` with one deliberate reordering, and its steps run in this order:
+  mask the callback token; validate every payload field; claim before anything is installed, minted or read;
+  check the federation configuration;
   mint a read-only token (contents and actions: read) for ONE dataset repository;
-  fetch `main` as git data, shallow and blob-less, with `init` and `fetch` and never a checkout;
-  refuse as `stale_head` when the fetched `main` is not the dispatched head;
+  fetch `main` as git data, shallow and blob-less, with `init` and `fetch` and never a checkout,
+  handing the token to each git command for that command alone, never writing it into the clone and unsetting it from the step's environment afterwards,
+  prefetching in one batch exactly the blobs the script reads (the root documents and the sampled sidecars,
+  chosen from `git ls-tree -r -z` so that a path git would quote is still found, by the same rule as the reader),
+  because the model step holds no credential and cannot read lazily: the reader runs with lazy fetching off,
+  so a blob the prefetch missed reads as unreadable and never as a network fetch; the step then records the fetched commit;
+  read the BIDS validation runs of that commit (the one other step that holds the dataset token, because it needs it);
+  only THEN check out `nemarOrg/nemar-cli` at `main` for the script, set up the runtime, and install its dependencies
+  with `--frozen-lockfile --ignore-scripts`;
   mint the OpenID Connect token last;
-  give the model step the federated identity and the callback token, and no GitHub credential;
+  run the review, which gives the model step the federated identity and the callback token and no GitHub credential,
+  and whose script refuses as `stale_head`, before it calls the model, when the fetched commit is not the dispatched head;
   report a failure after the claim through a dependency-free `curl` step;
+  pin every third-party action to a full commit SHA;
   use one concurrency group per run; and print ids and fixed words only, because the log is public.
+  What the order closes: code planted before the mint, install-time scripts, and the dataset token sitting in a configuration file.
+  What it does not close: the pinned actions' own code; the callback token, which the dispatch payload carries in the event file that every step can read
+  (the model step needs it to post, as in the pull-request review); and the mint action's post step, which the dependency tree's runtime code in the model step could reach.
+  A two-job split that hands the clone over as an artifact was rejected, because the central repository's logs and artifacts are public and the clone is private dataset text.
+  The head is compared in the script, before the model call but after the checkout and the install that follow the fetch,
+  so a push to `main` in that gap still costs one model call; the approval's own head check (ADR 0086) still refuses a stale approval.
+  The prefetch downloads each selected blob whole, because a missing blob cannot be sized beforehand;
+  the reader's ceilings (4 MiB a document, 1 MiB a sidecar) apply after the download, and the job's 20-minute timeout is the only bound before it.
 - **Where it departs from the pull-request review.**
   There is no GitHub event: the Worker starts the review from the screen result, so the App needs no new subscription.
   There is no pull-request text and no fork: the job reads `main` at the screened commit.
-  Nothing is written to GitHub, so there is no republish pass.
-  The claim checks, in the same conditional update that claims, that the review is the newest of its request,
-  that the request is still `requested`, and that its screened head and flag are still the row's;
+  Nothing is written to a dataset repository, so there is no republish pass.
+  The claim checks, in the same conditional update that claims, that the request is still `requested`,
+  that its flag and screened head are still the row's, and that the screen's gate is still clear or acknowledge
+  (the unique key on the request, the head and the flag makes that row the review in force);
   a claim that cannot settle closes the attempt as `stale_head`, as in ADR 0092.
   The callback origin comes from the workflow's own table keyed by the environment's NAME, never from the payload.
   The token domain is `publication-review`;
@@ -297,30 +372,58 @@ the authors half of its question is answered by the fact that ADR 0065's inverte
   and its request's mail is tried.
   It runs whatever the flag says.
   The dev Worker never ages a row, so every surface reads a row dispatched longer ago than the deadline plus one tick
-  as `review_did_not_report`, as ADR 0093 does.
+  as `review_did_not_report`, as ADR 0093 does; the admin mail is the one exception and reads the deadline itself (section 6).
+  A result that arrives as the watchdog fires is never dropped:
+  the store, the re-block of a failed minimum and the mail re-arm are one atomic batch, and the two states a result may land on,
+  `dispatched` and `unreported`, are tried in that order (a row only moves from the first to the second).
 - **Caps.** A depositor's requests may cost 5 model calls in any 24 hours and the platform 50,
   counted from `attempts` after the insert so that concurrent starts cannot all slip under (ADR 0092's ranking).
-  Over a cap the row is `declined` (`review_limit_reached`).
-  An administrator's `start` is held by the platform's cap only.
+  `attempts` is one slot per attempt, and a restart of an attempt that reached a model adds one,
+  so nothing that happens to an attempt (a decline, a failed dispatch, the watchdog giving up) lowers what the calls before it cost.
+  An attempt counts when it is still `dispatched`, has reported, or took its claim and did not end in a word that says no model was reached;
+  one nobody claimed (the workflow undeployed, Actions down) held no model, because the claim precedes any model spend, and does not count.
+  Over a cap the row is `declined`, with the detail `depositor_limit` or `platform_limit`, both shown as `review_limit_reached`.
+  An administrator's `start` is held by the platform's cap only; the call still counts toward the depositor's tally,
+  because it costs the platform and bounds the depositor's own next request.
   There is no contributor tally and no override table:
   depositors are approved accounts (ADR 0040), publication requests are rare, and the cap is enough.
 - **The flag, and what it does not switch** (call 11, amended).
   `PUBLICATION_REVIEW_ENABLED = "1"` is set in `[env.dev.vars]` and absent from `[vars]` of `backend/wrangler-sccn.toml`,
   so production is dark, and turning it on is a reviewed change to that file.
-  The flag switches the model review and its gate, nothing else.
+  The flag switches the review: whether one is started, its gate, the admin mail's wait for it and its section,
+  and the hand-over from the advisory pre-screen (with the flag on, the pre-screen of ADR 0014 is not dispatched for a dataset the review applies to,
+  so the deploy that turns the review on is the one that stops it); it switches nothing else.
   The mechanical refusals ship unconditionally in Phase 2:
   a `blocked` request cannot be approved, and the ADR 0026 minimums refuse wherever they are evaluated, whatever the flag says.
   With the flag off, no review is started, the claim route refuses a new claim so that no model call is spent,
-  the result route still stores a result whose run was already claimed (the call was spent, and the record stays honest),
+  the result route still stores the result of a run that took its claim (the call was spent, and the record stays honest),
   the watchdog still closes rows, the mail does not wait for a review,
   and a stored review is shown as advice and gates nothing.
+  A report is stored only for a run that took its claim, whatever the flag says, because a report implies a model call
+  and the claim precedes any spend; an error word is recorded whether or not a claim was taken,
+  so that a failure before the claim (a payload the job could not validate, a fetch that failed) can be diagnosed.
+  A request that is not assessed (the review is off and no row exists, the request is over and has no row, a mirror or an exemplar)
+  has no outcome and no reasons on any surface, and is never shown as a pass or as action required.
+- **The administrator's start.** `POST /admin/publish/:id/review/start` is a thin adapter over the one start path a screen result also takes.
+  It accepts a bearer key, or a session cookie only from a NEMAR origin (the rule of `approve-dispatch`, because the call spends the platform's money).
+  It answers 202 when a review was handed over (`dispatched`, `redispatched`) or its run stands (`dispatch_claimed`),
+  409 with a closed code for a request that cannot be started as it stands (`review_disabled`, `not_applicable`, `not_owned_here`,
+  `request_not_requested`, `screen_not_ready`, `running`, `has_result`, `platform_limit`),
+  502 when the hand-over failed (`dispatch_failed`, `dispatch_unconfigured`), and 500 for a database fault.
+  It writes the audit row `publication_review_started` for a start that is going; a failed audit write is logged and never fails the start.
+  There is no route for `start --all`: that is a loop in the command-line interface (Phase 2).
 - **Environment fences.** The dev Worker starts reviews only for the datasets it owns (`isDevOwnedDatasetId`),
   and production never for those; each Worker answers only from its own D1.
   The review mails administrators only, under the production-only fence of `getAdminEmailsForCategory`,
-  and makes no write to `nemarDatasets`.
+  and makes no write to a dataset repository: the one call it makes to GitHub is the dispatch of the workflow to the central repository.
 - **Credentials.** The only credential minted is the one-shot callback token,
   an HMAC over the review id and a nonce, spent by the result;
   it grants nothing beyond posting that review's report, and joins no revocation list (AGENTS.md).
+- **Bounds, in one place.** A document is read up to 4 MiB (`DOCUMENT_BYTE_CEILING`) and a sidecar up to 1 MiB;
+  the model sees at most the caps of section 3 after normalization, a `participants.json` column's fields are cut at 100, 500 and 50 characters,
+  the job samples at most 64 data sidecars and reduces them to at most 8 distinct sampling rates and 8 distinct channel counts,
+  the watchdog takes at most 20 rows a tick, the job times out at 20 minutes, and the deadline for a report is 30.
+  A request's live facts are read only while it is `requested` or `blocked` (section 5).
 
 ### 8. What the administrator sees and may do
 
@@ -358,10 +461,11 @@ the authors half of its question is answered by the fact that ADR 0065's inverte
   This differs from ADR 0093 on purpose: there an uncertain or missing review only asks for confirmation,
   and here every non-pass needs the force path, because the act that follows publishes a DOI.
 - **The web page shows the same words.**
-  The Worker serves the review rendered by `describePublicationReview` beside `identifier_screen`
-  in `GET /admin/publish/requests`, so the page renders the server's sentences.
-  The small fixed vocabulary the page needs to decide by itself is declared once in `shared/contract/publication-review-copy.ts`,
-  transcribed into `nemarOrg/website` and pinned by a drift test on each side (ADR 0045's pattern).
+  The list route carries each request's review as a summary (a headline, a tone, the closed reason codes and ids), not as sentences;
+  the sentences, the cures and the next command come from `GET /admin/publish/:id/review`, which renders `describePublicationReview`.
+  So the page either fetches that detail for the request being decided or renders the reasons from the shared words,
+  transcribed into `nemarOrg/website` and pinned by a drift test on each side (ADR 0045's pattern); Phase 4 chooses and records which.
+  The small fixed vocabulary the page needs to decide by itself is declared once in `shared/contract/publication-review-copy.ts` (Phase 4).
   A non-pass needs the same explicit confirmation on the page,
   sent as the review id and the reasons shown in `approve-dispatch`'s body.
 - **The Worker is the gate; the command-line tool explains.**
@@ -446,7 +550,7 @@ and each has a closed word and a sentence in the shared module.
 | The model is unavailable, refuses, runs out of room, or returns nothing usable | `errored` / `model_*` | `review_could_not_run` |
 | The report fails the parser | `errored` / `report_invalid` | `review_could_not_run` |
 | The job fails after the claim | `errored` / `workflow_failed` | `review_could_not_run` |
-| A cap is reached | `declined` / `review_limit_reached` | `review_limit_reached`; `start` |
+| A cap is reached | `declined` / `depositor_limit` or `platform_limit` | `review_limit_reached`; `start` |
 | The gate cannot read a live fact | nothing stored | a refusal that names the fact, and says to try again |
 
 ## Consequences

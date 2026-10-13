@@ -38,10 +38,17 @@ import {
   RESET_SCREEN_COLUMNS_SQL,
   type ScreenView,
   mailPublicationRequest,
+  reviewHoldSql,
   screenEmailSection,
   screenView,
   startScreenAndNotify,
 } from "../../services/identifier-screen";
+import { ownedHere } from "../../services/pr-review-queue";
+import {
+  publicationReviewApplies,
+  publicationReviewEmailSection,
+  reviewEnabled,
+} from "../../services/publication-review-view";
 import { mirrorReconcileRemovals, resolveRepoCollaborators } from "../../services/repo-spec";
 import { markDatasetPrivate, markDatasetPublic } from "../../services/s3";
 import { checkSubmissionGate } from "../../services/submission-gate";
@@ -546,11 +553,25 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
     // the request is already 'requested', so a dispatch failure must not 500
     // the call -- we log it and leave the row as a normal pending request.
     // The verdict arrives later at /webhooks/prescreen-result.
+    //
+    // ADR 0102 retires this advisory check in favour of the publication review, and the two
+    // must not both read the README: with the review on (exactly the word `1`) the pre-screen
+    // is not dispatched for a request the review will run for, so the deploy that turns the
+    // review on is the one that stops it, with no gap and no overlap. "Will run for" is what
+    // the start of a review asks (`startPublicationReview`): the flag, a dataset the review
+    // applies to (not an OpenNeuro mirror or an exemplar) and one this Worker owns. A request
+    // outside that gets no review, so it keeps the pre-screen exactly as before. Only the
+    // dispatch is conditioned. The pre-screen's callback route, its columns and
+    // PRESCREEN_CALLBACK_SECRET (which also signs the identifier screen's, the sweep's and the
+    // pull-request review's tokens) all stay.
+    const reviewWillRun =
+      reviewEnabled(c.env) && publicationReviewApplies(dataset) && ownedHere(c.env, datasetId);
     if (
       prId !== null &&
       repoName &&
       pat &&
       c.env.PRESCREEN_ENABLED === "true" &&
+      !reviewWillRun &&
       c.env.PRESCREEN_CALLBACK_SECRET
     ) {
       try {
@@ -884,7 +905,14 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
 
     // Resend notification to admins who have publication_request notifications
     // enabled, with the screen section as stored: a request that predates the
-    // screen says "NOT RUN for this request", never nothing.
+    // screen says "NOT RUN for this request", never nothing. The review's section
+    // is the one the screen callback and the watchdog build (ADR 0102), so the
+    // reminder never says less about the review than the mail it reminds of.
+    // ONE instant, in whole seconds, decides what that section says about a review
+    // in flight and whether the reminder counts as the mail below: a review that
+    // crossed its deadline between the two would otherwise be called running in
+    // the reminder and not in flight at the stamp, and its own mail skipped.
+    const reviewAtMs = Math.floor(Date.now() / 1000) * 1000;
     try {
       const outcome = await mailPublicationRequest(c.env, {
         datasetId,
@@ -895,13 +923,19 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
           request.identifier_screen_status,
           request.identifier_screen_report,
         ),
+        review: await publicationReviewEmailSection(c.env, request.id, reviewAtMs),
       });
       if (outcome.delivered > 0 && request.identifier_screen_status !== null) {
         // A result whose first mail was lost has now reached an admin, so the
-        // watchdog must not send it a third time.
+        // watchdog must not send it a third time. Not while the mail is held for
+        // a review in flight: the reminder then said the review is running, the
+        // mail that carries its verdict has not gone, and stamping it here would
+        // stop that mail for good (the lease takes only an unstamped request).
         await db
           .prepare(
-            "UPDATE publication_requests SET identifier_screen_emailed_at = COALESCE(identifier_screen_emailed_at, datetime('now')) WHERE id = ?",
+            `UPDATE publication_requests
+                SET identifier_screen_emailed_at = COALESCE(identifier_screen_emailed_at, datetime('now'))
+              WHERE id = ?${reviewHoldSql(reviewEnabled(c.env), reviewAtMs)}`,
           )
           .bind(request.id)
           .run();
