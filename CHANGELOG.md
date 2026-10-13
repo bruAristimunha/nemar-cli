@@ -19,10 +19,11 @@ The website's server-side requests are counted per visitor instead of as one cli
 the fix for the `/discover` 429 errors (#1709), together with a rate limiter whose windows no
 longer slide, a modality filter that matches a whole token, a corrected check before an
 administrator approves a pull request, and a weekly drift check that can finally file its
-issue. The automated review of dataset pull requests stays off in production, as in 0.10.16.
-There is no migration and no new secret. The `/discover` fix needs a second deploy to take
-effect for visitors: the website must be promoted to production after this release (see Deploy
-coupling).
+issue. The automated review of dataset pull requests stays off in production, as in 0.10.16;
+its first live run passed on dev on 2026-10-12, with a throwaway pull request to an exemplar
+dataset. There is no migration and no new secret. Counting per visitor needs a second deploy: the
+website must be promoted to production after this release (see Deploy coupling), while the
+fixed windows and the higher cap help the shared pool at once.
 
 ### Changed
 
@@ -44,7 +45,10 @@ coupling).
   whatever the cap; that is most of the 40 percent in #1709. The record now carries the window's
   end, a block ends where the window does, `Retry-After` is the seconds left and
   `X-RateLimit-Reset` is the window's end. One read, write and refuse path serves every bucket,
-  including the data-plane miss budget, the private-grant budget and the observe-only path.
+  including the data-plane miss budget, the private-grant budget and the observe-only path. A
+  fixed window can admit up to twice a cap across a boundary, so the strict sign-in bucket can
+  pass up to 20 requests across a boundary instead of 10; ADR 0099 accepts that, because the
+  sign-in routes also limit per email.
 - **Every answer says how the caller was identified, and browsers can read the headers (ADR
   0098).** `X-RateLimit-Caller` is `edge`, `site` or `unattributed` on every answer, including
   the admin-bypass answer and the private-grant refusal; `X-RateLimit-Bucket` values are
@@ -75,8 +79,8 @@ coupling).
   and the development bypass are unchanged. To be honest about the number: a default Discover
   page costs 11 API calls (about 180 views per window) and the largest page the website can
   render costs about 101 (about 19 views), so capping what one page hydrates is the website's
-  to decide. **Nothing changes for the website's visitors until the website is promoted to
-  production.**
+  to decide. **Per-visitor counting waits for the website's promotion to production;** the fixed
+  windows and the 1000 cap apply to the shared pool as soon as this Worker is released.
 - **A stalled Cache API can no longer hang a request, and a failed cache write no longer demotes
   an admin (ADR 0098).** Every wait on the cache is bounded at 500 ms and fails open, including
   deferred writes and body reads. An admin the database had just confirmed keeps the admin
@@ -93,9 +97,11 @@ coupling).
   the step after the third failure instead of reading an error as "no issue", which would have
   filed a duplicate every Monday. A lookup also keeps only an issue whose title starts with its
   own prefix, so the probe-broken and report-broken issues are no longer taken for the drift
-  issue. The first run after the fix files the first drift issue; the report on 2026-10-12
-  listed 96 of 1303 versions with no `summary.json`. **This takes effect when it reaches
-  `main`:** scheduled workflows run from the default branch, and this change targets `dev`.
+  issue. The backfill of 2026-10-12 cleared the 96 of 1303 versions that had no `summary.json`,
+  so the first corrected run is expected to file nothing; dispatch the workflow once from
+  `main` after the release to confirm that the job runs green. **This takes effect when it
+  reaches `main`:** scheduled workflows run from the default branch, and this change targets
+  `dev`.
 - **The nightly dev-suite issue no longer files a duplicate when its lookup fails.** The same
   `|| true` pattern read a failed lookup as "no open issue", and the label step hid a real
   failure behind "already exists". The lookup is now retried three times and fails the step if
@@ -121,6 +127,10 @@ coupling).
   still substring filters. Adjacent fix: `GET /datasets/search` now sends `Cache-Control:
   no-store` on every response; it sent no `Cache-Control` at all, including on its 400s, which
   `GET /datasets` already sent as `no-store`. No migration and no deploy coupling.
+  The CLI help, the MCP schema text and the OpenAPI description for `modality` say so too.
+  To match both EEG and intracranial datasets, pass `eeg,ieeg`. An empty `modality=` is still no
+  filter. A `modality` value of 49 or more characters used to return 500, because of D1's 50-byte
+  `LIKE` pattern limit, and now matches nothing.
 - **`nemar admin pr-reviews approve --merge` and `y` in `next` no longer approve a pull request
   they then refuse to merge (ADR 0093 amendment).** Both approved first and read GitHub's
   `mergeable_state` afterwards, and `y` was offered for every state but `dirty` and `behind`, so a
@@ -163,18 +173,32 @@ coupling).
 
 - No migration, no new Worker secret or variable, and the automated pull-request review stays
   off in production. The keyed log pseudonym derives from the existing `ENCRYPTION_KEY`.
-- **Release the Worker first, then promote the website.** Until the website calls through the
-  service binding with `X-Forwarded-For` (nemarOrg/website, merged to `staging`), its
-  visitors keep arriving from shared addresses and the `/discover` errors continue to depend on
-  the 1000 cap and the fixed windows alone. Releasing the website first would send binding calls
-  to a Worker that would count them as unattributed.
-- After the website is in production: two calls for one visitor should read
-  `X-RateLimit-Bucket: site-ip` with `X-RateLimit-Remaining` at 1999 then 1998 and a second
-  visitor should start at 1999. The `[rate-limit] counting a request without CF-Connecting-IP by
+- **Release the Worker first, then promote the website,** so the first binding calls are counted
+  in `site-ip` and the keying can be checked. Until the website calls through the service binding
+  with `X-Forwarded-For` (nemarOrg/website, merged to `staging`), its visitors keep arriving from
+  shared addresses and the `/discover` errors depend on the 1000 cap and the fixed windows
+  alone. The order is not a safety gate: 0.10.16 counts a binding call by its raw
+  `X-Forwarded-For` in the old `ip` bucket (cap 500, sliding), per visitor, so promoting the
+  website first would be safe and only the website's own first-call check would warn.
+- The keying cannot be read from the website's logs or from a browser: the website logs
+  `remaining` once per bucket kind per isolate, and its proxy forwards no rate-limit headers. To
+  check it before promoting the website, make calls for one visitor and one other from a
+  throwaway Worker bound to `nemar-api` through a service binding (`X-Forwarded-For` set to
+  reserved documentation addresses such as `203.0.113.201` and `203.0.113.202`), delete the
+  Worker afterwards, and expect `X-RateLimit-Bucket: site-ip` and `X-RateLimit-Caller: site`, a
+  first `X-RateLimit-Remaining` of 1999 that falls overall across six or more calls a second or
+  two apart (the count is kept per data center, so an occasional repeat or small rise is
+  normal), and the other visitor starting at 1999. The `[rate-limit] counting a request without CF-Connecting-IP by
   its forwarded visitor` line should appear and no "request with neither" warning. #1712 (demote
   that line) stays open until this has been observed.
 - The weekly summary.json drift check runs from `main`, so its first corrected run is the Monday
-  after this release.
+  after this release. Dispatch it once from `main` after the release; it should run green and
+  file nothing, because production coverage is 1303 of 1303.
+- Check the fixed windows after deploy: `Retry-After` counts down within a window and
+  `X-RateLimit-Reset` stays fixed until the window ends (the check ADR 0099 relies on).
+- The CLI command reference on docs.nemar.org is regenerated for 0.10.17 afterwards: the
+  `--merge` help of `admin pr-reviews approve` and the `--modality` help of `dataset list` and
+  `search` changed.
 - Watch how often the `[rate-limit] the cache keeps stalling` line appears after deploy; the
   breaker's three constants are the knob, and production stall rates are unknown.
 
