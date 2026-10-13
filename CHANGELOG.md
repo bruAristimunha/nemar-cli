@@ -84,6 +84,26 @@ earlier releases are described only by their generated notes.
   repository whose protection required an approving review would read `blocked` before the approval
   and is now refused; neither the ruleset applied to published datasets nor the classic protection on
   the four legacy repositories requires one.
+- **A Cache API that keeps stalling no longer costs every API request half a second (#1715,
+  ADR 0098 amendment).** Every rate-limiter wait on the cache was bounded at 500 ms with no
+  memory, so while the cache stayed stalled each request paid the bound in each place it used
+  the cache, the website's server-side renders included. Each Worker isolate now keeps a small
+  breaker: three stalls within 60 seconds open it, an open breaker skips the cache at once for
+  10 seconds, and then one probe closes it when the cache answers. Fail-open is unchanged: a
+  skipped call is treated as a stalled one was, the request is served and not counted, and
+  nothing is ever refused because of it. Counting can stay off on an isolate for up to 10
+  seconds after the cache recovers. Skips are logged in the existing fault line as
+  `CacheSkippedError`, and opening and closing each have a rate-limited line. No migration and
+  no deploy coupling.
+- **The rate limiter's observe-only warning no longer logs a reversible hash of the caller's
+  address (#1713, ADR 0098 amendment).** Its `ipHash` field was a plain SHA-256 of the address
+  (or of `site:<address>`), which anyone can reverse for an IPv4 address by trying every
+  address. It is now an HMAC-SHA-256 under a key derived from the existing `ENCRYPTION_KEY`
+  secret with HKDF, so it still tells one caller from another but a reader of the log cannot
+  recover the address. A Worker without `ENCRYPTION_KEY` leaves the field out. The field keeps
+  its name; its values change, so a pseudonym logged before this release does not match one
+  logged after. No new secret, no migration and no deploy coupling. The same unkeyed hash is
+  still stored with sessions and the device sign-in audit; that is tracked in #1733.
 
 ## 0.10.16 - 2026-10-11
 

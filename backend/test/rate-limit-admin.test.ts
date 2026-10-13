@@ -119,6 +119,35 @@ describe("a token the database says is an admin", () => {
     expect(await h.storedAdminFlag(await hashApiKey(ADMIN_KEY))).toEqual({ admin: true });
   });
 
+  test("a member's token is not an admin: counted in the token bucket, and remembered as not one", async () => {
+    // The other half of the role check. Without it, a regression that made every
+    // token an admin would take the token bucket away from everyone and fail nothing.
+    db.run(
+      `INSERT INTO users (username, email, password_hash, status, role, email_verified, service_access, sandbox_completed)
+       VALUES ('rl-member', 'rl-member@example.org', 'x', 'approved', 'member', 1, 1, 1)`,
+    );
+    const member = db
+      .query<{ id: number }, []>("SELECT id FROM users WHERE username='rl-member'")
+      .get();
+    if (!member) throw new Error("seed failed");
+    db.query("INSERT INTO tokens (user_id, api_key_hash, api_key_prefix) VALUES (?, ?, ?)").run(
+      member.id,
+      await hashApiKey(MEMBER_KEY),
+      MEMBER_KEY.slice(0, 8),
+    );
+    const res = await hit(
+      buildApp(),
+      { ...edge("203.0.113.16"), ...bearer(MEMBER_KEY) },
+      "/admin/users",
+      env,
+    );
+    expect(res.headers.get("X-RateLimit-Bucket")).toBe("token");
+    expect(res.headers.get("X-RateLimit-Remaining")).toBe(
+      String(__limits.TOKEN_MAX_REQUESTS_AUTHED - 1),
+    );
+    expect(await h.storedAdminFlag(await hashApiKey(MEMBER_KEY))).toEqual({ admin: false });
+  });
+
   test("stays an admin when only the cache write fails", async () => {
     class PutFails extends InMemoryCache {
       async put(): Promise<void> {

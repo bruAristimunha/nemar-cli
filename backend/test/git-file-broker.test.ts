@@ -38,7 +38,7 @@ import type { Database } from "bun:sqlite";
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import type { Server } from "bun";
 import { Hono } from "hono";
-import { __limits } from "../src/middleware/rateLimit";
+import { __limits, __resetCacheBreakerForTests } from "../src/middleware/rateLimit";
 import { dataRoutes } from "../src/routes/data";
 import { gitFileCacheKey } from "../src/services/git-file-cache";
 import { fetchGitTrackedFile } from "../src/services/github/git-file-broker";
@@ -777,6 +777,10 @@ describe("the route: the gate, then the bytes", () => {
 
     afterEach(() => {
       (globalThis as { caches?: unknown }).caches = originalCaches;
+      // The stalled caches below make the miss budget's writes stall, and the
+      // limiter remembers stalls per process (its breaker, #1715): forget them, so
+      // they cannot add up with another file's and switch its counting off.
+      __resetCacheBreakerForTests();
     });
 
     function install(cache: unknown): void {

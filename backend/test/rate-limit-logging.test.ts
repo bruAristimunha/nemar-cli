@@ -17,6 +17,7 @@ import {
 import type { Bindings } from "../src/types/bindings";
 import { InMemoryCache } from "./helpers/cache";
 import {
+  PROD_ENV,
   T0,
   buildApp,
   edge,
@@ -435,21 +436,22 @@ describe("a fault line says where the work failed", () => {
   });
 
   test("the limiter's own logic is a different phase, so a bug there is not mistaken for the cache", async () => {
-    // The observe-only warning hashes the key before it logs; a platform that cannot
-    // hash makes the limiter itself fail after the cache answered.
+    // The observe-only warning signs a pseudonym of the key before it logs (#1713); a
+    // platform that cannot sign makes the limiter itself fail after the cache answered.
     await h.seed(`ip:${ADDRESS}`, {
       count: __limits.MAX_REQUESTS,
       warned: false,
       windowEnd: T0 + 30_000,
     });
-    const digest = spyOn(crypto.subtle, "digest").mockImplementation(() => {
-      throw new TypeError("digest is unavailable");
+    const sign = spyOn(crypto.subtle, "sign").mockImplementation(() => {
+      throw new TypeError("sign is unavailable");
     });
     try {
-      const res = await hit(buildApp({ observeOnly: true }), edge(ADDRESS));
+      const keyed = { ...PROD_ENV, ENCRYPTION_KEY: "rate-limit-logging-test-key" } as Bindings;
+      const res = await hit(buildApp({ observeOnly: true }), edge(ADDRESS), "/datasets", keyed);
       expect(res.status).toBe(200);
     } finally {
-      digest.mockRestore();
+      sign.mockRestore();
     }
     // It is the limiter failing, not the cache, and the line says so.
     const limiterFaults = h.error.mock.calls.filter((c) => c[0] === "[rate-limit] limiter fault");

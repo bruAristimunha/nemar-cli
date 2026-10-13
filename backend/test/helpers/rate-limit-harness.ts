@@ -1,8 +1,10 @@
 // What every rate limiter suite that drives the REAL limiter through a real Hono
 // app needs, in one place (#1709): the working in-memory Cache double installed as
-// `caches.default`, one controllable clock that the limiter and the cache both read
-// (`Date.now`, held by a spy; it is the only thing replaced), quiet console spies
-// whose calls the log tests read, and an app with a route for every bucket.
+// `caches.default` (one a test can make stall, #1715), one controllable clock that
+// the limiter and the cache both read (`Date.now`, held by a spy; it is the only
+// thing replaced), quiet console spies whose calls the log tests read, and an app
+// with a route for every bucket. The limiter's module-level state (its log slots and
+// its cache-stall breaker) is cleared before and after every test.
 //
 // Call `useRateLimitHarness()` once at the top level of a test file. It registers
 // its own `beforeEach` and `afterEach`, and hands back a view onto the current
@@ -12,6 +14,7 @@ import { afterEach, beforeEach, spyOn } from "bun:test";
 import { Hono } from "hono";
 import {
   type RateLimiterOptions,
+  __resetCacheBreakerForTests,
   __resetRateLimitLogsForTests,
   rateLimiter,
 } from "../../src/middleware/rateLimit";
@@ -19,6 +22,33 @@ import type { Bindings, Variables } from "../../src/types/bindings";
 import { InMemoryCache } from "./cache";
 
 export type AppEnv = { Bindings: Bindings; Variables: Variables };
+
+/**
+ * The harness's cache: the working `InMemoryCache`, which a test can make stall. While
+ * `stalled` is true, `match` and `put` never settle, the way a Cache API that has
+ * stopped answering behaves; while `putsStall` is true only `put` does. The limiter's
+ * 500 ms bound and its breaker are what end the wait. `calls` counts the calls that
+ * reached the cache, so a test can tell a call the breaker skipped from one it made.
+ * Not a stand-in for business logic: the platform failing is the one thing a test
+ * cannot get from the real runtime.
+ */
+export class ControllableCache extends InMemoryCache {
+  stalled = false;
+  putsStall = false;
+  calls = 0;
+
+  match(request: RequestInfo | URL): Promise<Response | undefined> {
+    this.calls++;
+    return this.stalled ? new Promise<never>(() => {}) : super.match(request);
+  }
+
+  put(request: RequestInfo | URL, response: Response): Promise<void> {
+    this.calls++;
+    return this.stalled || this.putsStall
+      ? new Promise<never>(() => {})
+      : super.put(request, response);
+  }
+}
 
 /** A whole second, so epoch-second arithmetic in a test is exact. */
 export const T0 = 1_800_000_000_000;
@@ -65,7 +95,7 @@ export const viaBinding = (visitor: string): Record<string, string> => ({
 
 export interface RateLimitHarness {
   /** The cache installed for the current test. */
-  readonly cache: InMemoryCache;
+  readonly cache: ControllableCache;
   /** The current time, in epoch milliseconds, for the limiter and the cache alike. */
   clock: number;
   readonly log: ReturnType<typeof spyOn>;
@@ -82,7 +112,7 @@ export interface RateLimitHarness {
 }
 
 export function useRateLimitHarness(): RateLimitHarness {
-  let cache = new InMemoryCache();
+  let cache = new ControllableCache();
   let clock = T0;
   let originalCaches: unknown;
   let nowSpy: ReturnType<typeof spyOn>;
@@ -96,10 +126,11 @@ export function useRateLimitHarness(): RateLimitHarness {
     logSpy = spyOn(console, "log").mockImplementation(() => {});
     warnSpy = spyOn(console, "warn").mockImplementation(() => {});
     errorSpy = spyOn(console, "error").mockImplementation(() => {});
-    cache = new InMemoryCache();
+    cache = new ControllableCache();
     originalCaches = (globalThis as { caches?: unknown }).caches;
     (globalThis as { caches?: unknown }).caches = { default: cache };
     __resetRateLimitLogsForTests();
+    __resetCacheBreakerForTests();
   });
 
   afterEach(() => {
@@ -109,8 +140,10 @@ export function useRateLimitHarness(): RateLimitHarness {
     errorSpy.mockRestore();
     (globalThis as { caches?: unknown }).caches = originalCaches;
     // The held clock is in the future: a slot left behind would silence the real
-    // clock's logs for any later file in this process.
+    // clock's logs for any later file in this process, and a breaker left open
+    // would skip its cache.
     __resetRateLimitLogsForTests();
+    __resetCacheBreakerForTests();
   });
 
   return {

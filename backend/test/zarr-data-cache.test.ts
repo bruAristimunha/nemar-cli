@@ -58,6 +58,7 @@ import {
   s3PublicUrl,
 } from "../src/routes/zarr-data";
 import { ZARR_DATASET_DOCUMENTS, zarrPurgeTargets } from "../src/services/cloudflare";
+import { hashIp } from "../src/services/web-session";
 import type { Bindings } from "../src/types/bindings";
 import { InMemoryCache, keyFor } from "./helpers/cache";
 import { freshDb, realD1 } from "./helpers/d1";
@@ -1929,7 +1930,13 @@ describe("rate limiter exemption for redirect candidates (#1181 phase 6 / issue 
   // non-bypassed code path. Computed lazily (per call, not per describe) so
   // it always reads the CURRENT `db` the outer beforeEach just rebuilt.
   function rlEnv(): Bindings {
-    return { ...testEnv(), ENVIRONMENT: "production" } as Bindings;
+    // ENCRYPTION_KEY keys the observe-only warning's caller pseudonym (#1713); a test
+    // value, so the line carries one.
+    return {
+      ...testEnv(),
+      ENVIRONMENT: "production",
+      ENCRYPTION_KEY: "zarr-data-cache-test-key",
+    } as Bindings;
   }
 
   test("a redirect candidate counts toward the shared data-ip bucket, but never 429s (observe-only, #1181 phase 6 review item 5)", async () => {
@@ -2010,9 +2017,11 @@ describe("rate limiter exemption for redirect candidates (#1181 phase 6 / issue 
       expect(payload.path).toBe(CHUNK_PATH);
       // The logged count is post-increment (this request's own hit included).
       expect(payload.count).toBe(__limits.DATA_MAX_REQUESTS + 1);
-      // Hashed, not the raw client IP, in the log line.
+      // A keyed pseudonym in the log line: not the raw client IP, and not its plain
+      // SHA-256, which anyone can reverse for an IPv4 address (#1713).
+      expect(payload.ipHash).toMatch(/^[0-9a-f]{64}$/);
       expect(payload.ipHash).not.toBe(ip);
-      expect(typeof payload.ipHash).toBe("string");
+      expect(payload.ipHash).not.toBe(await hashIp(ip));
 
       // A third, still-over-cap redirect in the SAME window does not warn
       // again -- "never per request".

@@ -47,8 +47,8 @@
 import type { Context, Next } from "hono";
 import { isInternalRequest } from "../lib/internal-request";
 import { ACTIVE_ACCOUNT_STATUS_SQL_LIST } from "../services/account-tier";
+import { logPseudonym } from "../services/log-pseudonym";
 import { hashApiKey } from "../services/token";
-import { hashIp } from "../services/web-session";
 import type { Bindings, Variables } from "../types/bindings";
 
 // Rate limit configuration
@@ -153,7 +153,9 @@ const TOKEN_MAX_REQUESTS_AUTHED = 1000;
 
 /** The longest the limiter waits for the Cache API on any one call, and for a
  *  data-plane write handed no `waitUntil`. A healthy call settles in
- *  milliseconds, so the bound is only ever felt when the cache has stalled. */
+ *  milliseconds, so the bound is only ever felt when the cache has stalled, and
+ *  the stall breaker (`cacheCall`) stops it being felt on every request while the
+ *  stall lasts. */
 const RATE_LIMIT_WRITE_STALL_MS = 500;
 
 const WINDOW_MS = WINDOW_SIZE * 1000;
@@ -243,6 +245,7 @@ const FAULT_CLASSES: ReadonlySet<string> = new Set([
   "AbortError",
   "TimeoutError",
   "CacheStallError",
+  "CacheSkippedError",
 ]);
 
 /** The part of a fault log key that is the error: its class when it is one we tell
@@ -276,6 +279,169 @@ function boundedWait<T>(work: Promise<T>, what: string): Promise<T> {
     timer = setTimeout(() => reject(new CacheStallError(what)), RATE_LIMIT_WRITE_STALL_MS);
   });
   return Promise.race([work, stalled]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * The cache-stall breaker (#1715): a small memory, per isolate, of the Cache API
+ * stalling, so a stall that lasts costs each isolate a few bounded waits rather than
+ * one on every request.
+ *
+ * The 500 ms bound above is per call and remembers nothing, so while the cache stays
+ * stalled every request pays it in each place it uses the cache (ADR 0098): about
+ * half a second on every website render through `site-ip`, a second on a token
+ * request. With the breaker:
+ *
+ *  - Closed (the normal state): every call is made and bounded as above. A healthy
+ *    call adds two clock reads, a comparison or two, a closure and an async frame,
+ *    and never a wait: about 0.2 microseconds a request, measured in process (Bun,
+ *    the in-memory test cache, 40,000 sequential requests, 4.4 before and 4.6 after).
+ *  - It opens after {@link BREAKER_STALLS_TO_OPEN} stalls within
+ *    {@link BREAKER_STALL_WINDOW_MS}. Only a {@link CacheStallError} counts: a call that
+ *    fails fast cost no time, and is the fault line's business, not the breaker's.
+ *  - Open: every limiter call to the Cache API is skipped at once with a
+ *    {@link CacheSkippedError}, for {@link BREAKER_COOL_DOWN_MS}. Nothing extends the
+ *    cool-down but a probe that stalls, so traffic cannot hold it open.
+ *  - After the cool-down the first call is the probe and is made; the calls behind
+ *    it keep skipping until it answers. A probe that answers, with a value or with a
+ *    fast error, closes the breaker and forgets the stalls; one that stalls opens it
+ *    for another cool-down. A probe that never reports is replaced after one
+ *    cool-down, so a lost probe cannot hold the breaker open either.
+ *
+ * Fail-open is unchanged. A skipped call is treated exactly as a stalled one has
+ * always been, without the wait: the request is served and not counted, with the
+ * headers a stalled call would have left it; the admin-flag lookup answers "not an
+ * admin"; the miss and private-grant budgets allow. The breaker never refuses a
+ * request and never counts one. The limiter is a fairness guard, and a
+ * cache that keeps stalling had already switched counting off: the breaker only
+ * stops each request waiting to find that out. The cost is that counting stays off
+ * on an isolate for up to one cool-down after the cache has recovered.
+ *
+ * The state is one record per isolate, at most {@link BREAKER_STALLS_TO_OPEN}
+ * timestamps and an end time, never per caller or per bucket: a stall is a property
+ * of the platform, and a stall met through one visitor's bucket is the same stall for
+ * every other. An isolate's requests share it, and since every read and write of it
+ * is synchronous, no two requests interleave inside an update. An isolate can be
+ * evicted at any moment; a new one starts closed and pays its own stalls before it
+ * opens, so the cost of a long stall is bounded per isolate (three waits to open, then
+ * one probe per cool-down), not per request. Isolates and data centers do not share
+ * it, as they do not share the counters. A Worker's clock moves only at I/O, and the
+ * breaker reads it as a call starts and as it settles, both after I/O, so a stall's
+ * 500 ms is visible to it.
+ *
+ * Every transition is logged through `logOncePerWindow`, so a flapping cache costs a
+ * few lines a window, not a line a cycle, and every skipped call is counted in the
+ * fault line of its bucket kind (`error: "CacheSkippedError"`, with `suppressed`).
+ */
+const BREAKER_STALLS_TO_OPEN = 3;
+/** A stall older than this no longer counts toward opening: one rate-limit window. */
+const BREAKER_STALL_WINDOW_MS = WINDOW_MS;
+/** How long an open breaker skips the cache before it lets a probe through. */
+const BREAKER_COOL_DOWN_MS = 10_000;
+
+interface CacheBreaker {
+  /** When the most recent stalls ended, oldest first; never more than BREAKER_STALLS_TO_OPEN. */
+  stalls: number[];
+  /** Calls are skipped while the clock is before this; 0 means closed. */
+  openUntil: number;
+}
+
+/** Module-level so it persists across requests in a warm isolate. */
+const breaker: CacheBreaker = { stalls: [], openUntil: 0 };
+
+/** The breaker was open, so the call was not made. Reported like any cache fault. */
+class CacheSkippedError extends Error {
+  constructor(what: string) {
+    super(`cache ${what} skipped: the cache stalled repeatedly and is not being waited on`);
+    this.name = "CacheSkippedError";
+  }
+}
+
+/** How a call was let through: `closed` normally, `probe` as the one call an open
+ *  breaker lets through after its cool-down. Null means skip it. */
+type BreakerRole = "closed" | "probe";
+
+function admitCacheCall(now: number): BreakerRole | null {
+  if (breaker.openUntil === 0) return "closed";
+  // A clock that went backwards must not hold the breaker open for longer than one
+  // cool-down, so an end further away than that is treated as passed.
+  if (now < breaker.openUntil && breaker.openUntil - now <= BREAKER_COOL_DOWN_MS) return null;
+  // The cool-down is over and this call is the probe. The calls behind it keep
+  // skipping until it reports, or for one more cool-down if it never does.
+  breaker.openUntil = now + BREAKER_COOL_DOWN_MS;
+  return "probe";
+}
+
+function openBreaker(now: number, trigger: "stalls" | "probe"): void {
+  breaker.openUntil = now + BREAKER_COOL_DOWN_MS;
+  logOncePerWindow("breaker:open", (suppressed, sinceMs) => {
+    console.error("[rate-limit] the cache keeps stalling; skipping it and failing open", {
+      trigger,
+      stallsToOpen: BREAKER_STALLS_TO_OPEN,
+      coolDownMs: BREAKER_COOL_DOWN_MS,
+      suppressed,
+      sinceMs,
+    });
+  });
+}
+
+function recordCacheOutcome(role: BreakerRole, stalled: boolean, now: number): void {
+  if (role === "probe") {
+    if (stalled) {
+      openBreaker(now, "probe");
+      return;
+    }
+    breaker.openUntil = 0;
+    breaker.stalls = [];
+    logOncePerWindow("breaker:close", (suppressed, sinceMs) => {
+      console.log("[rate-limit] the cache answered again; no longer skipping it", {
+        suppressed,
+        sinceMs,
+      });
+    });
+    return;
+  }
+  if (!stalled) return;
+  breaker.stalls.push(now);
+  if (breaker.stalls.length > BREAKER_STALLS_TO_OPEN) breaker.stalls.shift();
+  // Already open (a call made before it opened, settling late): a late stall is no
+  // reason to keep it open longer.
+  if (breaker.openUntil !== 0) return;
+  const oldest = breaker.stalls[0] as number;
+  if (breaker.stalls.length === BREAKER_STALLS_TO_OPEN && now - oldest < BREAKER_STALL_WINDOW_MS) {
+    openBreaker(now, "stalls");
+  }
+}
+
+/**
+ * Every call the limiter makes to the Cache API: through the breaker, then bounded
+ * by {@link boundedWait}. `start` makes the call only once the breaker has let it
+ * through, so a skipped call costs nothing. Whatever it throws reaches the caller,
+ * which fails open and logs it, as before.
+ */
+async function cacheCall<T>(what: string, start: () => Promise<T>): Promise<T> {
+  const role = admitCacheCall(Date.now());
+  if (role === null) throw new CacheSkippedError(what);
+  let stalled = false;
+  try {
+    return await boundedWait(start(), what);
+  } catch (err) {
+    stalled = err instanceof CacheStallError;
+    throw err;
+  } finally {
+    recordCacheOutcome(role, stalled, Date.now());
+  }
+}
+
+/** Test-only: close the breaker and forget its stalls, so one test's stalls cannot
+ *  decide another's. Module-level state, like the log slots. */
+export function __resetCacheBreakerForTests(): void {
+  breaker.stalls = [];
+  breaker.openUntil = 0;
+}
+
+/** Test-only: what the breaker holds, to show it stays bounded. */
+export function __cacheBreakerForTests(): { open: boolean; stallsRemembered: number } {
+  return { open: breaker.openUntil !== 0, stallsRemembered: breaker.stalls.length };
 }
 
 /** Where in a counter's work a fault happened: `match` the lookup, `read` the
@@ -475,7 +641,7 @@ function counterRecord(state: __CounterState, now: number): Response {
 async function readRecordBody(cached: Response | undefined): Promise<unknown> {
   if (!cached) return undefined;
   try {
-    return await boundedWait(cached.json(), "read");
+    return await cacheCall("read", () => cached.json());
   } catch (err) {
     // Only a body that is not JSON is a damaged record. A body that cannot be read
     // at all (a stream that errors, one that never finishes) says nothing about
@@ -1222,7 +1388,7 @@ async function isPrivilegedToken(env: Bindings, hashedApiKey: string): Promise<b
   let cache: Cache;
   try {
     cache = caches.default;
-    const cached = await boundedWait(cache.match(cacheKey), "match");
+    const cached = await cacheCall("match", () => cache.match(cacheKey));
     if (cached) {
       phase = "read";
       const known = await readAdminFlag(cached);
@@ -1277,7 +1443,7 @@ async function isPrivilegedToken(env: Bindings, hashedApiKey: string): Promise<b
   // into a stranger.
   try {
     const ttl = admin ? WINDOW_SIZE : Math.min(WINDOW_SIZE, 30);
-    await boundedWait(
+    await cacheCall("put", () =>
       cache.put(
         cacheKey,
         new Response(JSON.stringify({ admin }), {
@@ -1287,7 +1453,6 @@ async function isPrivilegedToken(env: Bindings, hashedApiKey: string): Promise<b
           },
         }),
       ),
-      "put",
     );
   } catch (err) {
     fault("put", err);
@@ -1303,7 +1468,7 @@ type AdminFlagRead = { admin: boolean } | { damage: "unparseable" | "no-boolean"
 async function readAdminFlag(cached: Response): Promise<AdminFlagRead> {
   let data: unknown;
   try {
-    data = await boundedWait(cached.json(), "read");
+    data = await cacheCall("read", () => cached.json());
   } catch (err) {
     if (err instanceof SyntaxError) return { damage: "unparseable" };
     throw err;
@@ -1472,9 +1637,10 @@ export async function rateLimiter(
   // undercounted requests are cache hits (`checkDataMissBudget` below counts
   // the expensive misses synchronously, on its own much smaller budget).
   // Every other bucket keeps the exact synchronous behavior it always had.
-  async function writeCount(write: Promise<unknown>): Promise<void> {
+  // `write` makes the call; it is handed over unmade so the breaker can skip it.
+  async function writeCount(write: () => Promise<unknown>): Promise<void> {
     if (keyKind !== "data-ip") {
-      await boundedWait(write, "put");
+      await cacheCall("put", write);
       return;
     }
     const defer = dataPlaneDefer();
@@ -1482,7 +1648,7 @@ export async function rateLimiter(
       // Bounded and logged like every other wait: a put that never settles would
       // otherwise leave no line and no count.
       defer(
-        boundedWait(write, "put").catch((err: unknown) => logCacheFault(keyKind, path, err, "put")),
+        cacheCall("put", write).catch((err: unknown) => logCacheFault(keyKind, path, err, "put")),
       );
       return;
     }
@@ -1493,7 +1659,7 @@ export async function rateLimiter(
     // settles in microtasks, so this bound is never felt in practice, and
     // it keeps the count observable to a test that awaits the response.
     try {
-      await boundedWait(write, "put");
+      await cacheCall("put", write);
     } catch (err) {
       logCacheFault(keyKind, path, err, "put");
     }
@@ -1512,7 +1678,7 @@ export async function rateLimiter(
     // The bucket's current window: its count and (for the observe-only path)
     // whether it already warned once. Read after the cache lookup, because a
     // Worker's clock only moves at I/O.
-    const cached = await boundedWait(cache.match(cacheKey), "match");
+    const cached = await cacheCall("match", () => cache.match(cacheKey));
     const now = Date.now();
     phase = "read";
     const body = await readRecordBody(cached);
@@ -1526,17 +1692,19 @@ export async function rateLimiter(
       // warn once if it crossed the trip point. `warned` rides in the same
       // cache record as `count` so it resets on the same window TTL.
       if (count >= maxRequests && !warned) {
-        // Hashed, not raw: this is a log line, not the enforcement key
-        // itself (which stays keyed on the raw IP, same as before) --
-        // avoids putting a raw client IP into structured logs.
-        // Same helper web-session.ts uses for privacy-preserving IP storage, so
-        // every IP hash in the codebase is produced by one named function.
-        const ipHash = await hashIp(rawKey);
+        // The caller's key (an address, or `site:<address>`), never in the clear:
+        // `ipHash` is a keyed pseudonym (`services/log-pseudonym.ts`, #1713), which
+        // tells one caller from another without letting a reader of the log
+        // recover the address. It used to be a plain SHA-256, which anyone can
+        // reverse for an IPv4 address by trying all 2^32. With no ENCRYPTION_KEY
+        // (a test, or a Worker never given one) the field is left out rather than
+        // unkeyed. The enforcement key itself stays the raw key, as before.
+        const ipHash = await logPseudonym(c.env.ENCRYPTION_KEY, rawKey);
         // Once per window per bucket kind (and again at the milestones) as well as
         // once per address: a flood from many addresses must not be a line each.
         logOncePerWindow(`observe:${keyKind}`, (suppressed, sinceMs) => {
           console.warn("[rate-limit] observe-only bucket would have tripped", {
-            ipHash,
+            ...(ipHash === null ? {} : { ipHash }),
             path,
             count: count + 1,
             suppressed,
@@ -1547,7 +1715,7 @@ export async function rateLimiter(
       }
       const observed = { ...state, count: count + 1, warned };
       phase = "put";
-      await writeCount(cache.put(cacheKey, counterRecord(observed, now)));
+      await writeCount(() => cache.put(cacheKey, counterRecord(observed, now)));
     } else if (count >= maxRequests) {
       const refused = refusal(keyKind, maxRequests, state, now, caller.source);
       logRefusal(keyKind, maxRequests, refused.body.retry_after as number, caller.source);
@@ -1557,7 +1725,9 @@ export async function rateLimiter(
       // expires with it; a refused request above writes nothing.
       const newCount = count + 1;
       phase = "put";
-      await writeCount(cache.put(cacheKey, counterRecord({ ...state, count: newCount }, now)));
+      await writeCount(() =>
+        cache.put(cacheKey, counterRecord({ ...state, count: newCount }, now)),
+      );
       phase = "decide";
       stamp = {
         "X-RateLimit-Limit": maxRequests.toString(),
@@ -1739,7 +1909,7 @@ async function consumeKeyedBudget(
 
   try {
     const cache = caches.default;
-    const cached = await boundedWait(cache.match(cacheKey), "match");
+    const cached = await cacheCall("match", () => cache.match(cacheKey));
     const now = Date.now();
     phase = "read";
     const body = await readRecordBody(cached);
@@ -1764,16 +1934,17 @@ async function consumeKeyedBudget(
     }
 
     phase = "put";
-    const write = cache.put(cacheKey, counterRecord({ ...state, count: state.count + 1 }, now));
+    const write = () =>
+      cache.put(cacheKey, counterRecord({ ...state, count: state.count + 1 }, now));
     if (waitUntil) {
       waitUntil(
-        boundedWait(write, "put").catch((err: unknown) =>
+        cacheCall("put", write).catch((err: unknown) =>
           logCacheFault(bucket.kind, undefined, err, "put"),
         ),
       );
     } else {
       try {
-        await boundedWait(write, "put");
+        await cacheCall("put", write);
       } catch (err) {
         logCacheFault(bucket.kind, undefined, err, "put");
       }
@@ -1802,4 +1973,12 @@ export const __limits = {
   NEUROBAGEL_MAX_REQUESTS,
   PRIVATE_GRANT_MAX_REQUESTS,
   WINDOW_SIZE,
+};
+
+/** The stall bound and the cache-stall breaker's numbers, for its tests; not caps. */
+export const __stallLimits = {
+  RATE_LIMIT_WRITE_STALL_MS,
+  BREAKER_STALLS_TO_OPEN,
+  BREAKER_STALL_WINDOW_MS,
+  BREAKER_COOL_DOWN_MS,
 };
