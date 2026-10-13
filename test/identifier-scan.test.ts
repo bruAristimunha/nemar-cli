@@ -495,6 +495,95 @@ describe("participant labels and local paths", () => {
     expect(scanTextForLocalPaths("cd /home/erin/project").length).toBe(1);
     expect(scanTextForLocalPaths("x = '/Users/dana/data.csv'").length).toBe(1);
   });
+
+  test("a real account later in a text is found after a generic one", () => {
+    for (const text of [
+      "cd /home/user/project then open /Users/erin/data.csv",
+      "C:\\Users\\runner\\work then C:\\Users\\dana\\data.csv",
+      "C:\\\\Users\\\\you\\\\x then C:\\\\Users\\\\dana\\\\data.csv",
+      "/home/user/x then C:\\Users\\erin\\y",
+      "C:\\Users\\runner\\x then /home/erin/y",
+      "/home/Runner/x and /home/erin/y",
+    ]) {
+      const found = scanTextForLocalPaths(text);
+      expect(found.map((f) => f.kind)).toEqual(["local-user-path"]);
+      expect(found[0]?.severity).toBe("review");
+      expect(found[0]?.field).toBe("text");
+      expect(JSON.stringify(found)).not.toMatch(/erin|dana/);
+    }
+    // The shape is that of the real account's path, not of the generic one before it.
+    const [finding] = scanTextForLocalPaths("cd /home/user/project then open /Users/erin/data.csv");
+    expect(finding?.shape).toBe(shapeOf("/Users/erin"));
+    expect(finding?.shape).not.toBe(shapeOf("/home/user"));
+  });
+
+  test("many generic accounts before a real one do not hide it", () => {
+    const generic = ["user", "you", "runner", "ubuntu", "root", "docker", "default", "shared"];
+    const text = [
+      ...generic.map((a) => `/home/${a}/work`),
+      ...generic.map((a) => `C:\\Users\\${a}\\work`),
+      "/Users/erin/data.csv",
+    ].join(" ; ");
+    expect(scanTextForLocalPaths(text).map((f) => f.kind)).toEqual(["local-user-path"]);
+    // Dropping the real account leaves nothing to find: the finding is not from the generic ones.
+    expect(
+      scanTextForLocalPaths(text.replace("/Users/erin/data.csv", "relative/data.csv")),
+    ).toEqual([]);
+  });
+
+  test("a text of only generic accounts has no finding, however many there are", () => {
+    const text = [
+      "cd /home/user/project",
+      "C:\\Users\\runner\\work",
+      "/Users/you/x",
+      "/home/ubuntu/y",
+      "C:\\\\Users\\\\vagrant\\\\z",
+    ].join("\n");
+    expect(scanTextForLocalPaths(text)).toEqual([]);
+  });
+
+  test("a text with several real accounts still yields one finding", () => {
+    const found = scanTextForLocalPaths("/Users/erin/a then /home/dana/b then C:\\Users\\fay\\c");
+    expect(found.map((f) => f.kind)).toEqual(["local-user-path"]);
+  });
+
+  test("a home path inside a URL stays excluded in a text with several paths", () => {
+    expect(
+      scanTextForLocalPaths("see https://example.org/home/erin/page and cd /home/user/project"),
+    ).toEqual([]);
+    expect(
+      scanTextForLocalPaths("cd /home/user/x ; see https://example.org/Users/dana/page"),
+    ).toEqual([]);
+    expect(
+      scanTextForLocalPaths("https://a.example/home/erin/p https://b.example/Users/dana/q"),
+    ).toEqual([]);
+    // A real path after the URLs is still found, and its shape is the real path's, not the URL's.
+    const [finding] = scanTextForLocalPaths(
+      "see https://example.org/home/erin/page and open /Users/dana/data.csv",
+    );
+    expect(finding?.kind).toBe("local-user-path");
+    expect(finding?.shape).toBe(shapeOf("/Users/dana"));
+  });
+
+  test("repeated calls on the same text give the same answer", () => {
+    const texts = [
+      "cd /home/user/project then open /Users/erin/data.csv",
+      "cd /home/user/project",
+      "C:\\Users\\runner\\work then C:\\Users\\dana\\data.csv",
+      "see https://example.org/home/erin/page",
+      "/Users/erin/work/x.py",
+      "relative/path/x.py",
+    ];
+    const first = texts.map((t) => scanTextForLocalPaths(t));
+    for (let round = 0; round < 3; round++) {
+      // Forwards, then backwards, so no call can depend on where an earlier one stopped.
+      expect(texts.map((t) => scanTextForLocalPaths(t))).toEqual(first);
+      expect([...texts].reverse().map((t) => scanTextForLocalPaths(t))).toEqual(
+        [...first].reverse(),
+      );
+    }
+    expect(first.map((f) => f.length)).toEqual([1, 0, 1, 0, 1, 0]);
+  });
 });
 
 describe("headers written by an independent EDF+ writer (edfio)", () => {

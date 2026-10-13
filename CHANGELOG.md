@@ -13,6 +13,17 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
+## Unreleased
+
+### Fixed
+
+- **A real local account later in a text is now found even when a generic one comes first
+  (#1737).** The local-user-path rule examined only the first home path in a text, so
+  `/home/user/project` before `/Users/erin/data.csv` ended the check at the generic account and
+  the real one went unseen. Every path is now examined, with the same single `review` finding
+  per text. The upload preflight, the fleet scan and the identifier screen all share the rule, so
+  a dataset that was reported clean only because of that ordering can now carry a finding.
+
 ## 0.10.17 - 2026-10-13
 
 The website's server-side requests are counted per visitor instead of as one client, which is
