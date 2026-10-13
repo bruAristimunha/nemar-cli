@@ -33,7 +33,7 @@
  * together -- documented, not an oversight.
  */
 
-import { buildPublicCatalogBase } from "./dataset-filters";
+import { buildPublicCatalogBase, parseTokenList } from "./dataset-filters";
 
 /** One vocabulary entry: a distinct value and how many datasets carry it. */
 export interface FacetVocabularyEntry {
@@ -166,24 +166,24 @@ async function fetchGroupedVocabulary(
 }
 
 /**
- * D3: split each row's comma-joined column, trim + lower-case each token,
- * and DEDUPE WITHIN THE ROW (a Set, not a plain array) before tallying, so
+ * D3: tokenize each row's comma-joined column with `parseTokenList` (split,
+ * trim, lower-case, drop empties, DEDUPE WITHIN THE ROW) before tallying, so
  * `eeg,eeg` in one dataset counts once for that dataset -- this tallies
- * DATASETS CARRYING THE VALUE, not raw token occurrences. Empty tokens (an
- * empty string, or the whole column NULL/'') are dropped, so a dataset with
- * an empty `tasks` string contributes to no bucket at all.
+ * DATASETS CARRYING THE VALUE, not raw token occurrences. A dataset with an
+ * empty or NULL column contributes to no bucket at all.
+ *
+ * That tokenizer is deliberately the one the `modality` FILTER uses
+ * (`MODALITY_TOKENS_SQL` in dataset-filters.ts is its SQL twin), so a value
+ * advertised here filters to exactly the count advertised here; the
+ * "vocabulary and filter agree" test in modality-exact-token.test.ts holds
+ * them to it. Only `modality` is filtered by whole token: `tasks`, tallied
+ * here the same way, is still a substring filter.
  */
 function tallyCommaJoinedColumn(values: readonly (string | null)[]): Map<string, number> {
   const counts = new Map<string, number>();
   for (const raw of values) {
     if (!raw) continue;
-    const tokens = new Set(
-      raw
-        .split(",")
-        .map((t) => t.trim().toLowerCase())
-        .filter((t) => t !== ""),
-    );
-    for (const token of tokens) {
+    for (const token of parseTokenList(raw)) {
       counts.set(token, (counts.get(token) ?? 0) + 1);
     }
   }

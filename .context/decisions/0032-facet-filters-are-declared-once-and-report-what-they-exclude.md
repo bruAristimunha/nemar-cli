@@ -249,3 +249,66 @@ projection).
   unlike the atomically-written pairs from migration 0070.
 - nm000111: confirmed live case where `n_channels` (19) disagrees with the
   true per-recording distribution (70/124 recordings actually at 20).
+
+## Amendment 2026-10-12 (#1711): `modality` is a whole-token match, and stays a bespoke filter
+
+The Decision keeps `modality` out of the facet table because its semantics are
+irregular, "LIKE-joined comma lists". For `modality` that irregularity was a defect:
+`datasets.modalities` is a comma-joined list (`eeg,ieeg,meg`) and the filter was
+`LOWER(modalities) LIKE '%<value>%'`, so `modality=EEG` also returned datasets whose
+modalities were only `ieeg`, `%` matched every row, and `_eg` matched `meg`. Production
+showed it: a search for `ieeg` with `modality=EEG` returned 97 of 100 rows with no `eeg`
+token.
+
+What is now decided:
+
+- **One definition, in `buildDatasetFilterClauses`.** `GET /datasets` (both branches),
+  every tier of `GET /datasets/search` and the MCP `search_datasets` tool all build their
+  filter through it, so the fix is one clause and no caller carries its own.
+- **Whole token, case-insensitive, tokenized once.** The stored list is lower-cased, split
+  on every comma in SQL and each token trimmed, so the first, middle and last token are
+  found the same way, `eeg` is not found inside `ieeg`, and whitespace inside a token stays
+  inside it (`e eg` is one token, never `eeg`). That is the same split, trim and
+  lower-case the vocabulary endpoint tallies with (`parseTokenList`), so a value the
+  vocabulary advertises filters to exactly its advertised count; a route test holds the two
+  together because either can be changed alone.
+- **A comma-separated value matches a dataset holding ANY of its tokens**, the same OR the
+  `license` filter and the enum facets use. Before, `eeg,meg` matched only a dataset whose
+  stored list happened to contain those two tokens adjacent and in that order.
+- **At most 32 distinct tokens per request, refused and not truncated.** A request over
+  the limit is a 400 on both HTTP endpoints and a refused tool call on MCP, the way a
+  malformed facet range is; truncating would answer a different question than the one
+  asked. Tokens are counted after normalising, so `eeg,EEG,eeg` is one. This is an input
+  contract, not a cost guard. The clause's cost is flat in the number of wanted tokens,
+  because the wanted set is probed through an index: on bun:sqlite over 1,000 synthetic
+  rows, one statement, about 1.3 ms for 1 to 100 distinct tokens and 3.4 ms for 8,000 (D1
+  was not measured). The limit keeps a request, which is an anonymous caller's URL, small
+  and predictable and gives clients one documented bound; BIDS defines 14 datatypes and
+  the production vocabulary holds 12, so 32 is wider than any real request. The old `LIKE`
+  was subject to the 50-byte pattern limit Cloudflare documents for D1, which bounded the
+  value as a side effect; the limit here replaces that bound by declaration. It is
+  declared once (`MAX_MODALITY_FILTER_TOKENS`, `shared/`), checked at the parse step of
+  every entry point, enforced again in the clause builder, and can be raised by changing
+  that constant.
+- **The wanted tokens are one `json_each` parameter**, not one placeholder per token and
+  not a LIKE pattern, so a list costs one bound parameter (the D1 ceiling,
+  `MAX_BOUND_PARAMS`) and there is nothing to escape.
+- **A supplied value that names no token (whitespace, bare commas) matches nothing.** It
+  binds an empty list. It is not dropped, which would turn a filter the caller asked for
+  into the whole catalog, and it is not a 400: `modality` predates the table and keeps the
+  contract it shipped with, under which such a value narrowed to nothing. (`license` is not
+  the analogy for this: it DROPS an unrecognised value and returns the whole catalog, the
+  opposite of matching nothing. The only thing the two share is that neither refuses.) An
+  EMPTY value is still no filter.
+
+Not decided here: `task` and `author` remain substring filters. Their documented contract
+is "substring match", and `task` has over a thousand distinct labels that people search by
+fragment; they are a separate decision if the same complaint is made of them. Moving
+`modality` into the facet table as a token-list kind remains possible, but it would change
+`FACETS.length`, the `search_datasets` filter cap that is sized from it, and the generated
+MCP and CLI flags, for no change in behavior. The admin sweep selector that reads
+`modalities LIKE '%eeg%'` is not this filter: it is a substring match on purpose, because
+the channel-montage probe also takes `ieeg`, and the sweep's remaining-count statement
+carries a note to keep the two in step.
+
+Receipt: `backend/test/modality-exact-token.test.ts`.

@@ -40,12 +40,32 @@ export interface PullState {
   /** `author_association` on the pull request ("COLLABORATOR" unless set). */
   assoc?: string;
   mergeableState?: string;
+  /** Answer without a `mergeable_state` at all, as an answer that does not carry the field would. */
+  omitMergeableState?: boolean;
   /** Served for the first N reads, then `mergeableState`. */
   unknownReads?: number;
   /** Set after the approval is recorded, to simulate a push landing in between. */
   movesToAfterReview?: string;
+  /**
+   * `mergeableState` once the approval is recorded: a check that turns pending, or a rule the
+   * approval itself changes, between the read before an approval and the read before its merge.
+   */
+  mergeableStateAfterReview?: string;
   /** The head every read AFTER THE FIRST sees: a push that lands between two readers' reads. */
   headAfterFirstRead?: string;
+  /**
+   * What every read made with the administrator's own token AFTER ITS FIRST answers instead: a
+   * status (a GitHub that stops answering), a head (a push), a mergeable state (a check that turns
+   * pending), or the pull request closed or merged. Counted over that token's reads only, so a read
+   * the Worker makes in between does not use it up.
+   */
+  adminReadsAfterFirst?: {
+    status?: number;
+    sha?: string;
+    mergeableState?: string;
+    state?: "open" | "closed";
+    merged?: boolean;
+  };
 }
 
 export interface GitHubStandin {
@@ -116,6 +136,7 @@ export function startGitHubStandin(): GitHubStandin {
     unreadableAnswers: false,
   };
   const reads: Record<string, number> = {};
+  const adminReads: Record<string, number> = {};
 
   const server: Server = Bun.serve({
     port: 0,
@@ -202,13 +223,25 @@ export function startGitHubStandin(): GitHubStandin {
         if (!p) return Response.json({ message: "Not Found" }, { status: 404 });
         if (req.method === "GET" && !pull[3]) {
           reads[key] = (reads[key] ?? 0) + 1;
+          if (token === ADMIN_TOKEN) adminReads[key] = (adminReads[key] ?? 0) + 1;
+          const adminRead = token === ADMIN_TOKEN ? adminReads[key] : 0;
+          const later = adminRead > 1 ? p.adminReadsAfterFirst : undefined;
+          if (later?.status) {
+            return Response.json({ message: "Server Error" }, { status: later.status });
+          }
           const unknown = (p.unknownReads ?? 0) >= reads[key];
           return Response.json({
             number: Number(pull[2]),
-            state: p.state ?? "open",
-            merged: p.merged ?? false,
+            state: later?.state ?? p.state ?? "open",
+            merged: later?.merged ?? p.merged ?? false,
             draft: p.draft ?? false,
-            mergeable_state: unknown ? "unknown" : (p.mergeableState ?? "clean"),
+            mergeable_state: p.omitMergeableState
+              ? undefined
+              : later?.mergeableState
+                ? later.mergeableState
+                : unknown
+                  ? "unknown"
+                  : (p.mergeableState ?? "clean"),
             title: "Add subjects",
             author_association: p.assoc ?? "COLLABORATOR",
             user: { login: p.author ?? "contributor", id: p.authorId ?? 501, type: "User" },
@@ -221,7 +254,9 @@ export function startGitHubStandin(): GitHubStandin {
               },
             },
             head: {
-              sha: p.headAfterFirstRead && reads[key] > 1 ? p.headAfterFirstRead : p.sha,
+              sha:
+                later?.sha ??
+                (p.headAfterFirstRead && reads[key] > 1 ? p.headAfterFirstRead : p.sha),
               ref: "add-subjects",
               repo: { full_name: `nemarDatasets/${pull[1]}`, owner: { login: "nemarDatasets" } },
             },
@@ -246,6 +281,7 @@ export function startGitHubStandin(): GitHubStandin {
           const login = typeof who === "object" ? who.login : "unknown";
           const commit = (body as { commit_id?: string } | null)?.commit_id ?? p.sha;
           if (p.movesToAfterReview) p.sha = p.movesToAfterReview;
+          if (p.mergeableStateAfterReview) p.mergeableState = p.mergeableStateAfterReview;
           if (state.unreadableAnswers) return new Response("<html>proxy</html>", { status: 200 });
           return Response.json({
             id: 1,
@@ -376,6 +412,7 @@ export function startGitHubStandin(): GitHubStandin {
       for (const k of Object.keys(state.pulls)) delete state.pulls[k];
       for (const k of Object.keys(state.users)) delete state.users[k];
       for (const k of Object.keys(reads)) delete reads[k];
+      for (const k of Object.keys(adminReads)) delete adminReads[k];
     },
     stop() {
       server.stop(true);

@@ -652,10 +652,9 @@ describe("parseSearchPagination clamping", () => {
   });
 });
 
-// Real modality vocabulary from the catalog (#1145 plan). Includes a
-// deliberate substring collision (ieeg contains eeg) to prove the SQL clause
-// preserves the OLD JS `.includes()` semantics rather than fixing it --
-// that quirk is out of scope for this phase.
+// Real modality vocabulary from the catalog (#1145 plan). Includes the
+// substring collision (`ieeg` contains `eeg`) that #1145 deliberately carried
+// over from the old JS `.includes()` and that #1711 then removed.
 const MODALITY_VOCAB = [
   "eeg",
   "anat",
@@ -671,7 +670,7 @@ const MODALITY_VOCAB = [
   "perf",
 ];
 
-describe("SQL modality filter matches the old JS substring semantics", () => {
+describe("SQL modality filter matches a whole modality token (#1711)", () => {
   const rowId = (i: number) => `nm${String(200000 + i).padStart(6, "0")}`;
   const allIds = MODALITY_VOCAB.map((_, i) => rowId(i));
 
@@ -681,19 +680,19 @@ describe("SQL modality filter matches the old JS substring semantics", () => {
     });
   }
 
-  // The old handler filtered with `r.modalities.toLowerCase().includes(mod)`
-  // in JS; the SQL clause is `LOWER(COALESCE(d.modalities,'')) LIKE '%mod%'`.
-  // Both are substring matches, so this is expected to reproduce the same
-  // quirk (e.g. filtering "eeg" also matches a row whose modality is "ieeg")
-  // rather than fix it -- fixing it is out of scope for this phase.
-  const jsSubstringMatch = (filterMod: string): Set<string> =>
+  // Each fixture row carries ONE modality, so a whole-token match for a filter
+  // term is exactly the row whose modality equals it. Written as that
+  // equality, not as the SQL under test: the old `.includes()` oracle here
+  // pinned the bug, and an oracle that mirrors the implementation can only
+  // ever agree with it.
+  const tokenMatch = (filterMod: string): Set<string> =>
     new Set(
       MODALITY_VOCAB.map((rowMod, i) => ({ rowMod, i }))
-        .filter(({ rowMod }) => rowMod.toLowerCase().includes(filterMod.toLowerCase()))
+        .filter(({ rowMod }) => rowMod === filterMod.toLowerCase())
         .map(({ i }) => rowId(i)),
     );
 
-  test("every filter term across the vocabulary agrees with `.toLowerCase().includes()`", async () => {
+  test("every filter term across the vocabulary returns exactly the rows holding that token", async () => {
     const db = freshDb();
     seedModalityFixture(db);
     const d1 = realD1(db);
@@ -702,18 +701,21 @@ describe("SQL modality filter matches the old JS substring semantics", () => {
       // Exercise via hydrateDatasetsByIds, the same SQL-filtering path the
       // search endpoint's semantic/exact-id tiers use.
       const hydrated = await hydrateDatasetsByIds(d1, allIds, { modality: filterMod });
-      expect(new Set(hydrated.map((r) => r.id))).toEqual(jsSubstringMatch(filterMod));
+      expect(new Set(hydrated.map((r) => r.id))).toEqual(tokenMatch(filterMod));
+      expect(hydrated).toHaveLength(1);
     }
     db.close();
   });
 
-  test("the ieeg/eeg substring collision is preserved (not a regression to fix here)", async () => {
+  test("eeg no longer returns the ieeg row, and ieeg does not return the eeg row", async () => {
     const db = freshDb();
     seedModalityFixture(db);
     const d1 = realD1(db);
-    const hydrated = await hydrateDatasetsByIds(d1, allIds, { modality: "eeg" });
-    // Row 0 is "eeg" itself, row 2 is "ieeg" (contains "eeg" as a substring).
-    expect(new Set(hydrated.map((r) => r.id))).toEqual(new Set([rowId(0), rowId(2)]));
+    const eeg = await hydrateDatasetsByIds(d1, allIds, { modality: "eeg" });
+    // Row 0 is "eeg" itself; row 2 is "ieeg", which holds no eeg token.
+    expect(eeg.map((r) => r.id)).toEqual([rowId(0)]);
+    const ieeg = await hydrateDatasetsByIds(d1, allIds, { modality: "ieeg" });
+    expect(ieeg.map((r) => r.id)).toEqual([rowId(2)]);
     db.close();
   });
 });

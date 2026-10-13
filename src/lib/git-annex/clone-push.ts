@@ -296,7 +296,7 @@ async function prepareAnnexBranchPush(
 }
 
 /** Signals on which an interrupted save still takes its assume-unchanged bits back. */
-const INTERRUPT_SIGNALS: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
+export const INTERRUPT_SIGNALS: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
 
 /**
  * Save all changes to the dataset
@@ -501,7 +501,7 @@ const STDERR_WRITE_MS = 500;
 const STDERR_WRITE_PAUSE_MS = 20;
 
 /** Sleep without leaving the signal handler: it cannot await. */
-function sleepSync(ms: number): void {
+export function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
@@ -520,7 +520,7 @@ function unmarkSync(path: string, input: string, timeoutMs: number): string | un
 }
 
 /** Ask the children of this process to stop, so an in-flight `git add` lets go of `index.lock`. */
-function stopChildren(): void {
+export function stopChildren(): void {
   // git removes its lock files when it receives SIGTERM. Where pkill is missing this does
   // nothing, and the retry window below is all there is.
   spawnSync("pkill", ["-TERM", "-P", String(process.pid)], { stdio: "ignore", timeout: 1_000 });
@@ -553,7 +553,7 @@ function describeStuckFlags(
  * write or answer EAGAIN, so this loops on the byte count for a short while; a stderr
  * that is closed (EPIPE) or stays unwritable ends it, and then the text is lost.
  */
-function writeStderrSync(text: string): void {
+export function writeStderrSync(text: string): void {
   const bytes = Buffer.from(text);
   const deadline = Date.now() + STDERR_WRITE_MS;
   let offset = 0;

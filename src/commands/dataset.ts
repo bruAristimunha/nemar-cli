@@ -36,6 +36,7 @@ import {
   publicationRequestNotice,
 } from "../../shared/identifier-screen-report.js";
 import { LICENSE_TIERS } from "../../shared/license-tiers.js";
+import { MODALITY_FILTER_CLI_HELP } from "../../shared/modality-filter.js";
 import { stepsForRelease } from "../../shared/publication-steps.js";
 import { RangeParseError } from "../../shared/range.js";
 import { addCi } from "../lib/api/admin.js";
@@ -2422,7 +2423,7 @@ const listCommand = datasetCommand
   .option("--mine", "List only your datasets (both private and public)")
   .option("--owner <username>", "List datasets owned by a specific user")
   .option("--search <query>", "Search by name, description, authors, or tasks")
-  .option("--modality <type>", "Filter by modality (eeg, emg, meg, etc.)")
+  .option("--modality <type>", MODALITY_FILTER_CLI_HELP)
   .option("--author <name>", "Filter by author name")
   .option("--task <name>", "Filter by task name")
   .option(
@@ -2641,7 +2642,7 @@ Examples:
 const searchCommand = datasetCommand
   .command("search <query>")
   .description("Search datasets using semantic matching")
-  .option("--modality <type>", "Filter by modality (eeg, emg, meg, etc.)")
+  .option("--modality <type>", MODALITY_FILTER_CLI_HELP)
   .option("--author <name>", "Filter by author name")
   .option("--task <name>", "Filter by task name")
   .option(

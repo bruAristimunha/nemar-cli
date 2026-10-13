@@ -26,6 +26,7 @@ import { printStepFailure } from "../cli-output.js";
 import { type LocalDatasetConfig, writeLocalConfig } from "../dataset-config.js";
 import { displayName, isPrintableInCommand } from "../display-name.js";
 import { acceptGitHubInvitation, configureGitHubRemote } from "../git-annex/github.js";
+import { PRIME_MIN_FILE_BYTES, primeIndexStat } from "../git-annex/index-prime.js";
 import {
   ADD_CHUNK_MAX_PATHS,
   chunkAddTargets,
@@ -107,6 +108,88 @@ function persistOptionalSpinnerWarning(spinner: Ora | null, warning: string): Or
     return null;
   }
   return persistSpinnerWarning(spinner, warning);
+}
+
+/**
+ * Record index stat data for the data files in `targets` whose recorded size reaches
+ * `minBytes`, so git can tell they are unchanged without streaming them through
+ * `git-annex filter-process` (ADR 0100, {@link primeIndexStat}). `when` says which
+ * entries the call is for: the ones an earlier run left in the index, before the add
+ * checks them, or the ones the add just staged. Returns false only when the repository's
+ * configuration could not be checked or put back, which fails the step; anything else
+ * leaves the files to be read the old way and says so.
+ */
+async function primeLargeDataFiles(
+  absolutePath: string,
+  targets: ReadonlyArray<{ path: string; size: number }>,
+  minBytes: number,
+  when: "before" | "after",
+  hooks: {
+    onSuspended?: (chunk: number) => void;
+    chunkPaths?: number;
+    stream?: NodeJS.WritableStream;
+  } = {},
+): Promise<boolean> {
+  const large = targets.filter((f) => f.size >= minBytes).map((f) => f.path);
+  if (large.length === 0) return true;
+  const spinner = ora({
+    text:
+      when === "before"
+        ? "Checking large data files an earlier run left in the index..."
+        : `Recording index stat data for ${countDataFiles(large.length)} of ${describeBytes(minBytes)} or more...`,
+    ...(hooks.stream ? { stream: hooks.stream } : {}),
+  }).start();
+  const result = await primeIndexStat(absolutePath, large, {
+    ...(hooks.onSuspended ? { onSuspended: hooks.onSuspended } : {}),
+    ...(hooks.chunkPaths === undefined ? {} : { chunkPaths: hooks.chunkPaths }),
+    onProgress: (done, total) => {
+      spinner.text = `Recording index stat data for large data files (${done.toLocaleString("en-US")} of ${total.toLocaleString("en-US")})...`;
+    },
+  });
+  if (result.status === "error") {
+    spinner.fail(result.error);
+    return false;
+  }
+  if (result.status === "skipped") {
+    spinner.warn(describePrimeSkip(result.reason, result.primed));
+    return true;
+  }
+  if (result.primed === 0) {
+    spinner.stop();
+    return true;
+  }
+  // `primed` counts the files handed to git; one that changed since it was tracked is
+  // checked but keeps zero stat data, so the line speaks of the unchanged ones.
+  spinner.succeed(
+    when === "before"
+      ? `Checked ${countDataFiles(result.primed)} of ${describeBytes(minBytes)} or more that an earlier run left in the index; the add need not re-read the unchanged ones`
+      : `Checked ${countDataFiles(result.primed)} of ${describeBytes(minBytes)} or more against the index; git need not re-read the unchanged ones`,
+  );
+  return true;
+}
+
+/**
+ * The warning for a priming that stopped early: how many files it did record, when it got
+ * that far, and that git reads the rest the old way. Exported for unit tests.
+ */
+export function describePrimeSkip(reason: string, primed?: number): string {
+  const what =
+    primed && primed > 0
+      ? `Index stat data was recorded for ${countDataFiles(primed)} before it stopped; the other large data files`
+      : "Large data files";
+  return `${what} will be re-read by git through git-annex filter-process (${reason})`;
+}
+
+/** "1 GiB", "512 MiB": a power-of-two size as a threshold is spoken. */
+function describeBytes(bytes: number): string {
+  const units = ["bytes", "KiB", "MiB", "GiB", "TiB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && Number.isInteger(value / 1024) && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toLocaleString("en-US")} ${units[unit]}`;
 }
 
 /**
@@ -2082,7 +2165,17 @@ export async function uploadDataToS3(
   filesToUpload: Array<{ path: string; size: number; mtimeMs?: number }>,
   uploadProgress: UploadProgress | null,
   datasetInfo: DatasetInfo,
-  deps: { openRemote?: OpenRemote } = {},
+  deps: {
+    openRemote?: OpenRemote;
+    /** Test hook: lets a small file reach the index priming (ADR 0100). */
+    primeMinBytes?: number;
+    /** Test hook: runs in each chunk's window while the filter process is out (after the add). */
+    primeOnSuspended?: (chunk: number) => void;
+    /** Test hook: the priming's chunk size, so a test can reach a second chunk. */
+    primeChunkPaths?: number;
+    /** Test hook: where the priming's spinner writes, so a test can read its lines. */
+    primeSpinnerStream?: NodeJS.WritableStream;
+  } = {},
 ): Promise<Step<S3StepState>> {
   let progress = uploadProgress;
   let spinner: Ora;
@@ -2206,6 +2299,26 @@ export async function uploadDataToS3(
       // above) are added -- already-copied files are annexed already, and a
       // whole-tree add re-reads every unlocked file's content (#884).
       if (addTargets.length > 0 && !isStepCompleted(progress, "tracking")) {
+        const primeMinBytes = deps.primeMinBytes ?? PRIME_MIN_FILE_BYTES;
+        // A large file an earlier run tracked (a run that was interrupted, or the last
+        // upload, whose save leaves entries without stat data) is in the index with zero
+        // stat data, and the add's check of already-indexed paths would stream it through
+        // filter-process twice to learn it is unchanged.
+        const primeHooks = {
+          ...(deps.primeChunkPaths === undefined ? {} : { chunkPaths: deps.primeChunkPaths }),
+          ...(deps.primeSpinnerStream ? { stream: deps.primeSpinnerStream } : {}),
+        };
+        if (
+          !(await primeLargeDataFiles(
+            absolutePath,
+            addTargets,
+            primeMinBytes,
+            "before",
+            primeHooks,
+          ))
+        ) {
+          return FAIL;
+        }
         spinner = ora(`Tracking ${addTargets.length} data files with git-annex...`).start();
         const addResult = await trackDataFiles(
           absolutePath,
@@ -2225,6 +2338,18 @@ export async function uploadDataToS3(
         spinner.succeed("Data files tracked by git-annex");
         markStepCompleted(progress, "tracking");
         writeUploadProgress(absolutePath, progress);
+        // `git annex add` staged each file with zero stat data, so the save's `git add -A`,
+        // the first `git status` afterwards and the next upload's add would each read it
+        // again. Stamped first: the files are tracked whatever this finds, and a re-run that
+        // has to put the configuration back does it at the start of the upload steps.
+        if (
+          !(await primeLargeDataFiles(absolutePath, addTargets, primeMinBytes, "after", {
+            ...primeHooks,
+            ...(deps.primeOnSuspended ? { onSuspended: deps.primeOnSuspended } : {}),
+          }))
+        ) {
+          return FAIL;
+        }
       } else if (addTargets.length > 0) {
         console.log(chalk.dim("  Data files already tracked by git-annex (skipping)"));
       }

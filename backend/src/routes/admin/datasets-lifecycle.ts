@@ -118,6 +118,11 @@ export const ZARR_SWEEP_STAMP_ONLY_SQL =
  * as the writes above: each runs only after a real GitHub token fetch and tree
  * walk, which tests cannot perform, so a test exercises the exact SQL text on a
  * real database instead of a hand copy.
+ *
+ * `modalities LIKE '%eeg%'` below is a SUBSTRING match on purpose, and it is not
+ * the public `modality` filter (a whole-token match since #1711): it has to stay
+ * in step with the channel-montage candidate selector, which says why it also
+ * takes `ieeg`.
  */
 export const CHANNEL_MONTAGE_SWEEP_REMAINING_SQL = `SELECT COUNT(*) AS n FROM datasets
        WHERE github_repo IS NOT NULL

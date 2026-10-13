@@ -43,7 +43,7 @@ import type { Database } from "bun:sqlite";
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import type { Server } from "bun";
 import { Hono } from "hono";
-import { __limits } from "../src/middleware/rateLimit";
+import { __limits, __resetRateLimitLogsForTests } from "../src/middleware/rateLimit";
 import {
   type CacheLike,
   FULL_OBJECT_CACHE_MAX_BYTES,
@@ -58,6 +58,7 @@ import {
   s3PublicUrl,
 } from "../src/routes/zarr-data";
 import { ZARR_DATASET_DOCUMENTS, zarrPurgeTargets } from "../src/services/cloudflare";
+import { hashIp } from "../src/services/web-session";
 import type { Bindings } from "../src/types/bindings";
 import { InMemoryCache, keyFor } from "./helpers/cache";
 import { freshDb, realD1 } from "./helpers/d1";
@@ -1929,7 +1930,13 @@ describe("rate limiter exemption for redirect candidates (#1181 phase 6 / issue 
   // non-bypassed code path. Computed lazily (per call, not per describe) so
   // it always reads the CURRENT `db` the outer beforeEach just rebuilt.
   function rlEnv(): Bindings {
-    return { ...testEnv(), ENVIRONMENT: "production" } as Bindings;
+    // ENCRYPTION_KEY keys the observe-only warning's caller pseudonym (#1713); a test
+    // value, so the line carries one.
+    return {
+      ...testEnv(),
+      ENVIRONMENT: "production",
+      ENCRYPTION_KEY: "zarr-data-cache-test-key",
+    } as Bindings;
   }
 
   test("a redirect candidate counts toward the shared data-ip bucket, but never 429s (observe-only, #1181 phase 6 review item 5)", async () => {
@@ -1966,6 +1973,9 @@ describe("rate limiter exemption for redirect candidates (#1181 phase 6 / issue 
   });
 
   test("N+1 redirects crossing the cap produce exactly one console.warn, never one per request", async () => {
+    // The warning is also limited to one per window per bucket kind for the whole
+    // isolate, so start from a state in which no earlier test has spoken.
+    __resetRateLimitLogsForTests();
     const ip = "203.0.113.14";
     const key = `https://rate-limit.internal/rl:data-ip:${ip}`;
     // Seed one below the cap so the SECOND request below is the one that
@@ -2007,9 +2017,11 @@ describe("rate limiter exemption for redirect candidates (#1181 phase 6 / issue 
       expect(payload.path).toBe(CHUNK_PATH);
       // The logged count is post-increment (this request's own hit included).
       expect(payload.count).toBe(__limits.DATA_MAX_REQUESTS + 1);
-      // Hashed, not the raw client IP, in the log line.
+      // A keyed pseudonym in the log line: not the raw client IP, and not its plain
+      // SHA-256, which anyone can reverse for an IPv4 address (#1713).
+      expect(payload.ipHash).toMatch(/^[0-9a-f]{64}$/);
       expect(payload.ipHash).not.toBe(ip);
-      expect(typeof payload.ipHash).toBe("string");
+      expect(payload.ipHash).not.toBe(await hashIp(ip));
 
       // A third, still-over-cap redirect in the SAME window does not warn
       // again -- "never per request".

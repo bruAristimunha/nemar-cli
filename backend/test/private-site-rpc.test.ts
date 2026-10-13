@@ -30,7 +30,7 @@ import {
 import worker from "../src/index";
 import { authMiddleware } from "../src/middleware/auth";
 import { maintenanceMode } from "../src/middleware/maintenance";
-import { __resetCacheFaultLogForTests } from "../src/middleware/rateLimit";
+import { __resetRateLimitLogsForTests } from "../src/middleware/rateLimit";
 import { authDocsRoutes } from "../src/routes/auth-docs";
 import { authPrivateRoutes } from "../src/routes/auth-private";
 import { authWebRoutes } from "../src/routes/auth-web";
@@ -1053,7 +1053,7 @@ describe("no log line carries the state, the code or the session value", () => {
         );
       }),
     );
-    __resetCacheFaultLogForTests();
+    __resetRateLimitLogsForTests();
     let code = "";
     let session = "";
     try {

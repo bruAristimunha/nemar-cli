@@ -50,6 +50,7 @@ jobs:
       decisions: ${{ steps.filter.outputs.decisions }}
       agentdocs: ${{ steps.filter.outputs.agentdocs }}
       neurobagel_deploy: ${{ steps.filter.outputs.neurobagel_deploy }}
+      workflows: ${{ steps.filter.outputs.workflows }}
       scrub: ${{ steps.filter.outputs.scrub }}
       # The ONE predicate for "the scrub suites must run", read by both `scrub-tools-shard` and
       # `scrub-tools` below so the shards and the check that gates on them cannot disagree about
@@ -170,6 +171,19 @@ jobs:
               - '.rules/**'
               - 'test/docs-links.unit.test.ts'
               - '.github/workflows/test.yml'
+            # The repository's own workflows and the dataset-side workflows it deploys.
+            # `test/workflow-gh-calls.test.ts` parses every one of them and fails on a `gh`
+            # call that has no repository, so it must run on exactly the change that can
+            # introduce one. A pull request editing only a workflow matched no other
+            # filter and ran no job, so the guard would have been skipped on the change it
+            # polices. FOURTH TIME FOR THIS GAP, after `shared:`, `decisions:` and
+            # `agentdocs:` above. It has to reach `unit-pure`, the job that runs the test.
+            # It is wired into `lint` as well, but only to keep the two `if:` conditions
+            # identical; that is convention, not a requirement: a job skipped by its
+            # `if:` reports Success and does not block a required check.
+            workflows:
+              - '.github/workflows/**'
+              - '.github/dataset-workflows/**'
             # Zarr conversion engine (epic #1108 Phase 1 / #1109). Repatriated
             # from nemarDatasets/.github, where test-generate-zarr.yml used to
             # run these; that workflow is retired and this filter replaces it.
@@ -685,9 +699,11 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     needs: changes
-    # Matches unit-pure's trigger so that, as a required check, lint never
-    # "skips" on a backend-only PR (a skipped required check blocks merges).
-    if: needs.changes.outputs.cli == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.zarr == 'true' || needs.changes.outputs.shared == 'true' || needs.changes.outputs.decisions == 'true' || needs.changes.outputs.agentdocs == 'true' || needs.changes.outputs.neurobagel_deploy == 'true'
+    # Kept identical to unit-pure's trigger so the two jobs run on the same changes.
+    # (A job skipped by its `if:` reports Success and does not block a required check.
+    # Only a skipped WORKFLOW leaves its checks pending, which is why `pull_request`
+    # above has no paths-ignore.)
+    if: needs.changes.outputs.cli == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.zarr == 'true' || needs.changes.outputs.shared == 'true' || needs.changes.outputs.decisions == 'true' || needs.changes.outputs.agentdocs == 'true' || needs.changes.outputs.neurobagel_deploy == 'true' || needs.changes.outputs.workflows == 'true'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -739,7 +755,7 @@ jobs:
     # that runs test/*.test.ts at all -- `lint` runs tsc and biome. Adding the
     # filter to `lint` alone left the index test still skipped on an ADR-only PR,
     # which is the gap it was added to close.
-    if: needs.changes.outputs.cli == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.zarr == 'true' || needs.changes.outputs.shared == 'true' || needs.changes.outputs.decisions == 'true' || needs.changes.outputs.agentdocs == 'true' || needs.changes.outputs.neurobagel_deploy == 'true'
+    if: needs.changes.outputs.cli == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.zarr == 'true' || needs.changes.outputs.shared == 'true' || needs.changes.outputs.decisions == 'true' || needs.changes.outputs.agentdocs == 'true' || needs.changes.outputs.neurobagel_deploy == 'true' || needs.changes.outputs.workflows == 'true'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -808,22 +824,27 @@ jobs:
           sparse-checkout-cone-mode: false
           ref: staging
 
-      # The deployed copy of onboard-openneuro.yml, for the same reason and with the
-      # same shape (#1309). That workflow is authored in this repo beside the CLI it
-      # invokes, then deployed by copying it whole into nemarDatasets/.github -- and
-      # the two had already drifted by one merged PR before anyone noticed, because
-      # nothing compared them. `main`, not a pre-release branch: that repo has no
-      # release train, so what is on main is what runs.
+      # The deployed copies of onboard-openneuro.yml and run-pr-review.yml, for the
+      # same reason and with the same shape (#1309). Both are authored in this repo
+      # beside the code they invoke, then deployed by copying them whole into
+      # nemarDatasets/.github -- and the first pair had already drifted by one merged
+      # PR before anyone noticed, because nothing compared them. `main`, not a
+      # pre-release branch: that repo has no release train, so what is on main is
+      # what runs.
       #
-      # nemarDatasets/.github is PUBLIC, so no token is needed. Sparse, non-cone, one
-      # file. It lands in dataset-workflows-live/ at the repo root, which the
-      # unit-pure file glob does not reach, so it cannot be mistaken for a test file.
-      - name: Check out the deployed dataset workflow
+      # nemarDatasets/.github is PUBLIC, so no token is needed. Sparse, non-cone, two
+      # files (non-cone mode takes file paths, one per line). They land in
+      # dataset-workflows-live/ at the repo root, which the unit-pure file glob does
+      # not reach, so they cannot be mistaken for test files. A workflow added to
+      # this list needs its own NEMAR_*_LIVE variable in the test step below.
+      - name: Check out the deployed dataset workflows
         uses: actions/checkout@v4
         with:
           repository: nemarDatasets/.github
           path: dataset-workflows-live
-          sparse-checkout: .github/workflows/onboard-openneuro.yml
+          sparse-checkout: |
+            .github/workflows/onboard-openneuro.yml
+            .github/workflows/run-pr-review.yml
           sparse-checkout-cone-mode: false
           ref: main
 
@@ -880,6 +901,7 @@ jobs:
           # broken checkout step cannot silently disable the check.
           NEMAR_WEBSITE_ACCOUNT_COPY: website-copy/src/lib/account-copy.ts
           NEMAR_DATASET_WORKFLOW_LIVE: dataset-workflows-live/.github/workflows/onboard-openneuro.yml
+          NEMAR_PR_REVIEW_WORKFLOW_LIVE: dataset-workflows-live/.github/workflows/run-pr-review.yml
           # Empty on a fork, where the checkout above is skipped, so the guard
           # skips VISIBLY instead of failing on a checkout that could never have
           # worked. On any run from this repository it is set, and a missing

@@ -26,6 +26,21 @@ jobs:
     timeout-minutes: 5
     permissions:
       issues: write
+    env:
+      # THIS JOB HAS NO CHECKOUT STEP, deliberately: it needs no source tree. But
+      # `gh` finds its repository by asking git for the remote, and with no
+      # checkout there is no git repository, so every `gh issue` and `gh label`
+      # call died with "failed to run git: fatal: not a git repository". Of the 20
+      # scheduled runs on record (the first on 2026-06-01), 19 failed that way in
+      # "Open / update drift issue", so the drift issue this workflow exists to
+      # file was never opened. The other one (2026-08-24) failed in "Open / update
+      # report-broken issue" for the same reason, while reporting that the
+      # coverage endpoint had answered HTTP 500, so that outage went unreported.
+      #
+      # Job-level so a step added later inherits it instead of repeating the bug.
+      # test/workflow-gh-calls.test.ts fails on a `gh` call that has no checkout, no
+      # GH_REPO and no --repo.
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Fetch coverage report
         id: fetch
@@ -159,18 +174,74 @@ jobs:
               out.write(f"body<<{delim}\n{body}\n{delim}\n")
           PYEOF
 
+      - name: Define the retry helper
+        # Each issue step below looks for an existing issue before it files one. A lookup that
+        # FAILS must fail its step: reading an error as "no issue" files a duplicate every
+        # week. But one transient API failure should not cost a week's alarm either, so each
+        # lookup goes through `retry`: three attempts, five seconds apart, and it still fails
+        # after the last. Steps share no shell state, so the function is written to a file
+        # once and each step sources it.
+        run: |
+          cat > "$RUNNER_TEMP/retry.sh" << 'EOF'
+          # retry COMMAND [ARGS...]: run it up to 3 times, RETRY_DELAY seconds apart (default 5),
+          # and print the output of the first success. After the third failure it returns 1, so
+          # `X=$(retry gh issue list ...)` under `set -e` still fails the step.
+          retry() {
+            local attempt=1 out
+            until out=$("$@"); do
+              if [ "$attempt" -ge 3 ]; then
+                echo "::error::Giving up after 3 attempts: ${*:1:3}" >&2
+                return 1
+              fi
+              echo "::warning::Attempt $attempt of 3 failed, retrying in ${RETRY_DELAY:-5}s: ${*:1:3}" >&2
+              attempt=$((attempt + 1))
+              sleep "${RETRY_DELAY:-5}"
+            done
+            printf '%s\n' "$out"
+          }
+          EOF
+
       - name: Ensure issue labels exist
         if: fromJSON(steps.fetch.outputs.drift) != 0
+        # A failure here stays in the log and in the run's annotations, but the step and the
+        # job stay green: with `continue-on-error` the runner reports the step as succeeded.
+        # Failing the job instead trades a duplicate for a lost alarm: one label-API hiccup
+        # would mean no issue at all this week. Nothing is hidden by letting the job go on:
+        # a label that is really missing still fails `gh issue create --label` in the steps
+        # below, and that failure is red.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # `drift` is a workflow-specific label that may not exist yet on a
-          # fresh repo; `P2` is the project's standard priority label. Create
-          # both idempotently so `gh issue create` below doesn't fail closed
-          # with "could not add label" on the first run.
-          gh label create drift --color FBCA04 --description "summary.json drift detected by the weekly cron" --force >/dev/null 2>&1 || true
-          gh label create P1 --force >/dev/null 2>&1 || true
-          gh label create P2 --force >/dev/null 2>&1 || true
+          set -euo pipefail
+          # `drift` is a workflow-specific label that does not exist on a fresh
+          # repo; P1 and P2 are the project's standard priority labels. Create
+          # only the ones that are missing.
+          #
+          # This used to end each call in `>/dev/null 2>&1 || true`, which hid both
+          # the missing `drift` label and the repository error above for twenty
+          # weeks. Every failure is now printed, and every label is attempted
+          # before the step reports failure.
+          #
+          # Not `gh label create --force`: with no --color it picks a RANDOM one,
+          # so every run would recolor the existing P1 and P2 labels.
+          LABELS=$(gh label list --limit 1000 --json name --jq '.[].name')
+          failed=0
+          ensure_label() {
+            local name="$1" color="$2" description="$3"
+            if grep -qixF "$name" <<< "$LABELS"; then
+              echo "Label '$name' exists."
+            elif gh label create "$name" --color "$color" --description "$description"; then
+              echo "Created label '$name'."
+            else
+              echo "::error::Could not create label '$name'."
+              failed=1
+            fi
+          }
+          ensure_label drift FBCA04 "summary.json drift detected by the weekly cron"
+          ensure_label P1 ff6347 "High priority - important features, significant bugs"
+          ensure_label P2 ffa500 "Normal priority - standard features and improvements"
+          exit "$failed"
 
       - name: Open / update drift issue
         # Skip when majority_errored is true — that case opens its own P1
@@ -186,9 +257,27 @@ jobs:
           ERROR_COUNT: ${{ steps.fetch.outputs.error }}
           ISSUE_BODY: ${{ steps.body.outputs.body }}
         run: |
-          TITLE="summary.json drift: ${DRIFT} version(s) need backfill"
+          set -euo pipefail
+          source "$RUNNER_TEMP/retry.sh"
+          # The title and the lookup that finds it again share this one prefix, so they
+          # cannot drift apart. It must not be a prefix of the probe-broken or report-broken
+          # prefixes below, nor they of it (test/workflow-gh-calls.test.ts checks).
+          PREFIX="summary.json drift:"
+          TITLE="${PREFIX} ${DRIFT} version(s) need backfill"
           # Reuse the most recent open drift issue if one exists; otherwise open a fresh one.
-          EXISTING=$(gh issue list --label "drift" --state open --search "summary.json drift" --json number --jq '.[0].number' || echo "")
+          # A FAILED lookup fails the step (set -e above), after three attempts. It used to end
+          # in `|| echo ""`, which turned an error into "no issue exists" and would have opened
+          # a duplicate every Monday once the repository error was fixed. An empty RESULT is
+          # fine and means there is none; an error is not.
+          #
+          # The match is on the TITLE PREFIX, not on the search text alone: the probe-broken
+          # and report-broken issues carry the `drift` label too, and "summary.json drift"
+          # appears in the title of one and the body of the other, so a bare search would
+          # find one of them and rewrite it into a drift report.
+          # The search text is the prefix without its colon, so it is not a third copy.
+          EXISTING=$(retry gh issue list --label "drift" --state open --search "${PREFIX%:}" \
+            --json number,title \
+            --jq "[.[] | select(.title | startswith(\"${PREFIX}\"))] | .[0].number // empty")
           if [ -n "$EXISTING" ]; then
             # Update both title and body so the count in the title doesn't
             # rot when subsequent runs change how many versions are drifted.
@@ -212,9 +301,15 @@ jobs:
           VERSIONS: ${{ steps.fetch.outputs.versions }}
           ISSUE_BODY: ${{ steps.body.outputs.body }}
         run: |
-          TITLE="summary.json probe failing for majority of versions (${ERROR_COUNT}/${VERSIONS})"
+          set -euo pipefail
+          source "$RUNNER_TEMP/retry.sh"
+          PREFIX="summary.json probe failing"
+          TITLE="${PREFIX} for majority of versions (${ERROR_COUNT}/${VERSIONS})"
           BODY=$'## Probe is failing for most versions\n\n'"$ISSUE_BODY"$'\n\n---\n\n**This is likely a `/<id>/<v>/summary.json` route or S3 IAM problem, NOT a backfill problem.** `nemar admin summary check --fix` will dispatch workflows that succeed at writing to S3 but the read path will keep returning error. Triage:\n\n1. Hit `https://data.nemar.org/<a-known-published-id>/v1.0.0/summary.json` directly. If it 5xx, that confirms route/IAM.\n2. Check the Worker error log for `[data] summary fetch failed`.\n3. Verify `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` Workers secrets are set + valid (`npx cfman wrangler --account sccn secret list -c backend/wrangler-sccn.toml`).\n\nTriggering workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
-          EXISTING=$(gh issue list --label "drift,P1" --state open --search "summary.json probe failing" --json number --jq '.[0].number' || echo "")
+          # A failed lookup fails the step rather than reading as "no issue" (see the drift step).
+          EXISTING=$(retry gh issue list --label "drift,P1" --state open --search "${PREFIX%:}" \
+            --json number,title \
+            --jq "[.[] | select(.title | startswith(\"${PREFIX}\"))] | .[0].number // empty")
           if [ -n "$EXISTING" ]; then
             gh issue edit "$EXISTING" --title "$TITLE" --body "$BODY"
           else
@@ -232,9 +327,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FETCH_ERROR: ${{ steps.fetch.outputs.fetch_error }}
         run: |
-          TITLE="summary.json drift cron broken"
+          set -euo pipefail
+          source "$RUNNER_TEMP/retry.sh"
+          PREFIX="summary.json drift cron broken"
+          TITLE="${PREFIX}"
           BODY=$'## Coverage endpoint or payload broken\n\n'"$FETCH_ERROR"$'\n\nThe weekly summary.json drift cron could not parse a coverage report. Run `nemar admin summary check --json` manually to triage. Triggering workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
-          EXISTING=$(gh issue list --label "drift,P1" --state open --search "summary.json drift cron broken" --json number --jq '.[0].number' || echo "")
+          # A failed lookup fails the step rather than reading as "no issue" (see the drift step).
+          EXISTING=$(retry gh issue list --label "drift,P1" --state open --search "${PREFIX%:}" \
+            --json number,title \
+            --jq "[.[] | select(.title | startswith(\"${PREFIX}\"))] | .[0].number // empty")
           if [ -n "$EXISTING" ]; then
             gh issue edit "$EXISTING" --title "$TITLE" --body "$BODY"
           else

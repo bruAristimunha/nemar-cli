@@ -24,6 +24,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "bun";
 import { FACETS, type FacetDefinition } from "../shared/facets";
+import { MAX_MODALITY_FILTER_TOKENS, MODALITY_FILTER_CLI_HELP } from "../shared/modality-filter";
 
 const CLI_ENTRY = join(import.meta.dir, "..", "src", "index.ts");
 const REPO_ROOT = join(import.meta.dir, "..");
@@ -523,6 +524,33 @@ describe("verification case 8: gaps found by mutation after the first review rou
       const result = await runCli(["dataset", "list", "--sort", "bogus"], server.url);
       expect(result.exitCode).not.toBe(0);
       expect(server.requests.length).toBe(0);
+    } finally {
+      server.stop();
+    }
+  });
+});
+
+describe("--modality (#1711)", () => {
+  // The match is the server's; the CLI's part is to say what it does and to
+  // send the value through untouched, so a comma list reaches the wire whole.
+  const collapse = (text: string) => text.replace(/\s+/g, " ");
+
+  test("both commands describe the whole-token match, the comma list and the limit", async () => {
+    for (const command of ["list", "search"]) {
+      const result = await runCli(["dataset", command, "--help"], "http://127.0.0.1:1");
+      expect(result.exitCode).toBe(0);
+      expect(collapse(result.stdout)).toContain(collapse(MODALITY_FILTER_CLI_HELP));
+    }
+    expect(MODALITY_FILTER_CLI_HELP).toContain("whole token");
+    expect(MODALITY_FILTER_CLI_HELP).toContain(String(MAX_MODALITY_FILTER_TOKENS));
+  });
+
+  test("a comma list is sent to the server as typed", async () => {
+    const server = startCaptureServer(EMPTY_LIST_ENVELOPE);
+    try {
+      const result = await runCli(["dataset", "list", "--modality", "eeg,meg"], server.url);
+      expect(result.exitCode).toBe(0);
+      expect(server.requests[0].searchParams.get("modality")).toBe("eeg,meg");
     } finally {
       server.stop();
     }

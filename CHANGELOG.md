@@ -13,7 +13,214 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
-## 0.10.16 - 2026-10-10
+## 0.10.17 - 2026-10-13
+
+The website's server-side requests are counted per visitor instead of as one client, which is
+the fix for the `/discover` 429 errors (#1709), together with a rate limiter whose windows no
+longer slide, a modality filter that matches a whole token, a corrected check before an
+administrator approves a pull request, a weekly drift check that can finally file its
+issue, and an upload step that no longer re-reads tracked files of 1 GiB or more through
+git-annex's filter process. The automated review of dataset pull requests stays off in
+production, as in 0.10.16; its first live run passed on dev on 2026-10-12, with a throwaway
+pull request to an exemplar dataset. There is no migration and no new secret. Counting per
+visitor needs a second deploy: the website must be promoted to production after this release
+(see Deploy coupling), while the fixed windows and the higher cap help the shared pool at once.
+
+### Changed
+
+- **The parity test for `run-pr-review.yml` now runs in CI against the deployed copy (ADR 0092).**
+  The workflow reached `nemarDatasets/.github` `main` on 2026-10-12 (commit `fe7f821a`), so the
+  `unit-pure` job's sparse checkout of that repository lists it beside `onboard-openneuro.yml` and
+  sets `NEMAR_PR_REVIEW_WORKFLOW_LIVE` to it. Until now the test skipped in CI, because there was
+  nothing to compare. With the variable set, a missing deployed copy fails the test, and so does a
+  deployed copy that differs from `.github/dataset-workflows/run-pr-review.yml` by a single byte.
+  A change to either copy now has to be deployed to the other in the same step, as it already
+  had to be for the onboarding workflow. Step 3 of ADR 0092's "Before it is switched on" is done.
+
+- **The anonymous per-IP cap is 1000 per window, up from 500 (ADR 0098).** It stays at 1000
+  because the authenticated token cap is 1000 and a token holder must not be limited more
+  strictly than an anonymous caller. `/mcp` shares this bucket, so its ceiling doubles with it.
+- **Rate-limit counters are fixed windows (ADR 0099).** The counter used to rewrite its record
+  with a fresh full minute on every allowed request, so the window slid, and a pool that never
+  went quiet for a minute was refused for about a minute after every `cap / rate` seconds,
+  whatever the cap; that is most of the 40 percent in #1709. The record now carries the window's
+  end, a block ends where the window does, `Retry-After` is the seconds left and
+  `X-RateLimit-Reset` is the window's end. One read, write and refuse path serves every bucket,
+  including the data-plane miss budget, the private-grant budget and the observe-only path. A
+  fixed window can admit up to twice a cap across a boundary, so the strict sign-in bucket can
+  pass up to 20 requests across a boundary instead of 10; ADR 0099 accepts that, because the
+  sign-in routes also limit per email.
+- **Every answer says how the caller was identified, and browsers can read the headers (ADR
+  0098).** `X-RateLimit-Caller` is `edge`, `site` or `unattributed` on every answer, including
+  the admin-bypass answer and the private-grant refusal; `X-RateLimit-Bucket` values are
+  unchanged. The rate-limit headers are exposed to browser callers on the nemar.org hosts and
+  are kept on handler responses.
+- **Limiter logs name who and where, once per window (ADR 0098).** Cache-fault lines are keyed
+  by bucket kind, phase and error class, say how long ago the previous line was, and speak again
+  at the 11th, 101st and 1001st call so a burst shows its size. Refusals are logged once per
+  window per caller source, a caller identified by an address is named by source and reason and
+  never by value, and token buckets write no identity line.
+
+### Fixed
+
+- **The website's server-side requests are counted per visitor, not as one client (#1709, ADR
+  0098).** The website renders `/discover` and dataset pages on the server, so every visitor
+  reached the API from the same few Cloudflare addresses and one per-address bucket was shared
+  by all of them; when it filled, visitors saw "Could not load datasets" for minutes. The website
+  will now call the Worker through a service binding and send the visitor's address in
+  `X-Forwarded-For`. The limiter counts a request that has no `CF-Connecting-IP` and a valid
+  first `X-Forwarded-For` address in a new `site-ip` bucket of 2000 per window, under a key a
+  public caller can never produce, and `X-Forwarded-For` is never read when `CF-Connecting-IP` is
+  present. A binding call with neither header now shares one `site-unattributed` bucket of
+  20,000 per window instead of getting a fresh random bucket per request, which was no limit at
+  all. The Worker's own in-process requests (an MCP tool reading `index.json`, the Neurobagel
+  gatherer) are not counted by the data-plane counter or its miss budget, and are counted by
+  their headers everywhere else. A forwarded visitor also gets their own ten sign-in requests
+  (the address half of #1354). The strict, data, token and Neurobagel caps, the admin bypass
+  and the development bypass are unchanged. To be honest about the number: a default Discover
+  page costs 11 API calls (about 180 views per window) and the largest page the website can
+  render costs about 101 (about 19 views), so capping what one page hydrates is the website's
+  to decide. **Per-visitor counting waits for the website's promotion to production;** the fixed
+  windows and the 1000 cap apply to the shared pool as soon as this Worker is released.
+- **A stalled Cache API can no longer hang a request, and a failed cache write no longer demotes
+  an admin (ADR 0098).** Every wait on the cache is bounded at 500 ms and fails open, including
+  deferred writes and body reads. An admin the database had just confirmed keeps the admin
+  bypass when the cache write fails or stalls, and a damaged cached admin flag is read again
+  from the database and logged once per window.
+- **The weekly summary.json drift check can file its issue.** The job has no checkout, so `gh`
+  had no repository to act on. Of the 20 scheduled runs on record (the first on 2026-06-01), 19
+  failed in the step that opens the issue and 1 in the step that reports a broken coverage
+  endpoint, so no drift issue was ever filed and the one outage it should have reported went
+  unreported. The job now names its repository. The label step creates the `drift` label if it
+  is missing and no longer hides its errors; a failure there is visible in the log but does not
+  stop the job, because a label that really is missing still fails the step that files the
+  issue. Each existing-issue lookup is retried three times, five seconds apart, and still fails
+  the step after the third failure instead of reading an error as "no issue", which would have
+  filed a duplicate every Monday. A lookup also keeps only an issue whose title starts with its
+  own prefix, so the probe-broken and report-broken issues are no longer taken for the drift
+  issue. The backfill of 2026-10-12 cleared the 96 of 1303 versions that had no `summary.json`,
+  so the first corrected run is expected to file nothing; dispatch the workflow once from
+  `main` after the release to confirm that the job runs green. **This takes effect when it
+  reaches `main`:** scheduled workflows run from the default branch, and this change targets
+  `dev`.
+- **The nightly dev-suite issue no longer files a duplicate when its lookup fails.** The same
+  `|| true` pattern read a failed lookup as "no open issue", and the label step hid a real
+  failure behind "already exists". The lookup is now retried three times and fails the step if
+  it still fails; the label step warns in the log instead of going silent.
+- **A test fails on a workflow `gh` call that has no repository, and CI runs it on a workflow-only
+  pull request.** `test/workflow-gh-calls.test.ts` checks every workflow the repository ships, `.yml`
+  or `.yaml`, and the per-dataset templates for a `gh` call with no checkout, `GH_REPO` or
+  `--repo`, a swallowed issue lookup, a lookup in a step that does not stop on error, and a
+  swallowed label create. A pull request that edited only a workflow used to run no job at all.
+- **The `modality` filter matches a whole modality, not a substring (#1711, ADR 0032
+  amendment).** `GET /datasets`, `GET /datasets/search` and the MCP `search_datasets` tool
+  matched `LIKE '%eeg%'` over the comma-joined modality list, so `modality=EEG` also returned
+  datasets that were intracranial only (`ieeg`), and a `%` or `_` in the value matched every
+  row or any character. The filter now matches a whole token, ignoring case, and a space
+  inside a token is part of it. **A partial name no longer matches:** `modality=ee` and
+  `modality=mot` used to return datasets and now return nothing; use the full name (`eeg`,
+  `motion`). A comma-separated value matches a dataset holding any of its tokens (it used to
+  match only a list that held them adjacent and in stored order). A value that names no
+  modality, such as whitespace or a bare comma, matches nothing. **At most 32 distinct
+  modalities may be named in one request**; more is a 400 (a refused tool call on MCP) rather
+  than a truncated list. Result counts for `modality=eeg` drop to the datasets that hold an
+  `eeg` token, which is the count `GET /datasets/facets` reports. `task` and `author` are
+  still substring filters. Adjacent fix: `GET /datasets/search` now sends `Cache-Control:
+  no-store` on every response; it sent no `Cache-Control` at all, including on its 400s, which
+  `GET /datasets` already sent as `no-store`. No migration and no deploy coupling.
+  The CLI help, the MCP schema text and the OpenAPI description for `modality` say so too.
+  To match both EEG and intracranial datasets, pass `eeg,ieeg`. An empty `modality=` is still no
+  filter. A `modality` value of 49 or more characters used to return 500, because of D1's 50-byte
+  `LIKE` pattern limit, and now matches nothing.
+- **`nemar admin pr-reviews approve --merge` and `y` in `next` no longer approve a pull request
+  they then refuse to merge (ADR 0093 amendment).** Both approved first and read GitHub's
+  `mergeable_state` afterwards, and `y` was offered for every state but `dirty` and `behind`, so a
+  pull request the automated review holds (its check is not required, so GitHub is expected to
+  report `unstable`: a check or status that is not required is not passing or has not reported) was
+  approved and left unmerged. The state is now read before anything is written, and again just before
+  the approval is written: unless GitHub says `clean` (asked again while it says `unknown`; an
+  unreadable or unrecognised state, a moved head and a pull request no longer open are not clean),
+  nothing is approved or merged, the state or the failed read is named with why it blocks, and the
+  way forward is given (approve without `--merge` for a state that will not clear, run the command
+  again for one that may or whose head changed; in `next`, `s` skips it and a fresh run looks again).
+  The second look narrows the window to one request and does not close it: GitHub has no
+  approve-and-merge call. `y` is not offered for such a pull request, `--force` does not reach it,
+  and `approve` without `--merge` is unchanged. The "clean only" rule itself is unchanged. A
+  repository whose protection required an approving review would read `blocked` before the approval
+  and is now refused; neither the ruleset applied to published datasets nor the classic protection on
+  the four legacy repositories requires one.
+- **A Cache API that keeps stalling no longer costs every API request half a second (#1715,
+  ADR 0098 amendment).** Every rate-limiter wait on the cache was bounded at 500 ms with no
+  memory, so while the cache stayed stalled each request paid the bound in each place it used
+  the cache, the website's server-side renders included. Each Worker isolate now keeps a small
+  breaker: three stalls within 60 seconds open it, an open breaker skips the cache at once for
+  10 seconds, and then one probe closes it when the cache answers. Fail-open is unchanged: a
+  skipped call is treated as a stalled one was, the request is served and not counted, and
+  nothing is ever refused because of it. Counting can stay off on an isolate for up to 10
+  seconds after the cache recovers. Skips are logged in the existing fault line as
+  `CacheSkippedError`, and opening and closing each have a rate-limited line. No migration and
+  no deploy coupling.
+- **The rate limiter's observe-only warning no longer logs a reversible hash of the caller's
+  address (#1713, ADR 0098 amendment).** Its `ipHash` field was a plain SHA-256 of the address
+  (or of `site:<address>`), which anyone can reverse for an IPv4 address by trying every
+  address. It is now an HMAC-SHA-256 under a key derived from the existing `ENCRYPTION_KEY`
+  secret with HKDF, so it still tells one caller from another but a reader of the log cannot
+  recover the address. A Worker without `ENCRYPTION_KEY` leaves the field out. The field keeps
+  its name; its values change, so a pseudonym logged before this release does not match one
+  logged after. No new secret, no migration and no deploy coupling. The same unkeyed hash is
+  still stored with sessions and the device sign-in audit; that is tracked in #1733.
+- **Tracking no longer leaves data files of 1 GiB or more for git to re-read through
+  git-annex filter-process (#1704, ADR 0100).** `git annex add` stages an unlocked file without
+  stat data, so the save, the first `git status` afterwards and the next upload's add each
+  streamed it through `git-annex filter-process` again, and the add's check of files already in
+  the index read each one twice. For data files of 1 GiB or more the tracking step now records
+  the stat data with `git add --refresh` through git-annex's per-file clean filter, which
+  answers from its inode cache without the file's content being sent. `filter.annex.process` is
+  out of the repository's configuration only for one chunk of 100 paths at a time, under
+  git-annex's own `filter.annex.process-temp-disabled` marker, and only when no other filter
+  process (an empty one included) is set in any scope; it is put back after each chunk, on
+  SIGINT, SIGTERM and SIGHUP, and at the start of the next upload, and a configuration that
+  cannot be put back fails the step. Files under 1 GiB are tracked as before, so after a save
+  that took the 1 GiB skip, the next upload still reads each of them twice; trees of many
+  smaller files, the common EEG case, keep that cost. Measured locally with the threshold
+  lowered to 100 MB so that 200 MiB files were primed, the bytes piped into the filter on a
+  second upload to a 1.26 GB dataset fell from 2,517 MB to 1.1 MB; at the shipped threshold
+  those files are not primed. Not measured on CephFS.
+
+### Deploy coupling
+
+- No migration, no new Worker secret or variable, and the automated pull-request review stays
+  off in production. The keyed log pseudonym derives from the existing `ENCRYPTION_KEY`.
+- **Release the Worker first, then promote the website,** so the first binding calls are counted
+  in `site-ip` and the keying can be checked. Until the website calls through the service binding
+  with `X-Forwarded-For` (nemarOrg/website, merged to `staging`), its visitors keep arriving from
+  shared addresses and the `/discover` errors depend on the 1000 cap and the fixed windows
+  alone. The order is not a safety gate: 0.10.16 counts a binding call by its raw
+  `X-Forwarded-For` in the old `ip` bucket (cap 500, sliding), per visitor, so promoting the
+  website first would be safe and only the website's own first-call check would warn.
+- The keying cannot be read from the website's logs or from a browser: the website logs
+  `remaining` once per bucket kind per isolate, and its proxy forwards no rate-limit headers. To
+  check it before promoting the website, make calls for one visitor and one other from a
+  throwaway Worker bound to `nemar-api` through a service binding (`X-Forwarded-For` set to
+  reserved documentation addresses such as `203.0.113.201` and `203.0.113.202`), delete the
+  Worker afterwards, and expect `X-RateLimit-Bucket: site-ip` and `X-RateLimit-Caller: site`, a
+  first `X-RateLimit-Remaining` of 1999 that falls overall across six or more calls a second or
+  two apart (the count is kept per data center, so an occasional repeat or small rise is
+  normal), and the other visitor starting at 1999. The `[rate-limit] counting a request without CF-Connecting-IP by
+  its forwarded visitor` line should appear and no "request with neither" warning. #1712 (demote
+  that line) stays open until this has been observed.
+- The weekly summary.json drift check runs from `main`, so its first corrected run is the Monday
+  after this release. Dispatch it once from `main` after the release; it should run green and
+  file nothing, because production coverage is 1303 of 1303.
+- Check the fixed windows after deploy: `Retry-After` counts down within a window and
+  `X-RateLimit-Reset` stays fixed until the window ends (the check ADR 0099 relies on).
+- The CLI command reference on docs.nemar.org is regenerated for 0.10.17 afterwards: the
+  `--merge` help of `admin pr-reviews approve` and the `--modality` help of `dataset list` and
+  `search` changed.
+- Watch how often the `[rate-limit] the cache keeps stalling` line appears after deploy; the
+  breaker's three constants are the knob, and production stall rates are unknown.
+
+## 0.10.16 - 2026-10-11
 
 Epic #1671 (upload and integrity fixes) reaches `main` together with the automated review of
 dataset pull requests and the admin command that works through it, publication requests that

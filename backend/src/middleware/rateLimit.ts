@@ -5,7 +5,7 @@
  * Cache API has no daily limits and is designed for this use case.
  *
  * Bucket policy:
- *   - Unauthenticated requests are keyed by IP and capped at 500/60s
+ *   - Unauthenticated requests are keyed by IP and capped at 1000/60s
  *     (`MAX_REQUESTS`).
  *   - Authenticated requests are keyed by the SHA-256 hash of the
  *     bearer token and capped at 1000/60s (`TOKEN_MAX_REQUESTS_AUTHED`).
@@ -26,12 +26,29 @@
  *     bucket's 60s window and trips it on the 11th, about 50 seconds in,
  *     so it rides the generic bucket plus its own per-row floor instead.
  *     See the `AUTH_PATHS` comment for the detail.
+ *   - Who an address names depends on how the request arrived (#1709, ADR
+ *     0098). Cloudflare sets `CF-Connecting-IP` on everything from the public
+ *     network, and that value alone keys the buckets above. A request through
+ *     a service binding (the website's Worker) has none, so the visitor the
+ *     caller forwarded in `X-Forwarded-For` is counted instead, in `site-ip`
+ *     (and in `site:`-prefixed keys of the strict, data and Neurobagel
+ *     buckets), and a request with neither is counted in one shared bucket.
+ *     `X-Forwarded-For` never chooses the bucket of a request that carries
+ *     `CF-Connecting-IP`.
+ *   - Every counter is a fixed window (`__CounterState`, ADR 0099): it starts with
+ *     the first request that finds none and ends 60 seconds later, `Retry-After`
+ *     and `X-RateLimit-Reset` say when, and a busy client is refused until then
+ *     and no longer.
+ *   - Every answer says how the caller was identified in `X-RateLimit-Caller`
+ *     (`edge`, `site` or `unattributed`), on the bucket header's side, because the
+ *     strict, data and Neurobagel buckets keep their names for every source.
  */
 
 import type { Context, Next } from "hono";
+import { isInternalRequest } from "../lib/internal-request";
 import { ACTIVE_ACCOUNT_STATUS_SQL_LIST } from "../services/account-tier";
+import { logPseudonym } from "../services/log-pseudonym";
 import { hashApiKey } from "../services/token";
-import { hashIp } from "../services/web-session";
 import type { Bindings, Variables } from "../types/bindings";
 
 // Rate limit configuration
@@ -45,7 +62,81 @@ const WINDOW_SIZE = 60; // seconds
 // primary control against abuse. Bumped 100 → 500 in #639 along with
 // adding Cache-Control to the three dataset GET endpoints (which is the
 // real architectural fix; this cap raise is defense-in-depth).
-const MAX_REQUESTS = 500;
+//
+// 1000 since #1709 (ADR 0098), up from 500. The website's ordinary traffic does not
+// ride this bucket (it is counted per visitor in `site-ip`); this is defense in
+// depth for the callers that still reach the API as one client: the website when
+// it cannot use its binding (a Pages preview, local development, or if a binding
+// call turns out to carry an address after all), the docs gate's Pages Function,
+// and shared CI runners.
+//
+// What a counted request costs: one Worker invocation and, for the catalog reads
+// that dominate, two or three D1 reads (a page of rows and its count; a search adds
+// an index lookup). The Cache-Control those routes send lets a client that honors
+// it skip the call; it does not make the Worker skip the work for one that does
+// not. At 1000 per window the ceiling for one address is about 17 requests a
+// second, 1.4 million a day, per data center.
+//
+// What the number does and does not protect against. It bounds a runaway loop from
+// one address. It does not bound a crawl spread over many addresses (each has its
+// own bucket, each data center its own counter), or the cost of any single call.
+// `/mcp` shares this bucket, and its tools read from S3 per call; those reads are
+// bounded by their own byte limits (#1498), not by this number, so a higher cap
+// raises how many one address may start. No Cloudflare rule in front of the Worker
+// is documented in this repository, so read this as the only floor.
+//
+// Why 1000 and not more. A token holder must never be limited more strictly than an
+// anonymous caller. `TOKEN_MAX_REQUESTS_AUTHED` is 1000, so this cannot go
+// above it without raising that one too, which is a separate decision; a test pins
+// the relation. The number is not what made the website's pool trip it: the counter
+// is a fixed window (`__CounterState`), so a rate below the cap per window is never
+// refused, whatever the cap. ADR 0099 has the measurements.
+const MAX_REQUESTS = 1000;
+// The website's own bucket, per forwarded visitor (#1709, ADR 0098). The website
+// reaches this Worker through a service binding, which carries no
+// `CF-Connecting-IP`, and forwards the visitor's address in `X-Forwarded-For`;
+// such a request is counted here, keyed by that address, instead of in `ip`.
+// The pool problem MAX_REQUESTS describes does not arise: each key is one
+// visitor, not every visitor behind a handful of Cloudflare egress addresses.
+//
+// What a page costs, and so what the number buys. A default Discover page makes
+// one search call and up to ten `GET /datasets/:id` hydrations, eleven calls, so
+// 2000 covers about 180 such page views in a window, three a second from one
+// address: more than a person produces. The largest page the website can render
+// today (`page_size=100`) hydrates every id in its slice, about 101 calls, and
+// spends the whole allowance in about 19 views, so a visitor or a crawler loading
+// such pages faster than one every three seconds reaches the cap inside a window.
+// The goal for this traffic, robots included, is that the data gets found, so the
+// number is generous, and it stays a floor against a runaway loop, not a quota.
+//
+// NEVER BELOW MAX_REQUESTS. A visitor who reaches the API through the website must
+// not be treated more strictly than a caller who reaches it directly, and a test
+// pins the relation so raising one cap cannot silently invert it.
+//
+// Counted like every bucket in this file, in a fixed window (`__CounterState`):
+// 2000 requests from one visitor in one window are admitted and the 2001st is
+// refused until the window ends, however busy the visitor is.
+const SITE_IP_MAX_REQUESTS = 2000;
+// A request with neither `CF-Connecting-IP` nor a usable `X-Forwarded-For`. The
+// public network cannot produce one (Cloudflare always sets the first), so it is a
+// caller inside the account that did not say who it acts for: today only the
+// website, if its forwarding broke. Every such request shares ONE bucket per kind,
+// not a fresh random one each, which would be no bucket at all and would switch the
+// limiter off for the strict buckets too. So the failure is bounded and visible:
+// `X-RateLimit-Caller: unattributed` on every answer, and a log line per bucket
+// per window (again on the 11th, 101st and 1001st call) that says why the forward
+// was unusable.
+//
+// The shared bucket is the whole site's traffic at once, so its cap is far above
+// any one visitor's: 20,000 is about 333 requests a second, some fifty times the
+// six or so a second that the 2026-10-11 production sample implies for the whole
+// website (a 40 percent refusal rate against the old sliding counter at a cap of
+// 500, ADR 0099), and still bounds a loop. The
+// strict, data and Neurobagel buckets keep their own caps for unattributed
+// callers, so a broken forward on a sign-in route throttles at the strict cap,
+// the same behavior the route had behind the shared egress pool (#1354), instead
+// of removing the floor.
+const SITE_UNATTRIBUTED_MAX_REQUESTS = 20_000;
 // Authenticated bucket. Originally sized for the heaviest single admin
 // orchestration: `nemar admin publish approve` on a 6500-object dataset
 // makes ~65 sequential CLI→Worker HTTP calls (one batch per ~100-object
@@ -60,36 +151,617 @@ const MAX_REQUESTS = 500;
 // in code review, not at runtime.
 const TOKEN_MAX_REQUESTS_AUTHED = 1000;
 
-/** See `writeCount`'s no-`waitUntil` fallback, below. */
+/** The longest the limiter waits for the Cache API on any one call, and for a
+ *  data-plane write handed no `waitUntil`. A healthy call settles in
+ *  milliseconds, so the bound is only ever felt when the cache has stalled, and
+ *  the stall breaker (`cacheCall`) stops it being felt on every request while the
+ *  stall lasts. */
 const RATE_LIMIT_WRITE_STALL_MS = 500;
 
-/** Last time {@link logCacheFaultOnce} actually emitted a log, module-level so
- *  it persists across requests in a warm isolate. */
-let lastCacheFaultLoggedAt = 0;
+const WINDOW_MS = WINDOW_SIZE * 1000;
 
-/**
- * Log a Cache API fault (the enforcement path failing open) at most once per
- * rate-limit window, per isolate. During a sustained Cache API outage every
- * request through `rateLimiter` or `checkDataMissBudget` used to hit this
- * same catch block and log unconditionally, which turns an outage into a
- * request-volume-scaled flood of `console.error` lines -- exactly the kind of
- * noise that makes the ONE line worth reading (the fault itself) harder to
- * find, not easier. A module-level timestamp is enough: it does not need to
- * be keyed by bucket or route, because the thing being reported is "the Cache
- * API is unavailable to this isolate right now," which is true for every
- * caller at once.
- */
-function logCacheFaultOnce(details: Record<string, unknown>): void {
-  const now = Date.now();
-  if (now - lastCacheFaultLoggedAt < WINDOW_SIZE * 1000) return;
-  lastCacheFaultLoggedAt = now;
-  console.error("[rate-limit] cache failure", details);
+/** What a log key remembers: when its window opened, when it last spoke, and how
+ *  many calls it has swallowed in this window and since it last spoke. */
+interface LogSlot {
+  windowAt: number;
+  lastAt: number;
+  inWindow: number;
+  sinceLine: number;
 }
 
-/** Test-only: let a test see the very next fault log again rather than
- *  waiting out a real window. */
-export function __resetCacheFaultLogForTests(): void {
-  lastCacheFaultLoggedAt = 0;
+/** Module-level so it persists across requests in a warm isolate. */
+const logSlots = new Map<string, LogSlot>();
+
+/** How many calls after a window's opening call a line speaks again (so the 11th,
+ *  101st and 1001st call in the window), so a burst that ends inside the window
+ *  shows its size without a line per call: at most four lines. */
+const LOG_MILESTONES: ReadonlySet<number> = new Set([10, 100, 1000]);
+
+/**
+ * Run `emit` at most once per rate-limit window per `key`, per isolate, and again
+ * on the 11th, 101st and 1001st call in the window. It is handed `suppressed`, the
+ * calls swallowed since the PREVIOUS LINE for that key (the call that is speaking is
+ * not one of them, so the lines and what they swallowed add up to the calls made),
+ * and `sinceMs`, the time since that previous line (0 for the first). So the line
+ * that opens a window reports the stretch before it, not the one just opening, and
+ * the size of a burst that ends inside a window is on the milestone lines, not on
+ * the next window's. That size is exact only to a factor of ten: a burst that ends
+ * between milestones shows as the last milestone it passed. Every log in this file
+ * that a request can trigger goes through here: during a sustained fault or a
+ * flood, a handful of lines per kind per minute is the line worth reading, and a
+ * line per request buries it. The key space is bounded by the kinds, sources and
+ * reasons below.
+ *
+ * `options.milestones: false` turns the repeats off, for a line that is healthy
+ * and informational rather than a symptom: a count of what it swallowed would be
+ * noise, and at steady traffic the repeats would add a few lines a minute.
+ */
+function logOncePerWindow(
+  key: string,
+  emit: (suppressed: number, sinceMs: number) => void,
+  options: { milestones?: boolean } = {},
+): void {
+  const now = Date.now();
+  const slot = logSlots.get(key);
+  // A clock that went backwards ends the quiet period as well: otherwise a slot
+  // stamped in the future would silence its line until the clock caught up.
+  if (slot && now >= slot.windowAt && now - slot.windowAt < WINDOW_MS) {
+    slot.inWindow++;
+    slot.sinceLine++;
+    if (options.milestones !== false && LOG_MILESTONES.has(slot.inWindow)) {
+      // `sinceLine` has just counted this call, which is speaking and so is not swallowed.
+      const suppressed = slot.sinceLine - 1;
+      const sinceMs = Math.max(0, now - slot.lastAt);
+      slot.sinceLine = 0;
+      slot.lastAt = now;
+      emit(suppressed, sinceMs);
+    }
+    return;
+  }
+  const suppressed = slot?.sinceLine ?? 0;
+  // Never negative, even if the clock has gone backwards since the previous line.
+  const sinceMs = slot ? Math.max(0, now - slot.lastAt) : 0;
+  logSlots.set(key, { windowAt: now, lastAt: now, inWindow: 0, sinceLine: 0 });
+  emit(suppressed, sinceMs);
+}
+
+/** The error's class name and nothing else. A cache key is a URL that carries the
+ *  caller's address and a runtime may quote it in a message, so no message from a
+ *  cache or database fault reaches the logs. */
+function errorName(error: unknown): string {
+  return error instanceof Error ? error.name : typeof error;
+}
+
+/** The error classes a fault log key tells apart; any other name is `other`, so the
+ *  key space has a hard ceiling whatever name a runtime gives an error. */
+const FAULT_CLASSES: ReadonlySet<string> = new Set([
+  "Error",
+  "TypeError",
+  "RangeError",
+  "SyntaxError",
+  "ReferenceError",
+  "EvalError",
+  "URIError",
+  "AbortError",
+  "TimeoutError",
+  "CacheStallError",
+  "CacheSkippedError",
+]);
+
+/** The part of a fault log key that is the error: its class when it is one we tell
+ *  apart, `other` otherwise. A transient stall must not hide a persistent bug of
+ *  another class in the same phase for the rest of the window. */
+function faultClass(error: unknown): string {
+  const name = errorName(error);
+  return FAULT_CLASSES.has(name) ? name : "other";
+}
+
+/** The Cache API did not answer within the bound. Reported like any cache fault. */
+class CacheStallError extends Error {
+  constructor(what: string) {
+    super(`cache ${what} did not settle within ${RATE_LIMIT_WRITE_STALL_MS} ms`);
+    this.name = "CacheStallError";
+  }
+}
+
+/**
+ * Wait for a Cache API call at most `RATE_LIMIT_WRITE_STALL_MS`, then give up
+ * with a {@link CacheStallError}, which every caller treats as a cache fault: the
+ * limiter fails open and logs it. Without a bound a stalled `match` or `put`
+ * leaves the request pending for as long as the runtime lets it, and the
+ * limiter sits in front of every API request, the website's server-side renders
+ * included. A call that fails after the bound is not left unhandled: the race
+ * subscribes to `work` as well, so its late rejection is already handled.
+ */
+function boundedWait<T>(work: Promise<T>, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const stalled = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new CacheStallError(what)), RATE_LIMIT_WRITE_STALL_MS);
+  });
+  return Promise.race([work, stalled]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * The cache-stall breaker (#1715): a small memory, per isolate, of the Cache API
+ * stalling, so a stall that lasts costs each isolate a few bounded waits rather than
+ * one on every request.
+ *
+ * The 500 ms bound above is per call and remembers nothing, so while the cache stays
+ * stalled every request pays it in each place it uses the cache (ADR 0098): about
+ * half a second on every website render through `site-ip`, a second on a token
+ * request. With the breaker:
+ *
+ *  - Closed (the normal state): every call is made and bounded as above. A healthy
+ *    call adds two clock reads, a comparison or two, a closure and an async frame,
+ *    and never a wait: about 0.2 microseconds a request, measured in process (Bun,
+ *    the in-memory test cache, 40,000 sequential requests, 4.4 before and 4.6 after).
+ *  - It opens after {@link BREAKER_STALLS_TO_OPEN} stalls within
+ *    {@link BREAKER_STALL_WINDOW_MS}. Only a {@link CacheStallError} counts: a call that
+ *    fails fast cost no time, and is the fault line's business, not the breaker's.
+ *  - Open: every limiter call to the Cache API is skipped at once with a
+ *    {@link CacheSkippedError}, for {@link BREAKER_COOL_DOWN_MS}. Nothing extends the
+ *    cool-down but a probe that stalls, so traffic cannot hold it open.
+ *  - After the cool-down the first call is the probe and is made; the calls behind
+ *    it keep skipping until it answers. A probe that answers, with a value or with a
+ *    fast error, closes the breaker and forgets the stalls; one that stalls opens it
+ *    for another cool-down. A probe that never reports is replaced after one
+ *    cool-down, so a lost probe cannot hold the breaker open either.
+ *
+ * Fail-open is unchanged. A skipped call is treated exactly as a stalled one has
+ * always been, without the wait: the request is served and not counted, with the
+ * headers a stalled call would have left it; the admin-flag lookup answers "not an
+ * admin"; the miss and private-grant budgets allow. The breaker never refuses a
+ * request and never counts one. The limiter is a fairness guard, and a
+ * cache that keeps stalling had already switched counting off: the breaker only
+ * stops each request waiting to find that out. The cost is that counting stays off
+ * on an isolate for up to one cool-down after the cache has recovered.
+ *
+ * The state is one record per isolate, at most {@link BREAKER_STALLS_TO_OPEN}
+ * timestamps and an end time, never per caller or per bucket: a stall is a property
+ * of the platform, and a stall met through one visitor's bucket is the same stall for
+ * every other. An isolate's requests share it, and since every read and write of it
+ * is synchronous, no two requests interleave inside an update. An isolate can be
+ * evicted at any moment; a new one starts closed and pays its own stalls before it
+ * opens, so the cost of a long stall is bounded per isolate (three waits to open, then
+ * one probe per cool-down), not per request. Isolates and data centers do not share
+ * it, as they do not share the counters. A Worker's clock moves only at I/O, and the
+ * breaker reads it as a call starts and as it settles, both after I/O, so a stall's
+ * 500 ms is visible to it.
+ *
+ * Every transition is logged through `logOncePerWindow`, so a flapping cache costs a
+ * few lines a window, not a line a cycle, and every skipped call is counted in the
+ * fault line of its bucket kind (`error: "CacheSkippedError"`, with `suppressed`).
+ */
+const BREAKER_STALLS_TO_OPEN = 3;
+/** A stall older than this no longer counts toward opening: one rate-limit window. */
+const BREAKER_STALL_WINDOW_MS = WINDOW_MS;
+/** How long an open breaker skips the cache before it lets a probe through. */
+const BREAKER_COOL_DOWN_MS = 10_000;
+
+interface CacheBreaker {
+  /** When the most recent stalls ended, oldest first; never more than BREAKER_STALLS_TO_OPEN. */
+  stalls: number[];
+  /** Calls are skipped while the clock is before this; 0 means closed. */
+  openUntil: number;
+}
+
+/** Module-level so it persists across requests in a warm isolate. */
+const breaker: CacheBreaker = { stalls: [], openUntil: 0 };
+
+/** The breaker was open, so the call was not made. Reported like any cache fault. */
+class CacheSkippedError extends Error {
+  constructor(what: string) {
+    super(`cache ${what} skipped: the cache stalled repeatedly and is not being waited on`);
+    this.name = "CacheSkippedError";
+  }
+}
+
+/** How a call was let through: `closed` normally, `probe` as the one call an open
+ *  breaker lets through after its cool-down. Null means skip it. */
+type BreakerRole = "closed" | "probe";
+
+function admitCacheCall(now: number): BreakerRole | null {
+  if (breaker.openUntil === 0) return "closed";
+  // A clock that went backwards must not hold the breaker open for longer than one
+  // cool-down, so an end further away than that is treated as passed.
+  if (now < breaker.openUntil && breaker.openUntil - now <= BREAKER_COOL_DOWN_MS) return null;
+  // The cool-down is over and this call is the probe. The calls behind it keep
+  // skipping until it reports, or for one more cool-down if it never does.
+  breaker.openUntil = now + BREAKER_COOL_DOWN_MS;
+  return "probe";
+}
+
+function openBreaker(now: number, trigger: "stalls" | "probe"): void {
+  breaker.openUntil = now + BREAKER_COOL_DOWN_MS;
+  logOncePerWindow("breaker:open", (suppressed, sinceMs) => {
+    console.error("[rate-limit] the cache keeps stalling; skipping it and failing open", {
+      trigger,
+      stallsToOpen: BREAKER_STALLS_TO_OPEN,
+      coolDownMs: BREAKER_COOL_DOWN_MS,
+      suppressed,
+      sinceMs,
+    });
+  });
+}
+
+function recordCacheOutcome(role: BreakerRole, stalled: boolean, now: number): void {
+  if (role === "probe") {
+    if (stalled) {
+      openBreaker(now, "probe");
+      return;
+    }
+    breaker.openUntil = 0;
+    breaker.stalls = [];
+    logOncePerWindow("breaker:close", (suppressed, sinceMs) => {
+      console.log("[rate-limit] the cache answered again; no longer skipping it", {
+        suppressed,
+        sinceMs,
+      });
+    });
+    return;
+  }
+  if (!stalled) return;
+  breaker.stalls.push(now);
+  if (breaker.stalls.length > BREAKER_STALLS_TO_OPEN) breaker.stalls.shift();
+  // Already open (a call made before it opened, settling late): a late stall is no
+  // reason to keep it open longer.
+  if (breaker.openUntil !== 0) return;
+  const oldest = breaker.stalls[0] as number;
+  if (breaker.stalls.length === BREAKER_STALLS_TO_OPEN && now - oldest < BREAKER_STALL_WINDOW_MS) {
+    openBreaker(now, "stalls");
+  }
+}
+
+/**
+ * Every call the limiter makes to the Cache API: through the breaker, then bounded
+ * by {@link boundedWait}. `start` makes the call only once the breaker has let it
+ * through, so a skipped call costs nothing. Whatever it throws reaches the caller,
+ * which fails open and logs it, as before.
+ */
+async function cacheCall<T>(what: string, start: () => Promise<T>): Promise<T> {
+  const role = admitCacheCall(Date.now());
+  if (role === null) throw new CacheSkippedError(what);
+  let stalled = false;
+  try {
+    return await boundedWait(start(), what);
+  } catch (err) {
+    stalled = err instanceof CacheStallError;
+    throw err;
+  } finally {
+    recordCacheOutcome(role, stalled, Date.now());
+  }
+}
+
+/** Test-only: close the breaker and forget its stalls, so one test's stalls cannot
+ *  decide another's. Module-level state, like the log slots. */
+export function __resetCacheBreakerForTests(): void {
+  breaker.stalls = [];
+  breaker.openUntil = 0;
+}
+
+/** Test-only: what the breaker holds, to show it stays bounded. */
+export function __cacheBreakerForTests(): { open: boolean; stallsRemembered: number } {
+  return { open: breaker.openUntil !== 0, stallsRemembered: breaker.stalls.length };
+}
+
+/** Where in a counter's work a fault happened: `match` the lookup, `read` the
+ *  record's body, `decide` the limiter's own logic, `put` the write. A `TypeError`
+ *  in `decide` is a limiter bug; the same in `match` or `put` is the runtime
+ *  refusing a call, and the two want different people. */
+type FaultPhase = "match" | "read" | "decide" | "put";
+
+/**
+ * Log a fault in the enforcement path (which fails open) once per window per
+ * bucket kind, phase and error class, and again on the 11th, 101st and 1001st
+ * call. One fault is one outage for every request of that kind, and a
+ * request-volume-scaled flood of `console.error` lines is exactly the noise that
+ * makes the line worth reading harder to find. Per kind rather than global so
+ * that an outage seen only by one bucket (a failing `put` on the data plane, say)
+ * is not hidden behind a different bucket's line.
+ */
+function logCacheFault(
+  keyKind: string,
+  route: string | undefined,
+  error: unknown,
+  phase: FaultPhase,
+): void {
+  // Keyed by phase and error class as well as kind, so a transient stall in the write
+  // cannot hide a later fault in the limiter's own logic on the same bucket for the
+  // whole window, nor a persistent bug of another class in the same phase.
+  logOncePerWindow(`fault:${keyKind}:${phase}:${faultClass(error)}`, (suppressed, sinceMs) => {
+    // `decide` is the limiter's own logic failing after the cache answered, not the
+    // cache failing, and it should not read as one.
+    console.error(
+      phase === "decide" ? "[rate-limit] limiter fault" : "[rate-limit] cache failure",
+      {
+        keyKind,
+        ...(route === undefined ? {} : { route }),
+        phase,
+        error: errorName(error),
+        suppressed,
+        sinceMs,
+      },
+    );
+  });
+}
+
+/** Test-only: let a test see the very next log lines again rather than waiting
+ *  out a real window. Clears every once-per-window slot. */
+export function __resetRateLimitLogsForTests(): void {
+  logSlots.clear();
+}
+
+/**
+ * The state of a bucket's CURRENT window, as its cache record stores it
+ * (#1709, ADR 0099). The window is FIXED: it starts with the first request that
+ * finds no live window and ends `WINDOW_SIZE` seconds later, and nothing that
+ * happens inside it moves the end. `windowEnd` is epoch milliseconds.
+ *
+ * A record is written back with the time that REMAINS in its window as the cache
+ * `max-age`, so the cache drops it at the end and a block ends at a boundary the
+ * client can compute from `Retry-After`. Refreshing the expiry on every allowed
+ * request instead would make the window slide, and a client that never went quiet
+ * for a whole window would be refused for about a minute after every `cap / rate`
+ * seconds, whatever the cap.
+ *
+ * The cost of a fixed window is that a client can spend a full cap at the end of
+ * one window and another at the start of the next, up to twice the cap across the
+ * boundary. The cap is a floor against a runaway loop, not a quota, and the
+ * sustained ceiling is the cap per window; ADR 0099 records why that is
+ * acceptable.
+ */
+export interface __CounterState {
+  count: number;
+  warned: boolean;
+  windowEnd: number;
+  /** Set when the record had to be repaired to be read; never stored. */
+  damage?: __CounterDamage;
+}
+
+/** What was wrong with a record that was repaired rather than trusted. */
+export type __CounterDamage = "unparseable" | "bad-count" | "bad-end";
+
+/** How far past one window an end may lie before it is called damage and not
+ *  the small difference between two isolates' clocks. It is cut to one window
+ *  either way. */
+const CLOCK_SKEW_TOLERANCE_MS = 5000;
+
+function freshWindow(now: number): __CounterState {
+  return { count: 0, warned: false, windowEnd: now + WINDOW_MS };
+}
+
+/**
+ * The state a cache record means at time `now`. `data` is the parsed record, or
+ * undefined when there is none.
+ *
+ *  - No record, or one whose window has ended (the cache had not dropped it yet):
+ *    a new window. One that ended more than a few seconds ago is also reported as
+ *    damage: the entry expires with its window, and local workerd drops it within a
+ *    second of its end (production's promptness is not verified here).
+ *  - A record from before windows were stored (`{count, warned}` only) has an end
+ *    nobody wrote down, but its entry cannot outlive a window from its last write,
+ *    so a full window from now is an upper bound for what a client is told, and the
+ *    entry's own expiry still clears it.
+ *  - An end further away than one window is cut to one window, so no record can
+ *    hold a bucket shut for longer than that.
+ *  - A count that is not a finite number above zero is zero.
+ *
+ * A record that is not an object, a count that is not a whole number above or at
+ * zero, and an end that is not a number or lies more than a few seconds past one
+ * window are repaired as above and also reported in `damage`, so the caller can
+ * say so: the bucket heals itself, and nobody learns that something wrote a bad
+ * record unless it is told.
+ */
+export function __readCounter(data: unknown, now: number): __CounterState {
+  if (data === undefined) return freshWindow(now);
+  if (typeof data !== "object" || data === null || Array.isArray(data)) {
+    return { ...freshWindow(now), damage: "unparseable" };
+  }
+  const record = data as { count?: unknown; warned?: unknown; windowEnd?: unknown };
+  const rawCount = record.count;
+  const count =
+    typeof rawCount === "number" && Number.isFinite(rawCount) && rawCount > 0
+      ? Math.floor(rawCount)
+      : 0;
+  const countDamaged = typeof rawCount !== "number" || !Number.isInteger(rawCount) || rawCount < 0;
+  const warned = record.warned === true;
+  const end = record.windowEnd;
+  if (end === undefined) {
+    return {
+      count,
+      warned,
+      windowEnd: now + WINDOW_MS,
+      ...(countDamaged ? { damage: "bad-count" as const } : {}),
+    };
+  }
+  if (typeof end === "number" && Number.isFinite(end)) {
+    if (end <= now) {
+      // An ended window is simply over, unless it ended long ago: the entry expires
+      // with its window (local workerd drops it within a second; production's
+      // promptness is not verified), so a record that old was most likely not
+      // written by this code (an end in seconds, or 0, say) and is reported as
+      // damage. One exception is a write that was abandoned at the 500 ms bound
+      // (`boundedWait`) and landed afterward: it carries a `max-age` computed when
+      // it was issued, so the record can outlive its `windowEnd` by the length of
+      // the stall, and a stall of five seconds or more can log a `bad-end` repair on
+      // top of the cache-fault line. The repair is right, the window had ended; the
+      // extra line is what not waiting costs.
+      return end <= now - CLOCK_SKEW_TOLERANCE_MS
+        ? { ...freshWindow(now), damage: "bad-end" }
+        : freshWindow(now);
+    }
+    const damage = countDamaged
+      ? ("bad-count" as const)
+      : end > now + WINDOW_MS + CLOCK_SKEW_TOLERANCE_MS
+        ? ("bad-end" as const)
+        : undefined;
+    return {
+      count,
+      warned,
+      windowEnd: Math.min(end, now + WINDOW_MS),
+      ...(damage ? { damage } : {}),
+    };
+  }
+  return {
+    count,
+    warned,
+    windowEnd: now + WINDOW_MS,
+    damage: countDamaged ? "bad-count" : "bad-end",
+  };
+}
+
+/**
+ * Whole seconds left in the window, at least 1 and at most one window. A state
+ * read by {@link __readCounter} is already inside those bounds, so they are the
+ * header staying honest for any state a caller builds some other way, and a test
+ * drives them directly.
+ */
+export function __secondsLeft(state: __CounterState, now: number): number {
+  return Math.min(WINDOW_SIZE, Math.max(1, Math.ceil((state.windowEnd - now) / 1000)));
+}
+
+/** The record to store: the state, expiring with its window rather than a full one. */
+function counterRecord(state: __CounterState, now: number): Response {
+  return new Response(
+    JSON.stringify({ count: state.count, warned: state.warned, windowEnd: state.windowEnd }),
+    {
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": `max-age=${__secondsLeft(state, now)}`,
+      },
+    },
+  );
+}
+
+/**
+ * Read a bucket's stored body: `undefined` when nothing is stored, `null` when
+ * what is stored is not JSON, the parsed value otherwise. This is the whole of
+ * the `read` phase of a fault: waiting on the body and nothing that interprets it.
+ */
+async function readRecordBody(cached: Response | undefined): Promise<unknown> {
+  if (!cached) return undefined;
+  try {
+    return await cacheCall("read", () => cached.json());
+  } catch (err) {
+    // Only a body that is not JSON is a damaged record. A body that cannot be read
+    // at all (a stream that errors, one that never finishes) says nothing about
+    // the record: it is a cache fault, and goes to the fail-open, loud path rather
+    // than being "repaired" into a reset counter that never limits.
+    if (!(err instanceof SyntaxError)) throw err;
+    return null;
+  }
+}
+
+/**
+ * Turn a stored body (see {@link readRecordBody}) into the bucket's state. A record
+ * that will not parse or will not make sense is repaired, not trusted and not failed
+ * open on, and the repair is logged once per window per bucket kind and kind of
+ * damage, and again on the 11th, 101st and 1001st call: the self-heal is right, a silent one would hide whatever is writing bad
+ * records. A fault in here is the limiter's own (phase `decide`), not the cache's.
+ */
+function interpretRecord(body: unknown, now: number, keyKind: string): __CounterState {
+  if (body === undefined) return freshWindow(now);
+  const state = __readCounter(body, now);
+  if (state.damage) {
+    const damage = state.damage;
+    logOncePerWindow(`damage:${keyKind}:${damage}`, (suppressed, sinceMs) => {
+      console.warn("[rate-limit] repaired a damaged counter record", {
+        keyKind,
+        damage,
+        suppressed,
+        sinceMs,
+      });
+    });
+  }
+  return state;
+}
+
+/** The 429 every counter in this file answers with: the same body and headers
+ *  whichever bucket tripped, `Retry-After` and `X-RateLimit-Reset` agreeing with
+ *  the window, and only `X-RateLimit-Bucket` telling the buckets apart.
+ *  `X-RateLimit-Caller` says how the caller was identified (`edge`, `site` or
+ *  `unattributed`) whichever bucket it landed in. */
+function refusal(
+  kind: string,
+  maxRequests: number,
+  state: __CounterState,
+  now: number,
+  caller?: __CallerSource,
+): { body: Record<string, unknown>; headers: Record<string, string> } {
+  const retryAfter = __secondsLeft(state, now);
+  return {
+    body: {
+      error: "Rate limit exceeded",
+      message: `Too many requests. Please try again in ${retryAfter} seconds.`,
+      retry_after: retryAfter,
+    },
+    headers: {
+      "Retry-After": retryAfter.toString(),
+      "X-RateLimit-Limit": maxRequests.toString(),
+      "X-RateLimit-Remaining": "0",
+      "X-RateLimit-Reset": Math.ceil(state.windowEnd / 1000).toString(),
+      "X-RateLimit-Bucket": kind,
+      ...(caller === undefined ? {} : { "X-RateLimit-Caller": caller }),
+    },
+  };
+}
+
+/** One line per window per caller source and bucket kind for the refusals (and
+ *  again on the 11th, 101st and 1001st call), so `wrangler tail` can show that a
+ *  bucket is refusing, how often, and for whom.
+ *  Keyed by the source as well as the bucket, so ordinary brute-force noise from
+ *  public callers on a strict bucket cannot take the one slot and hide the site
+ *  being refused on it. Never an address. */
+function logRefusal(
+  keyKind: string,
+  maxRequests: number,
+  retryAfter: number,
+  caller: __CallerSource | undefined,
+): void {
+  logOncePerWindow(`refusal:${caller ?? "account"}:${keyKind}`, (suppressed, sinceMs) => {
+    console.warn("[rate-limit] refusing", {
+      keyKind,
+      ...(caller === undefined ? {} : { caller }),
+      maxRequests,
+      retryAfter,
+      suppressed,
+      sinceMs,
+    });
+  });
+}
+
+/**
+ * Set headers on the response a handler produced. A handler that returns its own
+ * `Response` replaces the one the context was building, and the headers of a
+ * `Response` from `fetch()` or `Response.redirect()` are immutable, so when the
+ * first write is refused the response is rebuilt from itself, which makes them
+ * writable, and written again.
+ */
+function stampHeaders(c: RateLimitContext, headers: Record<string, string>): void {
+  const apply = (res: Response) => {
+    for (const [name, value] of Object.entries(headers)) res.headers.set(name, value);
+  };
+  try {
+    apply(c.res);
+    return;
+  } catch {
+    // Immutable headers: rebuild the response from itself below.
+  }
+  try {
+    c.res = new Response(c.res.body, c.res);
+    apply(c.res);
+  } catch (err) {
+    // The answer is the handler's and is good; the headers are a courtesy. Failing
+    // here would turn a success into a 500 that `--search "[rate-limit]"` could not
+    // find, so it is told once, with the tag, and the response goes out without.
+    logOncePerWindow("stamp", (suppressed, sinceMs) => {
+      console.warn("[rate-limit] could not set the rate limit headers on a response", {
+        error: errorName(err),
+        suppressed,
+        sinceMs,
+      });
+    });
+  }
 }
 
 // A legitimate full-dataset download over the data plane (`nemar-py
@@ -170,8 +842,8 @@ const DATA_PATH_RE = /^\/(nemar\/)?data(\/|$)/;
 // make every novel one cost a D1 lookup (the hole `anonymousSurface` below documents
 // for /mcp). And the one legitimate client, the node's loader, fetches an index and
 // then up to three files per dataset in one run: about 2,400 requests for 800
-// datasets, which the 500/min anonymous floor would refuse halfway through a first
-// load. The loader is sequential and fetches at most a few requests a second, so
+// datasets, which the 1,000/min anonymous floor would refuse about 58 percent of
+// (2,400 requests against 1,000) in a first load. The loader is sequential and fetches at most a few requests a second, so
 // 1,200/min is above any rate it sustains and still bounds a runaway caller.
 const NEUROBAGEL_PATH_RE = /^\/neurobagel(\/|$)/;
 const NEUROBAGEL_MAX_REQUESTS = 1200;
@@ -202,7 +874,7 @@ const AUTH_PATHS = [
   "/auth/code/verify",
   "/auth/logout",
   // Settings self-service (#912/#911): cookie-authenticated mutations.
-  // Without these entries they'd fall to the generic ip bucket (500/min);
+  // Without these entries they'd fall to the generic ip bucket (1000/min);
   // the email-change request in particular reveals address collisions to
   // the (authenticated) caller, so the 10/min floor is load-bearing.
   "/auth/profile",
@@ -236,7 +908,7 @@ const AUTH_PATHS = [
   // code). At that cadence 10 polls fit inside the strict bucket's 60s
   // window and the 11th trips it, about 50 seconds in -- not the "third
   // poll" a looser count might suggest. In practice this route lands in
-  // the plain `ip` bucket (500/min), not `token`: the CLI has not
+  // the plain `ip` bucket (1000/min), not `token`: the CLI has not
   // collected a key yet while it is polling, so it holds no bearer to
   // authenticate a request with. Its own per-row 5-second floor
   // (`DEVICE_POLL_SQL`) answers `slow_down` to anything faster than that
@@ -270,11 +942,11 @@ const AUTH_PATHS = [
   // bucket. One admin clicking through the dozen operations pages would sit at
   // the strict cap on their own, and two browsing at once would trip it, which
   // would read as "the gate is broken" rather than "you are rate limited". It
-  // rides the generic ip bucket (500/min) instead: the route mints nothing,
+  // rides the generic ip bucket (1000/min) instead: the route mints nothing,
   // reveals nothing beyond whether one 256-bit value is a live admin session,
   // and cannot be brute-forced at any rate a bucket would help with. Note the
   // comment on MAX_REQUESTS below -- shared CF egress IPs are why that bucket
-  // is 500 rather than 100 in the first place.
+  // is far above the 100 it started at.
   //
   // `/auth/docs/cli-session` IS here, and unlike the two above it is called by
   // a person's own machine rather than by a Worker, so the per-IP key is a real
@@ -367,7 +1039,10 @@ export function __readBearerTokenFromHeader(authHeader: string | undefined): str
  *  - `neurobagel-ip` for the Neurobagel artifact store's read route
  *    (`/neurobagel/*`). 1,200/60s, IP-keyed, checked before the bearer branch for
  *    the reasons at NEUROBAGEL_PATH_RE.
- *  - `ip` for everything else (the unauthenticated cap).
+ *  - `ip` for everything else (the unauthenticated cap), or, for a caller
+ *    without `CF-Connecting-IP`, `site-ip` (the visitor it forwarded) or
+ *    `site-unattributed` (nobody named). The `ip` argument is the caller key
+ *    from {@link __readCallerIdentity} and `source` is its source.
  *
  * Admin endpoints used to be entirely exempt; that gave an admin
  * running a malformed loop unbounded access to the worker. Keeping the
@@ -375,10 +1050,231 @@ export function __readBearerTokenFromHeader(authHeader: string | undefined): str
  * floor without the floor being absent.
  */
 export interface __BucketSelection {
-  keyKind: "auth-ip" | "ip" | "token" | "data-ip" | "neurobagel-ip";
-  /** Pre-hash key material: the IP, or the raw bearer token. */
+  keyKind:
+    | "auth-ip"
+    | "ip"
+    | "site-ip"
+    | "site-unattributed"
+    | "token"
+    | "data-ip"
+    | "neurobagel-ip";
+  /** Pre-hash key material: the caller key (see {@link __CallerIdentity}), or the raw bearer token. */
   rawKey: string;
   maxRequests: number;
+}
+
+/**
+ * How a request came to carry (or not carry) an address (#1709, ADR 0098).
+ *
+ *  - `edge`: it has `CF-Connecting-IP`. Cloudflare sets that header on every
+ *    request that arrives from the public network and a client cannot omit or
+ *    replace it, so it is the caller's address and `X-Forwarded-For` is never
+ *    looked at. This is the only source a public caller can have.
+ *  - `site`: no `CF-Connecting-IP`, and `X-Forwarded-For` starts with a valid IP
+ *    literal. A request through a service binding does not arrive from the
+ *    public network, so it carries no `CF-Connecting-IP` unless its caller sets
+ *    one; the Cloudflare account is the trust boundary (ADR 0078), and the
+ *    caller names the visitor it acts for. The caller must SET the header from
+ *    its own `CF-Connecting-IP`, never pass a visitor's header through.
+ *  - `unattributed`: neither. Not reachable from the public network.
+ *
+ * A request this Worker built for itself and handed to one of its own sub-apps (an
+ * MCP tool reading `index.json` through the zarr gateway, the Neurobagel gatherer
+ * reading the data plane) is not a source of its own. It has no address, so it reads
+ * as `unattributed`; what sets it apart is a mark held by object identity
+ * (`lib/internal-request.ts`), which nothing a client sends can claim. The mark
+ * exempts it from the data plane's two buckets (`data-ip` and the miss budget) and
+ * from nothing else, so a request marked by mistake is still counted, loudly,
+ * everywhere that matters more.
+ */
+export type __CallerSource = "edge" | "site" | "unattributed";
+
+/** A caller's source and its bucket key. The key is the address itself for an
+ *  `edge` caller, `site:<address>` for a `site` caller, and a fixed word for an
+ *  `unattributed` one. The prefix puts every site key in a keyspace of its own,
+ *  so it cannot collide with a real address (no IP literal starts with `s`,
+ *  which is not a hex digit), and the fixed word cannot be an address either.
+ *  An `unattributed` caller also says why, for the log and never the response. */
+export interface __CallerIdentity {
+  source: __CallerSource;
+  key: string;
+  detail?: __UnattributedDetail;
+}
+
+/** Why `X-Forwarded-For` named nobody. None of it is the value itself. */
+export type __UnattributedReason =
+  | "absent"
+  | "too-long"
+  | "first-entry-not-an-ip"
+  | "unspecified-or-loopback";
+
+export interface __UnattributedDetail {
+  reason: __UnattributedReason;
+  /** Length of the header, 0 when absent. */
+  forwardedLength: number;
+  /** For `first-entry-not-an-ip`, a coarse class of what the first entry looked like. */
+  shape?: string;
+}
+
+export type __ForwardedParse = { ok: true; ip: string } | ({ ok: false } & __UnattributedDetail);
+
+const SITE_KEY_PREFIX = "site:";
+const UNATTRIBUTED_KEY = "unattributed";
+/** A longer `X-Forwarded-For` is not read at all: a forwarding hop sets one address. */
+const MAX_FORWARDED_HEADER_LENGTH = 512;
+/** The longest textual IP literal: eight groups, or an IPv4-mapped form, is 45 characters. */
+const MAX_IP_LITERAL_LENGTH = 45;
+/** Dotted-quad with each octet 0 to 255 and no leading zero, which some parsers read as octal. */
+const IPV4_LITERAL_RE =
+  /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
+/** What the URL parser makes of an IPv4-mapped IPv6 address: two hex groups after `::ffff:`. */
+const MAPPED_IPV4_RE = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/;
+
+/**
+ * An IP literal in canonical form, or null. IPv4 is matched strictly. IPv6 is
+ * validated and compressed by the URL parser, so `2001:DB8:0:0::1` and
+ * `2001:db8::1` are one key, and an IPv4-mapped address is turned back into the
+ * dotted address it wraps, so `::ffff:203.0.113.7` and `203.0.113.7` are one
+ * visitor too. Anything else (a host name, a port, brackets, a zone id, an
+ * over-long string, `unknown`) is null.
+ *
+ * Two checks come before the parser, for different reasons. The 45-character
+ * bound refuses nothing the parser would accept (no valid literal is longer);
+ * it, like the character set, keeps the parser from being handed an arbitrary
+ * string. The character set is NOT redundant: the parser reads
+ * `http://[<candidate>]/`, so a candidate such as `2001:db8::5]/x` closes the
+ * bracket itself and the rest is taken as a path, and would be accepted as
+ * `2001:db8::5` with junk after it.
+ */
+function canonicalIpLiteral(candidate: string): string | null {
+  if (candidate.length === 0 || candidate.length > MAX_IP_LITERAL_LENGTH) return null;
+  if (IPV4_LITERAL_RE.test(candidate)) return candidate;
+  if (!candidate.includes(":") || !/^[0-9a-fA-F:.]+$/.test(candidate)) return null;
+  let canonical: string;
+  try {
+    canonical = new URL(`http://[${candidate}]/`).hostname.slice(1, -1);
+  } catch {
+    return null;
+  }
+  const mapped = MAPPED_IPV4_RE.exec(canonical);
+  if (!mapped) return canonical;
+  const high = Number.parseInt(mapped[1] as string, 16);
+  const low = Number.parseInt(mapped[2] as string, 16);
+  return `${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`;
+}
+
+/** The addresses a forwarding caller writes when it has no visitor to name: this host
+ *  and this machine. Counting thousands of visitors in one `site:` key would be a
+ *  silent bucket of everyone, so they are treated as no address at all. */
+function isUnspecifiedOrLoopback(ip: string): boolean {
+  return ip === "0.0.0.0" || ip === "::" || ip === "::1" || ip.startsWith("127.");
+}
+
+/** A coarse class of an entry that is not an address, never the entry. */
+function shapeOf(entry: string): string {
+  if (entry === "") return "empty";
+  if (/[[\]]/.test(entry)) return "bracketed";
+  if (entry.includes("%")) return "zone-id";
+  if (/^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(entry)) return "ipv4-with-port";
+  if (/^[0-9a-fA-F:.]+$/.test(entry))
+    return entry.includes(":") ? "malformed-ipv6" : "malformed-ipv4";
+  if (/^[A-Za-z_-]+$/.test(entry)) return "word";
+  return "other";
+}
+
+/**
+ * Read the first entry of an `X-Forwarded-For` value: its canonical address, or
+ * the reason there is none. Only the first entry is read, and an unreadable one
+ * is not skipped to reach a later one.
+ */
+export function __parseForwardedFor(header: string | null | undefined): __ForwardedParse {
+  if (!header) return { ok: false, reason: "absent", forwardedLength: 0 };
+  const forwardedLength = header.length;
+  if (forwardedLength > MAX_FORWARDED_HEADER_LENGTH) {
+    return { ok: false, reason: "too-long", forwardedLength };
+  }
+  const comma = header.indexOf(",");
+  const first = (comma < 0 ? header : header.slice(0, comma)).trim();
+  const ip = canonicalIpLiteral(first);
+  if (ip === null) {
+    return { ok: false, reason: "first-entry-not-an-ip", forwardedLength, shape: shapeOf(first) };
+  }
+  if (isUnspecifiedOrLoopback(ip)) {
+    return { ok: false, reason: "unspecified-or-loopback", forwardedLength };
+  }
+  return { ok: true, ip };
+}
+
+/** The first entry of an `X-Forwarded-For` value as a canonical address, or null. */
+export function __firstForwardedIp(header: string | null | undefined): string | null {
+  const parsed = __parseForwardedFor(header);
+  return parsed.ok ? parsed.ip : null;
+}
+
+/**
+ * The trust rule, in one place. `CF-Connecting-IP` wins whenever it is present
+ * and `X-Forwarded-For` is then ignored; the forwarded address is read only when
+ * it is absent.
+ */
+export function __readCallerIdentity(
+  cfConnectingIp: string | null | undefined,
+  xForwardedFor: string | null | undefined,
+): __CallerIdentity {
+  if (cfConnectingIp) return { source: "edge", key: cfConnectingIp };
+  const parsed = __parseForwardedFor(xForwardedFor);
+  if (parsed.ok) return { source: "site", key: `${SITE_KEY_PREFIX}${parsed.ip}` };
+  const { ok: _ok, ...detail } = parsed;
+  return { source: "unattributed", key: UNATTRIBUTED_KEY, detail };
+}
+
+/** The identity of a request, read from its headers. The one place the middleware and
+ *  the per-route budgets (`checkDataMissBudget`, `checkPrivateGrantBudget`) take it
+ *  from. Whether a request is the Worker's own is a separate question,
+ *  {@link isInternalRequest}, which only the data plane's buckets ask. */
+function callerIdentityOf(request: Request): __CallerIdentity {
+  return __readCallerIdentity(
+    request.headers.get("CF-Connecting-IP"),
+    request.headers.get("X-Forwarded-For"),
+  );
+}
+
+/**
+ * One line per isolate per window for each (caller source, bucket kind) that is
+ * not an ordinary public request, and, for an unattributed caller, again on the 11th,
+ * 101st and 1001st call. It is the way to see, with `wrangler tail`,
+ * that the website's calls arrive as `site` (the property ADR 0098 rests on and
+ * cannot prove before production), and to be told when a caller stops forwarding
+ * a visitor, on whichever bucket that happens. An unattributed line says why,
+ * by reason, header length and a coarse shape. Never per request, and never an
+ * address or the value of a header.
+ */
+function logIdentityOnce(
+  caller: __CallerIdentity,
+  keyKind: string,
+  maxRequests: number,
+  path: string,
+): void {
+  if (caller.source === "edge") return;
+  logOncePerWindow(
+    `identity:${caller.source}:${keyKind}:${caller.detail?.reason ?? ""}`,
+    (suppressed, sinceMs) => {
+      if (caller.source === "site") {
+        console.log(
+          "[rate-limit] counting a request without CF-Connecting-IP by its forwarded visitor",
+          { keyKind, maxRequests, path, suppressed, sinceMs },
+        );
+      } else {
+        console.warn(
+          "[rate-limit] request with neither CF-Connecting-IP nor a usable X-Forwarded-For; counted in a shared bucket",
+          { keyKind, maxRequests, path, suppressed, sinceMs, ...caller.detail },
+        );
+      }
+    },
+    // The `site` line is the healthy case, the evidence that the website's calls
+    // arrive as expected, and it would otherwise repeat on the 11th, 101st and 1001st
+    // call at the website's rate. An unattributed line is a symptom and keeps them.
+    { milestones: caller.source !== "site" },
+  );
 }
 
 /**
@@ -411,6 +1307,7 @@ export function __selectBucket(
   rawPath: string,
   authHeader: string | undefined,
   ip: string,
+  source: __CallerSource = "edge",
 ): __BucketSelection {
   const path = __normalizeMountPath(rawPath);
   if (AUTH_PATHS.some((p) => path === p || path.startsWith(`${p}/`) || path.startsWith(`${p}?`))) {
@@ -430,6 +1327,21 @@ export function __selectBucket(
   const bearer = __readBearerTokenFromHeader(authHeader);
   if (bearer) {
     return { keyKind: "token", rawKey: bearer, maxRequests: TOKEN_MAX_REQUESTS_AUTHED };
+  }
+  // The anonymous bucket, by how the caller was identified (#1709, ADR 0098).
+  // `ip` here is the caller key, so a `site` or `unattributed` caller never
+  // shares a counter with a real address. The strict, data and Neurobagel
+  // buckets above keep their own caps for every source; only this one, whose
+  // cap exists to be generous to the website, differs.
+  if (source === "site") {
+    return { keyKind: "site-ip", rawKey: ip, maxRequests: SITE_IP_MAX_REQUESTS };
+  }
+  if (source === "unattributed") {
+    return {
+      keyKind: "site-unattributed",
+      rawKey: ip,
+      maxRequests: SITE_UNATTRIBUTED_MAX_REQUESTS,
+    };
   }
   return { keyKind: "ip", rawKey: ip, maxRequests: MAX_REQUESTS };
 }
@@ -458,13 +1370,53 @@ export function __selectBucket(
  */
 async function isPrivilegedToken(env: Bindings, hashedApiKey: string): Promise<boolean> {
   const cacheKey = new Request(`https://rate-limit.internal/admin-flag:${hashedApiKey}`);
+  const fault = (phase: string, err: unknown) =>
+    logOncePerWindow(`admin-flag:${phase}:${faultClass(err)}`, (suppressed, sinceMs) => {
+      // The write is the one phase that does not fail the lookup: the database
+      // already answered, so the line says what broke rather than that the lookup did.
+      console.warn(
+        phase === "put"
+          ? "[rate-limit] admin-flag cache write failed"
+          : "[rate-limit] admin-flag lookup failed",
+        { phase, error: errorName(err), suppressed, sinceMs },
+      );
+    });
+
+  // The cached answer, if there is a usable one. A cache that fails here fails the
+  // lookup closed (not an admin): nothing was learned.
+  let phase = "match";
+  let cache: Cache;
   try {
-    const cache = caches.default;
-    const cached = await cache.match(cacheKey);
+    cache = caches.default;
+    const cached = await cacheCall("match", () => cache.match(cacheKey));
     if (cached) {
-      const data = (await cached.json()) as { admin: boolean };
-      return data.admin === true;
+      phase = "read";
+      const known = await readAdminFlag(cached);
+      if ("admin" in known) return known.admin;
+      // A record that is not a usable flag is read again from the database and
+      // replaced below, rather than holding the token to "not an admin" until it
+      // expires, and reported like a damaged counter record: the self-heal is
+      // right, a silent one would hide whatever is writing bad records. The line
+      // says only what has happened by now, that the record was found damaged and
+      // the database is being read: the database or the write may still fail, and
+      // then nothing was replaced.
+      const damage = known.damage;
+      logOncePerWindow(`admin-flag-damaged:${damage}`, (suppressed, sinceMs) => {
+        console.warn("[rate-limit] found a damaged admin-flag record, reading the database", {
+          keyKind: "admin-flag",
+          damage,
+          suppressed,
+          sinceMs,
+        });
+      });
     }
+  } catch (err) {
+    fault(phase, err);
+    return false;
+  }
+
+  let admin: boolean;
+  try {
     // Same status set authMiddleware accepts (ADR 0040 phase 2): the quota a
     // token gets must be decided over the same population that token can
     // authenticate as, or an admin sitting at `verified` would authenticate
@@ -480,22 +1432,50 @@ async function isPrivilegedToken(env: Bindings, hashedApiKey: string): Promise<b
     )
       .bind(hashedApiKey)
       .first<{ role: string | null }>();
-    const admin = row?.role === "admin" || row?.role === "owner";
-    const ttl = admin ? WINDOW_SIZE : Math.min(WINDOW_SIZE, 30);
-    await cache.put(
-      cacheKey,
-      new Response(JSON.stringify({ admin }), {
-        headers: {
-          "Content-Type": "application/json",
-          "Cache-Control": `max-age=${ttl}`,
-        },
-      }),
-    );
-    return admin;
+    admin = row?.role === "admin" || row?.role === "owner";
   } catch (err) {
-    console.warn(`[rate-limit] admin-flag lookup failed: ${(err as Error).message ?? err}`);
+    fault("lookup", err);
     return false;
   }
+
+  // Remembering the answer is an optimization. The database already said who this
+  // is, so a cache that cannot take the write must not turn an admin it confirmed
+  // into a stranger.
+  try {
+    const ttl = admin ? WINDOW_SIZE : Math.min(WINDOW_SIZE, 30);
+    await cacheCall("put", () =>
+      cache.put(
+        cacheKey,
+        new Response(JSON.stringify({ admin }), {
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": `max-age=${ttl}`,
+          },
+        }),
+      ),
+    );
+  } catch (err) {
+    fault("put", err);
+  }
+  return admin;
+}
+
+/** What a cached admin-flag record holds: the flag, or why it holds none that can be
+ *  used (`unparseable`: not JSON; `no-boolean`: JSON without a boolean `admin`).
+ *  Anything else that goes wrong reading the body is a cache fault and propagates. */
+type AdminFlagRead = { admin: boolean } | { damage: "unparseable" | "no-boolean" };
+
+async function readAdminFlag(cached: Response): Promise<AdminFlagRead> {
+  let data: unknown;
+  try {
+    data = await cacheCall("read", () => cached.json());
+  } catch (err) {
+    if (err instanceof SyntaxError) return { damage: "unparseable" };
+    throw err;
+  }
+  const admin =
+    typeof data === "object" && data !== null ? (data as { admin?: unknown }).admin : undefined;
+  return typeof admin === "boolean" ? { admin } : { damage: "no-boolean" };
 }
 
 export interface RateLimiterOptions {
@@ -510,10 +1490,13 @@ export interface RateLimiterOptions {
    * visible, and a later PROXIED request from that IP correctly 429s once
    * the shared bucket is exhausted, observed traffic included.
    *
-   * Logs exactly ONE `console.warn` per window, the first time the count
-   * reaches the point enforcement would have blocked -- never per request,
-   * which would be the same noise this option replaces (an unconditional
-   * per-request log the zarr sub-app used to emit for every exempted hit).
+   * Warns once per address per window (the record's `warned` flag), the first
+   * time the count reaches the point enforcement would have blocked, and the
+   * warning is one line per window per bucket kind however many addresses reach
+   * it, again only on the 11th, 101st and 1001st call (`logOncePerWindow`) --
+   * never per request, which would be the same noise this option replaces (an
+   * unconditional per-request log the zarr sub-app used to emit for every exempted
+   * hit).
    */
   observeOnly?: boolean;
 
@@ -529,7 +1512,7 @@ export interface RateLimiterOptions {
    *
    *  1. The bucket is keyed on the raw bearer, so rotating a fresh 32-character
    *     string per request minted a fresh 1000/min bucket every time and the
-   *     500/min IP floor was bypassed entirely.
+   *     1000/min IP floor was bypassed entirely.
    *  2. Every novel token reached {@link isPrivilegedToken}, which is a cache
    *     miss plus a D1 `SELECT` joining `tokens` to `users` -- an
    *     unauthenticated D1-query amplifier, one query per request, from one IP.
@@ -567,10 +1550,11 @@ export async function rateLimiter(
   }
 
   const path = c.req.path;
-  // Fall back to a random UUID instead of the shared "unknown" sentinel
-  // so headerless requests each get their own bucket rather than pooling.
-  const ip =
-    c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For") || crypto.randomUUID();
+  // Who this request's address names. `CF-Connecting-IP` decides whenever it is
+  // present and `X-Forwarded-For` is then never read, so a client cannot choose
+  // its bucket; see `__CallerSource`. A request with neither shares ONE bucket per
+  // kind; a fresh random one each would be no limit at all.
+  const caller = callerIdentityOf(c.req.raw);
 
   // `c.executionCtx.waitUntil`, or undefined outside a real Worker
   // invocation -- Hono throws on the getter then, the same fallback
@@ -592,8 +1576,25 @@ export async function rateLimiter(
   const { keyKind, rawKey, maxRequests } = __selectBucket(
     path,
     options.anonymousSurface ? undefined : c.req.header("Authorization"),
-    ip,
+    caller.key,
+    caller.source,
   );
+  // A request this Worker built for itself is not a caller of the data plane: see
+  // `__CallerSource`. It used to be bucketed by a random UUID, which is to say not at
+  // all, and the pooled bucket that now catches a caller with no address must not
+  // catch it. The exemption is this bucket's alone: on any other kind the mark
+  // changes nothing, so a request marked by mistake is counted and logged like any
+  // other caller with no address. It also needs the request to have no address, as
+  // the mark's definition says (`lib/internal-request.ts`): a marked request that
+  // carries a usable one is counted as that address, like an unmarked request.
+  if (keyKind === "data-ip" && caller.source === "unattributed" && isInternalRequest(c.req.raw)) {
+    await next();
+    return;
+  }
+  // Only where the address chose the bucket. A token bucket is keyed by the token,
+  // so a line about "counted by its forwarded visitor" or "in a shared bucket"
+  // would be false of it.
+  if (keyKind !== "token") logIdentityOnce(caller, keyKind, maxRequests, path);
 
   // Token buckets hash the raw bearer; the auth middleware later
   // re-hashes the same value to look the user up in D1. IP buckets use
@@ -604,11 +1605,16 @@ export async function rateLimiter(
   // operations (mass reindex, release sweeps) routinely exceed the
   // 1000/60s token bucket; capping them produced opaque "Network error"
   // failures in the CLI because requests dropped after the local
-  // limiter 429d. The CF-edge layer still enforces its own per-IP
-  // ceilings, so the floor isn't absent.
+  // limiter 429d. A call over the website's service binding reaches this Worker
+  // without the zone's edge protections (WAF, rate-limiting rules, bot
+  // management), so for a site caller these counters are the only floor and this
+  // bypass removes it: the admin token is the control there, not a limit.
   if (keyKind === "token" && (await isPrivilegedToken(c.env, bucketKeyValue))) {
-    c.header("X-RateLimit-Bucket", "admin-bypass");
     await next();
+    stampHeaders(c, {
+      "X-RateLimit-Bucket": "admin-bypass",
+      "X-RateLimit-Caller": caller.source,
+    });
     return;
   }
 
@@ -631,21 +1637,19 @@ export async function rateLimiter(
   // undercounted requests are cache hits (`checkDataMissBudget` below counts
   // the expensive misses synchronously, on its own much smaller budget).
   // Every other bucket keeps the exact synchronous behavior it always had.
-  async function writeCount(write: Promise<unknown>): Promise<void> {
+  // `write` makes the call; it is handed over unmade so the breaker can skip it.
+  async function writeCount(write: () => Promise<unknown>): Promise<void> {
     if (keyKind !== "data-ip") {
-      await write;
+      await cacheCall("put", write);
       return;
     }
-    const logFailure = (err: unknown) => {
-      console.error("[rate-limit] cache failure", {
-        route: path,
-        keyKind,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    };
     const defer = dataPlaneDefer();
     if (defer) {
-      defer(write.catch(logFailure));
+      // Bounded and logged like every other wait: a put that never settles would
+      // otherwise leave no line and no count.
+      defer(
+        cacheCall("put", write).catch((err: unknown) => logCacheFault(keyKind, path, err, "put")),
+      );
       return;
     }
     // No execution context -- a route test driving the app directly, per
@@ -654,109 +1658,95 @@ export async function rateLimiter(
     // `git-file-cache.ts`'s own no-`waitUntil` fallback: a healthy write
     // settles in microtasks, so this bound is never felt in practice, and
     // it keeps the count observable to a test that awaits the response.
-    await Promise.race([
-      write.catch(logFailure),
-      new Promise<void>((resolve) => setTimeout(resolve, RATE_LIMIT_WRITE_STALL_MS)),
-    ]);
+    try {
+      await cacheCall("put", write);
+    } catch (err) {
+      logCacheFault(keyKind, path, err, "put");
+    }
   }
+
+  // The headers this request's answer will carry, decided here and applied after
+  // the handler ran: a handler that builds its own `Response` replaces anything
+  // set on the context before it, so setting them first would lose them.
+  let stamp: Record<string, string> | undefined;
+  // Where a fault happened, for the log (see `FaultPhase`).
+  let phase: FaultPhase = "match";
 
   try {
     const cache = caches.default;
 
-    // Get current count (and, for the observe-only path, whether this
-    // window already warned once) from cache.
-    const cached = await cache.match(cacheKey);
-    let count = 0;
-    let warned = false;
-
-    if (cached) {
-      const data = (await cached.json()) as { count: number; warned?: boolean };
-      count = data.count;
-      warned = data.warned === true;
-    }
+    // The bucket's current window: its count and (for the observe-only path)
+    // whether it already warned once. Read after the cache lookup, because a
+    // Worker's clock only moves at I/O.
+    const cached = await cacheCall("match", () => cache.match(cacheKey));
+    const now = Date.now();
+    phase = "read";
+    const body = await readRecordBody(cached);
+    phase = "decide";
+    const state = interpretRecord(body, now, keyKind);
+    const count = state.count;
+    let warned = state.warned;
 
     if (options.observeOnly) {
       // Never block -- just record the hit against the shared bucket and
       // warn once if it crossed the trip point. `warned` rides in the same
       // cache record as `count` so it resets on the same window TTL.
       if (count >= maxRequests && !warned) {
-        // Hashed, not raw: this is a log line, not the enforcement key
-        // itself (which stays keyed on the raw IP, same as before) --
-        // avoids putting a raw client IP into structured logs.
-        // Same helper web-session.ts uses for privacy-preserving IP storage, so
-        // every IP hash in the codebase is produced by one named function.
-        const ipHash = await hashIp(rawKey);
-        console.warn("[rate-limit] observe-only bucket would have tripped", {
-          ipHash,
-          path,
-          count: count + 1,
+        // The caller's key (an address, or `site:<address>`), never in the clear:
+        // `ipHash` is a keyed pseudonym (`services/log-pseudonym.ts`, #1713), which
+        // tells one caller from another without letting a reader of the log
+        // recover the address. It used to be a plain SHA-256, which anyone can
+        // reverse for an IPv4 address by trying all 2^32. With no ENCRYPTION_KEY
+        // (a test, or a Worker never given one) the field is left out rather than
+        // unkeyed. The enforcement key itself stays the raw key, as before.
+        const ipHash = await logPseudonym(c.env.ENCRYPTION_KEY, rawKey);
+        // Once per window per bucket kind (and again at the milestones) as well as
+        // once per address: a flood from many addresses must not be a line each.
+        logOncePerWindow(`observe:${keyKind}`, (suppressed, sinceMs) => {
+          console.warn("[rate-limit] observe-only bucket would have tripped", {
+            ...(ipHash === null ? {} : { ipHash }),
+            path,
+            count: count + 1,
+            suppressed,
+            sinceMs,
+          });
         });
         warned = true;
       }
+      const observed = { ...state, count: count + 1, warned };
+      phase = "put";
+      await writeCount(() => cache.put(cacheKey, counterRecord(observed, now)));
+    } else if (count >= maxRequests) {
+      const refused = refusal(keyKind, maxRequests, state, now, caller.source);
+      logRefusal(keyKind, maxRequests, refused.body.retry_after as number, caller.source);
+      return c.json(refused.body, 429, refused.headers);
+    } else {
+      // Increment the counter. The record keeps the window's original end and
+      // expires with it; a refused request above writes nothing.
       const newCount = count + 1;
-      await writeCount(
-        cache.put(
-          cacheKey,
-          new Response(JSON.stringify({ count: newCount, warned }), {
-            headers: {
-              "Content-Type": "application/json",
-              "Cache-Control": `max-age=${WINDOW_SIZE}`,
-            },
-          }),
-        ),
+      phase = "put";
+      await writeCount(() =>
+        cache.put(cacheKey, counterRecord({ ...state, count: newCount }, now)),
       );
-      await next();
-      return;
+      phase = "decide";
+      stamp = {
+        "X-RateLimit-Limit": maxRequests.toString(),
+        "X-RateLimit-Remaining": (maxRequests - newCount).toString(),
+        "X-RateLimit-Bucket": keyKind,
+        "X-RateLimit-Caller": caller.source,
+      };
     }
-
-    if (count >= maxRequests) {
-      // Calculate retry-after (approximate)
-      const retryAfter = WINDOW_SIZE;
-
-      return c.json(
-        {
-          error: "Rate limit exceeded",
-          message: `Too many requests. Please try again in ${retryAfter} seconds.`,
-          retry_after: retryAfter,
-        },
-        429,
-        {
-          "Retry-After": retryAfter.toString(),
-          "X-RateLimit-Limit": maxRequests.toString(),
-          "X-RateLimit-Remaining": "0",
-          "X-RateLimit-Reset": (Math.floor(Date.now() / 1000) + retryAfter).toString(),
-          "X-RateLimit-Bucket": keyKind,
-        },
-      );
-    }
-
-    // Increment counter and store in cache with TTL
-    const newCount = count + 1;
-    const response = new Response(JSON.stringify({ count: newCount, warned }), {
-      headers: {
-        "Content-Type": "application/json",
-        "Cache-Control": `max-age=${WINDOW_SIZE}`,
-      },
-    });
-    await writeCount(cache.put(cacheKey, response));
-
-    // Add rate limit headers to response
-    c.header("X-RateLimit-Limit", maxRequests.toString());
-    c.header("X-RateLimit-Remaining", (maxRequests - newCount).toString());
-    c.header("X-RateLimit-Bucket", keyKind);
   } catch (error) {
     // Fail open so a cache outage doesn't block all traffic, but emit a
-    // structured log (deduped to once per window per isolate, see
-    // `logCacheFaultOnce`) so Workers tail / log tooling surfaces the issue.
+    // structured log (once per window per bucket kind, phase and error class per
+    // isolate, and again at the milestones, see `logCacheFault`) so Workers tail /
+    // log tooling surfaces the issue.
     // TODO(#478): replace with Sentry captureException once DSN is wired.
-    logCacheFaultOnce({
-      route: path,
-      keyKind,
-      error: error instanceof Error ? error.message : String(error),
-    });
+    logCacheFault(keyKind, path, error, phase);
   }
 
   await next();
+  if (stamp) stampHeaders(c, stamp);
 }
 
 /**
@@ -813,8 +1803,8 @@ export type DataMissBudgetOutcome =
  * listing, or the "not in the manifest at all" 404 (none of those go through
  * this path either).
  *
- * Mirrors `rateLimiter`'s own mechanics: a Cache API counter (`{count}`
- * under `max-age=<WINDOW_SIZE>`; it needs no `warned` flag, having no
+ * Mirrors `rateLimiter`'s own mechanics: the same fixed-window Cache API
+ * counter (`__CounterState`; its `warned` flag is unused, there being no
  * observe-only mode), the same dev-environment and `X-Test-Bypass`
  * exemptions, and the same
  * `waitUntil`-deferred write with the bounded no-context fallback (so a
@@ -829,14 +1819,24 @@ export async function checkDataMissBudget(
   request: Request,
   waitUntil: ((work: Promise<unknown>) => void) | undefined,
 ): Promise<DataMissBudgetOutcome> {
-  const ip =
-    request.headers.get("CF-Connecting-IP") ||
-    request.headers.get("X-Forwarded-For") ||
-    crypto.randomUUID();
+  // The same identity the middleware uses, so a visitor forwarded by the website
+  // is charged to their own miss budget and an unattributed caller to one shared
+  // budget, not to a fresh random one.
+  const caller = callerIdentityOf(request);
+  // A request this Worker built for itself spends no miss budget, any more than it
+  // spends the `data-ip` bucket (see `rateLimiter`): this is the data plane's own.
+  // The mark alone is not enough: a marked request carries neither address header,
+  // so one that carries a usable address is counted like any other caller.
+  if (caller.source === "unattributed" && isInternalRequest(request)) return { allowed: true };
   return consumeKeyedBudget(
     env,
     request,
-    { kind: DATA_MISS_BUCKET_KIND, key: ip, maxRequests: DATA_MISS_MAX_REQUESTS },
+    {
+      kind: DATA_MISS_BUCKET_KIND,
+      key: caller.key,
+      maxRequests: DATA_MISS_MAX_REQUESTS,
+      caller: caller.source,
+    },
     waitUntil,
   );
 }
@@ -871,6 +1871,9 @@ export async function checkPrivateGrantBudget(
       kind: PRIVATE_GRANT_BUCKET_KIND,
       key: `user-${userId}`,
       maxRequests: PRIVATE_GRANT_MAX_REQUESTS,
+      // Keyed by account, but the answer still says how the request arrived, as
+      // every other refusal does.
+      caller: callerIdentityOf(request).source,
     },
     waitUntil,
   );
@@ -879,17 +1882,16 @@ export async function checkPrivateGrantBudget(
 /**
  * The shared core of the keyed budgets a route checks itself, because the
  * key is something only the route knows (whether a request missed the cache,
- * which account a session names). Mirrors `rateLimiter`'s own mechanics: a
- * Cache API counter (`{count}` under `max-age=<WINDOW_SIZE>`, with no
- * `warned` flag because there is no observe-only mode), the same
- * dev-environment and `X-Test-Bypass`
+ * which account a session names). Mirrors `rateLimiter`'s own mechanics: the
+ * same fixed-window Cache API counter (`__CounterState`, read and written by the
+ * same functions), the same dev-environment and `X-Test-Bypass`
  * exemptions, the same fail-open on a cache outage, and the same
  * `waitUntil`-deferred write with the bounded no-context fallback.
  */
 async function consumeKeyedBudget(
   env: Pick<Bindings, "ENVIRONMENT" | "TEST_BYPASS_TOKEN">,
   request: Request,
-  bucket: { kind: string; key: string; maxRequests: number },
+  bucket: { kind: string; key: string; maxRequests: number; caller?: __CallerSource },
   waitUntil: ((work: Promise<unknown>) => void) | undefined,
 ): Promise<DataMissBudgetOutcome> {
   // Same narrower check as `rateLimiter`'s dev bypass, deliberately: staging
@@ -903,72 +1905,56 @@ async function consumeKeyedBudget(
   }
 
   const cacheKey = new Request(`https://rate-limit.internal/rl:${bucket.kind}:${bucket.key}`);
+  let phase: FaultPhase = "match";
 
   try {
     const cache = caches.default;
-    const cached = await cache.match(cacheKey);
-    const count = cached ? ((await cached.json()) as { count: number }).count : 0;
+    const cached = await cacheCall("match", () => cache.match(cacheKey));
+    const now = Date.now();
+    phase = "read";
+    const body = await readRecordBody(cached);
+    phase = "decide";
+    const state = interpretRecord(body, now, bucket.kind);
 
-    if (count >= bucket.maxRequests) {
-      const retryAfter = WINDOW_SIZE;
+    if (state.count >= bucket.maxRequests) {
+      const refused = refusal(bucket.kind, bucket.maxRequests, state, now, bucket.caller);
+      logRefusal(
+        bucket.kind,
+        bucket.maxRequests,
+        refused.body.retry_after as number,
+        bucket.caller,
+      );
       return {
         allowed: false,
-        response: new Response(
-          JSON.stringify({
-            error: "Rate limit exceeded",
-            message: `Too many requests. Please try again in ${retryAfter} seconds.`,
-            retry_after: retryAfter,
-          }),
-          {
-            status: 429,
-            headers: {
-              "Content-Type": "application/json",
-              "Retry-After": retryAfter.toString(),
-              "X-RateLimit-Limit": bucket.maxRequests.toString(),
-              "X-RateLimit-Remaining": "0",
-              "X-RateLimit-Reset": (Math.floor(Date.now() / 1000) + retryAfter).toString(),
-              "X-RateLimit-Bucket": bucket.kind,
-            },
-          },
-        ),
+        response: new Response(JSON.stringify(refused.body), {
+          status: 429,
+          headers: { "Content-Type": "application/json", ...refused.headers },
+        }),
       };
     }
 
-    const newCount = count + 1;
-    const write = cache
-      .put(
-        cacheKey,
-        new Response(JSON.stringify({ count: newCount }), {
-          headers: {
-            "Content-Type": "application/json",
-            "Cache-Control": `max-age=${WINDOW_SIZE}`,
-          },
-        }),
-      )
-      .catch((err: unknown) => {
-        console.error("[rate-limit] cache failure", {
-          keyKind: bucket.kind,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      });
+    phase = "put";
+    const write = () =>
+      cache.put(cacheKey, counterRecord({ ...state, count: state.count + 1 }, now));
     if (waitUntil) {
-      waitUntil(write);
+      waitUntil(
+        cacheCall("put", write).catch((err: unknown) =>
+          logCacheFault(bucket.kind, undefined, err, "put"),
+        ),
+      );
     } else {
-      await Promise.race([
-        write,
-        new Promise<void>((resolve) => setTimeout(resolve, RATE_LIMIT_WRITE_STALL_MS)),
-      ]);
+      try {
+        await cacheCall("put", write);
+      } catch (err) {
+        logCacheFault(bucket.kind, undefined, err, "put");
+      }
     }
     return { allowed: true };
   } catch (error) {
     // Fail open, the same policy `rateLimiter` itself follows on a cache
-    // outage: a broken Cache API must not block traffic. Deduped the same
-    // way, and against the SAME timestamp: one outage should log once total,
-    // not once per bucket kind.
-    logCacheFaultOnce({
-      keyKind: bucket.kind,
-      error: error instanceof Error ? error.message : String(error),
-    });
+    // outage: a broken Cache API must not block traffic. Logged the same way,
+    // once per window per bucket kind, phase and error class.
+    logCacheFault(bucket.kind, undefined, error, phase);
     return { allowed: true };
   }
 }
@@ -980,9 +1966,19 @@ export const __limits = {
   AUTH_MAX_REQUESTS,
   TOKEN_MAX_REQUESTS_AUTHED,
   MAX_REQUESTS,
+  SITE_IP_MAX_REQUESTS,
+  SITE_UNATTRIBUTED_MAX_REQUESTS,
   DATA_MAX_REQUESTS,
   DATA_MISS_MAX_REQUESTS,
   NEUROBAGEL_MAX_REQUESTS,
   PRIVATE_GRANT_MAX_REQUESTS,
   WINDOW_SIZE,
+};
+
+/** The stall bound and the cache-stall breaker's numbers, for its tests; not caps. */
+export const __stallLimits = {
+  RATE_LIMIT_WRITE_STALL_MS,
+  BREAKER_STALLS_TO_OPEN,
+  BREAKER_STALL_WINDOW_MS,
+  BREAKER_COOL_DOWN_MS,
 };

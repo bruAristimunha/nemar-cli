@@ -25,6 +25,11 @@
  *   with the approval standing. An administrator can be a bypass actor on the
  *   ruleset, so this does not attempt a merge GitHub reports as blocked; the ruleset is what
  *   enforces, and it is not this code's job to defeat it.
+ * - **Whether a merge can be asked for is settled BEFORE anything is written.** A person who asks
+ *   for the merge too (`approve --merge`, or `y` in `next`) has not asked for an approval that
+ *   cannot be followed by it, so {@link checkMergeable} is asked first,
+ *   and a state that is not `clean` (or is still `unknown`) writes nothing. The look after the
+ *   approval ({@link mergeWhenClean}) stays, for a state that changed in between.
  * - **A write whose result is not known is said to be unknown.** A request that got no answer, or
  *   an answer that cannot be read, may have been applied; it is reported as `unknown`, never as a
  *   refusal, and so is a 5xx from a gateway in front of GitHub.
@@ -640,16 +645,226 @@ export type MergeMethod = (typeof MERGE_METHODS)[number];
 const MERGEABLE = "clean";
 
 /**
+ * Why each `mergeable_state` GitHub reports is not `clean`, in words. Only `clean` is merged on, so
+ * a state that is not listed (`has_hooks` is a GitHub Enterprise Server value, and GitHub can add
+ * more) is still refused, with the last sentence.
+ */
+const NOT_CLEAN_WHY = new Map<string, string>([
+  ["blocked", "a required check or review is not satisfied"],
+  ["behind", "the branch is behind main"],
+  ["dirty", "it has merge conflicts"],
+  [
+    "unstable",
+    "a check or status that is not required is not passing or has not reported, for example the automated review holding the pull request",
+  ],
+  ["draft", "it is a draft"],
+  ["unknown", "GitHub has not said whether it can be merged"],
+]);
+
+/**
+ * Why GitHub's `mergeable_state` is not one a merge is attempted on. Meaningful for any state but
+ * `clean`. A Map, so a state named like an object property (`constructor`) is not read as one.
+ */
+export function notCleanWhy(state: string): string {
+  return NOT_CLEAN_WHY.get(state) ?? "this tool merges only a pull request GitHub reports as clean";
+}
+
+/** What can be done about a merge that would not be attempted: see {@link MergeCheck}. */
+export type MergeAdvice = "without_merge" | "retry" | "rerun" | "none";
+
+/**
+ * What a merge may be told about GitHub's `mergeable_state`, as ONE value for every place that asks:
+ * the check before an approval, the one right before it, the `next` card, and the look before the
+ * merge. `ok` only for `clean`. Otherwise `why` is the sentence (which state, why it blocks, that
+ * no merge would be tried), `card` the short phrase for the `next` card, and `advice` what the
+ * administrator can do: `without_merge` for a state that will not clear by itself, `retry` for one
+ * that may (GitHub still working it out, a read that failed), `rerun` when the head is another
+ * commit than the one shown (waiting does not help, a fresh run reads the new one), `none` when the
+ * pull request is no longer open.
+ *
+ * A state that is missing, empty or unrecognised is not `clean`: it is refused, and a missing one
+ * reads as `unknown`.
+ */
+export type MergeCheck =
+  | { ok: true }
+  | { ok: false; why: string; card: string; advice: MergeAdvice };
+
+/** A {@link MergeCheck} that refuses. */
+export type MergeRefused = Extract<MergeCheck, { ok: false }>;
+
+export function mergeCheckOf(state: string | null | undefined): MergeCheck {
+  const word = state && state.length > 0 ? state : "unknown";
+  if (word === MERGEABLE) return { ok: true };
+  return {
+    ok: false,
+    why: `GitHub reports this pull request as '${stateWord(word)}' (${notCleanWhy(word)}), so a merge would not be attempted.`,
+    card: `${notCleanWhy(word)} (GitHub: ${stateWord(word)})`,
+    advice: word === "unknown" ? "retry" : "without_merge",
+  };
+}
+
+/**
+ * A `mergeable_state` as shown to a person. GitHub's are lowercase words with underscores
+ * (`has_hooks`); anything else is not shown as sent, because it reaches a terminal and
+ * {@link sanitizeNote} would eat the underscore.
+ */
+export function stateWord(state: string): string {
+  return /^[a-z][a-z_]{0,29}$/.test(state) ? state : "unrecognised";
+}
+
+/**
+ * What a read of GitHub's mergeability came to: the state, or why there is none. `unreadable` is a
+ * failed read of the pull request (`status` is GitHub's, or 0 for no answer); `moved` is a head that
+ * is no longer the commit being acted on; `closed` is a pull request that is no longer open.
+ */
+export type MergeStateRead =
+  | { ok: true; state: string }
+  | { ok: false; kind: "unreadable"; status: number; reason: string }
+  | { ok: false; kind: "moved" }
+  | { ok: false; kind: "closed"; merged: boolean };
+
+/**
+ * A pull request as a caller has read it: its head and, when one was read with it, the state. They
+ * are one value on purpose. {@link PullRequestFacts} is one, so a caller passes what it read and a
+ * state cannot be paired with a commit it was not read for.
+ */
+export interface MergeSeen {
+  headSha: string;
+  /**
+   * The state read with that head, or null when none was read yet (it is then read). When it is not
+   * `unknown` nothing more is read; when it is, GitHub is still working it out.
+   */
+  mergeableState: string | null;
+}
+
+interface SettleOptions {
+  base?: string;
+  sleep?: (ms: number) => Promise<void>;
+  /** Reads in all, counting the one already made. */
+  tries?: number;
+}
+
+/**
+ * GitHub's `mergeable_state` for the head in `seen`. It is computed lazily, so an `unknown` is asked
+ * about again a few times, a second apart; one that is still `unknown` after that is returned as
+ * `unknown`, for the caller to treat as not clean. A re-read that finds another head is `moved`, and
+ * one that finds the pull request closed or merged is `closed`. Never sleeps after the last read.
+ */
+export async function settleMergeState(
+  token: string,
+  datasetId: string,
+  prNumber: number,
+  seen: MergeSeen,
+  options: SettleOptions = {},
+): Promise<MergeStateRead> {
+  const base = options.base ?? githubApiBase();
+  const sleep = options.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
+  const tries = options.tries ?? 5;
+
+  let state = seen.mergeableState;
+  let reads = state === null ? 0 : 1;
+  for (;;) {
+    if (state === null) {
+      const pr = await fetchPullRequest(token, datasetId, prNumber, base);
+      if (!pr.ok) return { ok: false, kind: "unreadable", status: pr.status, reason: pr.reason };
+      if (pr.value.state !== "open") {
+        return { ok: false, kind: "closed", merged: pr.value.state === "merged" };
+      }
+      if (pr.value.headSha !== seen.headSha) return { ok: false, kind: "moved" };
+      state = pr.value.mergeableState;
+      reads++;
+    }
+    if (state !== "unknown" || reads >= tries) return { ok: true, state };
+    await sleep(1000);
+    state = null;
+  }
+}
+
+/** A read that gave no state, as a refusal that says what happened and not "GitHub has not said". */
+function unreadMergeCheck(read: Extract<MergeStateRead, { ok: false }>): MergeRefused {
+  if (read.kind === "moved") {
+    return {
+      ok: false,
+      why: "The pull request changed since it was read.",
+      card: "the pull request changed since it was read",
+      advice: "rerun",
+    };
+  }
+  if (read.kind === "closed") {
+    return {
+      ok: false,
+      why: `The pull request is no longer open (it was ${read.merged ? "merged" : "closed"}).`,
+      card: "the pull request is no longer open",
+      advice: "none",
+    };
+  }
+  const reason = read.reason.replace(/\.$/, "");
+  return {
+    ok: false,
+    why: `Could not check whether it can be merged (${reason}).`,
+    card: `could not be checked (${reason})`,
+    advice: "retry",
+  };
+}
+
+/**
+ * Whether a merge of the head in `seen` may be asked for now: GitHub's state, asked again while it
+ * is `unknown`, as a {@link MergeCheck}. This is the ONE place that decides it, for the check made
+ * before the approval is confirmed, the one made right before it is written, and the `next` card.
+ * A pull request whose state was already read and is settled costs no request; one passed with only
+ * its head and no state (`mergeableState: null`) is read.
+ */
+export async function checkMergeable(
+  token: string,
+  datasetId: string,
+  prNumber: number,
+  seen: MergeSeen,
+  options: SettleOptions = {},
+): Promise<MergeCheck> {
+  const read = await settleMergeState(token, datasetId, prNumber, seen, options);
+  return read.ok ? mergeCheckOf(read.state) : unreadMergeCheck(read);
+}
+
+/**
+ * The check made immediately before an approval that asks for a merge is written, by both callers
+ * (`approve --merge` after its confirmation, `y` in `next` when it is answered), so they cannot
+ * disagree. The early check can be minutes old by then, a check can have started or reported, and an
+ * approval cannot be taken back: the state is READ again (one request when it is clean), with only the
+ * head in hand so no state is carried over, and a refusal says it came from this second look.
+ */
+export async function recheckBeforeApproval(
+  token: string,
+  datasetId: string,
+  prNumber: number,
+  headSha: string,
+  options: SettleOptions = {},
+): Promise<MergeCheck> {
+  const check = await checkMergeable(
+    token,
+    datasetId,
+    prNumber,
+    { headSha, mergeableState: null },
+    options,
+  );
+  return check.ok ? check : { ...check, why: `Checked again just before approving: ${check.why}` };
+}
+
+/**
  * A merge that did not happen, with what is known of it ({@link WriteOutcome}). `not_sent` covers
  * every case where this code decided not to ask (a failed read of the pull request first, a branch
  * that moved, a state that is not `clean`), so only `unknown` means "GitHub may have merged it".
  * `status` is GitHub's where it answered, 405 or 409 where this code decided, and 0 for no answer.
  */
-export type MergeResult = { ok: true } | (WriteFailure & { mergeableState?: string });
+export type MergeResult = { ok: true } | (WriteFailure & { merge?: MergeRefused });
 
 /**
  * Merge the pull request at `headSha`, only if GitHub says it is mergeable WITHOUT a bypass.
  * Mergeability is computed lazily, so an `unknown` is asked about again a few times.
+ *
+ * This runs AFTER the approval, so it is the second look, not the first: the caller that asked for
+ * a merge has already checked the state before approving anything ({@link checkMergeable}), and
+ * this one catches a state that changed since (a check that turned pending, a push, the approval
+ * itself).
  */
 export async function mergeWhenClean(
   token: string,
@@ -660,21 +875,16 @@ export async function mergeWhenClean(
   options: { base?: string; sleep?: (ms: number) => Promise<void>; tries?: number } = {},
 ): Promise<MergeResult> {
   const base = options.base ?? githubApiBase();
-  const sleep = options.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
-  const tries = options.tries ?? 5;
 
-  let state = "unknown";
-  for (let i = 0; i < tries; i++) {
-    const pr = await fetchPullRequest(token, datasetId, prNumber, base);
-    if (!pr.ok) {
-      return {
-        ok: false,
-        outcome: "not_sent",
-        status: pr.status,
-        reason: `Not merged: ${pr.reason} The approval stands.`,
-      };
-    }
-    if (pr.value.headSha !== headSha) {
+  const read = await settleMergeState(
+    token,
+    datasetId,
+    prNumber,
+    { headSha, mergeableState: null },
+    options,
+  );
+  if (!read.ok) {
+    if (read.kind === "moved") {
       return {
         ok: false,
         outcome: "not_sent",
@@ -682,25 +892,29 @@ export async function mergeWhenClean(
         reason: "The pull request changed after it was approved, so it was not merged.",
       };
     }
-    state = pr.value.mergeableState;
-    if (state !== "unknown") break;
-    await sleep(1000);
-  }
-  if (state !== MERGEABLE) {
-    const explain: Record<string, string> = {
-      blocked: "a required check or review is not satisfied",
-      behind: "the branch is behind main",
-      dirty: "it has merge conflicts",
-      unstable: "a check is failing",
-      draft: "it is a draft",
-      unknown: "GitHub has not finished working out whether it can merge",
+    if (read.kind === "closed") {
+      return {
+        ok: false,
+        outcome: "not_sent",
+        status: 409,
+        reason: `Not merged: ${unreadMergeCheck(read).why} The approval stands.`,
+      };
+    }
+    return {
+      ok: false,
+      outcome: "not_sent",
+      status: read.status,
+      reason: `Not merged: ${read.reason} The approval stands.`,
     };
+  }
+  const check = mergeCheckOf(read.state);
+  if (!check.ok) {
     return {
       ok: false,
       outcome: "not_sent",
       status: 405,
-      mergeableState: state,
-      reason: `Not merged: GitHub says it cannot be merged cleanly (${explain[state] ?? sanitizeNote(state, 30)}). The approval stands.`,
+      merge: check,
+      reason: `Not merged: ${check.why} The approval stands.`,
     };
   }
 

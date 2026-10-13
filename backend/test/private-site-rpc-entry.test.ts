@@ -8,7 +8,7 @@
  * default AND exports the class under the name a caller's binding names, and
  * that each method reaches the function behind it with a working `env`. So the
  * Worker is bundled by the PRODUCTION bundler (`wrangler deploy --dry-run
- * --outdir`, from this directory, with `wrangler-sccn.toml`) and the bundle
+ * --outdir`, from `backend/`, with `wrangler-sccn.toml`; see `helpers/worker-bundle.ts`) and the bundle
  * runs in real workerd, next to a second Worker that holds a service binding
  * to it, the same shape the private site's Worker has in production. The rules
  * the methods apply are proven in `private-site-rpc.test.ts`.
@@ -23,58 +23,15 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { Miniflare } from "miniflare";
 import { NEMAR_API_RPC_ENTRYPOINT } from "../../shared/contract/private-site.js";
 import { hashApiKey } from "../src/services/token";
 import { hashCookieId } from "../src/services/web-session";
 import { applyMigrations, migrationFiles } from "./helpers/miniflare-d1";
+import { bundleWorker, wranglerCompatibility } from "./helpers/worker-bundle";
 
-const BACKEND = join(import.meta.dir, "..");
 const API_KEY = "nm_rpc-entry-test-key-0123456789abcdef012345";
 const APP_COOKIE = "rpc-entry-app-session-cookie-value-0123456789";
-
-/** The compatibility settings the deployed Worker runs under, read from its
- *  own config so this test cannot drift onto different ones. */
-function wranglerCompatibility(): { date: string; flags: string[] } {
-  const toml = readFileSync(join(BACKEND, "wrangler-sccn.toml"), "utf-8");
-  const date = /^compatibility_date\s*=\s*"([^"]+)"/m.exec(toml)?.[1];
-  const flags = /^compatibility_flags\s*=\s*\[([^\]]*)\]/m.exec(toml)?.[1];
-  if (!date || flags === undefined)
-    throw new Error("wrangler-sccn.toml: no compatibility settings");
-  return { date, flags: [...flags.matchAll(/"([^"]+)"/g)].map((m) => m[1] as string) };
-}
-
-/**
- * The Worker as it would be deployed: `wrangler deploy --dry-run --outdir`
- * bundles `main` from `wrangler-sccn.toml` with the same bundler and settings
- * a real deploy uses, and stops before uploading. No credentials are needed.
- */
-function bundleWorker(): string {
-  const outdir = mkdtempSync(join(tmpdir(), "nemar-rpc-entry-"));
-  try {
-    const run = Bun.spawnSync(
-      [
-        join(BACKEND, "node_modules/.bin/wrangler"),
-        "deploy",
-        "--dry-run",
-        "-c",
-        "wrangler-sccn.toml",
-        "--outdir",
-        outdir,
-      ],
-      { cwd: BACKEND, stdout: "pipe", stderr: "pipe", env: { ...process.env, CI: "1" } },
-    );
-    if (run.exitCode !== 0) {
-      throw new Error(`wrangler dry-run failed: ${run.stderr.toString()}${run.stdout.toString()}`);
-    }
-    return readFileSync(join(outdir, "worker.js"), "utf-8");
-  } finally {
-    rmSync(outdir, { recursive: true, force: true });
-  }
-}
 
 /** The caller: a Worker whose only job is to call the binding and report
  *  what came back, including a throw. */
@@ -176,11 +133,11 @@ beforeAll(async () => {
     )
     .bind(userId, await hashCookieId(APP_COOKIE))
     .run();
-});
+}, 60_000);
 
 afterAll(async () => {
   await mf?.dispose();
-});
+}, 30_000);
 
 describe("src/worker.ts in workerd", () => {
   test("the default export is still the HTTP app", async () => {
