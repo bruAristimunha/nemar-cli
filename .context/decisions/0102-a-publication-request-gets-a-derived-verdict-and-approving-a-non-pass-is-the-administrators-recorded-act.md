@@ -516,19 +516,22 @@ the authors half of its question is answered by the fact that ADR 0065's inverte
   The review never calls `/approve` or `/deny`, and nothing is denied automatically.
   The only status a review changes is the mechanical `requested` to `blocked` of section 5, which ADR 0026 already makes.
   An executor never decides: it carries out a decision someone made.
-- **Making "attributed to" exact is Phase 3's, and its shape is set here.**
-  Until then ADR 0080's lease-based attribution stands, with the gap #1604 describes:
-  a terminal approval inside a live web lease is recorded as the clicker's, and could ride on the clicker's recorded override.
-  Until then an override sent inside a live web lease by anyone but the clicker is refused (`override_inside_web_approval`),
-  so none is ever recorded under another administrator's name; the ride on the clicker's own recorded override stays as it is.
-  The proposed fix is a dispatch token minted per claim and valid only while that claim's lease is live.
-  The executor presents it on every `/approve` call of that run, one per batch and retry, so it cannot be single-use,
+- **"Attributed to" is exact: a per-claim dispatch token proves that a run belongs to its click (Phase 3, ADR 0103).**
+  A web click's claim gets a token derived from the claim's own columns (the dataset, the request, the clicker and the instant of the claim),
+  signed with the callback secret under its own domain tag; the Worker stores none of it and there is no migration.
+  The executor presents it in the header `X-Approval-Dispatch-Token` on every `/approve` call of that run, one per batch and retry, so it cannot be single-use,
   and `approve-publication.yml` masks it as its first step, as `run-pr-review.yml` masks its token.
-  The clicker is the approver only for a run that carries it; every other caller is recorded as themselves.
-  It carries attribution and no authority, and joins no revocation list,
-  because `resolveApprover` already re-checks the clicker's role and status at each use.
-  The same token carries the `request_id` precondition of #1579 and authenticates the release endpoint of #1582.
-  Phase 3 records the change in its own ADR, because it changes ADR 0080's decision 5.
+  The clicker is the approver only for a call that presents a valid token while the claim's lease is live.
+  A call with no token is recorded as its caller, whatever the lease says, and its approval takes the claim over.
+  A stale or expired token is refused (409 `dispatch_superseded`, `dispatch_expired`) and never quietly downgraded to the caller.
+  A call that carries a token may carry no override, no screen acknowledgment and no skipped CI check (409 `decision_with_dispatch_token`),
+  because the first two were recorded at the click, under the clicker's id, and the third is a decision the click never made.
+  So an override is recorded only under the credential that sent it, or at the clicker's own dispatch, and the Phase 2 stop-gap refusal is gone.
+  The token carries attribution and no authority, and joins no revocation list,
+  because `resolveApprover` re-checks the clicker's role and status at each use.
+  The `request_id` precondition of #1579 is a field of its own in the body, and the token binds the request as well;
+  the release endpoint of #1582 is authenticated by the token alone.
+  ADR 0103 records the change, because it partially supersedes ADR 0080's decision 5.
 
 ### 10. Relations to earlier decisions
 
@@ -551,7 +554,7 @@ the authors half of its question is answered by the fact that ADR 0065's inverte
 - **ADR 0086 stands.**
   Its gate, acknowledgment, binding and mail lease are unchanged;
   the mail now also waits for the review, which ADR 0086 gains as an amendment on acceptance.
-- **ADR 0080 stands until Phase 3** (section 9).
+- **ADR 0080 stands, except that its decision 5 (the fork on the lease) is partly superseded by ADR 0103** (section 9).
 - **ADR 0092 and ADR 0093 are the template**; section 7 lists where this departs from them.
 
 ### Failure modes, and what the administrator sees
@@ -603,7 +606,8 @@ and each has a closed word and a sentence in the shared module.
     A pass is a model's opinion that facts could not contradict, not a certification.
   - **Override fatigue.**
     A model that is often wrong teaches administrators to pass `--force`; the calibration and the soak measure it first.
-  - **The interim attribution gap** of section 9, closed by Phase 3, which is why production stays dark until Phase 3 ships.
+  - **The interim attribution gap** of section 9 is closed in code by Phase 3 (ADR 0103);
+    production stays dark until the executor's workflow sends the token and that is verified on staging ("Before it is switched on", item 7).
   - **The allow path is not exercised live before production.**
     The soak denies every request it makes, so the first live approval through the gate happens in production.
 
@@ -680,8 +684,13 @@ The maintainer decided all twelve on 2026-10-12, as recommended, and amended cal
    (ADR 0068 names `nm099997` as the next one; created only after step 3, and never approved under a name).
    A fix to the script found by the soak reaches the soak only through another production release.
 6. Add the review's statement to the policy pages, after the separate docs change that corrects them for current practice.
-7. Fix #1604 (a terminal approval inside a live web lease is attributed to the administrator who clicked; Phase 3 attributes it to its own caller),
-   which production must not be lit without; until then the Worker refuses an override sent inside a web approval (`override_inside_web_approval`).
+7. Verify the attribution that Phase 3 fixed in code (#1604, ADR 0103), which production must not be lit without:
+   the executor's workflow carries the maintainer's edit (it masks the dispatch token first, exports it for the approve step's process alone and never through `GITHUB_ENV`, installs the CLI that matches the environment, and releases the claim on failure);
+   the audit query on staging shows every web approval attributed to the administrator who clicked
+   (the `approval_dispatched` audit rows joined to `publication_requests.approved_by` for published requests;
+   a mismatch is a candidate to read, not a violation, because a deliberate terminal takeover or a re-dispatch by another administrator also differs);
+   and the maintainer's decision on the open question of a clicker who is no longer an active administrator is recorded in ADR 0103
+   (today it records the question and that it is undecided).
 8. Ship Phases 3 and 4, then add `PUBLICATION_REVIEW_ENABLED = "1"` to `[vars]`,
    delete the `PRESCREEN_ENABLED` secret and disable `run-prescreen.yml` (section 10),
    and run `nemar admin publish start --all` once for the requests already open.
@@ -717,7 +726,7 @@ Where the two differ, this is the later text.
    In `/approve` the order is:
    a request that is `blocked` and has not started publishing, in the sense of item 6 (409 `request_blocked`);
    the approver of record (ADR 0080);
-   an override sent inside a web approval (409 `override_inside_web_approval`, item 5);
+   an override sent inside a web approval (409 `override_inside_web_approval`, item 5; Phase 3 changed this: see the Phase 3 amendment);
    the identifier screen's gate;
    the review gate (409 `publication_review_not_clear`);
    the recording of the override;
@@ -744,7 +753,8 @@ Where the two differ, this is the later text.
    The words are `REVIEW_GATE_REFUSALS` in `shared/publication-review.ts`.
    A refusal of a review the gate read carries the review's headline and every live reason in the shared words;
    `unverified` carries no reasons and no outcome, and so does the `review_changed` refusal that falls back after a re-read that failed.
-   `request_blocked`, `request_changed` and `override_inside_web_approval` are 409 codes of their own, not refusal words of the gate.
+   `request_blocked`, `request_changed` and `override_inside_web_approval` are 409 codes of their own, not refusal words of the gate
+   (Phase 3 changed this: see the Phase 3 amendment).
    The gate reads no GitHub, so `identifier_screen_stale` is never derived from the review's own read;
    whether the screened commit is still `main` stays the identifier screen's gate's, which runs first.
 
@@ -756,7 +766,7 @@ Where the two differ, this is the later text.
    the `dataset_published` audit row gains `review_gate` and `skip_ci_check`;
    a skipped CI check and an administrator's comment each write an audit row of their own (`publication_ci_check_skipped`, `publication_request_commented`);
    a request that changed while an approval was being checked is refused (409 `request_changed`);
-   an override sent with a session cookie to `/approve`, or inside a web approval, is refused (item 5);
+   an override sent with a session cookie to `/approve`, or inside a web approval, is refused (item 5; Phase 3 changed this: see the Phase 3 amendment);
    and the comment route exists (item 11).
    `publication_review_overridden` is written only when the gate is enforced, so never with the flag off.
 
@@ -781,15 +791,18 @@ Where the two differ, this is the later text.
 5. **Who may send an override, and whose it is.**
    `/approve` accepts an override only with an API key and answers a session cookie 403 `origin_not_allowed`,
    because a cookie rides along with any cross-site request a browser can be made to send;
-   this is the one slice of #1603 that Phase 2 needs, and the rest of #1603 stays in Phase 3.
+   this is the one slice of #1603 that Phase 2 needs, and the rest of #1603 stays in Phase 3 (Phase 3 built it: see the Phase 3 amendment).
    `approve-dispatch` accepts one under its own Origin rule.
    ADR 0080's attribution is unchanged and the gate inherits it:
-   its approver is the approver of record in `/approve` and the clicker in `approve-dispatch`.
+   its approver is the approver of record in `/approve` and the clicker in `approve-dispatch`
+   (Phase 3 changed this: see the Phase 3 amendment).
    Until Phase 3 fixes #1604, an override sent inside a live web lease by anyone but the clicker is refused (`override_inside_web_approval`),
    so none is recorded under another administrator's name,
-   and a terminal approval inside that lease still rides on the clicker's own recorded override.
+   and a terminal approval inside that lease still rides on the clicker's own recorded override
+   (Phase 3 changed this: see the Phase 3 amendment).
    The executor's account sends no override.
-   Production must not be switched on before #1604 is fixed ("Before it is switched on", item 7).
+   Production must not be switched on before #1604 is fixed ("Before it is switched on", item 7)
+   (Phase 3 changed this: see the Phase 3 amendment).
 
 6. **A dispatched review is read by time while a request can still be gated, and the gate derives as the detail does.**
    For a request that is `requested` or `approving`, a row that is `dispatched` reads as `review_running` until the overdue window and as `review_did_not_report` after it;
@@ -884,3 +897,81 @@ Where the two differ, this is the later text.
     The hint to attach the log to a new issue is not printed where exit 1 is the command's own answer (a refusal the Worker made with a 4xx or a closed word, not being signed in, a declined confirmation),
     and is kept for a server error, a network failure and anything else that may be a bug.
     The other admin commands keep their exit-0 shape, which is left to a follow-up.
+
+## Amendment 2026-10-13 (#1730): Phase 3, what changed for the review
+
+Phase 3 made "attributed to" exact and guarded the approval path.
+[ADR 0103](0103-a-web-approval-is-attributed-by-a-per-claim-dispatch-token-and-a-terminal-approval-takes-the-claim-over.md) records the decisions;
+this amendment says what they changed for the review.
+The text above was corrected in place where the built behavior made a sentence false
+(section 9's last bullet, section 10, the accepted risk about attribution, and "Before it is switched on", item 7);
+the statements of the Phase 2 amendment that Phase 3 replaced are marked and kept, so that its history stays readable.
+Where the two differ, this is the later text.
+
+1. **The stop-gap refusal is gone.**
+   `override_inside_web_approval` is removed from the contract and nothing answers with it.
+   Its guarantee, that an override is never recorded under another administrator's name, now comes from the attribution rule:
+   an override or a screen acknowledgment is recorded only under the credential that sent it, or at the clicker's own dispatch.
+   The ride on the clicker's recorded override, which Phase 2 left standing, is closed too.
+   A terminal approval inside a live web claim presents no token, so it is recorded as its caller, needs its caller's own override,
+   and once it has passed every gate it takes the claim over, so the executor the click dispatched is refused at its next call.
+2. **The executor sends no decision, and the review's override reaches the run through the token.**
+   A call that presents a valid token is recorded as the clicker, so the clicker's recorded override and acknowledgment count for it, as section 8 says of the executor's `--yes` run.
+   Such a call may not carry a decision of its own: no override, no identifier screen acknowledgment and no skipped CI check.
+   Any of the three is 409 `decision_with_dispatch_token`, and nothing is recorded.
+   Only `skip_ci_check: true` counts: an explicit `false` is allowed, because the CLI sends it on every call.
+   A skipped CI check is one of them because it is recorded under the approver, which for a token call is the clicker, and the click did not skip it.
+   The executor workflow sends none of the three.
+   `nemar admin publish approve` refuses `--force`, `--acknowledge-identifier-screen` and `--skip-ci-check` while `NEMAR_APPROVAL_DISPATCH_TOKEN` is set, before it sends anything.
+   `next` never reads the variable.
+3. **The order of the checks changes.**
+   In `/approve` it is now: the outdated-client refusal (426), the request read (404), `request_mismatch`, `request_blocked`,
+   the dispatch token (409 `dispatch_superseded`, `dispatch_expired`), the approver of record, `decision_with_dispatch_token`,
+   then, for a run whose steps are all complete, the all-steps-done branch (item 6 below), which runs neither gate and records no override;
+   for any other run, the identifier screen's gate, the review gate, the recording of the override, and the conditional mark.
+   For a call with no token, the mark also clears the claim; for a call with a token, it marks only while the claim is still the one verified.
+   In `approve-dispatch` it is: the dataset id for the environment (400 `invalid_dataset_id`), the body, the request read, `request_mismatch`,
+   `not_dispatchable` for a blocked request, the screen's state, the review gate, the signing secret (502 `dispatch_unconfigured`), and then the claim;
+   the override is still recorded last, after the head check.
+4. **The words a client leads with grow.**
+   The contract's list of approval refusals (`APPROVAL_REFUSAL_ERROR_CODES`) is now `publication_review_not_clear`, `request_blocked`, `request_changed`,
+   `request_mismatch`, `dispatch_superseded`, `dispatch_expired`, `decision_with_dispatch_token`, `approval_in_flight`, `deny_after_publishing`, `invalid_dataset_id` and `approval_closed_during_run`,
+   each with a sentence in the shared module.
+   The 409 `approval_closed_during_run` is not `request_changed`: it says that the steps have run, and its sentence names the repair by hand.
+5. **Deny's rules touch the review's states.**
+   `/deny` takes the optional `request_id` and is refused while an approval is in flight, by the lease the dispatch route claims with:
+   a web dispatch inside its fifteen minutes, or an `approving` request with a heartbeat inside them, unless it failed more than a minute ago (409 `approval_in_flight`).
+   It is also refused once publishing has started, whatever the request's status or block reason (409 `deny_after_publishing`).
+   That predicate is deliberately broader than the gate's `publishingStanding`, which will not trust the steps of a `requested` request or of a `blocked` one with another reason:
+   the gate asks whether old steps may skip a check, and a denial asks whether anything irreversible has happened.
+   So a `requested` request, with a review in any state, can be denied unless it carries steps beyond validation from an earlier approval (follow-up #1766);
+   an `approving` request that stalled before it started publishing can be denied,
+   which keeps the cure that section 8 names for a hard reason on a stopped approval;
+   and a request that has started publishing cannot be denied.
+   An `approving` one, and one the owner-name check walked back to `blocked`, is finished with `approve --resume`.
+   A `requested` one may be finished by approving it, unless it carries every step: that is refused as closed (`approval_closed_during_run`) and repaired by hand.
+   A `blocked` one with another reason waits for its depositor to fix what blocked it (follow-up #1766).
+   The refusal's sentence promises none of these cures, and tells the administrator to check the dataset first.
+   Started publishing means that a step beyond the validation-only ones has completed or is marked as the request's current step.
+   The current step counts because a step is marked before it runs and stays marked when it fails or is interrupted, and the first mutation, `s3_public_read`, may have applied the bucket policy without a record.
+   So a request whose first mutation failed stays undeniable until it is retried to completion or repaired by hand.
+   The depositor's mail goes only after the denial is written.
+6. **The final write is guarded, and a closed request is not marked published.**
+   The write that ends an approval requires that the request is still `approving`.
+   A run whose request was denied once its lease had lapsed, or was blocked again, answers 409 `approval_closed_during_run` and leaves one audit row, `approval_finished_on_closed_request`.
+   A resumed run whose steps are all done follows the same rule, and refuses a request that is not `approving` before it runs any tail job, so a refusal never follows a write that cannot be taken back.
+   When a tail job warns, that run leaves the request `approving`, so that approving again retries it,
+   and answers `status: "approving"` with the warnings joined in the singular `warning`, the key the CLI prints.
+   A missing `datasets` row, or a failed read of it, while the audit row is built is a warning and no row, never a guessed review gate.
+   When none warns, it marks the request `published`, and only when that write changed the row it writes the `dataset_published` audit row, once, with the approver of record as its user (the clicker for a call under a token, with `executed_by` naming the caller) and the flag `finished_by_resume`.
+   The step loop's closing path writes its `dataset_published` row on the same terms, only when its own write changed the request, so a publication has one row whichever call finished it.
+   The step loop's own end has the same "approve again" dead end after a warning, which Phase 3 does not change: it is a known limit with a follow-up (ADR 0103, decision 12).
+7. **None of this is behind the flag.**
+   Item 3 of the Phase 2 amendment lists what production changes with `PUBLICATION_REVIEW_ENABLED` off.
+   Phase 3 adds, also unconditionally: the dispatch token and the takeover, `request_id` on the three routes, the id rule of `approve-dispatch`,
+   the token-authenticated release endpoint and `last_error` on the five early exits, the router-wide Origin guard, the deny rules and the guarded final write.
+   The release notes say so.
+8. **"Before it is switched on", item 7, is a verification, and one question stays open.**
+   The code is fixed.
+   What remains is the executor's workflow sending the token, which only the maintainer can change, and the staging audit query showing web approvals attributed to their clickers.
+   A valid token whose clicker is no longer an active administrator falls back to the caller, as ADR 0080 decided, and the maintainer has not decided whether such a click should publish at all (ADR 0103).

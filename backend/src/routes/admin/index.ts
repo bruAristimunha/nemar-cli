@@ -8,7 +8,7 @@
  */
 
 import { Hono } from "hono";
-import { adminMiddleware, authMiddleware } from "../../middleware/auth";
+import { adminMiddleware, authMiddleware, cookieOriginGuard } from "../../middleware/auth";
 import { registerDatasetLifecycleRoutes } from "./datasets-lifecycle";
 import { registerDoiRoutes } from "./doi";
 import { registerExemplarRoutes } from "./exemplar";
@@ -38,9 +38,13 @@ import { registerZarrFidelitySweepRoutes } from "./zarr-fidelity-sweep";
 
 export const adminRoutes: AdminRouter = new Hono();
 
-// All admin routes require authentication and admin role
+// All admin routes require authentication and admin role, and a write made with a session cookie
+// has to come from a NEMAR page (#1603, #1584; ADR 0103, decision 10). The guard reads what
+// authMiddleware set, and runs after the role check so a member is told "Admin access required"
+// and not asked about an Origin.
 adminRoutes.use("*", authMiddleware);
 adminRoutes.use("*", adminMiddleware);
+adminRoutes.use("*", cookieOriginGuard);
 
 // BEFORE registerUsersRoutes, and it has to be. Hono runs every handler whose
 // pattern matches, in REGISTRATION order, and `GET /users/:username` matches

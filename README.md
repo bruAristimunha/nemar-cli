@@ -331,6 +331,8 @@ nemar admin publish approve <dataset-id> --force
                                            # Approve over a review that is not a pass
 nemar admin publish approve <dataset-id> --acknowledge-identifier-screen "<reason>"
                                            # Approve over a screen that needs review
+nemar admin publish approve <dataset-id> --request-id <n>
+                                           # Approve only if request n is the one in force
 nemar admin publish deny <dataset-id>      # Deny publication request
 nemar admin publish screen <dataset-id>    # Re-run the identifier screen
 ```
@@ -343,6 +345,16 @@ Each request also gets an automated review of what the depositor submitted,
 which `admin publish list` and `admin publish show` state.
 An approval over a review that is not a pass needs `--force` and is recorded
 with your account.
+An approval is for the request it showed, and the API refuses it when that
+request was denied or filed again since (`--request-id` names it yourself).
+An approval started from the website is run by a workflow that is handed a
+token in the environment variable `NEMAR_APPROVAL_DISPATCH_TOKEN` and runs
+`approve --resume --yes` with it, so the token is never typed at a terminal.
+With the variable set, the API records the administrator who clicked as the
+approver, and `--force`, `--acknowledge-identifier-screen` and
+`--skip-ci-check` are refused.
+Without the variable the command is your own approval, recorded under your
+account, and `next` never reads it.
 
 ### Admin Commands
 
@@ -459,9 +471,10 @@ See [the Zenodo testing guide](https://docs.nemar.org/develop/zenodo-testing/) f
 ### CLI Usage
 
 ```bash
-NEMAR_API_KEY          # API key (alternative to `nemar auth login -k`)
-NEMAR_NO_BROWSER=1     # Never try to open a browser during sign-in (same as --no-open)
-NEMAR_NO_COLOR         # Disable colored output
+NEMAR_API_KEY                  # API key (alternative to `nemar auth login -k`)
+NEMAR_NO_BROWSER=1             # Never try to open a browser during sign-in (same as --no-open)
+NEMAR_NO_COLOR                 # Disable colored output
+NEMAR_APPROVAL_DISPATCH_TOKEN  # Dispatch token of a web approval; set only by the web approval executor, never by a person
 ```
 
 ### Testing

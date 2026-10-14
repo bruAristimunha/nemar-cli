@@ -1,8 +1,9 @@
 /**
  * The bounds of the publication approval path are declared once, in `shared/publication-limits.ts`
- * (ADR 0102), and the Worker enforces them from there. These tests drive the real deny route, the
- * real acknowledgment schema and the shared words that quote a dataset id at the boundaries of the
- * shared constants, so a bound that is edited in one place and copied in another fails here.
+ * (ADR 0102; ADR 0103 decision 8 for the dispatch id rule), and the Worker enforces them from
+ * there. These tests drive the real deny route, the real acknowledgment schema and the shared
+ * words that quote a dataset id at the boundaries of the shared constants, so a bound that is
+ * edited in one place and copied in another fails here.
  */
 
 import type { Database } from "bun:sqlite";
@@ -11,6 +12,7 @@ import { Hono } from "hono";
 import {
   ACKNOWLEDGMENT_MAX_LENGTH,
   ACKNOWLEDGMENT_MIN_LENGTH,
+  APPROVAL_DISPATCH_ID_RE,
   DENIAL_REASON_MAX_LENGTH,
   PUBLICATION_DATASET_ID_RE,
 } from "../../shared/publication-limits";
@@ -101,6 +103,58 @@ describe("the dataset id a command is built from", () => {
       expect(PUBLICATION_DATASET_ID_RE.test(id)).toBe(false);
       expect(cureOf("review_not_started", id, true)).toContain("<dataset>");
       expect(cureOf("review_not_started", id, true)).not.toContain(id || "\u0000");
+    }
+  });
+});
+
+describe("the dataset id a web approval may dispatch", () => {
+  // The executor workflow (`approve-publication.yml` in the central workflow repository) accepts
+  // `nm` or `on` plus six digits, and on dev also `xx` plus six digits; it cannot import this
+  // constant, so the rule is stated on both sides. A route that let any other id through would
+  // claim the lease, dispatch, and hold the lease for fifteen minutes behind a workflow that fails
+  // in its first step.
+  const ON_BOTH = ["nm000123", "on000123", "nm000001", "nm099999", "on999999"];
+  const DEV_ONLY = ["xx000123", "xx099999", "xx090001"];
+  const NEITHER = [
+    "nm00012",
+    "nm0001234",
+    "NM000123",
+    "Nm000123",
+    "ds000123",
+    "ab000123",
+    "000123",
+    "nm00012a",
+    "nm000123\n",
+    "\nnm000123",
+    " nm000123",
+    "nm000123 ",
+    "nm000123 --force",
+    "nm000123/../x",
+    "",
+  ];
+
+  test("production accepts nm and on ids and nothing else", () => {
+    for (const id of ON_BOTH) expect(APPROVAL_DISPATCH_ID_RE.production.test(id), id).toBe(true);
+    for (const id of [...DEV_ONLY, ...NEITHER]) {
+      expect(APPROVAL_DISPATCH_ID_RE.production.test(id), JSON.stringify(id)).toBe(false);
+    }
+  });
+
+  test("dev accepts the sandbox xx ids as well, and nothing else", () => {
+    for (const id of [...ON_BOTH, ...DEV_ONLY]) {
+      expect(APPROVAL_DISPATCH_ID_RE.dev.test(id), id).toBe(true);
+    }
+    for (const id of NEITHER) {
+      expect(APPROVAL_DISPATCH_ID_RE.dev.test(id), JSON.stringify(id)).toBe(false);
+    }
+  });
+
+  test("the two rules are the only ones, and dev says what the publication id pattern says", () => {
+    expect(Object.keys(APPROVAL_DISPATCH_ID_RE).sort()).toEqual(["dev", "production"]);
+    for (const id of [...ON_BOTH, ...DEV_ONLY, ...NEITHER]) {
+      expect(APPROVAL_DISPATCH_ID_RE.dev.test(id), JSON.stringify(id)).toBe(
+        PUBLICATION_DATASET_ID_RE.test(id),
+      );
     }
   });
 });

@@ -58,6 +58,7 @@ import {
 } from "../../../shared/publication-review.js";
 import { minimumFailureSentence } from "../../../shared/submission-minimums.js";
 import type { Bindings } from "../types/bindings.js";
+import { APPROVAL_CLAIM_CLEAR_SQL } from "./approval-dispatch.js";
 import { isNonProductionEnv } from "./environment.js";
 import { getDatasetsAuth, getDatasetsToken } from "./github-auth.js";
 import { signPublicationReviewCallbackToken } from "./github/callback-tokens.js";
@@ -888,7 +889,7 @@ function whileWaiting(
  */
 const REBLOCK_SQL = `UPDATE publication_requests
     SET status = 'blocked', block_reason = 'min_requirements_failed',
-        min_requirements_reasons = ?, approval_requested_by = NULL, approval_dispatched_at = NULL,
+        min_requirements_reasons = ?, ${APPROVAL_CLAIM_CLEAR_SQL},
         updated_at = datetime('now')
   WHERE id = ? AND status = 'requested' AND anonymous = ?
     AND ${screenedHeadSql("publication_requests")} = ?

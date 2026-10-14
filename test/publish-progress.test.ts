@@ -97,6 +97,7 @@ interface FakeApproveCall {
     skip_ci_check?: boolean;
     acknowledge_identifier_screen?: string;
     override_publication_review?: { review_id: number | null; reasons: string[] };
+    request_id?: number;
   };
 }
 
@@ -386,6 +387,65 @@ describe("approvePublication onProgress", () => {
       expect("override_publication_review" in call.body).toBe(false);
       expect("acknowledge_identifier_screen" in call.body).toBe(false);
     }
+  });
+
+  test("the request id rides on every call of a paged run, and on none when it is not given (#1579)", async () => {
+    // Same stand-in as the override's: the real route cannot be made to page without a bucket, so
+    // the paging loop is read here, and what the real router does with the field is pinned in
+    // approve-request-precondition.test.ts and the CLI suites.
+    const paged = () => [
+      {
+        message: "batch 1",
+        step: "s3_lock",
+        steps_completed: [],
+        step_results: [],
+        s3_lock_continuation_token: "tok-2",
+        s3_lock_total: 200,
+        s3_lock_batch_count: 100,
+        hasMore: true,
+      },
+      {
+        message: "batch 2",
+        step: "s3_lock",
+        steps_completed: [],
+        step_results: [],
+        s3_lock_continuation_token: "tok-3",
+        s3_lock_total: 200,
+        s3_lock_batch_count: 50,
+        hasMore: true,
+      },
+      {
+        message: "batch 3",
+        step: "s3_lock",
+        steps_completed: [],
+        step_results: [],
+        s3_lock_total: 200,
+        s3_lock_batch_count: 50,
+      },
+    ];
+    fake = startFakeApproveServer(DATASET, paged());
+    process.env.TEST_API_URL = fake.url;
+    await approvePublication(
+      DATASET,
+      false,
+      false,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { requestId: 41 },
+    );
+    expect(fake.calls.length).toBe(3);
+    for (const call of fake.calls) expect(call.body.request_id).toBe(41);
+
+    // Not given: on no call, as the bodies of every caller before it.
+    await fake.stop();
+    fake = startFakeApproveServer(DATASET, paged());
+    process.env.TEST_API_URL = fake.url;
+    await approvePublication(DATASET, false);
+    expect(fake.calls.length).toBe(3);
+    for (const call of fake.calls) expect("request_id" in call.body).toBe(false);
   });
 
   test("calls without onProgress don't throw and still drive pagination", async () => {

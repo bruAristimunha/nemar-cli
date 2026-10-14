@@ -28,8 +28,9 @@
  *    for and the reasons shown; it is recorded only when that review is still the one in force,
  *    and only by a statement that pins the row as it was read (`RECORD_OVERRIDE_SQL`).
  *  - **A recorded override is its approver's.** It satisfies a later run only when that run is
- *    attributed to the same administrator (`resolveApprover`, ADR 0080): the web executor's run
- *    passes on its clicker's override, and any other administrator's run does not.
+ *    attributed to the same administrator (`resolveApprover`; ADR 0103, decision 4): a run the
+ *    web started (it carries the click's dispatch token) passes on its clicker's override, and
+ *    any other administrator's run, a terminal's included, does not.
  */
 
 import {
@@ -327,9 +328,10 @@ function decide(args: ReviewGateArgs, d: DerivedPublicationReview): ReviewGateRe
  * is on the row, and losing the second record must not refuse an approval already decided.
  *
  * The audit row names no executor. An override is its sender's act and is recorded under the
- * approver of record, and the approval route refuses an override from anyone but the approver
- * (`override_inside_web_approval`) before the gate runs, so the sender and the approver are the
- * same administrator whenever one is recorded.
+ * approver of record, and the one run whose approver is not its sender (a call carrying a valid
+ * dispatch token, whose approver is the clicker) may send none: the approval route refuses it
+ * (`decision_with_dispatch_token`, ADR 0103 decision 5) before the gate runs, so the sender and
+ * the approver are the same administrator whenever one is recorded.
  */
 export async function recordApprovalOverride(
   env: Bindings,

@@ -23,7 +23,8 @@ import type { Server } from "bun";
 import { Hono } from "hono";
 import {
   APPROVAL_REFUSAL_ERROR_CODES,
-  OVERRIDE_INSIDE_WEB_APPROVAL_MESSAGE,
+  DECISION_WITH_DISPATCH_TOKEN_MESSAGE,
+  DISPATCH_SUPERSEDED_MESSAGE,
   REQUEST_CHANGED_MESSAGE,
 } from "../../shared/contract/publication";
 import {
@@ -62,17 +63,21 @@ import {
   seedScreenedRequest,
   seedUser,
   setOverride,
+  webClaim,
 } from "./helpers/publication-review";
 import { hookedD1 } from "./helpers/publication-review-harness";
 
 const ADMIN_A_KEY = "review-gate-admin-a-0123456789abcdef0123456789abcdef";
 const ADMIN_B_KEY = "review-gate-admin-b-0123456789abcdef0123456789abcdef";
+const GATE_SECRET = "review-gate-secret";
 const DATASET = "nm000481";
 const MIRROR = "nm000482";
 const EXEMPLAR = "xx099960";
 
 let server: Server;
 let calls: { method: string; path: string; event?: string }[] = [];
+/** The `client_payload` of every approval the Worker dispatched: what the executor is handed. */
+let dispatchPayloads: Record<string, unknown>[] = [];
 let mainHead = SCREENED_HEAD;
 let bidsConclusion = "success";
 /** Runs inside the stand-in as the request for `main` and the dispatch arrive: for ordering. */
@@ -91,9 +96,15 @@ beforeAll(() => {
       const p = new URL(req.url).pathname;
       const sent =
         req.method === "POST"
-          ? ((await req.json().catch(() => null)) as { event_type?: string } | null)
+          ? ((await req.json().catch(() => null)) as {
+              event_type?: string;
+              client_payload?: Record<string, unknown>;
+            } | null)
           : null;
       calls.push({ method: req.method, path: p, event: sent?.event_type });
+      if (sent?.event_type === "approve-publication" && sent.client_payload) {
+        dispatchPayloads.push(sent.client_payload);
+      }
       if (req.method === "GET" && /\/git\/ref\/heads\/main$/.test(p)) {
         onRefRead?.();
         return Response.json({ object: { sha: mainHead } });
@@ -124,6 +135,7 @@ afterAll(() => {
 
 afterEach(() => {
   calls = [];
+  dispatchPayloads = [];
   mainHead = SCREENED_HEAD;
   bidsConclusion = "success";
   onRefRead = null;
@@ -144,7 +156,7 @@ function env(over: Partial<Bindings> = {}, lit = true): Bindings {
     DB: realD1(db),
     ENVIRONMENT: "production",
     GITHUB_ADMIN_PAT: "ghp_review_gate_test",
-    PRESCREEN_CALLBACK_SECRET: "review-gate-secret",
+    PRESCREEN_CALLBACK_SECRET: GATE_SECRET,
     PUBLICATION_REVIEW_ENABLED: lit ? "1" : undefined,
     API_BASE_URL: "https://api.test.nemar.org",
     ...over,
@@ -170,7 +182,7 @@ function seed(over: Seed = {}): { requestId: number; datasetId: string } {
 
 function approve(
   body: Record<string, unknown> = { resume: true },
-  o: { key?: string; dataset?: string; bindings?: Bindings } = {},
+  o: { key?: string; dataset?: string; bindings?: Bindings; token?: string } = {},
 ): Promise<Response> {
   return app.request(
     `/admin/publish/${o.dataset ?? DATASET}/approve`,
@@ -179,6 +191,8 @@ function approve(
       headers: {
         Authorization: `Bearer ${o.key ?? ADMIN_A_KEY}`,
         "Content-Type": "application/json",
+        // The proof that the call belongs to a web click's claim (#1604); a terminal sends none.
+        ...(o.token === undefined ? {} : { "X-Approval-Dispatch-Token": o.token }),
       },
       body: JSON.stringify(body),
     },
@@ -209,6 +223,20 @@ function published(): { user_id: number; details: Record<string, unknown> } {
   const rows = auditRows("dataset_published");
   expect(rows).toHaveLength(1);
   return rows[0];
+}
+
+/**
+ * A web click's claim on a request, by `clicker`, and the token its dispatch carried: written the
+ * way the dispatch route writes it and signed by the production signer (`webClaim`). `dispatchedAt`
+ * is a SQLite modifier; the default is a claim made a minute ago, inside the 15 minute lease.
+ */
+const claim = (requestId: number, clicker: number, dispatchedAt = "-1 minutes"): Promise<string> =>
+  webClaim(db, { requestId, clickerId: clicker, dispatchedAt, secret: GATE_SECRET });
+
+/** The two claim columns of a request, as they stand. */
+function claimOf(id: number): { by: unknown; at: unknown } {
+  const r = requestRow(id);
+  return { by: r.approval_requested_by, at: r.approval_dispatched_at };
 }
 
 // ============================================================================
@@ -480,30 +508,71 @@ describe("--skip-ci-check is recorded", () => {
   });
 });
 
-describe("the audit trail names the executor one way", () => {
-  test("19. a skip inside a web approval records executed_by as the same username the approval row does", async () => {
-    // The executor's service account (B) runs the clicker's (A's) approval. Both rows name B as
-    // the executor, and both as the username: one type for the field across the whole trail.
+describe("a skipped CI check is a decision, and a decision is recorded under the credential that sent it", () => {
+  test("19. a skip sent with a web run's token is refused as decision_with_dispatch_token, and nothing is recorded", async () => {
+    // The click made its decision; the executor carries it out and may not add one. A skip sent
+    // under the token would be recorded under the clicker, who never asked for it.
     const { requestId } = seed({
       requestStatus: "approving",
       steps: DONE.filter((s) => s !== "ci_check"),
     });
     seedPublicationReview(db, { requestId, datasetId: DATASET, state: "reported" });
-    db.run(
-      `UPDATE publication_requests
-          SET approval_requested_by = ?, approval_dispatched_at = datetime('now', '-1 minutes')
-        WHERE id = ?`,
-      [adminA, requestId],
-    );
+    const token = await claim(requestId, adminA);
+    const claimBefore = claimOf(requestId);
+    const before = requestRow(requestId);
+
+    const res = await approve({ resume: true, skip_ci_check: true }, { key: ADMIN_B_KEY, token });
+
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: string; message: string };
+    expect(body).toEqual({
+      error: "decision_with_dispatch_token",
+      message: DECISION_WITH_DISPATCH_TOKEN_MESSAGE,
+    });
+    expect(APPROVAL_REFUSAL_ERROR_CODES).toContain(body.error);
+    expect(auditRows("publication_ci_check_skipped")).toHaveLength(0);
+    expect(auditRows("dataset_published")).toHaveLength(0);
+    expect(requestRow(requestId)).toEqual(before);
+    expect(claimOf(requestId)).toEqual(claimBefore);
+  });
+
+  test("19. the refusal is for the skip alone: an explicit false is no decision, and the run goes on under the click", async () => {
+    // The CLI sends `skip_ci_check: false` on every call, so a refusal on the field's presence
+    // would refuse every web run.
+    const { requestId } = seed({
+      requestStatus: "approving",
+      steps: DONE.filter((s) => s !== "ci_check"),
+    });
+    seedPublicationReview(db, { requestId, datasetId: DATASET, state: "reported" });
+    const token = await claim(requestId, adminA);
+
+    const res = await approve({ resume: true, skip_ci_check: false }, { key: ADMIN_B_KEY, token });
+
+    expect(res.status).toBe(200);
+    expect(requestRow(requestId).approved_by).toBe(adminA);
+    expect(auditRows("publication_ci_check_skipped")).toHaveLength(0);
+    expect(published().details).toMatchObject({ approved_by: "gateadmina", skip_ci_check: false });
+  });
+
+  test("19. without the token a skip is its sender's own, claim or no claim: B's skip inside A's live claim is B's, and B takes the claim over", async () => {
+    const { requestId } = seed({
+      requestStatus: "approving",
+      steps: DONE.filter((s) => s !== "ci_check"),
+    });
+    seedPublicationReview(db, { requestId, datasetId: DATASET, state: "reported" });
+    await claim(requestId, adminA);
+
     const res = await approve({ resume: true, skip_ci_check: true }, { key: ADMIN_B_KEY });
+
     expect(res.status).toBe(200);
     const skipped = auditRows("publication_ci_check_skipped");
     expect(skipped).toHaveLength(1);
-    // Attributed to the clicker, executed by the service account.
-    expect(skipped[0].user_id).toBe(adminA);
-    expect(skipped[0].details).toEqual({ request_id: requestId, executed_by: "gateadminb" });
-    expect(skipped[0].details.executed_by).toBe(published().details.executed_by as string);
-    expect(typeof skipped[0].details.executed_by).toBe("string");
+    expect(skipped[0].user_id).toBe(adminB);
+    // B is the approver and the caller: there is no separate executor to name.
+    expect(skipped[0].details).toEqual({ request_id: requestId });
+    expect(published().user_id).toBe(adminB);
+    expect(published().details).toMatchObject({ skip_ci_check: true });
+    expect(claimOf(requestId)).toEqual({ by: null, at: null });
   });
 });
 
@@ -987,21 +1056,32 @@ describe("an override is its approver's, and it is recorded once", () => {
     expect(overrideRows()[0].user_id).toBe(adminB);
   });
 
-  test("23. #1604 as it stands: a terminal approval by B inside A's live web lease is A's, and rides on A's override", async () => {
-    // Pinned so Phase 3 flips it on purpose: until a dispatch token makes attribution exact
-    // (ADR 0102 section 9, #1604), a run inside a live lease is attributed to the clicker, and so
-    // satisfies the gate on the clicker's recorded override. (A NEW override sent from a terminal
-    // inside the lease is refused, below, so none is recorded under the clicker's id.)
+  test("23. a terminal approval by B inside A's live web claim is B's own act: it does not ride on A's override, and A's claim is intact", async () => {
+    // The flip of the earlier pin (#1604, ADR 0103 decisions 4 and 6). Inside a live claim, with no
+    // dispatch token, B is not A's run: B is recorded as B, B needs B's own override, and a refusal
+    // changes nothing, so the run the click dispatched can still be carried out by its executor.
     const { requestId, reviewId } = seedFailing();
     setOverride(db, reviewId, adminA, ["question_failed"]);
-    db.run(
-      `UPDATE publication_requests
-          SET approval_requested_by = ?, approval_dispatched_at = datetime('now', '-1 minutes')
-        WHERE id = ?`,
-      [adminA, requestId],
-    );
-    const res = await approve({ resume: true }, { key: ADMIN_B_KEY });
-    expect(res.status).toBe(200);
+    const token = await claim(requestId, adminA);
+    const claimBefore = claimOf(requestId);
+    const reviewBefore = reviewRow(reviewId);
+
+    const body = await refusalOf(await approve({ resume: true }, { key: ADMIN_B_KEY }));
+    expect(body.refusal).toBe("needs_override");
+    expect(body.uncovered).toEqual(["question_failed"]);
+
+    const row = requestRow(requestId);
+    expect(row.status).toBe("requested");
+    expect(row.approved_by).toBeNull();
+    expect(claimOf(requestId)).toEqual(claimBefore);
+    expect(reviewRow(reviewId)).toEqual(reviewBefore);
+    expect(auditRows("dataset_published")).toHaveLength(0);
+    expect(overrideRows()).toHaveLength(0);
+
+    // The control: the refused call took nothing over, so the executor's run, with A's token, still
+    // is A's and rides on A's recorded override.
+    const run = await approve({ resume: true }, { key: ADMIN_B_KEY, token });
+    expect(run.status).toBe(200);
     expect(requestRow(requestId).approved_by).toBe(adminA);
     expect(published().user_id).toBe(adminA);
     expect(published().details).toMatchObject({
@@ -1009,24 +1089,12 @@ describe("an override is its approver's, and it is recorded once", () => {
       executed_by: "gateadminb",
     });
   });
-});
 
-describe("#1604 as it stands: an override is never recorded under another administrator's name", () => {
-  // Until a dispatch token makes attribution exact (ADR 0102 section 9, #1604, Phase 3), a terminal
-  // approval inside a live web lease is attributed to the clicker. The ride on the clicker's own
-  // recorded override (test 23, above) stays as it is; a NEW override sent from a terminal inside
-  // a lease would be recorded as the clicker's, with the sender as the executor, so it is refused.
-  const lease = (requestId: number) =>
-    db.run(
-      `UPDATE publication_requests
-          SET approval_requested_by = ?, approval_dispatched_at = datetime('now', '-1 minutes')
-        WHERE id = ?`,
-      [adminA, requestId],
-    );
-
-  test("23. an override sent by B inside A's live lease is refused, and recorded under nobody", async () => {
+  test("23. B's own override at a terminal inside A's live claim is recorded as B's, B is the approver, and B takes the claim over", async () => {
     const { requestId, reviewId } = seedFailing();
-    lease(requestId);
+    setOverride(db, reviewId, adminA, ["question_failed"]);
+    await claim(requestId, adminA);
+
     const res = await approve(
       {
         resume: true,
@@ -1034,13 +1102,145 @@ describe("#1604 as it stands: an override is never recorded under another admini
       },
       { key: ADMIN_B_KEY },
     );
+    expect(res.status).toBe(200);
+
+    expect(requestRow(requestId).approved_by).toBe(adminB);
+    expect(reviewRow(reviewId).override_by).toBe(adminB);
+    expect(overrideRows()).toHaveLength(1);
+    expect(overrideRows()[0].user_id).toBe(adminB);
+    expect(published().user_id).toBe(adminB);
+    // B is the approver and the caller: there is no separate executor to name.
+    expect(published().details).not.toHaveProperty("executed_by");
+    expect(claimOf(requestId)).toEqual({ by: null, at: null });
+  });
+
+  test("23. the takeover: after B approves at a terminal, the executor's call with A's token is superseded, and approved_by stays B", async () => {
+    // A pass review, so B needs no override; the run stops at the CI check, after the mark, so the
+    // request is still `approving` when the executor's call arrives.
+    bidsConclusion = "failure";
+    const executorKey = "review-gate-executor-0123456789abcdef0123456789abcdef";
+    await seedUser(db, "gateexecutor", "admin", executorKey);
+    const { requestId } = seed({ steps: [] });
+    seedPublicationReview(db, { requestId, datasetId: DATASET, state: "reported" });
+    const token = await claim(requestId, adminA);
+
+    const asB = await approve({ resume: true }, { key: ADMIN_B_KEY });
+    expect(asB.status).toBe(422);
+    expect(requestRow(requestId).status).toBe("approving");
+    expect(requestRow(requestId).approved_by).toBe(adminB);
+    expect(claimOf(requestId)).toEqual({ by: null, at: null });
+    const afterB = requestRow(requestId);
+
+    const asExecutor = await approve({ resume: true }, { key: executorKey, token });
+    expect(asExecutor.status).toBe(409);
+    expect(await asExecutor.json()).toEqual({
+      error: "dispatch_superseded",
+      message: DISPATCH_SUPERSEDED_MESSAGE,
+    });
+    // Nothing about the request moved: B's approval is the one on record.
+    expect(requestRow(requestId)).toEqual(afterB);
+    expect(requestRow(requestId).approved_by).toBe(adminB);
+    expect(auditRows("dataset_published")).toHaveLength(0);
+  });
+
+  test("23. a token-bearing call that marks keeps the claim: the same token carries the retry after the run failed, recorded as the clicker", async () => {
+    // A web approval is many calls (every batch of the lock loop, every retry of a failed step)
+    // and each carries the one token of the click. Only a call WITHOUT the token ends the claim;
+    // a call that marks under the token must leave it standing, or every later call of the run
+    // is refused as superseded.
+    bidsConclusion = "failure";
+    const executorKey = "review-gate-executor-0123456789abcdef0123456789abcdef";
+    await seedUser(db, "gateexecutor", "admin", executorKey);
+    const { requestId } = seed({ steps: DONE.filter((s) => s !== "ci_check") });
+    seedPublicationReview(db, { requestId, datasetId: DATASET, state: "reported" });
+    const token = await claim(requestId, adminA);
+    const claimBefore = claimOf(requestId);
+
+    const first = await approve({ resume: true }, { key: executorKey, token });
+    // Marked, then stopped by the CI check.
+    expect(first.status).toBe(422);
+    expect(requestRow(requestId).status).toBe("approving");
+    expect(requestRow(requestId).approved_by).toBe(adminA);
+    expect(claimOf(requestId)).toEqual(claimBefore);
+
+    // The retry: the check passes now, and the same token is still the claim's.
+    bidsConclusion = "success";
+    const retry = await approve({ resume: true }, { key: executorKey, token });
+    expect(retry.status).toBe(200);
+    expect(requestRow(requestId).status).toBe("published");
+    expect(requestRow(requestId).approved_by).toBe(adminA);
+    expect(published().user_id).toBe(adminA);
+    expect(published().details).toMatchObject({
+      approved_by: "gateadmina",
+      executed_by: "gateexecutor",
+    });
+  });
+
+  test("23. the first call of a fresh web approval (resume false) marks under the token and leaves the claim for the next call", async () => {
+    // The executor's first call is not a resume. It marks the request and stops here at the CI
+    // check; the claim must stand, and the next call with the token is still the click's run.
+    bidsConclusion = "failure";
+    const executorKey = "review-gate-executor-0123456789abcdef0123456789abcdef";
+    await seedUser(db, "gateexecutor", "admin", executorKey);
+    const { requestId } = seed({ steps: [] });
+    seedPublicationReview(db, { requestId, datasetId: DATASET, state: "reported" });
+    const token = await claim(requestId, adminA);
+    const claimBefore = claimOf(requestId);
+
+    const first = await approve({ resume: false }, { key: executorKey, token });
+    expect(first.status).toBe(422);
+    expect(requestRow(requestId).status).toBe("approving");
+    expect(requestRow(requestId).approved_by).toBe(adminA);
+    expect(claimOf(requestId)).toEqual(claimBefore);
+
+    // The retry is a resume. It is not refused as superseded: it reaches the CI check again.
+    const retry = await approve({ resume: true }, { key: executorKey, token });
+    expect(retry.status).toBe(422);
+    expect(requestRow(requestId).approved_by).toBe(adminA);
+    expect(claimOf(requestId)).toEqual(claimBefore);
+    expect(auditRows("dataset_published")).toHaveLength(0);
+  });
+});
+
+/**
+ * An override is recorded only under the credential that sent it, or at the clicker's own
+ * dispatch (#1604, ADR 0103 decision 5). This is the guarantee the earlier refusal
+ * `override_inside_web_approval` stood in for; it is now structural, and held here as a property:
+ * after every scenario, every override on a review row and in the audit trail names `sender`, and
+ * when `sender` is null (the call was refused, or sent none) there is none.
+ */
+function expectOverridesRecordedBy(sender: number | null): void {
+  for (const r of reviewRows()) {
+    if (r.override_by !== null) expect(r.override_by).toBe(sender);
+  }
+  for (const a of overrideRows()) expect(a.user_id).toBe(sender);
+  if (sender === null) {
+    expect(reviewRows().filter((r) => r.override_by !== null)).toHaveLength(0);
+    expect(overrideRows()).toHaveLength(0);
+  }
+}
+
+describe("#1604: a run the web started carries its click's decision and sends none of its own", () => {
+  const override = (reviewId: number) => ({
+    override_publication_review: { review_id: reviewId, reasons: ["question_failed"] },
+  });
+
+  test("23. an override sent by B with A's token is refused as decision_with_dispatch_token, and recorded under nobody", async () => {
+    const { requestId, reviewId } = seedFailing();
+    const token = await claim(requestId, adminA);
+    const claimBefore = claimOf(requestId);
+
+    const res = await approve({ resume: true, ...override(reviewId) }, { key: ADMIN_B_KEY, token });
+
     expect(res.status).toBe(409);
     const body = (await res.json()) as { error: string; message: string };
     expect(body).toEqual({
-      error: "override_inside_web_approval",
-      message: OVERRIDE_INSIDE_WEB_APPROVAL_MESSAGE,
+      error: "decision_with_dispatch_token",
+      message: DECISION_WITH_DISPATCH_TOKEN_MESSAGE,
     });
     expect(APPROVAL_REFUSAL_ERROR_CODES).toContain(body.error);
+    // The earlier stop-gap is gone from the contract: its job is structural now (decision 5).
+    expect(APPROVAL_REFUSAL_ERROR_CODES).not.toContain("override_inside_web_approval");
     // Nothing ran and nothing was recorded, under A or under B.
     expect(reviewRow(reviewId).override_by).toBeNull();
     expect(reviewRow(reviewId).override_reasons).toBeNull();
@@ -1049,54 +1249,205 @@ describe("#1604 as it stands: an override is never recorded under another admini
     expect(row.status).toBe("requested");
     expect(row.approved_by).toBeNull();
     expect(auditRows("dataset_published")).toHaveLength(0);
-    // The lease is the clicker's still: refusing the override did not touch it.
-    expect(row.approval_requested_by).toBe(adminA);
+    // The claim is the clicker's still: refusing the decision did not touch it.
+    expect(claimOf(requestId)).toEqual(claimBefore);
+    expectOverridesRecordedBy(null);
   });
 
-  test("23. the refusal is for the override and nothing else: B's bodies without one, and A's own, pass as before", async () => {
-    const { requestId, reviewId } = seedFailing();
-    lease(requestId);
-    // No override from B: the gate answers as it does (A recorded none, so one is needed).
-    const bare = await approve({ resume: true }, { key: ADMIN_B_KEY });
-    expect((await refusalOf(bare)).refusal).toBe("needs_override");
-    // A's own override inside A's own lease is A's act, recorded under A.
-    const own = await approve({
-      resume: true,
-      override_publication_review: { review_id: reviewId, reasons: ["question_failed"] },
-    });
-    expect(own.status).toBe(200);
-    expect(reviewRow(reviewId).override_by).toBe(adminA);
-    expect(overrideRows()).toHaveLength(1);
-    expect(requestRow(requestId).status).toBe("published");
-  });
+  test("23. an identifier-screen acknowledgment sent with the token is refused the same way, and recorded nowhere", async () => {
+    const { requestId } = seed({ status: "unchecked" });
+    seedPublicationReview(db, { requestId, datasetId: DATASET, state: "reported" });
+    const token = await claim(requestId, adminA);
+    const before = requestRow(requestId);
 
-  test("23. outside any lease a terminal's override is its own, B's included", async () => {
-    const { reviewId } = seedFailing();
     const res = await approve(
       {
         resume: true,
-        override_publication_review: { review_id: reviewId, reasons: ["question_failed"] },
+        acknowledge_identifier_screen: "Read the recording formats by hand, nothing to remove",
       },
-      { key: ADMIN_B_KEY },
+      { key: ADMIN_B_KEY, token },
     );
+
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe("decision_with_dispatch_token");
+    expect(requestRow(requestId)).toEqual(before);
+    expect(requestRow(requestId).identifier_screen_ack_by).toBeNull();
+    expect(auditRows("identifier_screen_acknowledged")).toHaveLength(0);
+  });
+
+  test("23. even the clicker's own override cannot travel with the token: the click recorded it already", async () => {
+    const { requestId, reviewId } = seedFailing();
+    const token = await claim(requestId, adminA);
+    const res = await approve({ resume: true, ...override(reviewId) }, { key: ADMIN_A_KEY, token });
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe("decision_with_dispatch_token");
+    expect(reviewRow(reviewId).override_by).toBeNull();
+    expectOverridesRecordedBy(null);
+  });
+
+  test("23. the refusal is for the decision and nothing else: B with the token and no decision carries A's recorded override as A's run", async () => {
+    const { requestId, reviewId } = seedFailing();
+    setOverride(db, reviewId, adminA, ["question_failed"]);
+    const token = await claim(requestId, adminA);
+
+    const res = await approve({ resume: true }, { key: ADMIN_B_KEY, token });
+
     expect(res.status).toBe(200);
-    expect(reviewRow(reviewId).override_by).toBe(adminB);
+    expect(requestRow(requestId).approved_by).toBe(adminA);
+    expect(published().details).toMatchObject({
+      approved_by: "gateadmina",
+      executed_by: "gateadminb",
+    });
+    // The override on the row is A's own act, recorded at the click; the run wrote none.
+    expect(overrideRows()).toHaveLength(0);
+    expectOverridesRecordedBy(adminA);
+  });
+
+  test("23. without the token an override is its sender's, claim or no claim: A's own inside A's claim is A's, B's outside any claim is B's", async () => {
+    const own = seedFailing();
+    await claim(own.requestId, adminA);
+    const asA = await approve({ resume: true, ...override(own.reviewId) }, { key: ADMIN_A_KEY });
+    expect(asA.status).toBe(200);
+    expect(reviewRow(own.reviewId).override_by).toBe(adminA);
+    expect(overrideRows()).toHaveLength(1);
+    expectOverridesRecordedBy(adminA);
+
+    // A request with no claim at all: B's override is B's.
+    db.run("DELETE FROM audit_log");
+    const other = seedFailing({ datasetId: "nm000484" });
+    const asB = await approve(
+      { resume: true, ...override(other.reviewId) },
+      { key: ADMIN_B_KEY, dataset: "nm000484" },
+    );
+    expect(asB.status).toBe(200);
+    expect(reviewRow(other.reviewId).override_by).toBe(adminB);
     expect(overrideRows()[0].details).not.toHaveProperty("executed_by");
   });
 
-  test("23. the executor sends no override, so the run rides on the clicker's recorded one: unchanged, #1604 is Phase 3's", async () => {
-    // The shape of `approve-dispatch` followed by the executor's run (test 12, above), with the
-    // refusal in place: nothing the executor needs is an override.
+  test("23. the executor sends no decision: approve-dispatch records the click's override, and the token carries the run on it", async () => {
+    // The shape of `approve-dispatch` followed by the executor's run (test 12, below), the way the
+    // workflow does it: the token out of the dispatch payload, the executor's own key, no override.
     const { requestId, reviewId } = seedFailing();
     const dispatched = await dispatchApproval({
       override_publication_review: { review_id: reviewId, reasons: ["question_failed"] },
     });
     expect(dispatched.status).toBe(202);
-    const run = await approve({ resume: true }, { key: ADMIN_B_KEY });
+    const token = dispatchPayloads[0]?.dispatch_token as string;
+    expect(token).toMatch(/^[0-9a-f]{64}$/);
+
+    // Without the token the same call is B's own act, and B has no override: refused, claim intact.
+    const claimBefore = claimOf(requestId);
+    const bare = await refusalOf(await approve({ resume: true }, { key: ADMIN_B_KEY }));
+    expect(bare.refusal).toBe("needs_override");
+    expect(claimOf(requestId)).toEqual(claimBefore);
+
+    const run = await approve({ resume: true }, { key: ADMIN_B_KEY, token });
     expect(run.status).toBe(200);
     expect(requestRow(requestId).approved_by).toBe(adminA);
     expect(overrideRows()).toHaveLength(1);
+    expectOverridesRecordedBy(adminA);
   });
+
+  test("23. the same for the screen's acknowledgment: the click records it, the token carries the run on it, and a call without the token has none", async () => {
+    // A screen that could not look at everything passes only with an administrator's recorded
+    // reason. The click records A's, and the executor's run, which carries the token, is A's and
+    // finds it; the same call made as B without the token is B's own, and B gave no reason.
+    const why = "Read the recording formats by hand, nothing to remove";
+    const { requestId } = seed({ status: "unchecked" });
+    seedPublicationReview(db, { requestId, datasetId: DATASET, state: "reported" });
+    const dispatched = await dispatchApproval({ acknowledge_identifier_screen: why });
+    expect(dispatched.status).toBe(202);
+    expect(requestRow(requestId).identifier_screen_ack_by).toBe(adminA);
+    const token = dispatchPayloads[0]?.dispatch_token as string;
+    const claimBefore = claimOf(requestId);
+
+    const bare = await approve({ resume: true }, { key: ADMIN_B_KEY });
+    expect(bare.status).toBe(409);
+    expect(((await bare.json()) as { error: string }).error).toBe("identifier_screen_not_clear");
+    expect(claimOf(requestId)).toEqual(claimBefore);
+    expect(requestRow(requestId).approved_by).toBeNull();
+
+    const run = await approve({ resume: true }, { key: ADMIN_B_KEY, token });
+    expect(run.status).toBe(200);
+    expect(requestRow(requestId).approved_by).toBe(adminA);
+    expect(published().details).toMatchObject({
+      approved_by: "gateadmina",
+      executed_by: "gateadminb",
+    });
+  });
+
+  // The property, over every way an override can be sent from a terminal or an executor: whatever
+  // the call's answer, an override is on record only under the account that sent it.
+  const SCENARIOS: Array<{
+    name: string;
+    claimed: boolean;
+    withToken: boolean;
+    key: string;
+    sends: boolean;
+    sender: "A" | "B" | null;
+  }> = [
+    {
+      name: "B's override at a terminal inside A's claim",
+      claimed: true,
+      withToken: false,
+      key: ADMIN_B_KEY,
+      sends: true,
+      sender: "B",
+    },
+    {
+      name: "B's override with A's token",
+      claimed: true,
+      withToken: true,
+      key: ADMIN_B_KEY,
+      sends: true,
+      sender: null,
+    },
+    {
+      name: "A's override at a terminal inside A's claim",
+      claimed: true,
+      withToken: false,
+      key: ADMIN_A_KEY,
+      sends: true,
+      sender: "A",
+    },
+    {
+      name: "A's override with A's own token",
+      claimed: true,
+      withToken: true,
+      key: ADMIN_A_KEY,
+      sends: true,
+      sender: null,
+    },
+    {
+      name: "B's override with no claim at all",
+      claimed: false,
+      withToken: false,
+      key: ADMIN_B_KEY,
+      sends: true,
+      sender: "B",
+    },
+    {
+      name: "B's call with A's token and no override",
+      claimed: true,
+      withToken: true,
+      key: ADMIN_B_KEY,
+      sends: false,
+      sender: null,
+    },
+  ];
+  for (const sc of SCENARIOS) {
+    test(`23. property: ${sc.name}: an override is recorded only under its sender`, async () => {
+      const { requestId, reviewId } = seedFailing();
+      const token = sc.claimed ? await claim(requestId, adminA) : undefined;
+      // A call that sends no override and has no recorded one is refused: also "none recorded".
+      const res = await approve(
+        { resume: true, ...(sc.sends ? override(reviewId) : {}) },
+        { key: sc.key, ...(sc.withToken && token ? { token } : {}) },
+      );
+      expect([200, 409]).toContain(res.status);
+      expectOverridesRecordedBy(sc.sender === null ? null : sc.sender === "A" ? adminA : adminB);
+    });
+  }
 });
 
 describe("the gate runs on a resume that has not started publishing, and only on that one", () => {
@@ -1781,7 +2132,10 @@ describe("the override comes from an API key", () => {
       expect(res.status).toBe(403);
       const body = (await res.json()) as { error: string; message: string };
       expect(body.error).toBe("origin_not_allowed");
-      expect(body.message).toContain("approve-dispatch");
+      // The router's cookie Origin guard answers a request with no NEMAR origin, in its own
+      // sentence; the route's stricter rule answers the one that has it.
+      if (origin === "https://app.nemar.org") expect(body.message).toContain("approve-dispatch");
+      else expect(body.message).not.toContain("approve-dispatch");
     }
     expect(reviewRow(reviewId).override_by).toBeNull();
     expect(auditRows("dataset_published")).toHaveLength(0);
@@ -1897,9 +2251,12 @@ describe("approve-dispatch runs the gate before it claims, and records after the
     });
     expect(requestRow(requestId).approval_requested_by).toBe(adminA);
 
-    // What the workflow does next: the executor's own key, no override, the lease live. It is
-    // attributed to the clicker, so it finds the clicker's recorded override and passes.
-    const run = await approve({ resume: true }, { key: ADMIN_B_KEY });
+    // What the workflow does next: the executor's own key and the token the dispatch handed it, no
+    // override, the lease live. It is attributed to the clicker, so it finds the clicker's recorded
+    // override and passes.
+    const token = dispatchPayloads[0]?.dispatch_token as string;
+    expect(token).toMatch(/^[0-9a-f]{64}$/);
+    const run = await approve({ resume: true }, { key: ADMIN_B_KEY, token });
     expect(run.status).toBe(200);
     expect(requestRow(requestId).approved_by).toBe(adminA);
     expect(published().user_id).toBe(adminA);
@@ -2003,7 +2360,7 @@ describe("approve-dispatch runs the gate before it claims, and records after the
     expect(dispatchesSent()).toBe(0);
   });
 
-  test("13. a malformed override is a 400 invalid_body that names both fields", async () => {
+  test("13. a malformed override is a 400 invalid_body that names every field the body takes", async () => {
     const { requestId } = seedFailing();
     for (const bad of [
       { override_publication_review: { review_id: 1 } },
@@ -2017,9 +2374,10 @@ describe("approve-dispatch runs the gate before it claims, and records after the
       expect(body.error).toBe("invalid_body");
       expect(body.message).toContain("acknowledge_identifier_screen");
       expect(body.message).toContain("override_publication_review");
+      expect(body.message).toContain("request_id");
       // The limits in the message are the shared constants', numbers, spelled once here as the oracle.
       expect(body.message).toBe(
-        "The only fields this accepts are acknowledge_identifier_screen, a reason of 10 to 500 characters, and override_publication_review, the review shown and the reasons shown.",
+        "The only fields this accepts are acknowledge_identifier_screen, a reason of 10 to 500 characters, override_publication_review, the review shown and the reasons shown, and request_id, the request this click is for.",
       );
     }
     expect(requestRow(requestId).approval_requested_by).toBeNull();

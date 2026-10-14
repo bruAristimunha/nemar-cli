@@ -3,8 +3,9 @@
  *
  * Written against the CURRENT inline handler BEFORE the orchestrator
  * extraction and kept green through every extraction commit: they pin the
- * pre-loop (426 gate, request lookup, all-completed short-circuit, the
- * 'approving' transition), resume filtering, the two no-op steps' recording
+ * pre-loop (426 gate, request lookup, all-completed short-circuit (which ends like the loop,
+ * ADR 0103 decision 12: published for an `approving` request, refused for any other),
+ * the 'approving' transition), resume filtering, the two no-op steps' recording
  * quirks, the finalize block (visibility self-heal, 'published' write, audit
  * row), and the exact response contract.
  *
@@ -25,6 +26,7 @@ import type { Database } from "bun:sqlite";
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import type { Server } from "bun";
 import { Hono } from "hono";
+import { APPROVAL_CLOSED_DURING_RUN_MESSAGE } from "../../shared/contract/publication.js";
 import { PUBLICATION_STEPS } from "../../shared/publication-steps.js";
 import { adminRoutes } from "../src/routes/admin";
 import { hashApiKey } from "../src/services/token";
@@ -204,24 +206,50 @@ describe("POST /admin/publish/:id/approve (golden characterization)", () => {
     expect(audit?.resource_id).toBe(DATASET);
   });
 
-  test("all-completed short-circuit: responds published, touches nothing", async () => {
+  test("all-completed short-circuit on a requested request: refused, the request is not touched", async () => {
     await seed(ALL_STEPS);
 
     const res = await approve({ resume: true });
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(409);
     const body = (await res.json()) as Record<string, unknown>;
-    expect(body).toEqual({
+    expect(body.error).toBe("approval_closed_during_run");
+    expect(body.message).toBe(APPROVAL_CLOSED_DURING_RUN_MESSAGE);
+
+    // The short-circuit still fires BEFORE the 'approving' transition, and it writes nothing to
+    // the request: the row stays exactly as seeded, and is no longer reported as published (it
+    // used to answer 200 `published` for a request it left `requested`). The refusal leaves one
+    // audit row that names the status it found.
+    const row = requestRow();
+    expect(row?.status).toBe("requested");
+    expect(row?.approved_by).toBeNull();
+    expect(row?.approved_at).toBeNull();
+    const audit = db
+      .query<{ action: string; details: string }, []>(
+        "SELECT action, details FROM audit_log WHERE action = 'approval_finished_on_closed_request'",
+      )
+      .all();
+    expect(audit).toHaveLength(1);
+    expect(JSON.parse(audit[0]?.details ?? "null")).toMatchObject({ request_status: "requested" });
+  });
+
+  test("all-completed short-circuit on an approving request: marked published, as the loop's end would", async () => {
+    await seed(ALL_STEPS);
+    db.run("UPDATE publication_requests SET status = 'approving' WHERE dataset_id = ?", [DATASET]);
+
+    const res = await approve({ resume: true });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
       message: "All steps already completed",
       dataset_id: DATASET,
       status: "published",
     });
 
-    // Quirk pin: the short-circuit fires BEFORE the 'approving' transition
-    // and performs NO writes — the row stays exactly as seeded.
+    // The answer is as it always was; the row now says so too.
     const row = requestRow();
-    expect(row?.status).toBe("requested");
-    expect(row?.approved_by).toBeNull();
-    expect(row?.approved_at).toBeNull();
+    expect(row?.status).toBe("published");
+    expect(row?.approved_at).not.toBeNull();
+    expect(row?.current_step).toBeNull();
+    expect(row?.last_error).toBeNull();
   });
 
   test("404 when no active publication request exists", async () => {

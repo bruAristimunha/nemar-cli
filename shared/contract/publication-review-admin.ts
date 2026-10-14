@@ -337,7 +337,12 @@ export const PUBLICATION_REVIEW_ERROR_CODES = [
 ] as const;
 export type PublicationReviewErrorCode = (typeof PUBLICATION_REVIEW_ERROR_CODES)[number];
 
-/** The body of every refusal and fault of these routes: a fixed sentence and a closed code. */
+/**
+ * The body of every refusal and fault these routes build themselves: a fixed sentence and a closed
+ * code. The one exception is `origin_not_allowed`, which the router's cookie Origin guard answers
+ * before a route runs, with {@link OriginNotAllowedBody}: the word is in `error` as well as in
+ * `code`, and the sentence is in `message`.
+ */
 export interface PublicationReviewErrorBody {
   error: string;
   code: PublicationReviewErrorCode;
@@ -486,11 +491,28 @@ export const PUBLICATION_COMMENT_ERROR_CODES = [
 export type PublicationCommentErrorCode = (typeof PUBLICATION_COMMENT_ERROR_CODES)[number];
 
 /**
- * The body of every refusal and fault of the comment route: a fixed sentence and a closed code,
- * the convention of the review routes (`{ error: sentence, code: word }`), unlike the approval
- * refusals above, which carry their word in `error`.
+ * The body of every refusal and fault the comment route builds itself: a fixed sentence and a
+ * closed code, the convention of the review routes (`{ error: sentence, code: word }`), unlike the
+ * approval refusals above, which carry their word in `error`. The one exception is
+ * `origin_not_allowed`, which the router's cookie Origin guard answers before the route runs, with
+ * {@link OriginNotAllowedBody}.
  */
 export interface PublicationCommentErrorBody {
   error: string;
   code: PublicationCommentErrorCode;
+}
+
+/**
+ * The body of the 403 `origin_not_allowed`, which the admin router's cookie Origin guard
+ * (`cookieOriginGuard`) answers for any write made with a session cookie that does not come from a
+ * NEMAR page: every route on the router, the comment's and the review's start included. It is an
+ * exception to the rule of those routes' own bodies, where `error` is the sentence: the word is in
+ * `error` as well as in `code`, so a caller that reads the refusal of an approval from `error`
+ * finds the word there, and the sentence is in `message`. A caller that shows `error` to a person
+ * shows the word, so it shows `message` for this refusal.
+ */
+export interface OriginNotAllowedBody {
+  error: "origin_not_allowed";
+  code: "origin_not_allowed";
+  message: string;
 }

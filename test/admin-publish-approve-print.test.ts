@@ -267,6 +267,9 @@ describe("the lines approve prints are clean of anything a terminal could act on
 // The whole loop, against a stand-in for the Worker
 // ---------------------------------------------------------------------------------------------
 
+/** The variable a web approval's executor is handed its token in; the command reads it. */
+const DISPATCH_TOKEN_VARIABLE = "NEMAR_APPROVAL_DISPATCH_TOKEN";
+
 describe("runApproval against a Worker that answers with hostile text", () => {
   let server: ReturnType<typeof Bun.serve>;
   let configDir: string;
@@ -302,6 +305,13 @@ describe("runApproval against a Worker that answers with hostile text", () => {
     // Colour and a spinner are not what is under test; plain text is.
     setEnv("NO_COLOR", "1");
     setEnv("CI", "1");
+    // The command reads the dispatch token variable of the runner's own environment when it runs
+    // in this process: a malformed value stops it before it reads anything, and a good one would
+    // make every call an executor's (ADR 0103, decision 3). The spawned commands of the other
+    // suites are cleaned by their harness; this one is not spawned, so it is cleared here and put
+    // back afterwards.
+    previous[DISPATCH_TOKEN_VARIABLE] = process.env[DISPATCH_TOKEN_VARIABLE];
+    Reflect.deleteProperty(process.env, DISPATCH_TOKEN_VARIABLE);
   });
 
   afterAll(() => {

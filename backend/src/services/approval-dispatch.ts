@@ -1,5 +1,6 @@
-import { hasRole, parseRole } from "../types/bindings";
+import { type Bindings, hasRole, parseRole } from "../types/bindings";
 import { isActiveAccountStatus } from "./account-tier";
+import { verifyApprovalDispatchToken } from "./github/callback-tokens";
 
 /**
  * The lease behind a web-launched approval (ADR 0080).
@@ -13,13 +14,15 @@ import { isActiveAccountStatus } from "./account-tier";
  * simply lapses once the signs stop, which is the only way a crashed or
  * cancelled executor can release it.
  *
- * ONE predicate, two readers. The dispatch route claims with it (a second click,
- * or a second admin, must not start a second run beside the first) and the list
+ * ONE predicate, three readers. The dispatch route claims with it (a second click,
+ * or a second admin, must not start a second run beside the first), the list
  * route reports it as `approval_in_flight`, so a page never offers a button the
- * route would refuse. Clients must not hard-code the minutes: they read the
- * boolean. That is why this is SQL rather than a function over a row: the claim
- * has to be one atomic conditional UPDATE, and a TypeScript copy for the list
- * would be a second statement of the same rule free to drift from the first.
+ * route would refuse, and the deny route refuses a request it says is in flight
+ * (a denial would overwrite a run that is still writing). Clients must not
+ * hard-code the minutes: they read the boolean. That is why this is SQL rather
+ * than a function over a row: the claim has to be one atomic conditional UPDATE,
+ * and a TypeScript copy for the list would be a second statement of the same
+ * rule free to drift from the first.
  *
  * Two clauses, because there are two ways to run an approval:
  *
@@ -65,8 +68,9 @@ export const FAILED_RUN_GRACE_SECONDS = 60;
  * WHERE). The interpolated value is a module constant, never input.
  *
  * Used where "is anything still associated with this request" is the question
- * rather than "is it running right now": attribution, which must keep naming
- * the admin who clicked across a failed step's retries.
+ * rather than "is it running right now": the dispatch token's check
+ * ({@link checkApprovalDispatchToken}), which must keep naming the admin who
+ * clicked across a failed step's retries.
  */
 export function approvalLeaseLiveSql(columnPrefix = ""): string {
   const p = columnPrefix;
@@ -102,6 +106,16 @@ export const ACTIVE_REQUEST_TAIL_SQL = `FROM publication_requests
    WHERE dataset_id = ? AND status IN ('requested', 'approving', 'blocked')
    ORDER BY requested_at DESC LIMIT 1`;
 
+/**
+ * The SET fragment that clears a web approval's claim (`approval_requested_by`,
+ * `approval_dispatched_at`). Every statement that ends a claim spells it from here, so the day a
+ * claim gains a column there is one place to add it and no statement that clears half of it.
+ * It carries no trailing comma: write `SET ${APPROVAL_CLAIM_CLEAR_SQL}, other = ?` or end the
+ * SET with it.
+ */
+export const APPROVAL_CLAIM_CLEAR_SQL =
+  "approval_requested_by = NULL, approval_dispatched_at = NULL";
+
 /** Who a publication is recorded as approved by. */
 export interface Approver {
   id: number;
@@ -109,52 +123,42 @@ export interface Approver {
 }
 
 /**
- * The approver of a run: the admin who clicked Approve on the website while that
- * click's run is still live, otherwise the account calling `/approve`.
+ * The approver of a run: the admin who clicked Approve on the website when this call proves it
+ * belongs to that click, otherwise the account calling `/approve`.
  *
- * Attribution forks on purpose (ADR 0080). An executor authenticates with its
- * own service key, so without this the `approved_by` column and the
- * `dataset_published` audit row would name the bot for every web approval. A
- * terminal approval never sets `approval_requested_by`, so it falls through to
- * the caller and behaves exactly as it always has; the caller is the person.
+ * Attribution forks on purpose (ADR 0080; ADR 0103, decision 4 for what it forks on). An executor
+ * authenticates with its own service key, so without this the `approved_by` column and the
+ * `dataset_published` audit row would name the bot for every web approval. A terminal approval
+ * carries no token, so it falls through to the caller and behaves exactly as it always has; the
+ * caller is the person.
  *
- * `approval_requested_by` is honored only while the lease is live
- * (`approvalLeaseLiveSql`, by time alone). The column is never cleared, so
- * without this a run that lapsed and was later resumed by a different admin at a
- * terminal would be recorded as the original clicker's approval, naming someone
- * who never saw that run finish. The caller evaluates `leaseLive` at the TOP of
- * `/approve`, before the request-start UPDATE bumps the heartbeat: every batch
- * call of a long web run arrives with a fresh `updated_at` and so still resolves
- * to the clicker, and so does the retry of a failed step (which is why this
- * reads the time-only lease and not the failure-aware in-flight predicate: a
- * failure must not strip the attribution from the retry that finishes the run).
+ * The proof is the dispatch token (#1604, ADR 0103 decisions 1 to 4): `proof` is the answer of
+ * {@link checkApprovalDispatchToken}, and only its `valid` variant, a call that presented the token
+ * of THIS claim of THIS request while its lease is live, carries the clicker (`clickerId`, read from
+ * the claim the token was verified against, so a valid proof with no clicker cannot be built). The
+ * fork is on the proof and not on the lease, so a
+ * person who runs `/approve` at a terminal inside a web run's live lease is recorded as themselves
+ * (and takes the claim over, at the mark), where the lease alone used to record them as the
+ * clicker. A call whose token does not verify never reaches here: the caller answers 409 first.
+ * The check is made at the TOP of `/approve`, before the request-start UPDATE bumps the heartbeat,
+ * and reads the time-only lease (`approvalLeaseLiveSql`), so every batch call of a long web run and
+ * the retry of a failed step still resolve to the clicker.
  *
- * The cost, stated in the ADR: a web run that sat quiet for longer than the
- * lease before its first `/approve` call is recorded under the executing key,
- * with `executed_by` still in the audit details.
- *
- * The fork is on the lease, not on who the caller is: a person who runs
- * `/approve` at a terminal inside a web run's live lease is recorded as that
- * run's clicker, with themselves kept as `executed_by` in the audit details
- * (ADR 0080 states this). Telling a service key from a person would need the
- * caller's account kind, and an executor whose key is not marked as a service
- * account would then lose web attribution entirely.
- *
- * A clicker whose account row is gone, who is no longer an active admin, or who
- * has been deleted falls back to the caller rather than failing a publication
- * that is already underway; the dispatch left its own audit row naming the
- * clicker by id.
+ * A clicker whose account row is gone, who is no longer an active admin, or who has been deleted
+ * falls back to the caller rather than failing a publication that is already underway; the dispatch
+ * left its own audit row naming the clicker by id. The token authorizes nothing and joins no
+ * revocation list for exactly this reason: this re-check, at each use, is what keeps a clicker's
+ * ended access from being recorded as an approval.
  */
 export async function resolveApprover(
   db: D1Database,
-  approvalRequestedBy: number | null,
-  leaseLive: boolean,
+  proof: Exclude<ApprovalDispatchTokenCheck, { kind: "refused" }>,
   caller: Approver,
 ): Promise<Approver> {
-  if (approvalRequestedBy === null || !leaseLive) return caller;
+  if (proof.kind !== "valid") return caller;
   const clicker = await db
     .prepare("SELECT id, username, email, role, status, deleted_at FROM users WHERE id = ?")
-    .bind(approvalRequestedBy)
+    .bind(proof.clickerId)
     .first<{
       id: number;
       username: string | null;
@@ -173,4 +177,89 @@ export async function resolveApprover(
   if (role === null || !hasRole(role, "admin")) return caller;
   // Web-only accounts may have no username yet; the address still names them.
   return { id: clicker.id, username: clicker.username || clicker.email };
+}
+
+/** Why a presented dispatch token was refused. */
+export type ApprovalDispatchRefusal = "dispatch_superseded" | "dispatch_expired";
+
+/** What {@link checkApprovalDispatchToken} found. */
+export type ApprovalDispatchTokenCheck =
+  | { kind: "absent" }
+  /**
+   * The token is the claim's own. `clickerId` and `claimedAt` are the claim's columns the token
+   * was verified against: the administrator who clicked, and the instant that click claimed the
+   * request. The caller attributes the run to the first and binds its mark to the second, so
+   * there is no bare "valid" beside nullable columns to get out of step.
+   */
+  | { kind: "valid"; clickerId: number; claimedAt: string }
+  | { kind: "refused"; code: ApprovalDispatchRefusal };
+
+/** The columns of a `publication_requests` row that a dispatch token is checked against. */
+export interface ApprovalClaimRow {
+  dataset_id: string;
+  id: number;
+  approval_requested_by: number | null;
+  approval_dispatched_at: string | null;
+  /**
+   * {@link approvalLeaseLiveSql} read in the SAME statement as the row, before the call's own
+   * heartbeat bump: 1 when the claim's lease is live by time alone. Compared with 1, so anything
+   * else (0, NULL from a missing column) is a lapsed lease.
+   */
+  approval_lease_live: number | null;
+}
+
+const SUPERSEDED: ApprovalDispatchTokenCheck = { kind: "refused", code: "dispatch_superseded" };
+const EXPIRED: ApprovalDispatchTokenCheck = { kind: "refused", code: "dispatch_expired" };
+
+/**
+ * Does this `/approve` call carry the token of the claim on the request it is about to act on?
+ *
+ * The token is derived from the claim's own columns (`signApprovalDispatchToken`), so presenting
+ * one that verifies means the call was dispatched by THIS click of THIS request (ADR 0103,
+ * decisions 1 and 4). The rules, in this order, each deciding before the next is read:
+ *
+ *   1. No header, or an empty or blank one: `absent`. The caller is a person at a terminal (or an
+ *      executor that predates the token), and is recorded as itself.
+ *   2. No secret on the Worker, no claim on the row, or a MAC that does not match: `superseded`.
+ *      The claim is gone (released, taken over, or denied), was replaced by a newer click, belongs
+ *      to another request or clicker, or the token is not one. A Worker that cannot check a token
+ *      is never one that honors it.
+ *   3. A MAC that matches while the lease has lapsed: `expired`. The run sat quiet past its
+ *      lease, so a click made long ago is not honored for work that happens now; clicking again
+ *      claims afresh. Asked only AFTER the MAC, so a stranger learns nothing about a lease.
+ *   4. Otherwise `valid`, carrying the claim's clicker and instant: rule 2 has already refused a
+ *      claim with either column null, so a `valid` answer cannot lack them.
+ *
+ * A `refused` call must change nothing: the caller answers 409 with the code before any write.
+ * The lease read is the time-only one (`approvalLeaseLiveSql`), not the failure-aware in-flight
+ * predicate, so the retry of a failed step stays attributed to the clicker.
+ */
+export async function checkApprovalDispatchToken(
+  env: Pick<Bindings, "PRESCREEN_CALLBACK_SECRET">,
+  row: ApprovalClaimRow,
+  token: string | null | undefined,
+): Promise<ApprovalDispatchTokenCheck> {
+  const presented = token?.trim();
+  if (!presented) return { kind: "absent" };
+  const secret = env.PRESCREEN_CALLBACK_SECRET;
+  if (!secret || row.approval_requested_by === null || row.approval_dispatched_at === null) {
+    return SUPERSEDED;
+  }
+  const matches = await verifyApprovalDispatchToken(
+    presented,
+    {
+      datasetId: row.dataset_id,
+      requestId: row.id,
+      clickerId: row.approval_requested_by,
+      claimedAt: row.approval_dispatched_at,
+    },
+    secret,
+  );
+  if (!matches) return SUPERSEDED;
+  if (row.approval_lease_live !== 1) return EXPIRED;
+  return {
+    kind: "valid",
+    clickerId: row.approval_requested_by,
+    claimedAt: row.approval_dispatched_at,
+  };
 }

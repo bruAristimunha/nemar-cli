@@ -1,5 +1,6 @@
 /**
- * POST /admin/publish/:id/approve-dispatch (ADR 0080).
+ * POST /admin/publish/:id/approve-dispatch (ADR 0080; ADR 0103 for the dispatch token, the id
+ * rule and `request_id`).
  *
  * The website cannot drive an approval itself: after the irreversible DOI
  * publish, S3 Object Lock runs in batches the CALLER must keep requesting, and
@@ -28,12 +29,19 @@ import type { Database } from "bun:sqlite";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import type { Server } from "bun";
 import { Hono } from "hono";
+import {
+  APPROVAL_REFUSAL_ERROR_CODES,
+  INVALID_DATASET_ID_MESSAGE,
+  REQUEST_MISMATCH_MESSAGE,
+} from "../../shared/contract/publication";
 import { adminRoutes } from "../src/routes/admin";
+import { verifyApprovalDispatchToken } from "../src/services/github/callback-tokens";
 import { hashApiKey } from "../src/services/token";
 import { issueSession } from "../src/services/web-session";
 import type { Bindings, Variables } from "../src/types/bindings";
 import { freshDb, interceptingD1, realD1, yieldingD1 } from "./helpers/d1";
 import { SCREENED_HEAD, mainRefAnswer, markScreen } from "./helpers/identifier-screen";
+import { WEB_CLAIM_SECRET, webClaim } from "./helpers/publication-review";
 
 const ADMIN_KEY = "dispatch-admin-key-0123456789abcdef0123456789abcdef";
 const SECOND_ADMIN_KEY = "dispatch-admin2-key-0123456789abcdef0123456789abcdef";
@@ -96,6 +104,7 @@ function env(): Bindings {
     DB: realD1(db),
     ENVIRONMENT: "test",
     GITHUB_ADMIN_PAT: "ghp_dispatch_test_token",
+    PRESCREEN_CALLBACK_SECRET: WEB_CLAIM_SECRET,
     ...envOverrides,
   } as Bindings;
 }
@@ -180,6 +189,28 @@ function dispatchWith(
   );
 }
 
+/** A click that sends a JSON body, as the website's does when it names the request it was shown. */
+function dispatchBody(
+  key: string,
+  body: Record<string, unknown>,
+  dataset = DATASET,
+  bindings: Bindings = env(),
+): Promise<Response> {
+  return app.request(
+    `/admin/publish/${dataset}/approve-dispatch`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+        "X-CLI-Version": "99.0.0",
+      },
+      body: JSON.stringify(body),
+    },
+    bindings,
+  );
+}
+
 async function errorBody(res: Response): Promise<{ error: string; message: string }> {
   return (await res.json()) as { error: string; message: string };
 }
@@ -215,15 +246,16 @@ describe("a pending request", () => {
     expect(dispatches).toHaveLength(1);
     expect(dispatches[0].path).toBe("/repos/nemarDatasets/.github/dispatches");
     expect(dispatches[0].authorization).toBe("Bearer ghp_dispatch_test_token");
-    expect(dispatches[0].body).toEqual({
-      event_type: "approve-publication",
-      client_payload: {
-        dataset_id: DATASET,
-        request_id: id,
-        resume: false,
-        environment: "dev",
-      },
+    // Exactly the contract and the claim's token (see "the dispatch token" below for the token).
+    const { dispatch_token: token, ...contract } = dispatches[0].body.client_payload;
+    expect(dispatches[0].body.event_type).toBe("approve-publication");
+    expect(contract).toEqual({
+      dataset_id: DATASET,
+      request_id: id,
+      resume: false,
+      environment: "dev",
     });
+    expect(token).toMatch(/^[0-9a-f]{64}$/);
   });
 
   test("names production only when the Worker is the production Worker", async () => {
@@ -367,6 +399,35 @@ describe("releasing a claim", () => {
     expect(row(id)?.approval_dispatched_at).not.toBeNull();
   });
 
+  test("clears only ITS claim: the same administrator's newer claim is not undone by this click's failure", async () => {
+    // The release is bound to the instant it claimed (`approval_dispatched_at`), not only to the
+    // clicker: a newer click by the SAME administrator is another claim, with another token, and an
+    // older click's late failure must not release it.
+    const id = seedRequest();
+    githubStatus = 422;
+    let landed = false;
+    let newer = "";
+    const bindings = {
+      ...env(),
+      DB: interceptingD1(realD1(db), (sql) => {
+        if (!landed && sql.includes("SET approval_requested_by = NULL")) {
+          landed = true;
+          db.run(
+            "UPDATE publication_requests SET approval_dispatched_at = datetime('now', '+7 seconds') WHERE id = ?",
+            [id],
+          );
+          newer = row(id)?.approval_dispatched_at ?? "";
+        }
+      }),
+    } as Bindings;
+
+    const res = await dispatchWith(ADMIN_KEY, DATASET, bindings);
+    expect(res.status).toBe(502);
+    expect(landed).toBe(true);
+    expect(row(id)?.approval_requested_by).toBe(adminId);
+    expect(row(id)?.approval_dispatched_at).toBe(newer);
+  });
+
   test("restores the cleared error only while no run has begun since the claim", async () => {
     // The claim clears `last_error`; a not-sent release puts it back. But
     // `/approve` bumps `updated_at` as it starts, so a changed `updated_at`
@@ -397,6 +458,216 @@ describe("releasing a claim", () => {
     expect(row(id)?.approval_requested_by).toBeNull();
     expect(row(id)?.approval_dispatched_at).toBeNull();
     expect(row(id)?.last_error).toBeNull();
+  });
+});
+
+describe("the dispatch token (#1604, ADR 0103 decisions 1 to 3)", () => {
+  /** What the executor would be handed: the one token in the click's payload. */
+  const tokenOf = (): string => dispatches[0].body.client_payload.dispatch_token as string;
+
+  test("the payload carries the request and a token that verifies against the claim as stored", async () => {
+    const id = seedRequest();
+    const res = await dispatchWith(ADMIN_KEY);
+    expect(res.status).toBe(202);
+
+    const payload = dispatches[0].body.client_payload;
+    expect(Object.keys(payload).sort()).toEqual([
+      "dataset_id",
+      "dispatch_token",
+      "environment",
+      "request_id",
+      "resume",
+    ]);
+    expect(payload.request_id).toBe(id);
+    expect(tokenOf()).toMatch(/^[0-9a-f]{64}$/);
+    // It is a MAC, not a secret: neither the Worker's signing secret nor the GitHub credential the
+    // dispatch authenticates with is in what the workflow is handed.
+    const sent = JSON.stringify(dispatches[0].body);
+    expect(sent).not.toContain(WEB_CLAIM_SECRET);
+    expect(sent).not.toContain("ghp_dispatch_test_token");
+    // Derived from the claim's own columns, exactly as stored: the production verifier, the row's values.
+    const claimed = row(id);
+    expect(
+      await verifyApprovalDispatchToken(
+        tokenOf(),
+        {
+          datasetId: DATASET,
+          requestId: id,
+          clickerId: adminId,
+          claimedAt: claimed?.approval_dispatched_at as string,
+        },
+        WEB_CLAIM_SECRET,
+      ),
+    ).toBe(true);
+  });
+
+  test("each click mints its own: a re-claim after the lease lapsed carries another token, and the first no longer fits", async () => {
+    const id = seedRequest();
+    // An earlier click's claim, 20 minutes old: its run never started and its lease has lapsed.
+    const first = await webClaim(db, {
+      requestId: id,
+      clickerId: secondAdminId,
+      dispatchedAt: "-20 minutes",
+    });
+    const res = await dispatchWith(ADMIN_KEY);
+    expect(res.status).toBe(202);
+
+    const second = tokenOf();
+    expect(second).not.toBe(first);
+    const claim = {
+      datasetId: DATASET,
+      requestId: id,
+      clickerId: adminId,
+      claimedAt: row(id)?.approval_dispatched_at as string,
+    };
+    expect(await verifyApprovalDispatchToken(second, claim, WEB_CLAIM_SECRET)).toBe(true);
+    // The older token is no longer the claim's: different clicker and instant.
+    expect(await verifyApprovalDispatchToken(first, claim, WEB_CLAIM_SECRET)).toBe(false);
+  });
+
+  test("the token is never answered, audited or listed", async () => {
+    seedRequest();
+    const res = await dispatchWith(ADMIN_KEY);
+    const answered = JSON.stringify(await res.json());
+    const token = tokenOf();
+    expect(answered).not.toContain(token);
+
+    // No audit row of any action holds it, nor any 64-hex value.
+    const audit = JSON.stringify(
+      db.query("SELECT action, resource_id, details FROM audit_log").all(),
+    );
+    expect(audit).not.toContain(token);
+    expect(audit).not.toMatch(/[0-9a-f]{64}/);
+
+    // Nor does the list the website and the CLI read, in any field of any request.
+    const list = await app.request(
+      "/admin/publish/requests",
+      { headers: { Authorization: `Bearer ${ADMIN_KEY}` } },
+      env(),
+    );
+    expect(list.status).toBe(200);
+    const listed = JSON.stringify(await list.json());
+    expect(listed).not.toContain(token);
+    expect(listed).not.toMatch(/[0-9a-f]{64}/);
+  });
+
+  test("the token is not written to the Worker's log either", async () => {
+    seedRequest();
+    const lines: string[] = [];
+    const realLog = console.log;
+    const realWarn = console.warn;
+    const realError = console.error;
+    const keep = (...args: unknown[]) => lines.push(args.map(String).join(" "));
+    console.log = keep;
+    console.warn = keep;
+    console.error = keep;
+    const statuses: number[] = [];
+    try {
+      // A 4xx from GitHub: nothing was sent, the claim is released.
+      githubStatus = 422;
+      statuses.push((await dispatchWith(ADMIN_KEY)).status);
+      // Accepted: the claim stands for the run.
+      githubStatus = 204;
+      statuses.push((await dispatchWith(ADMIN_KEY)).status);
+      // The lease lapses with nothing started, so a second administrator may claim afresh; GitHub
+      // then answers 503, which leaves it unknown whether the event was queued.
+      db.run(
+        "UPDATE publication_requests SET approval_requested_by = NULL, approval_dispatched_at = NULL",
+      );
+      githubStatus = 503;
+      statuses.push((await dispatchWith(SECOND_ADMIN_KEY, DATASET)).status);
+    } finally {
+      console.log = realLog;
+      console.warn = realWarn;
+      console.error = realError;
+    }
+    // All three reached GitHub, and each answered as its own path does: the paths under test ran.
+    expect(statuses).toEqual([502, 202, 502]);
+    expect(dispatches).toHaveLength(3);
+    const token = dispatches.map((d) => d.body.client_payload.dispatch_token as string);
+    // Two clickers, so at least two distinct tokens: the check below has something to look for.
+    expect(new Set(token).size).toBeGreaterThanOrEqual(2);
+    for (const t of token) expect(lines.join("\n")).not.toContain(t);
+    // The unconfirmed path logs the dataset and GitHub's status, and never the token (checked
+    // above over every line); the audit row it leaves holds the status only, not GitHub's body.
+    const unconfirmed = lines.find((l) => l.includes("dispatch failed") && l.includes("503"));
+    expect(unconfirmed).toBeDefined();
+    expect(unconfirmed).toContain(DATASET);
+    const audit = db
+      .query<{ details: string }, []>(
+        "SELECT details FROM audit_log WHERE action = 'approval_dispatch_unconfirmed'",
+      )
+      .all();
+    expect(audit).toHaveLength(1);
+    expect(JSON.parse(audit[0].details)).toMatchObject({ reason: "http_503" });
+  });
+
+  test("a Worker with no signing secret refuses before it claims: 502 dispatch_unconfigured, nothing claimed, nothing sent", async () => {
+    const id = seedRequest();
+    const before = row(id);
+    envOverrides = { PRESCREEN_CALLBACK_SECRET: undefined };
+    const res = await dispatchWith(ADMIN_KEY);
+
+    expect(res.status).toBe(502);
+    const body = await errorBody(res);
+    expect(body.error).toBe("dispatch_unconfigured");
+    // Its own sentence, not the one for a missing GitHub credential, and still "do not retry".
+    expect(body.message).toContain("Retrying will not help");
+    expect(body.message).toContain("secret");
+    expect(body.message).not.toContain("GitHub credential");
+    expect(dispatches).toHaveLength(0);
+    expect(row(id)).toEqual(before);
+    // The same for an empty one: an unset binding and a blank one are both no secret.
+    envOverrides = { PRESCREEN_CALLBACK_SECRET: "" };
+    expect((await dispatchWith(ADMIN_KEY)).status).toBe(502);
+    expect(row(id)).toEqual(before);
+  });
+
+  test("a claim instant the signer refuses releases the claim and answers 502, sending nothing", async () => {
+    // A defense in depth: the claim's instant is signed as one line of the message, so one that
+    // holds a line break cannot be signed. The database never stores one, so the fault is put on
+    // the real row the way the claim would have written it: the claim's UPDATE runs, and then the
+    // instant stored (and answered) is one the signer refuses. The release is bound to THAT
+    // instant, so it clears this very claim and the administrator can click again.
+    const id = seedRequest();
+    const odd = "2026-10-13 17:00:00\n7";
+    const real = realD1(db);
+    const bindings = {
+      ...env(),
+      DB: {
+        prepare(sql: string) {
+          const stmt = real.prepare(sql);
+          if (!sql.includes("RETURNING approval_dispatched_at")) return stmt;
+          const api = {
+            bind(...p: unknown[]) {
+              stmt.bind(...p);
+              return api;
+            },
+            async first() {
+              await stmt.first();
+              db.run("UPDATE publication_requests SET approval_dispatched_at = ? WHERE id = ?", [
+                odd,
+                id,
+              ]);
+              return { claimed_at: odd };
+            },
+          };
+          return api;
+        },
+        batch: (stmts: unknown[]) =>
+          (real as unknown as { batch(s: unknown[]): unknown }).batch(stmts),
+      } as unknown as D1Database,
+    } as Bindings;
+
+    const res = await dispatchWith(ADMIN_KEY, DATASET, bindings);
+
+    expect(res.status).toBe(502);
+    expect((await errorBody(res)).error).toBe("dispatch_failed");
+    expect(dispatches).toHaveLength(0);
+    expect(row(id)?.approval_requested_by).toBeNull();
+    expect(row(id)?.approval_dispatched_at).toBeNull();
+    // Released, so the next click (with a sane clock) goes through.
+    expect((await dispatchWith(ADMIN_KEY)).status).toBe(202);
   });
 });
 
@@ -929,4 +1200,266 @@ describe("who may dispatch", () => {
       expect(list.status).toBe(401);
     });
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// #1583 (ADR 0103 decision 8): the id is checked before anything is read or claimed
+// ---------------------------------------------------------------------------------------------
+
+describe("the dataset id is validated for the environment before the claim (#1583, decision 8)", () => {
+  // The executor workflow accepts nm or on plus six digits, and on dev xx plus six digits. A
+  // dispatch for any other id used to claim the lease, dispatch, and fail in the workflow's own
+  // validation with the lease held for fifteen minutes. Each case seeds a request under the very
+  // id the route is asked about, so a route that skipped the check would claim and dispatch it.
+
+  /** The SQL of every statement the route ran against the requests table, in order. */
+  function requestStatementsOf(run: (bindings: Bindings) => Promise<Response>) {
+    const seen: string[] = [];
+    const bindings = {
+      ...env(),
+      DB: interceptingD1(realD1(db), (sql) => {
+        if (sql.includes("publication_requests")) seen.push(sql);
+      }),
+    } as Bindings;
+    return run(bindings).then((res) => ({ res, seen }));
+  }
+
+  /**
+   * A request that would be claimed and dispatched if the route asked nothing of the id. The
+   * screen's own parser refuses a report for an id that is not an id, so the request is seeded
+   * under a valid one and renamed, report included, which leaves the screen gate satisfied.
+   */
+  function seedRequestForAnyId(dataset: string, seed: Seed = {}): number {
+    const id = seedRequest(seed);
+    db.run(
+      `UPDATE publication_requests
+          SET dataset_id = ?, identifier_screen_report = json_set(identifier_screen_report, '$.scan.id', ?)
+        WHERE id = ?`,
+      [dataset, dataset, id],
+    );
+    return id;
+  }
+
+  const PRODUCTION_ACCEPTS = ["nm000123", "on000123"];
+  const PRODUCTION_REFUSES = ["xx000123", "nm00012", "NM000123", "nm0001234", "ds000123"];
+
+  test.each(PRODUCTION_ACCEPTS)(
+    "production accepts %s: claimed and dispatched",
+    async (dataset) => {
+      envOverrides = { ENVIRONMENT: "production" };
+      const id = seedRequest({ dataset });
+      const res = await dispatchWith(ADMIN_KEY, dataset);
+      expect(res.status).toBe(202);
+      expect(row(id)?.approval_requested_by).toBe(adminId);
+      expect(dispatches).toHaveLength(1);
+      expect(dispatches[0].body.client_payload).toMatchObject({
+        dataset_id: dataset,
+        environment: "production",
+      });
+    },
+  );
+
+  test.each(PRODUCTION_REFUSES)(
+    "production refuses %s: 400 invalid_dataset_id, no read, no claim, no dispatch, no audit",
+    async (dataset) => {
+      envOverrides = { ENVIRONMENT: "production" };
+      const id = seedRequestForAnyId(dataset, { lastError: "EZID 503", status: "approving" });
+      const before = row(id);
+      const { res, seen } = await requestStatementsOf((bindings) =>
+        dispatchWith(ADMIN_KEY, dataset, bindings),
+      );
+      expect(res.status).toBe(400);
+      const refused = await errorBody(res);
+      expect(refused).toEqual({
+        error: "invalid_dataset_id",
+        message: INVALID_DATASET_ID_MESSAGE,
+      });
+      expect(APPROVAL_REFUSAL_ERROR_CODES).toContain(refused.error);
+      expect(row(id)).toEqual(before);
+      expect(dispatches).toHaveLength(0);
+      // Before ANY read of the requests table, not only before the claim.
+      expect(seen).toEqual([]);
+      const audits = db.query("SELECT COUNT(*) AS n FROM audit_log WHERE action LIKE 'approval_%'");
+      expect(audits.get()).toEqual({ n: 0 });
+    },
+  );
+
+  // Dev is `ENVIRONMENT` of anything but exactly "production": the failure direction is the
+  // harmless one (`approvalDispatchEnvironment`), so an unset or misspelled value is dev too.
+  for (const [what, environment] of [
+    ["development", "development"],
+    ["test", "test"],
+    ["unset", undefined],
+    ["a misspelling of production", "prod"],
+  ] as const) {
+    test(`a Worker whose ENVIRONMENT is ${what} accepts xx000123: claimed and dispatched as dev`, async () => {
+      envOverrides = { ENVIRONMENT: environment };
+      const id = seedRequest({ dataset: "xx000123" });
+      const res = await dispatchWith(ADMIN_KEY, "xx000123");
+      expect(res.status).toBe(202);
+      expect(row(id)?.approval_requested_by).toBe(adminId);
+      expect(dispatches[0].body.client_payload).toMatchObject({
+        dataset_id: "xx000123",
+        environment: "dev",
+      });
+    });
+  }
+
+  test.each(["nm00012", "NM000123", "nm0001234", "ds000123", "xx00012", "xx0001234"])(
+    "dev still refuses %s: the rule is nm, on or xx and six digits",
+    async (dataset) => {
+      const id = seedRequestForAnyId(dataset);
+      const res = await dispatchWith(ADMIN_KEY, dataset);
+      expect(res.status).toBe(400);
+      expect((await errorBody(res)).error).toBe("invalid_dataset_id");
+      expect(row(id)?.approval_requested_by).toBeNull();
+      expect(row(id)?.approval_dispatched_at).toBeNull();
+      expect(dispatches).toHaveLength(0);
+    },
+  );
+
+  test("the id is refused before the body is read: a malformed body does not change the answer", async () => {
+    envOverrides = { ENVIRONMENT: "production" };
+    const id = seedRequestForAnyId("xx000123");
+    const res = await dispatchBody(ADMIN_KEY, { bogus: true }, "xx000123");
+    expect(res.status).toBe(400);
+    expect((await errorBody(res)).error).toBe("invalid_dataset_id");
+    expect(row(id)?.approval_requested_by).toBeNull();
+    expect(dispatches).toHaveLength(0);
+  });
+
+  test("and before the 404: an invalid id with no request at all is the id's 400", async () => {
+    envOverrides = { ENVIRONMENT: "production" };
+    const res = await dispatchWith(ADMIN_KEY, "xx000123");
+    expect(res.status).toBe(400);
+    expect((await errorBody(res)).error).toBe("invalid_dataset_id");
+  });
+
+  test("a valid id whose request does not exist is still the 404", async () => {
+    envOverrides = { ENVIRONMENT: "production" };
+    const res = await dispatchWith(ADMIN_KEY, "nm000124");
+    expect(res.status).toBe(404);
+    expect((await errorBody(res)).error).toBe("not_found");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// #1579 (ADR 0103 decision 7): the optional request_id precondition
+// ---------------------------------------------------------------------------------------------
+
+describe("a request_id names the request the click was for (#1579, decision 7)", () => {
+  test("the id of the active request is accepted: 202, claimed, dispatched", async () => {
+    const id = seedRequest();
+    const res = await dispatchBody(ADMIN_KEY, { request_id: id });
+    expect(res.status).toBe(202);
+    expect(((await res.json()) as { request_id: number }).request_id).toBe(id);
+    expect(row(id)?.approval_requested_by).toBe(adminId);
+    expect(dispatches).toHaveLength(1);
+    expect(dispatches[0].body.client_payload).toMatchObject({ request_id: id });
+  });
+
+  test("the body without it is what every existing caller sends, and is unchanged", async () => {
+    const id = seedRequest();
+    const res = await dispatchBody(ADMIN_KEY, {});
+    expect(res.status).toBe(202);
+    expect(row(id)?.approval_requested_by).toBe(adminId);
+  });
+
+  test("another request's id is 409 request_mismatch: nothing claimed, nothing dispatched, the row as it was", async () => {
+    const id = seedRequest({
+      status: "approving",
+      updatedAt: "-20 minutes",
+      lastError: "EZID 503",
+    });
+    const before = row(id);
+    const res = await dispatchBody(ADMIN_KEY, { request_id: id + 1 });
+    expect(res.status).toBe(409);
+    const refused = await errorBody(res);
+    expect(refused).toEqual({
+      error: "request_mismatch",
+      message: REQUEST_MISMATCH_MESSAGE,
+    });
+    expect(APPROVAL_REFUSAL_ERROR_CODES).toContain(refused.error);
+    expect(row(id)).toEqual(before);
+    expect(dispatches).toHaveLength(0);
+  });
+
+  test("the page showed request 1, which was denied and filed again as request 2: refused, 2 untouched", async () => {
+    const denied = seedRequest({ status: "denied", requestedAt: "-5 hours" });
+    const filed = seedRequest({ requestedAt: "-1 hours" });
+    const res = await dispatchBody(ADMIN_KEY, { request_id: denied });
+    expect(res.status).toBe(409);
+    expect((await errorBody(res)).error).toBe("request_mismatch");
+    expect(row(filed)?.approval_requested_by).toBeNull();
+    expect(row(filed)?.approval_dispatched_at).toBeNull();
+    expect(row(denied)?.status).toBe("denied");
+    expect(dispatches).toHaveLength(0);
+    // The page that reads again and names the new request gets through.
+    const again = await dispatchBody(ADMIN_KEY, { request_id: filed });
+    expect(again.status).toBe(202);
+    expect(row(filed)?.approval_requested_by).toBe(adminId);
+  });
+
+  test("the mismatch comes before the gates: a request the screen would refuse answers request_mismatch", async () => {
+    const id = seedRequest();
+    // A screen that never ran: the gate refuses this click (identifier_screen_not_clear).
+    db.run(
+      "UPDATE publication_requests SET identifier_screen_status = NULL, identifier_screen_report = NULL WHERE id = ?",
+      [id],
+    );
+    const gated = await dispatchBody(ADMIN_KEY, { request_id: id });
+    expect(gated.status).toBe(409);
+    expect((await errorBody(gated)).error).toBe("identifier_screen_not_clear");
+
+    const res = await dispatchBody(ADMIN_KEY, {
+      request_id: id + 1,
+      acknowledge_identifier_screen: "Read every flagged file by hand, nothing to remove",
+    });
+    expect(res.status).toBe(409);
+    expect((await errorBody(res)).error).toBe("request_mismatch");
+    // Nothing the body carried was recorded.
+    expect(
+      db
+        .query(
+          "SELECT identifier_screen_ack_at, identifier_screen_ack_by FROM publication_requests WHERE id = ?",
+        )
+        .get(id),
+    ).toEqual({ identifier_screen_ack_at: null, identifier_screen_ack_by: null });
+    expect(row(id)?.approval_requested_by).toBeNull();
+  });
+
+  test("and before the blocked refusal, as it is in /approve", async () => {
+    const id = seedRequest({ status: "blocked" });
+    const res = await dispatchBody(ADMIN_KEY, { request_id: id + 1 });
+    expect(res.status).toBe(409);
+    expect((await errorBody(res)).error).toBe("request_mismatch");
+    const matching = await dispatchBody(ADMIN_KEY, { request_id: id });
+    expect(matching.status).toBe(409);
+    expect((await errorBody(matching)).error).toBe("not_dispatchable");
+  });
+
+  test("with no active request at all it is the 404, whatever id was named", async () => {
+    const res = await dispatchBody(ADMIN_KEY, { request_id: 7 });
+    expect(res.status).toBe(404);
+    expect((await errorBody(res)).error).toBe("not_found");
+  });
+
+  test.each([0, -1, 1.5, "7", null, true])(
+    "request_id %p is not a request id: 400 invalid_body, nothing claimed",
+    async (value) => {
+      const id = seedRequest();
+      const res = await dispatchBody(ADMIN_KEY, { request_id: value });
+      expect(res.status).toBe(400);
+      expect((await errorBody(res)).error).toBe("invalid_body");
+      expect(row(id)?.approval_requested_by).toBeNull();
+      expect(dispatches).toHaveLength(0);
+    },
+  );
+
+  test("a field the route does not know is still refused: the body stays strict", async () => {
+    const id = seedRequest();
+    const res = await dispatchBody(ADMIN_KEY, { request_id: id, dataset_id: DATASET });
+    expect(res.status).toBe(400);
+    expect((await errorBody(res)).error).toBe("invalid_body");
+  });
 });

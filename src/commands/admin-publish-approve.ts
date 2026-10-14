@@ -58,6 +58,63 @@ import {
 import { approveEvidenceLines } from "../lib/publication-review-display.js";
 import { plain } from "../lib/terminal-text.js";
 
+/**
+ * The environment variable a web approval's executor is handed its dispatch token in (#1604, ADR
+ * 0103 decision 3). Read by `approve` and by nothing else; never printed, never logged.
+ */
+const DISPATCH_TOKEN_ENV = "NEMAR_APPROVAL_DISPATCH_TOKEN";
+
+/**
+ * What `approve` says on standard error, before it reads or sends anything, when the variable is
+ * set: a run that presents a token is an executor's run, and a stale variable in a person's shell
+ * would otherwise make their own approval fail with `dispatch_superseded` and a sentence that never
+ * names it. It carries the variable's name and never its value.
+ */
+const DISPATCH_TOKEN_NOTICE = `This run presents the dispatch token in ${DISPATCH_TOKEN_ENV} (an executor's run for a web approval); unset the variable to approve as yourself.`;
+
+/**
+ * Appended to the Worker's sentence when it refuses the token the run presented
+ * (`dispatch_superseded` or `dispatch_expired`). Said here, not in the Worker's shared sentences:
+ * the Worker cannot know whether the caller is an executor or a person with a stale variable.
+ */
+const DISPATCH_TOKEN_UNSET_HINT = `If you are not running a dispatched approval, unset ${DISPATCH_TOKEN_ENV} and run it again.`;
+
+/**
+ * What the dispatch token variable holds, read the way `approve` uses it. The two ends are trimmed,
+ * as the Worker trims the header, so a token exported with the newline a file ends with is the
+ * same token (ADR 0103, decision 3). What is left is none when it is empty (an unset variable, an
+ * empty one, or whitespace alone). Anything else must be what a header can carry: printable ASCII
+ * with no whitespace inside, so a stray line break, a typographic quote pasted with the value or a
+ * character from another script is refused here with a sentence, not handed to the HTTP client,
+ * which throws on it and reports a network failure that the command would retry for a while. A
+ * straight quote is printable ASCII and is sent; the Worker refuses it. The Worker mints 64
+ * lowercase hexadecimal characters; this does not insist on that, so a token of another shape
+ * still reaches the Worker and is refused there with the Worker's own words. The `problem` names
+ * what is wrong and never the value, which is a credential.
+ */
+function readDispatchToken(
+  raw: string | undefined,
+): { kind: "none" } | { kind: "token"; value: string } | { kind: "malformed"; problem: string } {
+  const value = raw?.trim() ?? "";
+  if (value === "") return { kind: "none" };
+  if (/^[\x21-\x7e]+$/.test(value)) return { kind: "token", value };
+  return {
+    kind: "malformed",
+    problem: /\s/.test(value)
+      ? "it contains whitespace"
+      : "it contains a character outside printable ASCII",
+  };
+}
+
+/** Whether `error` is the Worker refusing the dispatch token a call carried (it was replaced, or has lapsed). */
+function isDispatchTokenRefusal(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    error.statusCode === 409 &&
+    (error.code === "dispatch_superseded" || error.code === "dispatch_expired")
+  );
+}
+
 export function registerApproveCommand(group: Command): void {
   group
     .command("approve")
@@ -67,15 +124,19 @@ export function registerApproveCommand(group: Command): void {
     .option("--sandbox", "Use Zenodo sandbox for testing")
     .option(
       "--skip-ci-check",
-      "Skip the orchestrator's live BIDS validation check (recorded; clears no review reason)",
+      `Skip the orchestrator's live BIDS validation check (recorded; clears no review reason; refused while ${DISPATCH_TOKEN_ENV} is set)`,
     )
     .option(
       "--acknowledge-identifier-screen <reason>",
-      `Approve over an identifier screen that needs review, recording why (${ACKNOWLEDGMENT_MIN_LENGTH} to ${ACKNOWLEDGMENT_MAX_LENGTH} characters)`,
+      `Approve over an identifier screen that needs review, recording why (${ACKNOWLEDGMENT_MIN_LENGTH} to ${ACKNOWLEDGMENT_MAX_LENGTH} characters; refused while ${DISPATCH_TOKEN_ENV} is set)`,
     )
     .option(
       "--force",
-      "Approve over a publication review that is not a pass, recorded with your account",
+      `Approve over a publication review that is not a pass, recorded with your account (refused while ${DISPATCH_TOKEN_ENV} is set)`,
+    )
+    .option(
+      "--request-id <n>",
+      "The request this approval is for (default: the one shown); refused if it is not the request in force",
     )
     .option(YES_OPTION, YES_DESCRIPTION)
     .option(NO_OPTION, NO_DESCRIPTION)
@@ -107,9 +168,32 @@ Description:
   --yes answers the confirmation and nothing else. It never stands in for
   --force or for --acknowledge-identifier-screen.
 
+  The approval is for the request shown: its number is sent with every approval
+  call of the run, and the API refuses it when that request was denied or filed
+  again since, so a request nobody read is never approved in its place.
+  --request-id <n> names it yourself (for a script that read the request
+  earlier); it is refused here, before any approval is sent, when it is not the
+  request shown.
+
+  A run the website started is handed a token, in the environment variable
+  ${DISPATCH_TOKEN_ENV}, and presents it on every approval call (as a header,
+  never printed or logged; the reads of the review and the status carry none).
+  With it the API records the administrator who clicked Approve as the approver,
+  and you are only the executor. Such a run carries the
+  decision its click made, so while the variable is set --force,
+  --acknowledge-identifier-screen and --skip-ci-check are refused here, before
+  anything is sent.
+  Without the variable the command is your own approval, recorded under your
+  account. Once it passes the gates it takes the claim over, and the website's
+  run is refused at its next call. 'next' never reads the variable.
+  A run that presents a token says so on standard error before it reads or sends
+  anything, and a refusal of that token is followed by how to unset the variable,
+  for a person whose shell still holds a stale one.
+
   --skip-ci-check skips the orchestrator's live CI check, and the approval's audit
   row records that it was used. It never clears a review reason: a failed or
-  unconcluded BIDS validation at the reviewed commit needs --force.
+  unconcluded BIDS validation at the reviewed commit needs --force. It is your
+  own decision, so a run that presents a dispatch token never uses it.
 
   An ANONYMOUS RELEASE runs a smaller step set: the GitHub repository stays
   private, no identifier is published, and the depositor is not named. The
@@ -149,6 +233,11 @@ Orchestrator Steps (execution order; shared/publication-steps.ts):
   publicly. See ANONYMOUS_RELEASE_SKIPPED_STEPS in shared/publication-steps.ts,
   which states the reason for each.
 
+Environment Variables:
+  ${DISPATCH_TOKEN_ENV}
+                  The dispatch token of a web approval, set for the run that
+                  executes it; leave it unset at a terminal.
+
 Resume Capability:
   If a step fails, the orchestrator saves progress. Use --resume to retry
   from the failed step without re-running successful steps.
@@ -162,6 +251,7 @@ Examples:
   $ nemar admin publish approve nm000104 --skip-ci-check    # Skip the live CI check only
   $ nemar admin publish approve nm000104 --force            # Approve over a review that is not a pass
   $ nemar admin publish approve nm000104 --yes              # Skip confirmation (never a reason)
+  $ nemar admin publish approve nm000104 --request-id 42    # Only if request 42 is the one in force
 
 After Approval:
   - User receives email with DOI and public dataset link
@@ -178,6 +268,7 @@ After Approval:
           skipCiCheck?: boolean;
           acknowledgeIdentifierScreen?: string;
           force?: boolean;
+          requestId?: string;
         },
       ) => {
         if (!requireSignedIn()) return;
@@ -206,6 +297,71 @@ After Approval:
           return;
         }
 
+        // The request number the administrator gave, checked before anything is read or sent.
+        const named =
+          options.requestId === undefined ? undefined : requestNumber(options.requestId);
+        if (options.requestId !== undefined && named === undefined) {
+          console.log(
+            chalk.red(
+              `--request-id needs a request number (a positive whole number); "${plain(options.requestId)}" is not one.`,
+            ),
+          );
+          process.exitCode = 1;
+          markReportedExit();
+          return;
+        }
+
+        // The dispatch token of a web approval this command is executing (#1604), from the
+        // environment the workflow set it in, and only here: `next` is a person's walk and never
+        // reads it, so a token left in a shell cannot turn it into an executor. Blank is none, and
+        // a value no header can carry is refused (`readDispatchToken`). A run the web started
+        // carries the decision its click made, and the API refuses a call that carries the token
+        // and a decision of its own, so the three decision flags (the override, the screen's
+        // acknowledgment and the skip of the CI check) are refused here, before anything is read or
+        // sent.
+        const tokenInput = readDispatchToken(process.env[DISPATCH_TOKEN_ENV]);
+        if (tokenInput.kind === "malformed") {
+          console.log(
+            chalk.red(
+              `${DISPATCH_TOKEN_ENV} is set to a value that cannot be a dispatch token (${tokenInput.problem}). Unset it to approve as yourself, or set it to the token the web approval handed this run. Nothing was sent.`,
+            ),
+          );
+          process.exitCode = 1;
+          markReportedExit();
+          return;
+        }
+        const dispatchToken = tokenInput.kind === "token" ? tokenInput.value : undefined;
+        if (dispatchToken !== undefined) {
+          const decision = options.force
+            ? "--force"
+            : ack !== undefined
+              ? "--acknowledge-identifier-screen"
+              : options.skipCiCheck
+                ? "--skip-ci-check"
+                : null;
+          if (decision !== null) {
+            // The click recorded an override and an acknowledgment, and made no CI decision at all:
+            // it has no option for one, so a run the website started never skips the CI check.
+            // Each flag gets the reason that is true of it (ADR 0103, decision 5).
+            const why =
+              decision === "--skip-ci-check"
+                ? "a run the website started never skips the CI check (the click has no such option), and the API refuses a run that asks to"
+                : "a run the website started carries the decision its click made, and the API refuses a run that sends one of its own";
+            console.log(
+              chalk.red(
+                `${decision} cannot be used while ${DISPATCH_TOKEN_ENV} is set: ${why}. Unset ${DISPATCH_TOKEN_ENV} to approve as yourself. Nothing was sent.`,
+              ),
+            );
+            process.exitCode = 1;
+            markReportedExit();
+            return;
+          }
+          // Said before anything is read or sent, on standard error so that standard output keeps
+          // what a script reads. A person whose shell still holds the variable learns here, and
+          // not from a refusal that does not name it, that this run is not their own approval.
+          console.error(chalk.yellow(DISPATCH_TOKEN_NOTICE));
+        }
+
         const action = options.resume
           ? `Resume publication of ${datasetId}`
           : `Approve and publish ${datasetId}`;
@@ -223,6 +379,22 @@ After Approval:
           failWith(printable(read.refused), ora(), "The publication review could not be read");
           return;
         }
+        // The request the run is for: the one the review just shown belongs to, unless the
+        // administrator named one. A name that is not the request shown is refused here, before the
+        // question and before any approval is sent (the review was read, which is how the request
+        // in force is known; the Worker would refuse the approval too, but later).
+        const shown = read.kind === "detail" ? requestNumber(read.detail.request_id) : undefined;
+        if (named !== undefined && shown !== undefined && named !== shown) {
+          console.log(
+            chalk.red(
+              `--request-id names request #${named}, but the request in force for ${plain(datasetId)} is #${shown}. No approval was sent.`,
+            ),
+          );
+          process.exitCode = 1;
+          markReportedExit();
+          return;
+        }
+        const requestId = named ?? shown;
         if (read.kind === "detail") {
           for (const line of reviewLines(read.detail, datasetId)) console.log(line);
         }
@@ -337,9 +509,21 @@ After Approval:
           skipCiCheck: !!options.skipCiCheck,
           acknowledge: ack,
           override: decision.override,
+          requestId,
+          dispatchToken,
         });
       },
     );
+}
+
+/**
+ * `value` as a request number: a positive whole number, from the text of `--request-id` or from a
+ * field of the review (a number there, but the client does not check that it is). Undefined for
+ * anything else, so a Worker that sends none, or sends something else, names no request.
+ */
+function requestNumber(value: unknown): number | undefined {
+  const n = typeof value === "string" && /^[1-9]\d*$/.test(value) ? Number(value) : value;
+  return typeof n === "number" && Number.isSafeInteger(n) && n > 0 ? n : undefined;
 }
 
 /**
@@ -411,6 +595,14 @@ interface RunApprovalOptions {
   acknowledge?: string;
   /** The review shown and the reasons shown, sent on every call of the run; null when none. */
   override: PublicationReviewOverride | null;
+  /** The request the run is for, sent on every call of the run so the Worker can refuse a stale one (#1579). */
+  requestId?: number;
+  /**
+   * The dispatch token of the web approval this run executes, sent as a header on every approval
+   * call of it and on no read (#1604). Only `approve` sets it, from the environment; `next` never
+   * does.
+   */
+  dispatchToken?: string;
 }
 
 /**
@@ -534,10 +726,13 @@ export function timelineLines(stepResults: StepResult[] | undefined): string[] {
  * The approval loop of `approve` and of `y` in `next`: the spinner, the progress, the retries, the
  * result lines and, for a refusal or a failure, the words and the exit code (1, always: #1581).
  *
- * The override is sent on every call of the run (`approvePublication`), so a retry that lands
- * before the run is marked approving passes the gate again with the same override. A refusal the
- * Worker answers with (the review gate, the screen, a blocked request) is printed in the shared
- * words, and so is a failure; the result says only whether the run went through.
+ * The override, the request number and the dispatch token (when the run executes a web approval)
+ * are sent on every call of the run (`approvePublication`), so a retry that lands before the run is
+ * marked approving passes the gate again with the same override, a request denied and filed again
+ * while the run goes is refused (`request_mismatch`), and every call proves it belongs to its
+ * click. A refusal the Worker answers with (the review gate, the screen, a blocked request) is
+ * printed in the shared words, and so is a failure; the result says only whether the run went
+ * through.
  */
 export async function runApproval(
   datasetId: string,
@@ -601,14 +796,20 @@ export async function runApproval(
       },
       opts.acknowledge,
       opts.override ?? undefined,
+      { requestId: opts.requestId, dispatchToken: opts.dispatchToken },
     );
     spinner.succeed(plain(result.message));
     for (const line of resultLines(result)) console.log(line);
     return { ok: true };
   } catch (error) {
-    failWith(printable(error), spinner, "Failed to approve publication", {
-      422: "Fix the CI issues and retry with --resume",
-    });
+    // A refusal of the token this run presented is followed by the way out for a person whose
+    // shell holds a stale one; a run that carried no token, or was refused for another reason,
+    // gets nothing added.
+    const hints: Record<number, string> = { 422: "Fix the CI issues and retry with --resume" };
+    if (opts.dispatchToken !== undefined && isDispatchTokenRefusal(error)) {
+      hints[409] = DISPATCH_TOKEN_UNSET_HINT;
+    }
+    failWith(printable(error), spinner, "Failed to approve publication", hints);
 
     // The review gate's refusal carries every live reason in the shared words: print each with
     // its cure, then where to read the whole review. `unverified` carries none (the Worker could

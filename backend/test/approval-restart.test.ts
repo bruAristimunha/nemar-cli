@@ -15,9 +15,11 @@
  * two numbers together.
  *
  * Driven through the real routes on a real schema. The restart is made to stop
- * after its first statement by approving an `xx` (sandbox) dataset, which
- * `/approve` refuses with a 400 only AFTER the request-start UPDATE, so nothing
- * external is touched and the row shows exactly what that UPDATE did.
+ * early by approving an `xx` (sandbox) dataset, which `/approve` refuses with a
+ * 400 only AFTER the request-start UPDATE, so nothing external is touched. That
+ * refusal now writes its own sentence as `last_error` (#1582), so the row is read
+ * at the one moment that shows what the request-start UPDATE alone did: just
+ * before that write.
  */
 
 import type { Database } from "bun:sqlite";
@@ -26,9 +28,10 @@ import { Hono } from "hono";
 import { APPROVE_RETRY_DELAY_MS } from "../../shared/publication-retry.js";
 import { adminRoutes } from "../src/routes/admin";
 import { FAILED_RUN_GRACE_SECONDS } from "../src/services/approval-dispatch";
+import { PRE_LOOP_FAILURE_SQL } from "../src/services/publication-orchestrator";
 import { hashApiKey } from "../src/services/token";
 import type { Bindings, Variables } from "../src/types/bindings";
-import { freshDb, realD1 } from "./helpers/d1";
+import { freshDb, interceptingD1, realD1 } from "./helpers/d1";
 
 const ADMIN_KEY = "restart-admin-key-0123456789abcdef0123456789abcdef";
 const SANDBOX_DATASET = "xx012345";
@@ -75,7 +78,7 @@ function seedFailedRun(): number {
     ?.id as number;
 }
 
-function approve(): Promise<Response> {
+function approve(bindings: Bindings = env): Promise<Response> {
   return app.request(
     `/admin/publish/${SANDBOX_DATASET}/approve`,
     {
@@ -83,7 +86,7 @@ function approve(): Promise<Response> {
       headers: { Authorization: `Bearer ${ADMIN_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({ resume: true }),
     },
-    env,
+    bindings,
   );
 }
 
@@ -101,18 +104,36 @@ describe("a restarting run", () => {
     const id = seedFailedRun();
     expect(await inFlight(id)).toBe(false);
 
-    const res = await approve();
+    // The row as the request-start UPDATE left it: read when the refusal below is about to write
+    // its own error, which is the next write of the call.
+    let afterStart: { status: string; last_error: string | null } | null = null;
+    const watched = {
+      ...env,
+      DB: interceptingD1(realD1(db), (sql) => {
+        if (sql === PRE_LOOP_FAILURE_SQL) {
+          afterStart = db
+            .query<{ status: string; last_error: string | null }, [number]>(
+              "SELECT status, last_error FROM publication_requests WHERE id = ?",
+            )
+            .get(id);
+        }
+      }),
+    } as Bindings;
+    const res = await approve(watched);
     // Refused by the sandbox gate, which runs AFTER the request-start UPDATE.
     expect(res.status).toBe(400);
 
+    // The previous attempt's error is cleared as the new attempt begins...
+    expect(afterStart).toEqual({ status: "approving", last_error: null });
+    // ...the refusal then says why it stopped, in its own words and not the old run's...
     const row = db
-      .query<{ status: string; last_error: string | null; updated_at: string }, [number]>(
-        "SELECT status, last_error, updated_at FROM publication_requests WHERE id = ?",
+      .query<{ status: string; last_error: string | null }, [number]>(
+        "SELECT status, last_error FROM publication_requests WHERE id = ?",
       )
       .get(id);
-    // The previous attempt's error is cleared as the new attempt begins...
-    expect(row?.last_error).toBeNull();
     expect(row?.status).toBe("approving");
+    expect(row?.last_error).toContain("Sandbox datasets");
+    expect(row?.last_error).not.toContain("EZID");
     // ...and the heartbeat is fresh, so the row reads as running at once.
     expect(await inFlight(id)).toBe(true);
   });

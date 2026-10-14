@@ -563,8 +563,12 @@ export class DispatchRejectedError extends Error {
  * drives the same caller-side loop (S3 Object Lock batches, retries,
  * `--resume`) a terminal does, which is why the approval does not run inside
  * the Worker: that loop is long and its cost belongs on the runner. The payload
- * names the dataset, the request it was claimed for, whether to resume, and the
- * environment. It carries no credential and no URL.
+ * names the dataset, the request it was claimed for, whether to resume, the
+ * environment, and the claim's dispatch token (#1604; ADR 0103, decision 3): the proof the
+ * runner's `/approve` calls present so the click is recorded as the approver.
+ * It carries no GitHub credential, no Worker secret and no URL; the token is a
+ * MAC over the claim's own columns, authorizes nothing by itself, and is never
+ * logged (the error text below has any copy of it removed).
  *
  * Failure has two meanings, and the difference matters to the caller:
  *   - {@link DispatchRejectedError} with `definitelyNotSent` (a 4xx): GitHub
@@ -573,9 +577,9 @@ export class DispatchRejectedError extends Error {
  *     `TimeoutError` after `timeoutMs`, or a {@link DispatchRejectedError} for a
  *     5xx): UNKNOWN. GitHub may have accepted the dispatch and lost only the
  *     reply, so a caller must not assume nothing started.
- * The error text names GitHub's status and body, never the token. `pat` must
- * carry write access on the central repo's dispatch endpoint -- use
- * `getDatasetsToken()`.
+ * The error text names GitHub's status and body, never the GitHub credential
+ * or the dispatch token. `pat` must carry write access on the central repo's
+ * dispatch endpoint -- use `getDatasetsToken()`.
  */
 export async function triggerApprovePublication(
   datasetId: string,
@@ -583,6 +587,7 @@ export async function triggerApprovePublication(
   resume: boolean,
   environment: ApprovalDispatchEnvironment,
   pat: string,
+  dispatchToken: string,
   timeoutMs: number = APPROVE_DISPATCH_TIMEOUT_MS,
 ): Promise<void> {
   const response = await fetch(`${GITHUB_API()}/repos/${CENTRAL_WORKFLOW_REPO}/dispatches`, {
@@ -600,13 +605,20 @@ export async function triggerApprovePublication(
         request_id: requestId,
         resume,
         environment,
+        dispatch_token: dispatchToken,
       },
     }),
     signal: AbortSignal.timeout(timeoutMs),
   });
 
   if (!response.ok) {
-    throw new DispatchRejectedError(response.status, await response.text());
+    // GitHub's body is part of the error the caller logs, and a 4xx can quote what it refused.
+    // The token is a secret in the log of a Worker, so no copy of it leaves with the error.
+    const detail = await response.text();
+    throw new DispatchRejectedError(
+      response.status,
+      dispatchToken ? detail.split(dispatchToken).join("[redacted]") : detail,
+    );
   }
 }
 

@@ -66,7 +66,9 @@ describe("signPublicationReviewCallbackToken / verifyPublicationReviewCallbackTo
   });
 
   test("signing refuses an empty secret, so a missing Worker secret cannot sign anything", async () => {
-    expect(signPublicationReviewCallbackToken(PAYLOAD, "")).rejects.toThrow(/secret is required/);
+    await expect(signPublicationReviewCallbackToken(PAYLOAD, "")).rejects.toThrow(
+      /secret is required/,
+    );
   });
 
   test("its domain is its own", () => {

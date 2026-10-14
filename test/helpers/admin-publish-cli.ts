@@ -58,6 +58,9 @@ const EXIT_WAIT_MS = 20_000;
  */
 const DRAIN_WAIT_MS = 5_000;
 
+/** Variables of the runner's own environment that change what the command does, so no command inherits them. */
+const AMBIENT_NOT_INHERITED = ["NEMAR_APPROVAL_DISPATCH_TOKEN", "NEMAR_DEBUG"];
+
 const CLI_ENTRY = join(import.meta.dir, "..", "..", "src", "index.ts");
 const REPO_ROOT = join(import.meta.dir, "..", "..");
 
@@ -159,8 +162,22 @@ export interface PublishCli {
   github: { seen: GitHubCall[]; dispatches: Dispatch[] };
   /** Every request the NEMAR API served for a command; cleared in place by `reset()`. */
   requests: ApiCall[];
-  /** The JSON body of every write the NEMAR API received, in order; cleared in place by `reset()`. */
-  posted: Array<{ path: string; body: Record<string, unknown> | null }>;
+  /**
+   * The JSON body of every write the NEMAR API received, in order; cleared in place by `reset()`.
+   * `dispatchToken` is whether the request carried the `X-Approval-Dispatch-Token` header (never its
+   * value: a test that needs the value has the dispatch payload), so a test can say which calls of a
+   * run presented the executor's proof.
+   */
+  posted: Array<{ path: string; body: Record<string, unknown> | null; dispatchToken: boolean }>;
+  /**
+   * The value of the `X-Approval-Dispatch-Token` header, as the API received it, of each write that
+   * carried one, in order; cleared in place by `reset()`. For a test of what the command did to a
+   * value before it sent it (a test-minted token, never a real credential), so one that only needs
+   * to know whether a call carried the proof reads `posted[].dispatchToken`.
+   */
+  dispatchTokenValues: string[];
+  /** The command's configuration directory, where `--debug` writes its `logs/` (a test reads them back). */
+  readonly configDir: string;
   /** Every mail the Worker sent through Resend during a command; cleared in place by `reset()`. */
   mail: CapturedEmail[];
   /** A fresh database, no accounts, and every knob above back at its default. Call it before each test. */
@@ -247,6 +264,7 @@ export function startPublishCli(): PublishCli {
   const github: PublishCli["github"] = { seen: [], dispatches: [] };
   const requests: ApiCall[] = [];
   const posted: PublishCli["posted"] = [];
+  const dispatchTokenValues: string[] = [];
   const mail: CapturedEmail[] = [];
 
   const githubServer = Bun.serve({
@@ -305,7 +323,13 @@ export function startPublishCli(): PublishCli {
           .clone()
           .json()
           .catch(() => null);
-        posted.push({ path: url.pathname, body });
+        posted.push({
+          path: url.pathname,
+          body,
+          dispatchToken: req.headers.has("x-approval-dispatch-token"),
+        });
+        const proof = req.headers.get("x-approval-dispatch-token");
+        if (proof !== null) dispatchTokenValues.push(proof);
       }
       const res = await app.handle(req, env());
       requests.push({ method: req.method, path: url.pathname, status: res.status });
@@ -455,8 +479,13 @@ export function startPublishCli(): PublishCli {
   }
 
   async function run(args: string[], opts: CliOptions): Promise<CliResult> {
+    // What the runner's own shell happens to hold is not what a test meant to run with: a stale
+    // dispatch token would turn a person's approval into an executor's, and a debug switch would
+    // write logs nobody asked for. A test that wants either passes it in `opts.env`.
+    const ambient: Record<string, string | undefined> = { ...process.env };
+    for (const name of AMBIENT_NOT_INHERITED) Reflect.deleteProperty(ambient, name);
     const childEnv: Record<string, string | undefined> = {
-      ...process.env,
+      ...ambient,
       ...opts.env,
       NEMAR_CONFIG_DIR: configDir,
       TEST_API_URL: `http://127.0.0.1:${apiServer.port}`,
@@ -490,6 +519,7 @@ export function startPublishCli(): PublishCli {
     get db() {
       return db;
     },
+    configDir,
     env,
     setEnv(over) {
       envOver = { ...envOver, ...over };
@@ -500,6 +530,7 @@ export function startPublishCli(): PublishCli {
     github,
     requests,
     posted,
+    dispatchTokenValues,
     mail,
     reset() {
       db = freshDb();
@@ -516,6 +547,7 @@ export function startPublishCli(): PublishCli {
       github.dispatches.length = 0;
       requests.length = 0;
       posted.length = 0;
+      dispatchTokenValues.length = 0;
       mail.length = 0;
       writeConfig(null);
     },

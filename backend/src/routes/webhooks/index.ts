@@ -13,6 +13,7 @@
 
 import { Hono } from "hono";
 import type { Bindings } from "../../types/bindings.js";
+import { registerApprovalReleaseRoutes } from "../callbacks/approval-release.js";
 import { registerArchiveReadyRoutes } from "../callbacks/archive-ready.js";
 import { registerIdentifierScreenRoutes } from "../callbacks/identifier-screen.js";
 import { registerIdentifierSweepCallbackRoutes } from "../callbacks/identifier-sweep.js";
@@ -38,6 +39,7 @@ registerManifestCallbackRoutes(webhooks);
 registerPrescreenRoutes(webhooks);
 registerPrReviewRoutes(webhooks);
 registerPublicationReviewRoutes(webhooks);
+registerApprovalReleaseRoutes(webhooks);
 registerIdentifierScreenRoutes(webhooks);
 registerIdentifierSweepCallbackRoutes(webhooks);
 registerImportStateRoutes(webhooks);

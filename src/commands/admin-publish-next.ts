@@ -434,6 +434,10 @@ async function approve(step: Step, card: Card): Promise<Outcome> {
       acknowledge,
       // The review and the reasons the card showed: never a second read.
       override: answer.override,
+      // The request the card was drawn for. The review was read after the list, so a request that
+      // was denied and filed again in between is the Worker's 409, and not an approval of one
+      // whose card this was not.
+      requestId: row.id,
     });
   } finally {
     stopListening();

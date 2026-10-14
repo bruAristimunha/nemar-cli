@@ -152,7 +152,19 @@ export function dlog(message: string): void {
 // in this set so redaction is correct by construction the day a caller does
 // start passing response headers through, rather than something someone has
 // to remember to add then.
-const REDACT_HEADER_NAMES = new Set(["authorization", "cookie", "set-cookie", "x-api-key"]);
+//
+// "x-approval-dispatch-token" is the per-claim token the executor of a web approval presents on
+// `/approve` (shared/contract/publication.ts, APPROVAL_DISPATCH_TOKEN_HEADER). It authorizes
+// nothing alone, but it is what lets that call be recorded as the administrator who clicked, and
+// the debug log is the file users are told to attach to public issues. A test holds this spelling
+// to the shared constant.
+const REDACT_HEADER_NAMES = new Set([
+  "authorization",
+  "cookie",
+  "set-cookie",
+  "x-api-key",
+  "x-approval-dispatch-token",
+]);
 
 /** Redact sensitive header values. Exported for direct unit testing. */
 export function redactHeaders(headers: Record<string, string>): Record<string, string> {

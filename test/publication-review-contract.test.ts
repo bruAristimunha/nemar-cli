@@ -11,11 +11,21 @@ import { join } from "node:path";
 import { BIDS_DATATYPES } from "../backend/src/services/datacite";
 import * as prompt from "../scripts/ci/pr-review-prompt";
 import {
+  APPROVAL_CLOSED_DURING_RUN_MESSAGE,
+  APPROVAL_DISPATCH_TOKEN_HEADER,
+  APPROVAL_IN_FLIGHT_MESSAGE,
   APPROVAL_REFUSAL_ERROR_CODES,
+  APPROVAL_RELEASE_REASONS,
+  APPROVAL_RELEASE_REASON_TEXT,
+  DECISION_WITH_DISPATCH_TOKEN_MESSAGE,
+  DENY_AFTER_PUBLISHING_MESSAGE,
+  DISPATCH_EXPIRED_MESSAGE,
+  DISPATCH_SUPERSEDED_MESSAGE,
   IDENTIFIER_SCREEN_ERROR_CODES,
-  OVERRIDE_INSIDE_WEB_APPROVAL_MESSAGE,
+  INVALID_DATASET_ID_MESSAGE,
   PUBLICATION_REFUSAL_ERROR_CODES,
   REQUEST_CHANGED_MESSAGE,
+  REQUEST_MISMATCH_MESSAGE,
 } from "../shared/contract/publication";
 import {
   OVERRIDE_FIELD,
@@ -116,6 +126,7 @@ import {
   submissionMinimumFailures,
 } from "../shared/submission-minimums";
 import * as untrusted from "../shared/untrusted-text";
+import { adminCommand } from "../src/commands/admin";
 
 /** A value no fixture text contains by accident; finding it in an output means it was quoted. */
 const SENTINEL = "Zqxjvw Sentinelname";
@@ -3022,16 +3033,36 @@ describe("the wire vocabulary the approval refusals and the comment route share"
       "publication_review_not_clear",
       "request_blocked",
       "request_changed",
-      "override_inside_web_approval",
+      "request_mismatch",
+      "dispatch_superseded",
+      "dispatch_expired",
+      "decision_with_dispatch_token",
+      "approval_in_flight",
+      "deny_after_publishing",
+      "invalid_dataset_id",
+      "approval_closed_during_run",
     ]);
     // The first two words are the `error` of the two bodies in the review's contract; the others
-    // are the orchestrator's own refusals (a request that changed while it was checked, and an
-    // override sent inside a web approval).
+    // are the orchestrator's and the deny route's own refusals (a request that changed while it
+    // was checked, a run for a request that is no longer the one in force, a dispatch token that
+    // was replaced or lapsed, a decision sent by a run the web started, a denial of a request
+    // that is running or has started publishing, and a dispatch for an id the executor's workflow
+    // would not accept). The earlier stop-gap `override_inside_web_approval` is gone: its
+    // guarantee is now structural (ADR 0103 decision 5: a run the web started carries no decision
+    // of its own).
+    expect([...APPROVAL_REFUSAL_ERROR_CODES]).not.toContain("override_inside_web_approval");
     expect([...APPROVAL_REFUSAL_ERROR_CODES]).toEqual([
       PUBLICATION_REVIEW_NOT_CLEAR_CODE,
       REQUEST_BLOCKED_CODE,
       "request_changed",
-      "override_inside_web_approval",
+      "request_mismatch",
+      "dispatch_superseded",
+      "dispatch_expired",
+      "decision_with_dispatch_token",
+      "approval_in_flight",
+      "deny_after_publishing",
+      "invalid_dataset_id",
+      "approval_closed_during_run",
     ]);
     // One word, one family: none of them is also another family's.
     for (const code of APPROVAL_REFUSAL_ERROR_CODES) {
@@ -3162,13 +3193,109 @@ describe("the gate refusal body is a union keyed on `refusal`", () => {
 describe("the sentences the Worker's tests import are pinned here, once", () => {
   // The other suites import these constants and never copy them, so an edit to a sentence cannot
   // pass them by also editing a hand-copied literal. These literals are the one oracle.
-  test("the two approval refusals the orchestrator words itself", () => {
+  test("the approval refusal the orchestrator words itself", () => {
     expect(REQUEST_CHANGED_MESSAGE).toBe(
       "The request changed while the approval was being checked (it was denied or blocked). Read it again before approving.",
     );
-    expect(OVERRIDE_INSIDE_WEB_APPROVAL_MESSAGE).toBe(
-      "A web approval of this request is in progress, so an override sent now would be recorded under the administrator who clicked. Wait for it to finish or stop, then approve again with --force.",
+  });
+
+  test("the refusals of the dispatch token, the request precondition and the denial", () => {
+    expect(REQUEST_MISMATCH_MESSAGE).toBe(
+      "The request in force for this dataset is not the one you meant (it was denied or filed again since). Read it again before going on.",
     );
+    expect(DISPATCH_SUPERSEDED_MESSAGE).toBe(
+      "The web approval this run was started for is no longer current (it was replaced by a newer click, released, or taken over by an approval at a terminal), so this run was refused and changed nothing.",
+    );
+    expect(DISPATCH_EXPIRED_MESSAGE).toBe(
+      "The web approval this run was started for has expired: the run sat idle longer than its lease, so a click made then is not honored now. Nothing was changed. Click Approve again to start a fresh run.",
+    );
+    expect(DECISION_WITH_DISPATCH_TOKEN_MESSAGE).toBe(
+      "A run started by a web approval carries the decision made at the click and may not send its own (an override, an identifier-screen acknowledgment or a skipped CI check). Nothing was recorded.",
+    );
+    expect(APPROVAL_IN_FLIGHT_MESSAGE).toBe(
+      "An approval of this request is running, so it cannot be denied right now. If the run stalls before it publishes anything, the request can be denied then.",
+    );
+    expect(DENY_AFTER_PUBLISHING_MESSAGE).toBe(
+      "Steps of an approval of this request have already run, so the dataset may already be public and the request cannot be denied. Check the dataset first. A blocked request waits for its depositor to fix what blocked it; for any other, check whether approving it again can finish it, or repair it by hand.",
+    );
+    expect(INVALID_DATASET_ID_MESSAGE).toBe(
+      "This is not a dataset id an approval can be started for from the web: it is nm or on followed by six digits (a development environment also accepts xx). Nothing was claimed and nothing was sent.",
+    );
+  });
+
+  test("the sentence of a run that finds its request closed, under a word of its own", () => {
+    expect(APPROVAL_CLOSED_DURING_RUN_MESSAGE).toBe(
+      "The request was closed while this approval was running (it was denied, blocked again or filed again), so the run did not mark it published. Its steps had already run, so the dataset may already be public. An approval cannot finish a closed request: check the dataset and the request (nemar admin publish list shows its status), then finish or repair it by hand.",
+    );
+    // `request_changed` means that nothing ran, and this one says the steps did: not that word.
+    expect([...APPROVAL_REFUSAL_ERROR_CODES]).toContain("approval_closed_during_run");
+    expect(APPROVAL_CLOSED_DURING_RUN_MESSAGE).not.toBe(REQUEST_CHANGED_MESSAGE);
+    expect(APPROVAL_CLOSED_DURING_RUN_MESSAGE).toMatch(/\.$/);
+    expect(APPROVAL_CLOSED_DURING_RUN_MESSAGE).not.toContain("\u2014");
+    // It names the repair, and every command it names is one this CLI registers: read from the
+    // real command tree, so renaming or removing the subcommand turns this red.
+    expect(APPROVAL_CLOSED_DURING_RUN_MESSAGE).toContain("by hand");
+    const named = [
+      ...APPROVAL_CLOSED_DURING_RUN_MESSAGE.matchAll(/nemar admin publish ([a-z][a-z-]*)/g),
+    ].map((match) => match[1]);
+    expect(named.length).toBeGreaterThan(0);
+    const registered =
+      adminCommand.commands.find((c) => c.name() === "publish")?.commands.map((c) => c.name()) ??
+      [];
+    expect(registered.length).toBeGreaterThan(0);
+    for (const name of named) expect(registered).toContain(name);
+  });
+
+  test("every approval refusal sentence is a plain sentence, and no two are the same", () => {
+    const sentences = [
+      REQUEST_CHANGED_MESSAGE,
+      REQUEST_MISMATCH_MESSAGE,
+      DISPATCH_SUPERSEDED_MESSAGE,
+      DISPATCH_EXPIRED_MESSAGE,
+      DECISION_WITH_DISPATCH_TOKEN_MESSAGE,
+      APPROVAL_IN_FLIGHT_MESSAGE,
+      DENY_AFTER_PUBLISHING_MESSAGE,
+      INVALID_DATASET_ID_MESSAGE,
+      APPROVAL_CLOSED_DURING_RUN_MESSAGE,
+      ...Object.values(APPROVAL_RELEASE_REASON_TEXT),
+    ];
+    expect(new Set(sentences).size).toBe(sentences.length);
+    for (const sentence of sentences) {
+      expect(sentence).toMatch(/\.$/);
+      expect(sentence).not.toContain("\u2014");
+    }
+  });
+
+  test("the words an executor's release may give, each with its one fixed sentence", () => {
+    expect([...APPROVAL_RELEASE_REASONS]).toEqual([
+      "workflow_failed",
+      "workflow_cancelled",
+      "secret_missing",
+      "install_failed",
+      "input_rejected",
+      "preflight_failed",
+    ]);
+    expect(Object.keys(APPROVAL_RELEASE_REASON_TEXT).sort()).toEqual(
+      [...APPROVAL_RELEASE_REASONS].sort(),
+    );
+    expect(APPROVAL_RELEASE_REASON_TEXT).toEqual({
+      workflow_failed:
+        "The approval workflow failed before the approval finished. Click Approve again to resume it.",
+      workflow_cancelled:
+        "The approval workflow was cancelled before the approval finished. Click Approve again to resume it.",
+      secret_missing:
+        "The approval workflow could not start because a credential it needs is not configured. Tell the maintainers, then click Approve again.",
+      install_failed:
+        "The approval workflow could not install the command line tool it runs. Click Approve again to retry.",
+      input_rejected:
+        "The approval workflow refused the request it was given, so the run did not start and changed nothing.",
+      preflight_failed:
+        "The approval workflow's own checks of the request failed before it began, so the run did not start and changed nothing.",
+    });
+  });
+
+  test("the header an executor presents its dispatch token in", () => {
+    expect(APPROVAL_DISPATCH_TOKEN_HEADER).toBe("X-Approval-Dispatch-Token");
   });
 
   test("the refusal for a review the gate could not check covers a failed read and a failed record alike", () => {

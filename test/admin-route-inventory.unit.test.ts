@@ -18,12 +18,12 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { adminMiddleware, authMiddleware } from "../backend/src/middleware/auth";
+import { adminMiddleware, authMiddleware, cookieOriginGuard } from "../backend/src/middleware/auth";
 import { adminRoutes } from "../backend/src/routes/admin";
 
 const EXPECTED_ENTRIES: Record<string, number> = {
-  // Router-level middleware (authMiddleware + adminMiddleware).
-  "ALL /*": 2,
+  // Router-level middleware (authMiddleware + adminMiddleware + cookieOriginGuard, #1603/#1584).
+  "ALL /*": 3,
 
   // Users / accounts
   "GET /users": 1,
@@ -223,14 +223,20 @@ describe("admin route inventory", () => {
   });
 
   test("entry total is pinned", () => {
-    expect(adminRoutes.routes.length).toBe(145);
+    expect(adminRoutes.routes.length).toBe(146);
   });
 
-  // The count pin above can't see a SWAP of the two router-level middleware
-  // entries. Order is load-bearing: authMiddleware resolves the user that
-  // adminMiddleware's role check reads.
-  test("router-level middleware order is pinned (auth before admin)", () => {
+  // The count pin above can't see a SWAP of the router-level middleware
+  // entries. Order is load-bearing: authMiddleware resolves the user and the
+  // `authMethod` that adminMiddleware's role check and cookieOriginGuard read,
+  // and the guard answers after the role check so a member hears "Admin
+  // access required" and is not asked about an Origin.
+  test("router-level middleware order is pinned (auth, admin, then the cookie Origin guard)", () => {
     const star = adminRoutes.routes.filter((r) => r.method === "ALL" && r.path === "/*");
-    expect(star.map((r) => r.handler)).toEqual([authMiddleware, adminMiddleware]);
+    expect(star.map((r) => r.handler)).toEqual([
+      authMiddleware,
+      adminMiddleware,
+      cookieOriginGuard,
+    ]);
   });
 });

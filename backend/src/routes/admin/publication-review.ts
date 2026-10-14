@@ -42,13 +42,12 @@ import { type StartOutcome, startPublicationReview } from "../../services/public
 import { errorWords } from "../../services/publication-review-log";
 import { readReview } from "../../services/publication-review-rows";
 import { publicationReviewDetail } from "../../services/publication-review-view";
-import { isAllowedOrigin } from "../../services/web-session";
 import type { AdminRouter } from "./shared";
 
 /** Answer with a fixed sentence and a code from the contract's closed list. */
 function refuse(
   c: Context,
-  status: 400 | 403 | 404 | 409 | 500,
+  status: 400 | 404 | 409 | 500,
   code: PublicationReviewErrorCode,
   error: string,
 ) {
@@ -188,19 +187,8 @@ export function registerPublicationReviewRoutes(admin: AdminRouter): void {
   });
 
   admin.post("/publish/:id/review/start", async (c) => {
-    // A session cookie rides along with any cross-site request a browser can be tricked into
-    // making, and this route spends the platform's money, so every path but a bearer key must come
-    // from a NEMAR origin (the rule of `approve-dispatch`). A bearer key cannot be forged
-    // cross-site and a terminal sends no Origin. Phrased as "not a token" so that an unset
-    // `authMethod` fails closed.
-    if (c.get("authMethod") !== "token" && !isAllowedOrigin(c.req.header("Origin"))) {
-      return refuse(
-        c,
-        403,
-        "origin_not_allowed",
-        "This request did not come from a NEMAR page, so it was not accepted.",
-      );
-    }
+    // This route spends the platform's money; the router's `cookieOriginGuard` has already refused
+    // a cookie request that did not come from a NEMAR page.
     const datasetId = c.req.param("id");
     if (!isValidDatasetId(datasetId)) {
       return refuse(c, 400, "bad_dataset", "That is not a dataset id.");

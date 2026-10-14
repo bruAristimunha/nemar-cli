@@ -45,6 +45,7 @@ import {
   textOf,
 } from "../backend/test/helpers/publication-review";
 import { asSend } from "../backend/test/helpers/resend";
+import { REQUEST_MISMATCH_MESSAGE } from "../shared/contract/publication";
 import {
   NOT_ASSESSED_LINE,
   PUBLICATION_FINDING_LABEL,
@@ -120,6 +121,15 @@ function seed(
   return { requestId, reviewId };
 }
 
+/**
+ * `requestId` as a request that has run no step. `seed` gives every request the steps of a golden
+ * resume (so an approval completes with no network), and a denial is refused for a request with a
+ * step done outside the validation-only ones, because its dataset may already be public: a test
+ * that denies a request makes it one that has not started.
+ */
+const notStarted = (requestId: number) =>
+  h.db.run("UPDATE publication_requests SET steps_completed = '[]' WHERE id = ?", [requestId]);
+
 const requestedAt = (datasetId: string, stamp: string) =>
   h.db.run("UPDATE publication_requests SET requested_at = ? WHERE dataset_id = ?", [
     stamp,
@@ -154,6 +164,47 @@ describe("y approves from the terminal", () => {
     expect(r.stdout).toContain("Done: 1 approved.");
     // The first card offers y, the second (not a pass, no --force) does not.
     expect(count(r.stdout, "y approve, ")).toBe(1);
+  });
+
+  test("y names the request of the card it was answering, each card its own (#1579)", async () => {
+    const a = seed(A);
+    const b = seed(B);
+    requestedAt(A, "2026-10-10 09:00:00");
+    requestedAt(B, "2026-10-11 09:00:00");
+
+    const r = await next("y\ny\n");
+
+    expect(r.exitCode).toBe(0);
+    expect(a.requestId).not.toBe(b.requestId);
+    expect(approveBodies(A)).toHaveLength(1);
+    expect(approveBodies(A)[0]?.request_id).toBe(a.requestId);
+    expect(approveBodies(B)).toHaveLength(1);
+    expect(approveBodies(B)[0]?.request_id).toBe(b.requestId);
+  });
+
+  test("a request denied and filed again after the list was read is not approved by y: the card named the old one (#1579)", async () => {
+    // The list shows request 1; before its card is drawn it was denied and request 2 was filed.
+    // The card's row is request 1's, so y says request 1, the Worker refuses, and 2 is untouched.
+    const a = seed(A);
+    let second = 0;
+    h.after("GET /admin/publish/requests", () => {
+      h.db.run("UPDATE publication_requests SET status = 'denied' WHERE id = ?", [a.requestId]);
+      second = seed(A).requestId;
+    });
+
+    const r = await next("y\n");
+
+    expect(second).toBeGreaterThan(a.requestId);
+    expect(r.exitCode).toBe(1);
+    expect(output(r)).toContain(REQUEST_MISMATCH_MESSAGE);
+    expect(approveBodies(A)).toHaveLength(1);
+    expect(approveBodies(A)[0]?.request_id).toBe(a.requestId);
+    expect(requestRow(second)).toEqual({
+      status: "requested",
+      approved_by: null,
+      denied_reason: null,
+    });
+    expect(r.stdout).toContain("Done: 1 failed.");
   });
 
   test("when the input ends during the approval, no second card is drawn and no review is read for it", async () => {
@@ -464,6 +515,7 @@ describe("the screen's acknowledgment is asked for, not assumed", () => {
 describe("n denies, with a reason the depositor is mailed", () => {
   test("a typed reason is posted as typed, denies the request and is mailed to the depositor", async () => {
     const { requestId } = seed(A);
+    notStarted(requestId);
 
     const r = await next("n\n  Please add a CHANGES entry.  \n");
 
@@ -883,7 +935,7 @@ describe("what fails exits 1, and the walk goes on", () => {
     // denial the Worker could not write (500 with no closed word), which may be a bug and must
     // bring the hint back; a mark that nothing can clear would leave it suppressed.
     seed(A, twoReasons());
-    seed(B);
+    notStarted(seed(B).requestId);
     requestedAt(A, "2026-10-10 09:00:00");
     requestedAt(B, "2026-10-11 09:00:00");
     h.after(`GET /admin/publish/${A}/review`, () => {
@@ -911,7 +963,7 @@ describe("what fails exits 1, and the walk goes on", () => {
     // Card 1: a denial the Worker could not write (500 with no closed word), which may be a bug.
     // Card 2: the Worker's refusal (409), an answer, which marks the exit as reported. A later
     // answer must not hide the earlier fault.
-    seed(A);
+    notStarted(seed(A).requestId);
     seed(B, twoReasons());
     requestedAt(A, "2026-10-10 09:00:00");
     requestedAt(B, "2026-10-11 09:00:00");

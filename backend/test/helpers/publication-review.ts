@@ -18,6 +18,7 @@ import {
   verdictOf,
 } from "../../../shared/publication-review";
 import { PUBLICATION_STEPS } from "../../../shared/publication-steps";
+import { signApprovalDispatchToken } from "../../src/services/github/callback-tokens";
 import { hashApiKey } from "../../src/services/token";
 import { SCREENED_HEAD, cleanScreenReportBody, markScreen } from "./identifier-screen";
 
@@ -294,6 +295,69 @@ export function setOverride(
         SET override_by = ?, override_at = COALESCE(?, datetime('now')), override_reasons = ?
       WHERE id = ?`,
     [by, at ?? null, JSON.stringify(reasons), reviewId],
+  );
+}
+
+/**
+ * The callback secret a test Worker is given when it takes {@link webClaim}'s token, so the two
+ * agree without each suite inventing a secret. A suite with a secret of its own passes it to both.
+ */
+export const WEB_CLAIM_SECRET = "web-claim-test-secret-0123456789abcdef";
+
+export interface WebClaim {
+  requestId: number;
+  /** The administrator who clicked: `approval_requested_by`. */
+  clickerId: number;
+  /**
+   * A SQLite modifier for when the claim was made, such as "-1 minutes" (the default, inside the
+   * 15 minute lease) or "-2 hours". It is the claim's instant, so two claims made with the same
+   * modifier in the same second are the same claim: a test of a replaced claim gives the second one
+   * another modifier.
+   */
+  dispatchedAt?: string;
+  /** The secret to sign with; default {@link WEB_CLAIM_SECRET}. */
+  secret?: string;
+}
+
+/**
+ * A web click's claim on a request, and the token the click's dispatch would have carried.
+ *
+ * Writes the two claim columns exactly as the dispatch route does (`approval_requested_by`, and
+ * `approval_dispatched_at` as SQLite's own `datetime('now', ...)` string) and signs the token with
+ * the PRODUCTION `signApprovalDispatchToken` over the row's real values as stored, read back after
+ * the write, so the token is derived from the claim and never from what a test believes it wrote.
+ * The status, `updated_at` and `last_error` are left as the test set them: a claim is the clicker's
+ * and the run's progress is the test's.
+ */
+export async function webClaim(db: Database, o: WebClaim): Promise<string> {
+  db.run(
+    `UPDATE publication_requests
+        SET approval_requested_by = ?, approval_dispatched_at = datetime('now', ?)
+      WHERE id = ?`,
+    [o.clickerId, o.dispatchedAt ?? "-1 minutes", o.requestId],
+  );
+  const row = db
+    .query<
+      {
+        dataset_id: string;
+        id: number;
+        approval_requested_by: number;
+        approval_dispatched_at: string;
+      },
+      [number]
+    >(
+      "SELECT dataset_id, id, approval_requested_by, approval_dispatched_at FROM publication_requests WHERE id = ?",
+    )
+    .get(o.requestId);
+  if (!row) throw new Error(`webClaim: request ${o.requestId} does not exist`);
+  return signApprovalDispatchToken(
+    {
+      datasetId: row.dataset_id,
+      requestId: row.id,
+      clickerId: row.approval_requested_by,
+      claimedAt: row.approval_dispatched_at,
+    },
+    o.secret ?? WEB_CLAIM_SECRET,
   );
 }
 

@@ -31,6 +31,16 @@ export function seedGolden(db: Database, over: Partial<SeedScreenedRequest> = {}
   return requestId;
 }
 
+/**
+ * A request waiting for its decision that has run no step. The golden seed above carries every
+ * step but the two no-ops, so that an approval can resume to its end with no network, and a denial
+ * is refused for a request with a step done outside the validation-only ones (the dataset may be
+ * public): a test that denies seeds this one.
+ */
+export function seedUnstarted(db: Database, over: Partial<SeedScreenedRequest> = {}): number {
+  return seedScreenedRequest(db, { datasetId: DATASET, ...over }).requestId;
+}
+
 /** The review in force of `requestId`, reported with `report` (a pass by default); returns its id. */
 export function seedReport(
   db: Database,

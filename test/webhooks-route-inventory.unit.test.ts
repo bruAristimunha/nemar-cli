@@ -45,6 +45,9 @@ const EXPECTED_ENTRIES: Record<string, number> = {
   "POST /publication-review-claim": 1,
   "POST /publication-review-result": 1,
 
+  // Web approval release (the dispatch token alone authenticates; ADR 0103, decision 9)
+  "POST /approval-release": 1,
+
   // OpenNeuro import state callback (bearer token)
   "POST /import-state": 1,
 
@@ -71,7 +74,7 @@ describe("webhooks route inventory", () => {
   });
 
   test("entry total is pinned", () => {
-    expect(webhooks.routes.length).toBe(17);
+    expect(webhooks.routes.length).toBe(18);
   });
 
   // The webhooks router has NO router-level middleware: every route does its

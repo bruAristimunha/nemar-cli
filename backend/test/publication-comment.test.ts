@@ -21,6 +21,7 @@
 
 import { beforeEach, describe, expect, test } from "bun:test";
 import {
+  type OriginNotAllowedBody,
   PUBLICATION_COMMENT_ERROR_CODES,
   PUBLICATION_COMMENT_MAX_LENGTH,
   type PublicationCommentErrorBody,
@@ -374,10 +375,14 @@ describe("who may call it, and what it refuses", () => {
         { cookie, headers },
       );
       expect(res.status).toBe(403);
+      // Answered by the admin router's cookie Origin guard, which carries the code in `code` as the
+      // comment's contract reads it (and in `error` as approve-dispatch's does), the sentence in
+      // `message`.
       expect(json).toEqual({
-        error: "This request did not come from a NEMAR page, so it was not accepted.",
+        error: "origin_not_allowed",
         code: "origin_not_allowed",
-      } satisfies PublicationCommentErrorBody);
+        message: PUBLICATION_COMMENT_SENTENCES.origin_not_allowed,
+      } satisfies OriginNotAllowedBody);
       expectNothingMailed(calls);
     }
     expect(auditRows()).toHaveLength(0);

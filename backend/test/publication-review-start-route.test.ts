@@ -20,6 +20,7 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { Hono } from "hono";
 import {
+  type OriginNotAllowedBody,
   PUBLICATION_REVIEW_ERROR_CODES,
   type PublicationReviewErrorBody,
   type PublicationReviewErrorCode,
@@ -36,6 +37,7 @@ import {
   PLATFORM_DAILY_CAP,
   PUBLICATION_REVIEW_DEADLINE_MINUTES as REVIEW_DEADLINE_MINUTES,
 } from "../../shared/publication-review";
+import { ORIGIN_NOT_ALLOWED_MESSAGE } from "../src/middleware/auth";
 import { adminRoutes } from "../src/routes/admin";
 import {
   NOT_HANDED_OVER,
@@ -113,6 +115,16 @@ function startWithCookie(datasetId: string, cookie: string, origin?: string) {
 }
 
 type ErrorBody = PublicationReviewErrorBody;
+
+/**
+ * What the router's cookie Origin guard answers: unlike the bodies of this route, `error` is the
+ * word and the sentence is in `message` (see `OriginNotAllowedBody`).
+ */
+const ORIGIN_REFUSAL = {
+  error: "origin_not_allowed",
+  code: "origin_not_allowed",
+  message: ORIGIN_NOT_ALLOWED_MESSAGE,
+} satisfies OriginNotAllowedBody;
 
 async function bodyOf<T>(res: Response): Promise<T> {
   return (await res.json()) as T;
@@ -206,7 +218,7 @@ describe("who may start a review", () => {
       "https://evil.example",
     );
     expect(res.status).toBe(403);
-    expect((await bodyOf<ErrorBody>(res)).code).toBe("origin_not_allowed");
+    expect(await bodyOf<OriginNotAllowedBody>(res)).toEqual(ORIGIN_REFUSAL);
     expectNothingStarted();
   });
 
@@ -214,7 +226,7 @@ describe("who may start a review", () => {
     request();
     const res = await startWithCookie(PROD_DATASET, await cookieFor(adminId));
     expect(res.status).toBe(403);
-    expect((await bodyOf<ErrorBody>(res)).code).toBe("origin_not_allowed");
+    expect(await bodyOf<OriginNotAllowedBody>(res)).toEqual(ORIGIN_REFUSAL);
     expectNothingStarted();
   });
 

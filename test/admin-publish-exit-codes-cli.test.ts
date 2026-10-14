@@ -29,7 +29,7 @@ import { afterAll, beforeEach, describe, expect, setDefaultTimeout, test } from 
 import { markScreen } from "../backend/test/helpers/identifier-screen";
 import { seedScreenedRequest } from "../backend/test/helpers/publication-review";
 import { type CliResult, startPublishCli } from "./helpers/admin-publish-cli";
-import { seedGolden } from "./helpers/approve-seeds";
+import { seedGolden, seedUnstarted } from "./helpers/approve-seeds";
 
 setDefaultTimeout(60_000);
 
@@ -316,7 +316,7 @@ describe("deny with no reason and nothing to ask on", () => {
   });
 
   test("a reason piped in is read as the reason, and nothing is asked", async () => {
-    const requestId = seedGolden(h.db);
+    const requestId = seedUnstarted(h.db);
     const r = await h.cli(["admin", "publish", "deny", DATASET, "--yes"], {
       input: "Please add the participants file\n",
     });
@@ -340,7 +340,7 @@ describe("deny with no reason and nothing to ask on", () => {
     });
 
     test("a typed reason is sent", async () => {
-      const requestId = seedGolden(h.db);
+      const requestId = seedUnstarted(h.db);
       const r = await h.cli(["admin", "publish", "deny", DATASET, "--yes"], {
         terminal: async (t) => {
           const asked = await t.waitFor("Reason for denial:");
@@ -465,7 +465,7 @@ describe("success still exits 0", () => {
   });
 
   test("deny --yes of an active request", async () => {
-    const requestId = seedGolden(h.db);
+    const requestId = seedUnstarted(h.db);
     const r = await h.cli(["admin", "publish", "deny", DATASET, ...WHY, "--yes"]);
     expect(r.exitCode).toBe(0);
     expect(requestStatus(requestId)).toBe("denied");

@@ -23,7 +23,9 @@
  * rows); refuse a started-publishing run that has `--resume` (the resume rows); drop the override
  * from a retry call (the retry row, "a retry after a 5xx"); exit 0 when the run gives up (the
  * "keeps failing" row); ask the question after a refused read (the "definitive answer" rows);
- * read the banner's release kind from the status again (the "banner names the kind" rows).
+ * read the banner's release kind from the status again (the "banner names the kind" rows); send no
+ * request id by default, or drop it from a retry, or let `--request-id` disagree with the detail
+ * (the "run is for the request the command read" rows).
  *
  * CI TIER: unit-pure. Hermetic: an in-process backend over a local database, the CLI spawned
  * against it, stand-ins only at GitHub and Resend, no live network; it sets its own default
@@ -40,6 +42,7 @@ import {
   setOverride,
 } from "../backend/test/helpers/publication-review";
 import { makePublicationReviewApp } from "../backend/test/helpers/publication-review-app";
+import { REQUEST_MISMATCH_MESSAGE } from "../shared/contract/publication";
 import {
   HARD_REASONS,
   NOT_ASSESSED_LINE,
@@ -1090,12 +1093,16 @@ describe("with the Worker's gate: what the Worker refuses is printed, and exits 
     expect(details.review_gate).toBe("enforced");
   });
 
-  test("the web executor's --yes run proceeds on the clicker's recorded override, sends none, and publishes", async () => {
+  test("a --yes run with no dispatch token does not ride on the clicker's recorded override: refused, and the click's claim is intact", async () => {
+    // The flip of the earlier pin (#1604, ADR 0103 decisions 4 and 6). The clicker's override
+    // covers the clicker's run, which is the one that carries the click's token
+    // (admin-publish-approve-token-cli.test.ts); the same command without it is its caller's own
+    // act, and the caller has no override.
     const requestId = seedGolden();
     const reviewId = seedReport(requestId, twoReasons());
-    const executorId = await h.admin("executor", EXECUTOR_KEY);
+    await h.admin("executor", EXECUTOR_KEY);
     // The clicker's confirmation, recorded through the real route (the page's body) before the
-    // executor runs; the claim it leaves is the live lease that makes the clicker the approver.
+    // executor runs; the claim it leaves is a live one, but only the token proves a call is its run.
     const dispatched = await direct(`/admin/publish/${DATASET}/approve-dispatch`, ADMIN_KEY, {
       override_publication_review: {
         review_id: reviewId,
@@ -1103,16 +1110,37 @@ describe("with the Worker's gate: what the Worker refuses is printed, and exits 
       },
     });
     expect(dispatched.status).toBe(202);
+    const claim = h.db
+      .query<
+        { approval_requested_by: number | null; approval_dispatched_at: string | null },
+        [number]
+      >(
+        "SELECT approval_requested_by, approval_dispatched_at FROM publication_requests WHERE id = ?",
+      )
+      .get(requestId);
 
     const r = await approve(["--resume", "--yes"], { as: "executor" });
 
     expect(r.stdout).toContain(`An override by administrator #${adminId}`);
-    expect(r.exitCode).toBe(0);
+    expect(r.exitCode).toBe(1);
+    expect(output(r)).toContain(REVIEW_GATE_REFUSAL_TEXT.needs_override.split(" Read it")[0]);
+    expect(h.requests.filter((c) => c.path === APPROVE_PATH).map((c) => c.status)).toEqual([409]);
     expect(approveBodies()).toHaveLength(1);
     expect(approveBodies()[0]).not.toHaveProperty("override_publication_review");
-    expect(requestRow(requestId)?.status).toBe("published");
-    expect(requestRow(requestId)?.approved_by).toBe(adminId);
-    expect(requestRow(requestId)?.approved_by).not.toBe(executorId);
+    expect(h.posted.filter((p) => p.path === APPROVE_PATH)[0]?.dispatchToken).toBe(false);
+    expect(requestRow(requestId)?.status).toBe("requested");
+    expect(requestRow(requestId)?.approved_by).toBeNull();
+    // Nothing was taken over: the executor the click dispatched can still carry out the click.
+    expect(
+      h.db
+        .query<
+          { approval_requested_by: number | null; approval_dispatched_at: string | null },
+          [number]
+        >(
+          "SELECT approval_requested_by, approval_dispatched_at FROM publication_requests WHERE id = ?",
+        )
+        .get(requestId),
+    ).toEqual(claim);
   });
 
   test("another administrator's recorded override covers nothing for this run: the Worker refuses and the command prints it", async () => {
@@ -1131,4 +1159,158 @@ describe("with the Worker's gate: what the Worker refuses is printed, and exits 
     expect(h.requests.filter((c) => c.path === APPROVE_PATH).map((c) => c.status)).toEqual([409]);
     expect(requestRow(requestId)?.status).toBe("requested");
   });
+});
+
+describe("the run is for the request the command read (#1579)", () => {
+  test("sends the request id of the detail it showed, with the rest of the body", async () => {
+    const requestId = seedGolden();
+    seedReport(requestId);
+
+    const r = await approve(["--resume", "--yes"]);
+
+    expect(r.exitCode).toBe(0);
+    expect(approveBodies()).toHaveLength(1);
+    expect(approveBodies()[0]?.request_id).toBe(requestId);
+    expect(approveBodies()[0]?.resume).toBe(true);
+    expect(requestRow(requestId)?.status).toBe("published");
+  });
+
+  test("a request denied and filed again between the command's read and its approval is refused, and the new request is untouched", async () => {
+    // The dangerous direction: the administrator read request 1 and said yes, but while the
+    // question stood the depositor's request was denied and a new one filed. Without the id the
+    // run finds the newest active request by itself and approves one nobody read.
+    const first = seedGolden();
+    seedReport(first);
+    let second = 0;
+    h.after(`GET /admin/publish/${DATASET}/review`, () => {
+      h.db.run("UPDATE publication_requests SET status = 'denied' WHERE id = ?", [first]);
+      second = seedGolden();
+      seedReport(second);
+    });
+
+    const r = await approve(["--resume", "--yes"]);
+
+    expect(second).toBeGreaterThan(first);
+    expect(r.exitCode).toBe(1);
+    expect(output(r)).toContain(REQUEST_MISMATCH_MESSAGE);
+    // One call, refused as a 409 that is not retried, and it named the request that was read.
+    expect(h.requests.filter((c) => c.path === APPROVE_PATH).map((c) => c.status)).toEqual([409]);
+    expect(approveBodies()).toHaveLength(1);
+    expect(approveBodies()[0]?.request_id).toBe(first);
+    expect(requestRow(second)).toEqual({ status: "requested", approved_by: null });
+    expect(requestRow(first)).toEqual({ status: "denied", approved_by: null });
+    const published = h.db
+      .query<{ n: number }, []>(
+        "SELECT COUNT(*) AS n FROM audit_log WHERE action = 'dataset_published'",
+      )
+      .get();
+    expect(published?.n).toBe(0);
+  });
+
+  test("a retry after a 5xx names the request again", async () => {
+    const requestId = seedGolden({ status: "unchecked" });
+    seedReport(requestId);
+    // The approval's own request lookup fails once, after the command's reads, and answers 500:
+    // the command retries by itself, and the retry is a call like the first.
+    let armed = false;
+    let failed = false;
+    h.after(`GET /admin/publish/${DATASET}/review`, () => {
+      armed = true;
+    });
+    h.hookDb({
+      statement(sql) {
+        if (armed && !failed && /FROM publication_requests/.test(sql)) {
+          failed = true;
+          throw new Error("simulated read failure");
+        }
+      },
+    });
+
+    const r = await approve(["--resume", "--yes", "--acknowledge-identifier-screen", WHY_ACK], {
+      env: SHORT_RETRY,
+    });
+
+    expect(failed).toBe(true);
+    expect(output(r)).toContain("Retrying in 0s");
+    expect(approveBodies()).toHaveLength(2);
+    for (const body of approveBodies()) expect(body?.request_id).toBe(requestId);
+    expect(r.exitCode).toBe(0);
+    expect(requestRow(requestId)?.status).toBe("published");
+  });
+
+  /** A review this version of the command cannot read: no detail, so no request id of its own. */
+  const unreadableReview = () =>
+    h.rewrite(`GET /admin/publish/${DATASET}/review`, (body) => {
+      body.gate = "something-newer";
+    });
+
+  test("--request-id is not sent when the review could not be read and none was named", async () => {
+    seedReport(seedGolden());
+    unreadableReview();
+
+    const without = await approve(["--resume", "--yes"]);
+
+    expect(without.exitCode).toBe(0);
+    expect(approveBodies()).toHaveLength(1);
+    expect(approveBodies()[0]).not.toHaveProperty("request_id");
+  });
+
+  test("--request-id names it when the review could not be read", async () => {
+    const requestId = seedGolden();
+    seedReport(requestId);
+    unreadableReview();
+
+    const named = await approve(["--resume", "--yes", "--request-id", String(requestId)]);
+
+    expect(named.exitCode).toBe(0);
+    expect(approveBodies()).toHaveLength(1);
+    expect(approveBodies()[0]?.request_id).toBe(requestId);
+  });
+
+  test("--request-id that agrees with the detail it read is sent as it is", async () => {
+    const requestId = seedGolden();
+    seedReport(requestId);
+
+    const r = await approve(["--resume", "--yes", "--request-id", String(requestId)]);
+
+    expect(r.exitCode).toBe(0);
+    expect(approveBodies()[0]?.request_id).toBe(requestId);
+  });
+
+  test("--request-id that disagrees with the detail it read is refused locally, with nothing posted", async () => {
+    const requestId = seedGolden();
+    seedReport(requestId);
+
+    const r = await approve(["--resume", "--yes", "--request-id", String(requestId + 5)]);
+
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toContain(`#${requestId + 5}`);
+    expect(r.stdout).toContain(`#${requestId}`);
+    // It was refused before the banner and the question, and before any write. The review was
+    // read (that is how the command knew the request in force), so the sentence says that no
+    // approval was sent, not that nothing was.
+    expect(r.stdout).not.toContain("This will run the following");
+    expect(r.stdout).toContain("No approval was sent.");
+    expect(r.stdout).not.toContain("Nothing was sent");
+    expect(h.requests.length).toBeGreaterThan(0);
+    expect(h.requests.every((c) => c.method === "GET")).toBe(true);
+    expect(h.posted).toEqual([]);
+    expect(requestRow(requestId)?.status).toBe("requested");
+  });
+
+  test.each(["0", "-4", "1.5", "7abc", "abc", ""])(
+    "--request-id %p is not a request id: refused before anything is sent",
+    async (value) => {
+      const requestId = seedGolden();
+      seedReport(requestId);
+
+      const r = await approve(["--resume", "--yes", "--request-id", value]);
+
+      expect(r.exitCode).toBe(1);
+      expect(r.stdout).toContain("--request-id needs a request number");
+      expect(h.posted).toEqual([]);
+      expect(h.requests).toEqual([]);
+      expect(requestRow(requestId)?.status).toBe("requested");
+    },
+  );
 });
