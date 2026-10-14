@@ -42,6 +42,7 @@ export const MAX_BODY_BYTES = 2048;
 let debugEnabled = false;
 let usageExit = false;
 let reportedExit = false;
+let possibleBugSeen = false;
 let lastStep: string | undefined;
 let cachedEnvironmentSection: string | undefined;
 const httpEntries: HttpLogEntry[] = [];
@@ -107,7 +108,28 @@ export function wasUsageExit(): boolean {
  * make both harder to read later.
  */
 export function markReportedExit(): void {
+  // A failure that may be a bug was already seen in this run ({@link unmarkReportedExit}), and an
+  // answer after it does not hide it.
+  if (possibleBugSeen) return;
   reportedExit = true;
+}
+
+/**
+ * Records that a failure that may be a bug was seen, for a command that can fail more than once in
+ * one run: it clears the mark and, from then on, {@link markReportedExit} does nothing. The state
+ * is process-wide, so a walk that has one request fail for a reason that may be a bug must keep
+ * the exit hook's invitation to attach the log, whatever answers (refusals the Worker made) come
+ * before or after it. Only answers suppress the hint.
+ */
+export function unmarkReportedExit(): void {
+  reportedExit = false;
+  possibleBugSeen = true;
+}
+
+/** Starts the exit state over, as a fresh process has it (for tests that run commands in one process). */
+export function resetReportedExit(): void {
+  reportedExit = false;
+  possibleBugSeen = false;
 }
 
 export function wasReportedExit(): boolean {

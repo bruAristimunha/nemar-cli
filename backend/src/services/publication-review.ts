@@ -469,13 +469,18 @@ export async function startPublicationReview(
       // The call the row already spent is recorded HERE, in the same write that takes the row
       // back, and never after the allowances have been consulted: a restart that is then declined
       // or fails to dispatch has still not undone the call before it.
+      //
+      // The same write takes back the recorded override (all three columns, which the
+      // migration's CHECK keeps together). It was given by reason code for what the earlier
+      // attempt showed, and a restart is a new attempt: it must not cover what this one will.
       const guard = restartGuard(plan.row);
       const reset = await db
         .prepare(
           `UPDATE publication_reviews
               SET state = 'dispatched', detail = NULL, nonce = ?, claimed_at = NULL,
                   decided_at = NULL, created_at = datetime('now'),
-                  attempts = attempts + ?, started_by = COALESCE(?, started_by)
+                  attempts = attempts + ?, started_by = COALESCE(?, started_by),
+                  override_by = NULL, override_at = NULL, override_reasons = NULL
             WHERE ${guard.sql}`,
         )
         .bind(nonce, plan.extraCalls, args.adminUserId ?? null, ...guard.binds)
@@ -583,7 +588,8 @@ async function recordUnconfigured(
         `UPDATE publication_reviews
             SET state = 'errored', detail = 'dispatch_unconfigured', nonce = NULL,
                 claimed_at = NULL, decided_at = datetime('now'),
-                attempts = attempts + ?, started_by = COALESCE(?, started_by)
+                attempts = attempts + ?, started_by = COALESCE(?, started_by),
+                override_by = NULL, override_at = NULL, override_reasons = NULL
           WHERE ${guard.sql}`,
       )
       .bind(plan.extraCalls, adminUserId ?? null, ...guard.binds)

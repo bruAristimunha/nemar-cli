@@ -37,7 +37,6 @@
 
 import {
   REPORT_VERSION,
-  type ScreenDescription,
   type ScreenError,
   type ScreenGate,
   type ScreenReport,
@@ -47,7 +46,6 @@ import {
   screenGate,
   stateOf,
 } from "../../../shared/identifier-screen-report.js";
-import { PUBLICATION_STEPS } from "../../../shared/publication-steps.js";
 import { auditLogStatement } from "../db/audit-log.js";
 import type { Bindings } from "../types/bindings.js";
 import {
@@ -65,14 +63,22 @@ import {
   signIdentifierScreenCallbackToken,
   triggerIdentifierScreenRun,
 } from "./github.js";
-import { isScreenExempt, readStoredReport, readStoredState } from "./identifier-screen-stored.js";
+import {
+  type ScreenView,
+  isScreenExempt,
+  readStoredReport,
+  readStoredState,
+  screenView,
+} from "./identifier-screen-stored.js";
 import { reviewInFlightSql } from "./publication-review-rows.js";
 import { publicationReviewEmailSection, reviewEnabled } from "./publication-review-view.js";
 
-// The two readers of a stored screen, and the sandbox exemption, live in their own module so the
-// publication review (ADR 0102) can use them without importing this one; re-exported for every
-// existing importer.
-export { isScreenExempt, readStoredReport, readStoredState };
+// The two readers of a stored screen, the sandbox exemption and the screen's status view live in
+// their own module so the publication review (ADR 0102) can use them without importing this one;
+// re-exported for every existing importer. The same goes for the function that says whether an
+// approval has started publishing, which moved to `shared/publication-steps.ts`.
+export { type ScreenView, isScreenExempt, readStoredReport, readStoredState, screenView };
+export { hasStartedPublishing } from "../../../shared/publication-steps.js";
 
 /**
  * A screen still pending this long after its dispatch has not reported, and is
@@ -91,36 +97,6 @@ export const SCREEN_REPORT_DEADLINE_MINUTES = 50;
 export const SCREEN_EMAIL_RETRY_AFTER_MINUTES = 5;
 
 /**
- * The steps an approval runs BEFORE it changes anything: validation only. The
- * first step after them, `s3_public_read`, is the first mutation (it makes the
- * data publicly readable; shared/publication-steps.ts says so where it orders
- * it). A resumed approval skips the identifier screen gate only once a step
- * outside this list has completed: from then on the publication is underway and
- * its own later steps commit to `main`, so a head check would refuse it halfway,
- * stranding a half-published dataset. Before then nothing is public, and a
- * resume, or a re-dispatch, is gated exactly like a fresh run, because the
- * depositor may have pushed new content after the earlier attempt stopped.
- */
-export const PRE_PUBLICATION_STEPS: readonly string[] = PUBLICATION_STEPS.slice(
-  0,
-  PUBLICATION_STEPS.indexOf("s3_public_read"),
-);
-
-/** True once an approval has completed a step that changed something (see {@link PRE_PUBLICATION_STEPS}). */
-export function hasStartedPublishing(stepsCompletedJson: string | null | undefined): boolean {
-  let steps: unknown;
-  try {
-    steps = JSON.parse(stepsCompletedJson || "[]");
-  } catch {
-    return false;
-  }
-  return (
-    Array.isArray(steps) &&
-    steps.some((s) => typeof s === "string" && !PRE_PUBLICATION_STEPS.includes(s))
-  );
-}
-
-/**
  * Rows the watchdog handles per tick, in EACH of its two passes. Each row costs a
  * few D1 statements and one Resend call per admin; the tick it rides also runs
  * the auto-import, so the bound keeps a backlog from spending that tick's budget.
@@ -132,13 +108,6 @@ export const IDENTIFIER_SCREEN_BLOCK_REASON = "identifier_screen_findings";
 
 /** Where the workflow posts its report, under API_BASE_URL. */
 export const IDENTIFIER_SCREEN_CALLBACK_PATH = "/webhooks/identifier-screen-result";
-
-/** What an exempt dataset's email and status say about the screen. Worker-fixed words. */
-export const EXEMPT_SCREEN_DESCRIPTION: ScreenDescription = {
-  headline: "Identifier screen: not applicable (sandbox)",
-  tone: "note",
-  lines: ["Sandbox (xx) datasets never publish real data, so they are not screened."],
-};
 
 /**
  * Every column the screen owns, reset to NULL. Spliced into the UPDATE that
@@ -173,24 +142,6 @@ export const RERUN_GUARD_SQL = `AND status IN ('requested', 'blocked', 'approvin
 /** A report the Worker writes itself, for a screen that produced none. */
 export function workerErrorReport(error: ScreenError): ScreenReport {
   return parseScreenReport({ version: REPORT_VERSION, scanner: null, head: null, error });
-}
-
-/** The screen as a status view shows it. */
-export interface ScreenView {
-  /** The stored state; `exempt` for a sandbox dataset; null when no screen was started. */
-  state: ScreenState | "exempt" | null;
-  headline: string;
-  tone: ScreenDescription["tone"];
-  lines: string[];
-}
-
-/** One reading of a row's screen, for every surface that shows it. */
-export function screenView(datasetId: string, rawStatus: unknown, rawReport: unknown): ScreenView {
-  if (isScreenExempt(datasetId)) return { state: "exempt", ...EXEMPT_SCREEN_DESCRIPTION };
-  const state = readStoredState(rawStatus);
-  const report = state === null ? null : readStoredReport(rawReport);
-  const d = describeScreen(state, report);
-  return { state, headline: d.headline, tone: d.tone, lines: d.lines };
 }
 
 /** The sentence that tells an admin what approval may do next, by gate. Worker-fixed words. */

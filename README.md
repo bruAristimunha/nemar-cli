@@ -321,18 +321,28 @@ nemar dataset publish resend <dataset-id>  # Resend admin notification
 
 # Admin: Manage publication requests
 nemar admin publish list                   # List all publication requests
-nemar admin publish list --pending         # List pending requests only
+nemar admin publish list --status requested  # One status (requested, approving, blocked, published, denied)
+nemar admin publish list --needs-me        # Only the requests you can act on now
+nemar admin publish show <dataset-id>      # The automated review of one request, in full
+nemar admin publish start <dataset-id>     # Start the automated review (--all: every request waiting)
+nemar admin publish next                   # One card per request that needs you: y approves, n denies, c comments
 nemar admin publish approve <dataset-id>   # Approve and publish dataset
+nemar admin publish approve <dataset-id> --force
+                                           # Approve over a review that is not a pass
 nemar admin publish approve <dataset-id> --acknowledge-identifier-screen "<reason>"
                                            # Approve over a screen that needs review
-nemar admin publish screen <dataset-id>    # Re-run the identifier screen
 nemar admin publish deny <dataset-id>      # Deny publication request
+nemar admin publish screen <dataset-id>    # Re-run the identifier screen
 ```
 
 A publication request is screened for identifying information before the
 admins are mailed; the mail, `publish status` and `admin publish list` state
 the result, and approval waits for a screen that is clear for the current
 `main`.
+Each request also gets an automated review of what the depositor submitted,
+which `admin publish list` and `admin publish show` state.
+An approval over a review that is not a pass needs `--force` and is recorded
+with your account.
 
 ### Admin Commands
 

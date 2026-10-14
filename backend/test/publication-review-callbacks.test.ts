@@ -1105,12 +1105,38 @@ describe("a failed submission minimum re-blocks the request", () => {
 });
 
 describe("a web approval's claim does not outlive the block it meets", () => {
-  /** The website's Approve click, as the route sees it. */
-  const click = (key: string, datasetId = PROD_DATASET) =>
+  /**
+   * The website's Approve click, as the route sees it. With the review on, a click while the
+   * review is still running needs the administrator's override of `review_running` (ADR 0102): the
+   * tests that click over a running review pass it, naming the review they were shown. A click
+   * with `reviewOff` is made with the review's flag off, which is how a test about the claim's
+   * lifecycle stays about that where the review at the commit would refuse the click.
+   */
+  const click = (
+    key: string,
+    o: { datasetId?: string; overrideFor?: number; reviewOff?: boolean } = {},
+  ) =>
     h.app.request(
-      `/admin/publish/${datasetId}/approve-dispatch`,
-      { method: "POST", headers: { Authorization: `Bearer ${key}`, "X-CLI-Version": "99.0.0" } },
-      h.env(),
+      `/admin/publish/${o.datasetId ?? PROD_DATASET}/approve-dispatch`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${key}`,
+          "X-CLI-Version": "99.0.0",
+          ...(o.overrideFor === undefined ? {} : { "Content-Type": "application/json" }),
+        },
+        ...(o.overrideFor === undefined
+          ? {}
+          : {
+              body: JSON.stringify({
+                override_publication_review: {
+                  review_id: o.overrideFor,
+                  reasons: ["review_running"],
+                },
+              }),
+            }),
+      },
+      o.reviewOff ? h.env({ PUBLICATION_REVIEW_ENABLED: undefined }) : h.env(),
     );
 
   const claimOf = (requestId: number) => {
@@ -1126,7 +1152,7 @@ describe("a web approval's claim does not outlive the block it meets", () => {
     // orchestrator's own walk-back to `blocked` clears both, for the reason given there.
     const admin = await keyedUser("rev_clicker", "admin");
     const { requestId, reviewId } = dispatched();
-    expect((await click(admin.key)).status).toBe(202);
+    expect((await click(admin.key, { overrideFor: reviewId })).status).toBe(202);
     expect(claimOf(requestId)).toEqual({
       approval_requested_by: admin.id,
       approval_dispatched_at: expect.any(String),
@@ -1160,7 +1186,7 @@ describe("a web approval's claim does not outlive the block it meets", () => {
     const depositorKey = await keyFor(depositorId, "rev_depositor");
 
     await withFakeResend(async () => {
-      expect((await click(clicker.key)).status).toBe(202);
+      expect((await click(clicker.key, { overrideFor: reviewId })).status).toBe(202);
       const token = await h.tokenFor(reviewId);
       await h.claim(reviewId, token);
       await h.result(reviewId, { outcome: "reported", report: failing() }, token);
@@ -1191,7 +1217,10 @@ describe("a web approval's claim does not outlive the block it meets", () => {
     );
     const rows = ((await list.json()) as { requests: Record<string, unknown>[] }).requests;
     expect(rows.find((r) => r.dataset_id === datasetId)?.approval_in_flight).toBe(false);
-    expect((await click(next.key)).status).toBe(202);
+    // At the same commit the review's report still says the minimum failed, a hard reason the
+    // gate refuses with the review on (its own tests own that). This test is about the lease, so
+    // the click is made with the review off.
+    expect((await click(next.key, { reviewOff: true })).status).toBe(202);
     expect(claimOf(requestId).approval_requested_by).toBe(next.id);
   });
 
@@ -1199,7 +1228,7 @@ describe("a web approval's claim does not outlive the block it meets", () => {
     // Only the re-block releases it: a met minimum leaves the request, and the run, alone.
     const admin = await keyedUser("rev_clicker", "admin");
     const { requestId, reviewId } = dispatched();
-    expect((await click(admin.key)).status).toBe(202);
+    expect((await click(admin.key, { overrideFor: reviewId })).status).toBe(202);
     const token = await h.tokenFor(reviewId);
     await withFakeResend(async () => {
       await h.claim(reviewId, token);

@@ -11,8 +11,23 @@ import { join } from "node:path";
 import { BIDS_DATATYPES } from "../backend/src/services/datacite";
 import * as prompt from "../scripts/ci/pr-review-prompt";
 import {
+  APPROVAL_REFUSAL_ERROR_CODES,
+  IDENTIFIER_SCREEN_ERROR_CODES,
+  OVERRIDE_INSIDE_WEB_APPROVAL_MESSAGE,
+  PUBLICATION_REFUSAL_ERROR_CODES,
+  REQUEST_CHANGED_MESSAGE,
+} from "../shared/contract/publication";
+import {
+  OVERRIDE_FIELD,
+  PUBLICATION_COMMENT_ERROR_CODES,
+  PUBLICATION_COMMENT_MAX_LENGTH,
   PUBLICATION_REVIEW_ERROR_CODES,
+  PUBLICATION_REVIEW_NOT_CLEAR_CODE,
   PUBLICATION_REVIEW_VIEW_KINDS,
+  type PublicationReviewGateRefusalBody,
+  type PublicationReviewScreenView,
+  REQUEST_BLOCKED_CODE,
+  type ReasonView,
   START_NOT_HANDED_OVER_REASONS,
   START_REASONS,
   START_REFUSED_REASONS,
@@ -36,6 +51,7 @@ import {
   MAX_PUBLICATION_FINDINGS,
   NEVER_REACHED_MODEL,
   NOT_ASSESSED_LINE,
+  OVERRIDE_REASONS,
   PLATFORM_DAILY_CAP,
   PUBLICATION_DECLINE_DETAILS,
   PUBLICATION_FINDING_CODES,
@@ -59,6 +75,8 @@ import {
   REVIEW_DATATYPES,
   REVIEW_DOCUMENTS,
   REVIEW_FORMATS,
+  REVIEW_GATE_REFUSALS,
+  REVIEW_GATE_REFUSAL_TEXT,
   REVIEW_OVERDUE_VIEW_MINUTES,
   REVIEW_UNREADABLE_HEADLINE,
   type Reason,
@@ -73,14 +91,20 @@ import {
   describePublicationReview,
   describeUnreadableReview,
   effectiveVersionOf,
+  hardReasonsOf,
   isWithheld,
+  overrideClassReasonsOf,
   parsePublicationCallbackOutcome,
   parsePublicationReviewEvidence,
   parsePublicationReviewReport,
   reasonLine,
   reasonsOf,
   reportReasons,
+  reviewGateRefusalText,
+  shownBlockReason,
+  startOffered,
   stricterOf,
+  uncoveredByOverride,
   verdictOf,
 } from "../shared/publication-review";
 import { README_CANDIDATES, firstReadme } from "../shared/readme-candidates";
@@ -841,7 +865,7 @@ describe("the parser refuses what the job must never send", () => {
 
 describe("free text is reduced to plain words, never refused for its content", () => {
   const hostile =
-    "@admins see [this](https://evil.example/x) <img src=x onerror=1> #12 GH-7 **bold** ‮evil `code` ![i](data:x) www.evil.example";
+    "@admins see [this](https://evil.example/x) <img src=x onerror=1> #12 GH-7 **bold** \u202eevil `code` ![i](data:x) www.evil.example";
 
   test("a hostile note and summary reach the parsed report as plain words", () => {
     const parsed = parsePublicationReviewReport(
@@ -852,7 +876,7 @@ describe("free text is reduced to plain words, never refused for its content", (
       }),
     );
     for (const text of [parsed.findings[0].note, parsed.summary]) {
-      expect(text).not.toMatch(/[@#<>`*‮[\]]/);
+      expect(text).not.toMatch(/[@#<>`*\u202e[\]]/);
       expect(text).not.toContain("evil.example");
       expect(text).not.toMatch(/https?:/);
       expect(text).toContain("(link removed)");
@@ -1289,6 +1313,15 @@ describe("the reasons table", () => {
       if (REASONS[c].clearedBy === "override") expect(REASONS[c].cure).toContain("override");
       else expect(REASONS[c].cure).not.toContain("--force");
     }
+  });
+
+  test("a failed minimum's cure is true of a request in any status: the depositor fixes it, and only a waiting request is moved to blocked", () => {
+    // The store moves only a `requested` request to blocked, so a cure that promised the move
+    // would be false for an approval that stopped behind the same reason (it is denied instead).
+    expect(REASONS.submission_minimum_failed.cure).toBe(
+      "The depositor fixes the dataset and requests publication again; a request still waiting for its decision is moved to blocked.",
+    );
+    expect(REASONS.submission_minimum_failed.cure).not.toContain("The request is moved to blocked");
   });
 
   test("the order is exactly ADR 0102's: the hard reasons, the screen's acknowledgment, then the overrides", () => {
@@ -1777,7 +1810,7 @@ describe("reportReasons, over every report dimension", () => {
 
 describe("describePublicationReview", () => {
   const hostile =
-    "@admins [click](https://evil.example) <script>x</script> #1 GH-2 `code` ‮ www.evil.example";
+    "@admins [click](https://evil.example) <script>x</script> #1 GH-2 `code` \u202e www.evil.example";
   const hostileReport = parsePublicationReviewReport(
     reportBody({
       summary: hostile,
@@ -1927,11 +1960,11 @@ describe("describePublicationReview", () => {
     });
     // The model's summary is a field of its own, in plain words; it is never one of the lines.
     expect(d.summary).not.toBeNull();
-    expect(d.summary).not.toMatch(/[@#<>`‮]/);
+    expect(d.summary).not.toMatch(/[@#<>`\u202e]/);
     expect(d.summary).not.toContain("evil.example");
     const text = d.lines.join("\n");
     expect(text).not.toContain("summary");
-    expect(text).not.toMatch(/[@#<>`‮]/);
+    expect(text).not.toMatch(/[@#<>`\u202e]/);
     expect(text).not.toContain("evil.example");
     expect(text).not.toContain("script");
     // The question's line names its finding by its closed label, not by the model's note.
@@ -2319,5 +2352,833 @@ describe("the version an approval would publish", () => {
       "utf8",
     );
     expect(src).toContain(`String(datasetDesc.Version || "${DEFAULT_PUBLICATION_VERSION}")`);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Phase 2's contract (ADR 0102, sections 5 and 8): what an administrator's override clears, when a
+// start is offered, where an approval stands, and the approval gate's words. The oracle lists are
+// written out here from the ADR's table, so editing the reasons table cannot move them without
+// this file being edited in the same change.
+// ---------------------------------------------------------------------------------------------
+
+/** What nothing clears (ADR 0102, section 5). */
+const HARD: readonly ReasonCode[] = [
+  "request_blocked",
+  "submission_minimum_failed",
+  "identifier_screen_blocks",
+  "identifier_screen_not_run",
+  "identifier_screen_pending",
+  "identifier_screen_stale",
+  "version_kept_after_anonymous_release",
+];
+
+/** What the screen's recorded acknowledgment clears: the one reason that is neither hard nor an override's. */
+const ACK: ReasonCode = "identifier_screen_needs_acknowledgment";
+
+/** What an administrator's override clears, in the table's order. */
+const OVERRIDABLE: readonly ReasonCode[] = [
+  "question_failed",
+  "steering_attempt",
+  "bids_failed_at_review",
+  "version_already_released",
+  "version_malformed",
+  "stored_verdict_fail",
+  "review_not_started",
+  "review_running",
+  "review_did_not_report",
+  "review_limit_reached",
+  "review_could_not_run",
+  "text_withheld",
+  "question_unknown",
+  "bids_unconcluded_at_review",
+  "version_missing",
+  "doi_state_unexpected",
+];
+
+describe("what an administrator's override clears", () => {
+  test("OVERRIDE_REASONS is exactly the reasons the ADR says an override clears, in the table's order", () => {
+    expect([...OVERRIDE_REASONS]).toEqual([...OVERRIDABLE]);
+  });
+
+  test("every reason is hard, the screen's, or cleared by an override: exactly one of the three", () => {
+    for (const code of REASON_CODES) {
+      const classes = [HARD.includes(code), code === ACK, OVERRIDABLE.includes(code)];
+      expect({ code, classes: classes.filter(Boolean).length }).toEqual({ code, classes: 1 });
+      expect({ code, hard: HARD_REASONS.includes(code) }).toEqual({
+        code,
+        hard: HARD.includes(code),
+      });
+      expect({ code, override: OVERRIDE_REASONS.includes(code) }).toEqual({
+        code,
+        override: OVERRIDABLE.includes(code),
+      });
+    }
+    expect(HARD.length + 1 + OVERRIDABLE.length).toBe(REASON_CODES.length);
+  });
+
+  test("hardReasonsOf keeps exactly the hard reasons, in the order given, as the objects given", () => {
+    expect(hardReasonsOf([])).toEqual([]);
+    for (const code of REASON_CODES) {
+      const reason = { code, detail: "x", extra: 7 };
+      const got = hardReasonsOf([reason]);
+      expect({ code, kept: got.length }).toEqual({ code, kept: HARD.includes(code) ? 1 : 0 });
+      if (got.length === 1) expect(got[0]).toBe(reason);
+    }
+    const mixed = [
+      R("question_failed", "meets_standards"),
+      R("identifier_screen_stale"),
+      R(ACK),
+      R("request_blocked", "min_requirements_failed"),
+      R("review_running"),
+      R("version_kept_after_anonymous_release"),
+    ];
+    expect(hardReasonsOf(mixed).map((r) => r.code)).toEqual([
+      "identifier_screen_stale",
+      "request_blocked",
+      "version_kept_after_anonymous_release",
+    ]);
+  });
+
+  test("overrideClassReasonsOf keeps exactly the override-class reasons, in the order given, as the objects given", () => {
+    expect(overrideClassReasonsOf([])).toEqual([]);
+    for (const code of REASON_CODES) {
+      const reason = { code, detail: "x", extra: 7 };
+      const got = overrideClassReasonsOf([reason]);
+      expect({ code, kept: got.length }).toEqual({
+        code,
+        kept: OVERRIDABLE.includes(code) ? 1 : 0,
+      });
+      if (got.length === 1) expect(got[0]).toBe(reason);
+    }
+    const mixed = [
+      R("request_blocked", "min_requirements_failed"),
+      R("text_withheld", "readme"),
+      R("identifier_screen_stale"),
+      R(ACK),
+      R("question_failed", "meets_standards"),
+      R("review_running"),
+      R("version_missing"),
+    ];
+    expect(overrideClassReasonsOf(mixed).map((r) => r.code)).toEqual([
+      "text_withheld",
+      "question_failed",
+      "review_running",
+      "version_missing",
+    ]);
+    // Every reason is exactly one of hard, the acknowledgment's or override-class.
+    for (const code of REASON_CODES) {
+      const reasons = [R(code)];
+      expect(
+        hardReasonsOf(reasons).length +
+          overrideClassReasonsOf(reasons).length +
+          (code === ACK ? 1 : 0),
+      ).toBe(1);
+    }
+  });
+
+  test("uncoveredByOverride names the override-class reasons the override did not name, and never a hard or acknowledgment one", () => {
+    for (const code of REASON_CODES) {
+      const overridable = OVERRIDABLE.includes(code);
+      expect({ code, uncovered: uncoveredByOverride([R(code)], []) }).toEqual({
+        code,
+        uncovered: overridable ? [code] : [],
+      });
+      // Named: covered. Another reason named: still uncovered.
+      expect(uncoveredByOverride([R(code)], [code])).toEqual([]);
+      expect({ code, uncovered: uncoveredByOverride([R(code)], ["text_withheld"]) }).toEqual({
+        code,
+        uncovered: overridable && code !== "text_withheld" ? [code] : [],
+      });
+    }
+    expect(uncoveredByOverride([], [])).toEqual([]);
+    expect(uncoveredByOverride([], ["question_failed"])).toEqual([]);
+  });
+
+  test("uncoveredByOverride returns every uncovered reason, each once, in the table's order whatever the order given", () => {
+    const reasons = [
+      R("text_withheld", "readme"),
+      R("question_failed", "meets_standards"),
+      R("question_failed", "name_adequate"),
+      R("identifier_screen_stale"),
+      R(ACK),
+      R("version_missing"),
+      R("doi_state_unexpected"),
+    ];
+    const want: ReasonCode[] = ["question_failed", "text_withheld", "doi_state_unexpected"];
+    expect(uncoveredByOverride(reasons, ["version_missing"])).toEqual(want);
+    expect(uncoveredByOverride([...reasons].reverse(), ["version_missing"])).toEqual(want);
+    expect(
+      uncoveredByOverride(reasons, ["version_missing", "text_withheld", "doi_state_unexpected"]),
+    ).toEqual(["question_failed"]);
+    expect(
+      uncoveredByOverride(reasons, [
+        "doi_state_unexpected",
+        "version_missing",
+        "text_withheld",
+        "question_failed",
+      ]),
+    ).toEqual([]);
+  });
+
+  test("a word that is not a reason covers nothing and breaks nothing; a hard or acknowledgment word covers nothing either", () => {
+    const reasons = [R("question_failed", "meets_standards"), R("text_withheld", "readme")];
+    const noise = ["bogus", "", " question_failed", "QUESTION_FAILED", "__proto__", "constructor"];
+    expect(uncoveredByOverride(reasons, noise)).toEqual(["question_failed", "text_withheld"]);
+    expect(uncoveredByOverride(reasons, [...noise, ...HARD, ACK, "question_failed"])).toEqual([
+      "text_withheld",
+    ]);
+    // Naming a hard reason does not make it overridable: with one standing, hardReasonsOf says so.
+    expect(uncoveredByOverride([R("request_blocked")], ["request_blocked"])).toEqual([]);
+    expect(hardReasonsOf([R("request_blocked")])).toHaveLength(1);
+  });
+
+  test("over every reason set of a pool and every override over it, uncoveredByOverride is the set difference", () => {
+    const pool: ReasonCode[] = [
+      "question_failed",
+      "text_withheld",
+      "review_running",
+      "identifier_screen_stale",
+      ACK,
+      "version_missing",
+    ];
+    let checked = 0;
+    for (let rs = 0; rs < 1 << pool.length; rs++) {
+      const reasons = pool.filter((_, i) => rs & (1 << i)).map((c) => R(c));
+      for (let gs = 0; gs < 1 << pool.length; gs++) {
+        const given: string[] = pool.filter((_, i) => gs & (1 << i));
+        if (gs & 1) given.push("bogus");
+        const want = OVERRIDABLE.filter(
+          (c) => reasons.some((r) => r.code === c) && !given.includes(c),
+        );
+        expect(uncoveredByOverride(reasons, given)).toEqual(want);
+        checked++;
+      }
+    }
+    expect(checked).toBe((1 << pool.length) * (1 << pool.length));
+  });
+});
+
+describe("the block reason a surface shows", () => {
+  test("a blocked request's plain word, and nothing else", () => {
+    const show = (status: string, block_reason: string | null) =>
+      shownBlockReason({ status, block_reason });
+    expect(show("blocked", "min_requirements_failed")).toBe("min_requirements_failed");
+    expect(show("blocked", "a")).toBe("a");
+    expect(show("blocked", "a".repeat(64))).toBe("a".repeat(64));
+    expect(show("blocked", "a".repeat(65))).toBeNull();
+    for (const bad of ["Not A Word!", "1abc", "_abc", "bids validation", "", "ÀB", "a\nb"]) {
+      expect(show("blocked", bad)).toBeNull();
+    }
+    expect(show("blocked", null)).toBeNull();
+    // A request that is not blocked shows none, whatever its column says.
+    for (const status of ["requested", "approving", "denied", "published"]) {
+      expect(show(status, "min_requirements_failed")).toBeNull();
+    }
+  });
+
+  test("reasonsOf shows the same word: one rule, two readers", () => {
+    const clean: LiveFacts = {
+      request: { status: "blocked", block_reason: "min_requirements_failed", anonymous: false },
+      screen: { gate: "clear", head: HEAD, acknowledged_by: null, head_current: null },
+      versions: {
+        version_row_exists: false,
+        prior_anonymous_request: false,
+        first_published: false,
+      },
+      doi: { concept_doi_present: false, concept_ezid_status: null },
+    };
+    for (const block_reason of ["min_requirements_failed", "Not A Word!", null, "x".repeat(70)]) {
+      const live = { ...clean, request: { ...clean.request, block_reason } };
+      const blocked = reasonsOf({ live, row: { kind: "none" } }).find(
+        (r) => r.code === "request_blocked",
+      );
+      expect(blocked?.detail).toBe(shownBlockReason(live.request));
+    }
+  });
+});
+
+describe("startOffered is the rule next uses, not a second one", () => {
+  const common = {
+    datasetId: "nm000123",
+    applies: true,
+    enabled: true,
+    outcome: null,
+    model: "claude-haiku-5-5",
+    head: HEAD,
+    version: "1.2.0",
+  } as const;
+
+  const nextOf = (reasons: Reason[], row: ReviewRowView, startable: boolean) =>
+    describePublicationReview({ ...common, reasons, row, startable }).next;
+
+  test("over every live fact, review row and status, a start is offered exactly when next is the start command", () => {
+    const seen = new Map<string, { reasons: Reason[]; row: ReviewRowView }>();
+    for (const live of liveFacts()) {
+      for (const { row } of ROWS) {
+        const reasons = reasonsOf({ live, row });
+        // `startOffered` and `next` read the reasons' codes and the row's kind and age, nothing else.
+        const key = `${reasons.map((r) => r.code).join(",")}|${row.kind}|${
+          row.kind === "dispatched" ? row.overdue : ""
+        }`;
+        if (!seen.has(key)) seen.set(key, { reasons, row });
+      }
+    }
+    // The rule, restated here by hand from ADR 0102: a request waiting for its decision, a row a
+    // start can create or restart, a reason whose cure is "start it", and no hard reason.
+    const START_CURES: readonly ReasonCode[] = [
+      "review_not_started",
+      "review_did_not_report",
+      "review_limit_reached",
+      "review_could_not_run",
+    ];
+    const restartable = (row: ReviewRowView) =>
+      ["none", "declined", "errored", "unreported"].includes(row.kind) ||
+      (row.kind === "dispatched" && row.overdue);
+    const oracle = (reasons: Reason[], row: ReviewRowView, startable: boolean) =>
+      startable &&
+      restartable(row) &&
+      reasons.some((r) => START_CURES.includes(r.code)) &&
+      !reasons.some((r) => HARD.includes(r.code));
+    const mismatches: string[] = [];
+    let offered = 0;
+    let withheld = 0;
+    for (const { reasons, row } of seen.values()) {
+      for (const startable of [true, false]) {
+        const next = nextOf(reasons, row, startable);
+        const wants = next?.startsWith("nemar admin publish start ") ?? false;
+        const got = startOffered({ reasons, row, startable });
+        const rule = oracle(reasons, row, startable);
+        if (got) offered++;
+        else withheld++;
+        if ((got !== wants || got !== rule) && mismatches.length < 5) {
+          mismatches.push(
+            `${row.kind} startable=${startable} ${reasons.map((r) => r.code).join(",")}: startOffered=${got}, next=${next}, rule=${rule}`,
+          );
+        }
+      }
+    }
+    expect(mismatches).toEqual([]);
+    // The matrix reaches both answers, and a lot of shapes.
+    expect(seen.size).toBeGreaterThan(300);
+    expect(offered).toBeGreaterThan(20);
+    expect(withheld).toBeGreaterThan(300);
+  });
+
+  test("the rule, case by case: a request waiting for its decision, a row a start can create or restart, a start cure, and no hard reason", () => {
+    const rows: Array<[ReviewRowView, boolean]> = [
+      [{ kind: "none" }, true],
+      [{ kind: "dispatched", overdue: false }, false],
+      [{ kind: "dispatched", overdue: true }, true],
+      [{ kind: "unreported" }, true],
+      [{ kind: "declined", detail: "platform_limit" }, true],
+      [{ kind: "errored", detail: "model_refused" }, true],
+      [{ kind: "reported", report: PARSED_REPORTS[0].report, stored: "pass" }, false],
+      [{ kind: "reported", report: null, stored: "pass" }, false],
+    ];
+    for (const [row, restartable] of rows) {
+      for (const code of START_CURE_REASONS) {
+        for (const startable of [true, false]) {
+          expect({
+            row: row.kind,
+            code,
+            startable,
+            offered: startOffered({ reasons: [R(code)], row, startable }),
+          }).toMatchObject({ offered: startable && restartable });
+        }
+      }
+      // A reason whose cure is not a start never offers one.
+      for (const code of REASON_CODES.filter((c) => !START_CURE_REASONS.includes(c))) {
+        expect(startOffered({ reasons: [R(code)], row, startable: true })).toBe(false);
+      }
+      // A hard reason ahead of it: the screen's own cure, or none, is what an administrator gets.
+      for (const code of HARD) {
+        expect(
+          startOffered({ reasons: [R(code), R("review_not_started")], row, startable: true }),
+        ).toBe(false);
+      }
+      expect(startOffered({ reasons: [], row, startable: true })).toBe(false);
+    }
+  });
+
+  test("with the review off or not applicable there is no next command, so a start is never offered by a rendering", () => {
+    for (const [applies, enabled] of [
+      [false, true],
+      [true, false],
+      [false, false],
+    ] as const) {
+      const d = describePublicationReview({
+        ...common,
+        applies,
+        enabled,
+        reasons: [R("review_not_started")],
+        row: { kind: "none" },
+        startable: true,
+      });
+      expect(d.next).toBeNull();
+    }
+  });
+
+  test("the same reasons are offered a start in one request state and not in another", () => {
+    const reasons = [R("review_could_not_run", "model_refused")];
+    const row: ReviewRowView = { kind: "errored", detail: "model_refused" };
+    expect(startOffered({ reasons, row, startable: true })).toBe(true);
+    expect(nextOf(reasons, row, true)).toBe("nemar admin publish start nm000123");
+    expect(startOffered({ reasons, row, startable: false })).toBe(false);
+    expect(nextOf(reasons, row, false)).toBe("nemar admin publish approve nm000123 --force");
+  });
+});
+
+describe("where an approval stands (describePublicationReview's approval input)", () => {
+  const common = {
+    datasetId: "nm000123",
+    applies: true,
+    enabled: true,
+    outcome: null,
+    model: "claude-haiku-5-5",
+    head: HEAD,
+    version: "1.2.0",
+    startable: false,
+  } as const;
+  const reported: ReviewRowView = {
+    kind: "reported",
+    report: PARSED_REPORTS[0].report,
+    stored: "pass",
+  };
+  const describe_ = (
+    reasons: Reason[],
+    approval?: "none" | "stopped" | "publishing",
+    row: ReviewRowView = reported,
+    over: Record<string, unknown> = {},
+  ) => describePublicationReview({ ...common, reasons, row, approval, ...over });
+  const STARTED =
+    "This approval has started publishing; it passed the gates when it started and is continued without them.";
+
+  test("none, or no word at all, is what Phase 1 said: three cases byte for byte", () => {
+    for (const approval of [undefined, "none"] as const) {
+      expect(describe_([], approval).next).toBe("nemar admin publish approve nm000123");
+      expect(describe_([R("question_failed", "meets_standards")], approval).next).toBe(
+        "nemar admin publish approve nm000123 --force",
+      );
+      expect(describe_([R(ACK), R("text_withheld", "readme,license")], approval).next).toBe(
+        'nemar admin publish approve nm000123 --acknowledge-identifier-screen "<reason>" --force',
+      );
+      expect(
+        describe_([R("review_running")], approval, { kind: "dispatched", overdue: false }).next,
+      ).toBe("nemar admin publish show nm000123");
+    }
+    // Phase 1 gave `describe_(reasons)` and `describe_(reasons, "none")` the same lines too.
+    const reasons = [R("question_failed", "meets_standards")];
+    expect(describe_(reasons, "none")).toEqual(describe_(reasons));
+    expect(describe_(reasons).lines).not.toContain(STARTED);
+  });
+
+  test("stopped: a resume of a run that has not started publishing is gated like a fresh one, so the command is today's with --resume after the id", () => {
+    expect(describe_([], "stopped").next).toBe("nemar admin publish approve nm000123 --resume");
+    expect(describe_([R("question_failed", "meets_standards")], "stopped").next).toBe(
+      "nemar admin publish approve nm000123 --resume --force",
+    );
+    expect(describe_([R(ACK), R("text_withheld", "readme,license")], "stopped").next).toBe(
+      'nemar admin publish approve nm000123 --resume --acknowledge-identifier-screen "<reason>" --force',
+    );
+    expect(describe_([R(ACK)], "stopped").next).toBe(
+      'nemar admin publish approve nm000123 --resume --acknowledge-identifier-screen "<reason>"',
+    );
+    // What is not an approval command stays what it was: the screen's cure, none, and the wait.
+    expect(describe_([R("identifier_screen_stale")], "stopped").next).toBe(
+      "nemar admin publish screen nm000123",
+    );
+    expect(describe_([R("request_blocked")], "stopped").next).toBeNull();
+    expect(
+      describe_([R("review_running")], "stopped", { kind: "dispatched", overdue: false }).next,
+    ).toBe("nemar admin publish show nm000123");
+    // The line about having started publishing is only for a run that has.
+    expect(describe_([R("question_failed", "meets_standards")], "stopped").lines).not.toContain(
+      STARTED,
+    );
+  });
+
+  test("publishing: the command is the resume whatever the reasons, a hard one included, and never --force", () => {
+    const resume = "nemar admin publish approve nm000123 --resume";
+    expect(describe_([], "publishing").next).toBe(resume);
+    for (const code of REASON_CODES) {
+      for (const startable of [true, false]) {
+        const d = describe_([R(code)], "publishing", reported, { startable });
+        expect({ code, next: d.next }).toEqual({ code, next: resume });
+      }
+    }
+    const everything = REASON_CODES.map((c) => R(c));
+    expect(describe_(everything, "publishing").next).toBe(resume);
+    for (const row of ROWS.map((r) => r.row)) {
+      expect(describe_([R("review_not_started")], "publishing", row).next).toBe(resume);
+    }
+  });
+
+  test("an approval that is not `none` is never startable: startable true changes nothing about the words or the command", () => {
+    // `startable` and `approval` both derive from the request's status (`requested`, or
+    // `approving`/`blocked`), so the pair `startable: true` with a stopped or publishing approval
+    // describes no request. It must not be read as one that a start can reach: that would offer
+    // `start`, with no `--resume`, to a request whose route refuses it.
+    const offers = [
+      [R("review_not_started")],
+      [R("review_could_not_run")],
+      [R("review_did_not_report")],
+      [R("review_limit_reached")],
+      [R("question_failed", "meets_standards"), R("review_not_started")],
+    ];
+    for (const approval of ["stopped", "publishing"] as const) {
+      for (const reasons of offers) {
+        for (const { row } of ROWS) {
+          const asked = describe_(reasons, approval, row, { startable: true });
+          const not = describe_(reasons, approval, row, { startable: false });
+          expect([approval, reasons.map((r) => r.code), row.kind, asked]).toEqual([
+            approval,
+            reasons.map((r) => r.code),
+            row.kind,
+            not,
+          ]);
+          expect(asked.next).not.toMatch(/ start /);
+        }
+      }
+    }
+    // The same pair with no approval is the one a start can reach, so it still is.
+    const fresh = describe_(
+      [R("review_not_started")],
+      "none",
+      { kind: "none" },
+      { startable: true },
+    );
+    expect(fresh.next).toBe("nemar admin publish start nm000123");
+    expect(
+      describe_([R("review_not_started")], "stopped", { kind: "none" }, { startable: true }).next,
+    ).toBe("nemar admin publish approve nm000123 --resume --force");
+  });
+
+  test("publishing says why no gate applies, once, ahead of the standing line", () => {
+    for (const reasons of [[], [R("question_failed", "meets_standards")], [R("request_blocked")]]) {
+      const d = describe_(reasons, "publishing");
+      expect(d.lines.filter((l) => l === STARTED)).toHaveLength(1);
+      expect(d.lines.at(-1)).toBe(NOT_ASSESSED_LINE);
+      expect(d.lines.indexOf(STARTED)).toBe(d.lines.length - 2);
+    }
+    // The line is a plain sentence of this module: no command, no id, nothing to quote.
+    expect(STARTED).not.toContain("<");
+  });
+
+  // The reasons nothing clears that the depositor, not an administrator, has to act on: a stopped
+  // approval behind one of them cannot be resumed and cannot be blocked, so the way out is a denial.
+  // The screen's own gaps are left out: an administrator's `screen` (or the wait) clears those.
+  const DEPOSITOR_HARD: readonly ReasonCode[] = [
+    "request_blocked",
+    "submission_minimum_failed",
+    "identifier_screen_blocks",
+    "version_kept_after_anonymous_release",
+  ];
+  const SCREEN_GAPS: readonly ReasonCode[] = [
+    "identifier_screen_not_run",
+    "identifier_screen_pending",
+    "identifier_screen_stale",
+  ];
+  const STOPPED_HARD =
+    "This approval stopped before it started publishing, and a reason that nothing clears now stands, so it cannot be resumed. Deny it with a reason (nemar admin publish deny nm000123); the depositor can request again.";
+
+  test("stopped behind a reason nothing clears says it cannot be resumed and how to end it, once, ahead of the standing line", () => {
+    for (const code of DEPOSITOR_HARD) {
+      const d = describe_([R(code)], "stopped");
+      expect({ code, n: d.lines.filter((l) => l === STOPPED_HARD).length }).toEqual({ code, n: 1 });
+      expect(d.lines.at(-1)).toBe(NOT_ASSESSED_LINE);
+      expect(d.lines.indexOf(STOPPED_HARD)).toBe(d.lines.length - 2);
+      // Nothing else moved: a hard reason other than the screen's has no command, as before.
+      expect(d.next).toBeNull();
+      expect(d.headline).toBe(describe_([R(code)], "none").headline);
+    }
+    // One of them among others, the screen's gaps and the overridable ones included.
+    const mixed = [
+      R("identifier_screen_stale"),
+      R("submission_minimum_failed"),
+      R("question_failed", "meets_standards"),
+    ];
+    expect(describe_(mixed, "stopped").lines.filter((l) => l === STOPPED_HARD)).toHaveLength(1);
+    // The line quotes the id the way the cures do, so a malformed one is never echoed.
+    const bad = describe_([R("submission_minimum_failed")], "stopped", reported, {
+      datasetId: `x ${SENTINEL}`,
+    });
+    expect(bad.lines).toContain(STOPPED_HARD.replace("nm000123", "<dataset>"));
+    expect(JSON.stringify(bad)).not.toContain("Zqxjvw");
+  });
+
+  test("the stopped line is for no other combination: not none, not publishing, not without a reason nothing clears, not where nothing is gated", () => {
+    const mentions = (d: { lines: string[] }) =>
+      d.lines.filter((l) => l.includes("This approval stopped before it started publishing"));
+    for (const code of DEPOSITOR_HARD) {
+      for (const approval of [undefined, "none", "publishing"] as const) {
+        expect({ code, approval, lines: mentions(describe_([R(code)], approval)) }).toEqual({
+          code,
+          approval,
+          lines: [],
+        });
+      }
+    }
+    // A stopped approval with nothing, with the overridable reasons, with the acknowledgment's and
+    // with the screen's gaps alone (the screen, or the wait, clears those): no line.
+    expect(mentions(describe_([], "stopped"))).toEqual([]);
+    for (const code of [...OVERRIDABLE, ACK, ...SCREEN_GAPS]) {
+      expect({ code, lines: mentions(describe_([R(code)], "stopped")) }).toEqual({
+        code,
+        lines: [],
+      });
+    }
+    // The screen's gaps keep the command they had: the line never contradicts it.
+    expect(describe_([R("identifier_screen_stale")], "stopped").next).toBe(
+      "nemar admin publish screen nm000123",
+    );
+    // Where nothing is gated the line is not said either: not applicable, the flag off, closed.
+    const hard = [R("submission_minimum_failed")];
+    expect(mentions(describe_(hard, "stopped", reported, { applies: false }))).toEqual([]);
+    expect(mentions(describe_(hard, "stopped", reported, { enabled: false }))).toEqual([]);
+    expect(mentions(describe_(hard, "stopped", { kind: "none" }, { enabled: false }))).toEqual([]);
+    expect(mentions(describe_(hard, "stopped", { kind: "none" }, { closed: true }))).toEqual([]);
+    expect(STOPPED_HARD.includes("<")).toBe(false);
+  });
+
+  test("the approval input changes nothing where nothing is gated: not applicable, off, and a closed request", () => {
+    for (const approval of ["none", "stopped", "publishing"] as const) {
+      const na = describe_([], approval, reported, { applies: false });
+      expect(na.next).toBeNull();
+      expect(na.lines).not.toContain(STARTED);
+      expect(describe_([], approval, { kind: "none" }, { enabled: false }).next).toBeNull();
+      expect(describe_([], approval, reported, { enabled: false }).next).toBeNull();
+    }
+    expect(describe_([], "publishing", { kind: "none" }, { closed: true }).headline).toBe(
+      "Publication review: not reviewed (the request is closed)",
+    );
+  });
+
+  test("a malformed dataset id is never quoted in the resume command", () => {
+    for (const approval of ["stopped", "publishing"] as const) {
+      const d = describe_([], approval, reported, { datasetId: `x ${SENTINEL}` });
+      expect(d.next).toBe("nemar admin publish approve <dataset> --resume");
+      expect(JSON.stringify(d)).not.toContain("Zqxjvw");
+    }
+  });
+});
+
+describe("the approval gate's words", () => {
+  test("the refusals, in declaration order (not the order the gate tries them)", () => {
+    expect([...REVIEW_GATE_REFUSALS]).toEqual([
+      "hard_reason",
+      "needs_override",
+      "override_not_covering",
+      "review_changed",
+      "no_review_row",
+      "unverified",
+    ]);
+  });
+
+  test("each has one sentence in plain ASCII words, none shared, none a placeholder for a real id", () => {
+    expect(Object.keys(REVIEW_GATE_REFUSAL_TEXT).sort()).toEqual([...REVIEW_GATE_REFUSALS].sort());
+    const sentences = new Set<string>();
+    for (const word of REVIEW_GATE_REFUSALS) {
+      const text = reviewGateRefusalText(word, "nm000123");
+      expect(text).toMatch(/^[A-Z][\x20-\x7e]*\.$/);
+      expect(text).not.toContain("<dataset>");
+      sentences.add(text);
+    }
+    expect(sentences.size).toBe(REVIEW_GATE_REFUSALS.length);
+  });
+
+  test("the sentences that send an administrator to a command name it for the dataset, and a malformed id is never quoted", () => {
+    for (const word of REVIEW_GATE_REFUSALS) {
+      const raw = REVIEW_GATE_REFUSAL_TEXT[word];
+      const quotes = raw.includes("<dataset>");
+      const text = reviewGateRefusalText(word, "nm000123");
+      expect({ word, quoted: text.includes("nm000123") }).toEqual({ word, quoted: quotes });
+      const bad = reviewGateRefusalText(word, `x ${SENTINEL}`);
+      expect(bad).not.toContain("Zqxjvw");
+      if (quotes) expect(bad).toContain("<dataset>");
+    }
+    expect(reviewGateRefusalText("needs_override", "nm000123")).toContain(
+      "nemar admin publish show nm000123",
+    );
+    expect(reviewGateRefusalText("needs_override", "nm000123")).toContain("--force");
+    expect(reviewGateRefusalText("no_review_row", "nm000123")).toContain(
+      "nemar admin publish start nm000123",
+    );
+  });
+
+  test("the sentences say what the gate does: an override never clears a hard reason, and an unreadable review is not a pass", () => {
+    const text = (w: (typeof REVIEW_GATE_REFUSALS)[number]) => reviewGateRefusalText(w, "nm000123");
+    expect(text("hard_reason")).toContain("no override");
+    expect(text("hard_reason")).not.toContain("--force");
+    expect(text("unverified")).toContain("refused");
+    expect(text("override_not_covering")).toContain("not given");
+    expect(text("review_changed")).toContain("no longer");
+  });
+});
+
+describe("the wire vocabulary the approval refusals and the comment route share", () => {
+  test("an approval refusal carries its word in `error` and its sentence in `message`, so the client leads with the sentence", () => {
+    expect([...APPROVAL_REFUSAL_ERROR_CODES]).toEqual([
+      "publication_review_not_clear",
+      "request_blocked",
+      "request_changed",
+      "override_inside_web_approval",
+    ]);
+    // The first two words are the `error` of the two bodies in the review's contract; the others
+    // are the orchestrator's own refusals (a request that changed while it was checked, and an
+    // override sent inside a web approval).
+    expect([...APPROVAL_REFUSAL_ERROR_CODES]).toEqual([
+      PUBLICATION_REVIEW_NOT_CLEAR_CODE,
+      REQUEST_BLOCKED_CODE,
+      "request_changed",
+      "override_inside_web_approval",
+    ]);
+    // One word, one family: none of them is also another family's.
+    for (const code of APPROVAL_REFUSAL_ERROR_CODES) {
+      expect(IDENTIFIER_SCREEN_ERROR_CODES).not.toContain(code);
+      expect(PUBLICATION_REFUSAL_ERROR_CODES).not.toContain(code);
+      expect(PUBLICATION_REVIEW_ERROR_CODES as readonly string[]).not.toContain(code);
+    }
+  });
+
+  test("the override's field and the comment route's words", () => {
+    expect(OVERRIDE_FIELD).toBe("override_publication_review");
+    expect([...PUBLICATION_COMMENT_ERROR_CODES]).toEqual([
+      "bad_dataset",
+      "not_found",
+      "origin_not_allowed",
+      "invalid_body",
+      "comment_not_sent",
+      "comment_not_confirmed",
+      "internal",
+    ]);
+    expect(PUBLICATION_COMMENT_MAX_LENGTH).toBe(2000);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Types. `test/publication-review-contract.test.ts` is covered by `bun run typecheck`, so the
+// `@ts-expect-error` lines below are checked there: one that stops being an error fails the
+// typecheck, which is how these pin a type's shape.
+// ---------------------------------------------------------------------------------------------
+
+describe("the gate refusal body is a union keyed on `refusal`", () => {
+  const view: ReasonView = {
+    code: "question_failed",
+    class: "fail",
+    cleared_by: "override",
+    detail: "meets_standards",
+    sentence: "A question failed.",
+    cure: "Read it.",
+  };
+  const unverified: PublicationReviewGateRefusalBody = {
+    error: PUBLICATION_REVIEW_NOT_CLEAR_CODE,
+    refusal: "unverified",
+    headline: REVIEW_UNREADABLE_HEADLINE,
+    message: "Could not be checked.",
+    outcome: null,
+    reasons: [],
+    uncovered: [],
+    review_id: null,
+    fact: "review",
+  };
+  const reasoned: PublicationReviewGateRefusalBody = {
+    error: PUBLICATION_REVIEW_NOT_CLEAR_CODE,
+    refusal: "needs_override",
+    headline: "Publication review: action required",
+    message: "Read it.",
+    outcome: "action_required",
+    reasons: [view],
+    uncovered: ["question_failed"],
+    review_id: 7,
+  };
+
+  /** What a client prints for a refusal: a switch over every word, which must stay exhaustive. */
+  function subject(body: PublicationReviewGateRefusalBody): string {
+    switch (body.refusal) {
+      case "unverified":
+        return `could not read the ${body.fact}`;
+      case "hard_reason":
+      case "needs_override":
+      case "override_not_covering":
+      case "review_changed":
+      case "no_review_row":
+        return `${body.reasons.length} reasons, review ${body.review_id}`;
+      default: {
+        const unreachable: never = body;
+        return unreachable;
+      }
+    }
+  }
+
+  test("a client switches on the word and reads each variant's own fields", () => {
+    expect(subject(unverified)).toBe("could not read the review");
+    expect(subject(reasoned)).toBe("1 reasons, review 7");
+    // Every word of the list is a case of the switch: the union and the list cannot drift apart.
+    for (const word of REVIEW_GATE_REFUSALS) {
+      const body: PublicationReviewGateRefusalBody =
+        word === "unverified" ? unverified : { ...reasoned, refusal: word };
+      expect(subject(body)).not.toBe("");
+    }
+  });
+
+  test("the types refuse what the wire never carries (checked by `bun run typecheck`)", () => {
+    const wrong: PublicationReviewGateRefusalBody[] = [
+      // @ts-expect-error a refusal of a review it read carries no `fact`
+      { ...reasoned, refusal: "hard_reason", fact: "request" },
+      // @ts-expect-error `unverified` carries no reasons
+      { ...unverified, reasons: [view] },
+      // @ts-expect-error `unverified` carries no outcome
+      { ...unverified, outcome: "pass" },
+      // @ts-expect-error `unverified` has no review id
+      { ...unverified, review_id: 3 },
+      // @ts-expect-error `unverified` without the check that failed
+      { ...unverified, fact: undefined },
+      // @ts-expect-error a word outside the closed list
+      { ...reasoned, refusal: "maybe" },
+    ];
+    // The values are only built here to be typed; nothing about them is asserted at run time.
+    expect(wrong).toHaveLength(6);
+  });
+
+  test("the screen's state is a stored state, `exempt` or null (checked by `bun run typecheck`)", () => {
+    const screen: PublicationReviewScreenView = {
+      state: "clean",
+      headline: "Identifier screen: clean",
+      tone: "ok",
+      lines: [],
+    };
+    for (const state of ["exempt", null, "pending", "error", "unreported"] as const) {
+      expect({ ...screen, state }.state).toBe(state);
+    }
+    const wrong: PublicationReviewScreenView[] = [
+      // @ts-expect-error a state is not any string
+      { ...screen, state: "whatever" },
+    ];
+    expect(wrong).toHaveLength(1);
+  });
+});
+
+describe("the sentences the Worker's tests import are pinned here, once", () => {
+  // The other suites import these constants and never copy them, so an edit to a sentence cannot
+  // pass them by also editing a hand-copied literal. These literals are the one oracle.
+  test("the two approval refusals the orchestrator words itself", () => {
+    expect(REQUEST_CHANGED_MESSAGE).toBe(
+      "The request changed while the approval was being checked (it was denied or blocked). Read it again before approving.",
+    );
+    expect(OVERRIDE_INSIDE_WEB_APPROVAL_MESSAGE).toBe(
+      "A web approval of this request is in progress, so an override sent now would be recorded under the administrator who clicked. Wait for it to finish or stop, then approve again with --force.",
+    );
+  });
+
+  test("the refusal for a review the gate could not check covers a failed read and a failed record alike", () => {
+    // `unverified` is also what a failed write of the override, or of its audit row, answers, so
+    // it must not claim the review "could not be read".
+    expect(REVIEW_GATE_REFUSAL_TEXT.unverified).toBe(
+      "The publication review could not be checked just now, so the approval is refused. Try again.",
+    );
+    expect(reviewGateRefusalText("unverified", "nm000123")).toBe(
+      REVIEW_GATE_REFUSAL_TEXT.unverified,
+    );
   });
 });

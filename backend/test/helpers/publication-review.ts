@@ -17,10 +17,14 @@ import {
   reportReasons,
   verdictOf,
 } from "../../../shared/publication-review";
+import { PUBLICATION_STEPS } from "../../../shared/publication-steps";
 import { hashApiKey } from "../../src/services/token";
 import { SCREENED_HEAD, cleanScreenReportBody, markScreen } from "./identifier-screen";
 
 export { SCREENED_HEAD };
+
+/** Every step but the two logged no-ops: a run the gates let through reaches `published`. */
+export const DONE = PUBLICATION_STEPS.filter((s) => s !== "upload_to_zenodo" && s !== "sync_nemar");
 
 /** Words a model wrote: they must reach a person through the detail view and never through a list or a mail. */
 export const SUMMARY_SENTINEL = "SUMMARY-SENTINEL-the-model-wrote-this";
@@ -192,6 +196,12 @@ export interface SeedReview {
   nonce?: string | null;
   claimed?: boolean;
   attempts?: number;
+  /**
+   * An override recorded on the row, as the approval gate writes it: the administrator and the
+   * reason codes it was given for, stored as a JSON array. All three columns or none (the
+   * migration's CHECKs). Left out, the row has none.
+   */
+  override?: { by: number; reasons: readonly string[] };
 }
 
 const randomHex = (bytes: number) =>
@@ -228,13 +238,15 @@ export function seedPublicationReview(db: Database, r: SeedReview): number {
     .query<{ id: number }, (string | number | null)[]>(
       `INSERT INTO publication_reviews
          (request_id, dataset_id, head_sha, anonymous, requested_by, started_by, state, verdict,
-          detail, report, nonce, claimed_at, attempts, created_at, decided_at)
+          detail, report, nonce, claimed_at, attempts, created_at, decided_at,
+          override_by, override_at, override_reasons)
        VALUES (?, ?, ?, ?,
                COALESCE(?, (SELECT requested_by FROM publication_requests WHERE id = ?), 1),
                ?, ?, ?, ?, ?, ?,
                CASE WHEN ? = 1 THEN datetime('now', ?) END,
                ?, datetime('now', ?),
-               CASE WHEN ? = 'dispatched' THEN NULL ELSE datetime('now', ?) END)
+               CASE WHEN ? = 'dispatched' THEN NULL ELSE datetime('now', ?) END,
+               ?, CASE WHEN ? IS NULL THEN NULL ELSE datetime('now') END, ?)
        RETURNING id`,
     )
     .get(
@@ -256,9 +268,33 @@ export function seedPublicationReview(db: Database, r: SeedReview): number {
       `-${minutes} minutes`,
       r.state,
       `-${minutes} minutes`,
+      r.override?.by ?? null,
+      r.override?.by ?? null,
+      r.override ? JSON.stringify(r.override.reasons) : null,
     );
   if (!row) throw new Error("seedPublicationReview inserted nothing");
   return row.id;
+}
+
+/**
+ * Record an override on a review row that exists already, as the approval gate writes it: the
+ * administrator, the instant (now, unless `at` says otherwise) and the reason codes, all three at
+ * once because the migration's CHECKs need them together. A row created in the same test takes the
+ * same override through {@link seedPublicationReview}'s `override` option instead.
+ */
+export function setOverride(
+  db: Database,
+  reviewId: number,
+  by: number,
+  reasons: readonly string[],
+  at?: string,
+): void {
+  db.run(
+    `UPDATE publication_reviews
+        SET override_by = ?, override_at = COALESCE(?, datetime('now')), override_reasons = ?
+      WHERE id = ?`,
+    [by, at ?? null, JSON.stringify(reasons), reviewId],
+  );
 }
 
 /** A screen report body that the production parser accepts for `status`, at `head`. */

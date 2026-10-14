@@ -21,6 +21,7 @@ import { join } from "node:path";
 import "./setup";
 import {
   PUBLICATION_STEPS,
+  type PublicationReviewOverride,
   type PublishProgressInfo,
   approvePublication,
   stepIndexFor,
@@ -94,6 +95,8 @@ interface FakeApproveCall {
     s3_lock_continuation_token?: string;
     s3_lock_total?: number;
     skip_ci_check?: boolean;
+    acknowledge_identifier_screen?: string;
+    override_publication_review?: { review_id: number | null; reasons: string[] };
   };
 }
 
@@ -322,6 +325,67 @@ describe("approvePublication onProgress", () => {
     // Second call: total threaded back so server can skip the count sweep.
     expect(fake.calls[1].body.s3_lock_total).toBe(4963);
     expect(fake.calls[1].body.s3_lock_continuation_token).toBe("tok-2");
+  });
+
+  test("the review override rides on every call of a paged run, beside the acknowledgment (ADR 0102)", async () => {
+    // The stand-in answers a paged run with the shape the real route does. The real route cannot
+    // be made to page without an S3 bucket, so the paging loop is read here, and what the real
+    // router receives is pinned by publication-review-client.test.ts.
+    const paged = () => [
+      {
+        message: "batch 1",
+        step: "s3_lock",
+        steps_completed: [],
+        step_results: [],
+        s3_lock_continuation_token: "tok-2",
+        s3_lock_total: 200,
+        s3_lock_batch_count: 100,
+        hasMore: true,
+      },
+      {
+        message: "batch 2",
+        step: "s3_lock",
+        steps_completed: [],
+        step_results: [],
+        s3_lock_total: 200,
+        s3_lock_batch_count: 100,
+      },
+    ];
+    const override: PublicationReviewOverride = {
+      review_id: 41,
+      reasons: ["question_failed", "text_withheld"],
+    };
+    fake = startFakeApproveServer(DATASET, paged());
+    process.env.TEST_API_URL = fake.url;
+    await approvePublication(
+      DATASET,
+      false,
+      false,
+      false,
+      undefined,
+      undefined,
+      "a recorded reason",
+      override,
+    );
+    expect(fake.calls.length).toBe(2);
+    for (const call of fake.calls) {
+      expect(call.body.override_publication_review).toEqual(override);
+      expect(call.body.acknowledge_identifier_screen).toBe("a recorded reason");
+    }
+    // The paging call always resumes; the override is no reason to change that.
+    expect(fake.calls[0].body.resume).toBe(false);
+    expect(fake.calls[1].body.resume).toBe(true);
+
+    // Not given: on no call.
+    await fake.stop();
+    fake = startFakeApproveServer(DATASET, paged());
+    process.env.TEST_API_URL = fake.url;
+    await approvePublication(DATASET, false);
+    expect(fake.calls.length).toBe(2);
+    for (const call of fake.calls) {
+      expect("override_publication_review" in call.body).toBe(false);
+      expect("acknowledge_identifier_screen" in call.body).toBe(false);
+    }
   });
 
   test("calls without onProgress don't throw and still drive pagination", async () => {

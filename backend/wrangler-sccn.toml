@@ -581,11 +581,13 @@ PR_REVIEW_ENABLED = "1"
 # it must never be added there by a change that is not reviewed for it. What turning production
 # on takes is ADR 0102's "Before it is switched on": Phases 2, 3 and 4 shipped (Phase 3 closes
 # the approval attribution gap), the soak done, and then adding PUBLICATION_REVIEW_ENABLED = "1"
-# to [vars]. The flag switches the review and its gate, the hold on a request's admin mail until
-# its review has reported and the review's section in that mail, and the hand-over from the
-# pre-screen of ADR 0014 (a request the review covers is not pre-screened); the mechanical
-# refusals do not depend on it. It lives in this file and not in the dashboard for the reason
-# PR_REVIEW_ENABLED gives above.
+# to [vars]. Production must not be lit until #1604 is fixed in Phase 3: a terminal approval
+# inside a live web lease is attributed to the administrator who clicked, and has to be
+# attributed to its own caller. The flag switches the review and its gate, the hold on a
+# request's admin mail until its review has reported and the review's section in that mail, and
+# the hand-over from the pre-screen of ADR 0014 (a request the review covers is not
+# pre-screened); the mechanical refusals do not depend on it. It lives in this file and not in
+# the dashboard for the reason PR_REVIEW_ENABLED gives above.
 PUBLICATION_REVIEW_ENABLED = "1"
 
 # Daily maintenance cron for dev/staging (epic #923 Phase 7). Offset an hour

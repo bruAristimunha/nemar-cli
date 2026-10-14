@@ -93,6 +93,9 @@ const EXPECTED_ENTRIES: Record<string, number> = {
   "GET /publish/:id/review": 1,
   // ADR 0102: start (or start again) the review of the screened commit; one route, no `--all`.
   "POST /publish/:id/review/start": 1,
+  // ADR 0102: mail the depositor an administrator's typed message and leave the request open; the
+  // body is parsed by hand, so there is one handler and no validator.
+  "POST /publish/:id/comment": 1,
   "POST /publish/:id/deny": 2,
   "POST /publish/:id/approve": 2,
   // ADR 0080: launch an approval from the web by dispatching it to an executor.
@@ -220,7 +223,7 @@ describe("admin route inventory", () => {
   });
 
   test("entry total is pinned", () => {
-    expect(adminRoutes.routes.length).toBe(144);
+    expect(adminRoutes.routes.length).toBe(145);
   });
 
   // The count pin above can't see a SWAP of the two router-level middleware

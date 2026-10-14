@@ -86,13 +86,17 @@ const MODULE_EXPORTS: Record<string, string[]> = {
   publish: [
     "PUBLICATION_STEPS",
     "approvePublication",
+    "commentOnPublication",
     "denyPublication",
+    "getPublicationReview",
     "getPublishStatus",
     "isRetryablePublishError",
     "listPublishRequests",
     "requestPublication",
     "rerunIdentifierScreen",
     "resendPublishNotification",
+    "reviewErrorCode",
+    "startPublicationReview",
     "stepIndexFor",
   ],
   data: [
@@ -261,6 +265,10 @@ const POST_SPLIT_ADDITIONS = [
   "setPrReviewAuthor", // ADR 0093: PUT /admin/pr-review-authors/:login (allow or block)
   "clearPrReviewAuthor", // ADR 0093: DELETE /admin/pr-review-authors/:login
   "startPrReview", // ADR 0092: POST /admin/pr-reviews/:dataset/:pr/start (review an open pull request)
+  "getPublicationReview", // ADR 0102: GET /admin/publish/:id/review
+  "startPublicationReview", // ADR 0102: POST /admin/publish/:id/review/start
+  "commentOnPublication", // ADR 0102: POST /admin/publish/:id/comment (mails the depositor an administrator's words)
+  "reviewErrorCode", // ADR 0102: the closed word of a review route's refusal (rawBody.code, not ApiError.code)
 ];
 
 /** The api.ts monolith's runtime surface, captured at #908 commit 1. */

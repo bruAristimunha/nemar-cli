@@ -5,6 +5,12 @@
  *   GET  /admin/publish/:id/review            the review of the active request, with its history
  *   POST /admin/publish/:id/review/start      start the review of the current screened commit
  *
+ * and the shapes the approval and the comment answer with (ADR 0102, sections 8 and 9):
+ *
+ *   POST /admin/publish/:id/approve           409 for a blocked request, and when the review gate refuses
+ *   POST /admin/publish/:id/approve-dispatch  409 when the review gate refuses
+ *   POST /admin/publish/:id/comment           a typed message mailed to the depositor
+ *
  * Types and closed vocabularies only, so the Worker that answers and the CLI that prints read ONE
  * definition. Every sentence comes from `shared/publication-review.ts`: `describePublicationReview`,
  * `describeUnreadableReview` and the reasons table; a client renders the server's words and decides
@@ -12,6 +18,7 @@
  * No shape here carries a nonce, a token, a path, a file name or a screen finding.
  */
 
+import type { ScreenState } from "../identifier-screen-report.js";
 import type {
   Answer,
   PublicationDeclineDetail,
@@ -22,6 +29,7 @@ import type {
   PublicationRunError,
   Question,
   ReasonCode,
+  ReviewGateRefusal,
 } from "../publication-review.js";
 
 // The review's own vocabulary is declared once, in `shared/publication-review.ts`.
@@ -35,6 +43,7 @@ export type {
   PublicationRunError,
   Question,
   ReasonCode,
+  ReviewGateRefusal,
 };
 
 /** Which Worker answered: its own D1, its own reviews. */
@@ -86,6 +95,13 @@ export interface ReasonView {
   detail: string | null;
   sentence: string;
   cure: string;
+  /**
+   * The whole reason as one line in the shared words (`reasonLine`: the sentence, the detail in
+   * words and the cure), the line `description.lines` carries for it. A client prints this and
+   * composes nothing from `detail`, whose closed words are not words for a person. Absent from a
+   * Worker that predates the field; a client then falls back to the sentence and the cure.
+   */
+  line?: string;
 }
 
 /** The review of one row of `GET /admin/publish/requests`. */
@@ -105,6 +121,14 @@ export interface PublicationReviewSummary {
   headline: string;
   tone: "ok" | "note" | "warn" | "stop";
   reasons: ReasonCode[];
+  /**
+   * An administrator's `start` is offered for this request: the one rule `describePublicationReview`
+   * uses for its next command (`startOffered`), and the route's own screen precondition. False
+   * unless the review is on and applies. A start the platform's allowance or the Worker's
+   * ownership refuses is still offered here, and answers 409; a client that starts many stops on
+   * `platform_limit`.
+   */
+  start_offered: boolean;
   /** The review in force, when there is one. */
   review_id: number | null;
   head_sha: string | null;
@@ -166,6 +190,18 @@ export interface PublicationReviewHistoryEntry {
   decided_at: string | null;
 }
 
+/**
+ * The request's identifier screen in `describeScreen`'s words: the same view the list row's
+ * `identifier_screen` carries, one function behind both. `state` is the stored state, `exempt` for
+ * a sandbox dataset, or null when no screen was started.
+ */
+export interface PublicationReviewScreenView {
+  state: ScreenState | "exempt" | null;
+  headline: string;
+  tone: "ok" | "note" | "warn" | "stop";
+  lines: string[];
+}
+
 /** `GET /admin/publish/:id/review`. */
 export interface PublicationReviewDetail {
   environment: PublicationReviewEnvironment;
@@ -174,6 +210,20 @@ export interface PublicationReviewDetail {
   request_id: number;
   request_status: string;
   anonymous: boolean;
+  /** The request's screen, so `approve` and `next` show it from the one read they make. */
+  identifier_screen: PublicationReviewScreenView;
+  /** The screen acknowledgment on record (who and when), or null. Its reason is not carried. */
+  screen_acknowledgment: { by: number; at: string } | null;
+  /** The request's block reason when it is blocked, as a plain word (`shownBlockReason`), else null. */
+  block_reason: string | null;
+  /**
+   * The request is `approving`, or `blocked` by the owner-name walk-back, and a step after the
+   * validation-only ones completed (`hasStartedPublishing`): a resume passes no gate, and
+   * `approve` without `--resume` would start the run over.
+   */
+  started_publishing: boolean;
+  /** `datasets.total_files` (the manifest-first count), or null when unknown. */
+  total_files: number | null;
   applies: boolean;
   gate: PublicationReviewGateState;
   /** Null when the request is not assessed; see {@link PublicationReviewSummary.outcome}. */
@@ -291,4 +341,156 @@ export type PublicationReviewErrorCode = (typeof PUBLICATION_REVIEW_ERROR_CODES)
 export interface PublicationReviewErrorBody {
   error: string;
   code: PublicationReviewErrorCode;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The approval gate (ADR 0102, sections 8 and 9)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * What an administrator approves over: the review shown and the reasons shown. The Worker records
+ * an override only when `review_id` is the review in force and `reasons` names every override-class
+ * reason that stands, so it attaches to what was shown or to nothing (`uncoveredByOverride`).
+ */
+export interface PublicationReviewOverride {
+  /** The review in force when it was shown; null when no review of the screened commit exists. */
+  review_id: number | null;
+  /** The reason codes shown. Only override-class codes are recorded. */
+  reasons: ReasonCode[];
+}
+
+/**
+ * The approval routes' body field. `/approve` accepts it from a bearer key only; the website
+ * records one through `approve-dispatch`.
+ */
+export const OVERRIDE_FIELD = "override_publication_review";
+
+/**
+ * The `error` of the 409 the approval routes answer with when the review gate refuses. A code in
+ * `error` and the sentence in `message`, so the CLI's client leads with the sentence
+ * (`APPROVAL_REFUSAL_ERROR_CODES`).
+ */
+export const PUBLICATION_REVIEW_NOT_CLEAR_CODE = "publication_review_not_clear";
+
+/** The `error` of the 409 `POST /admin/publish/:id/approve` answers with for a blocked request. */
+export const REQUEST_BLOCKED_CODE = "request_blocked";
+
+/**
+ * 409 from `POST /admin/publish/:id/approve` and `approve-dispatch` when the review gate cannot
+ * read what it needs (`refusal: "unverified"`): it refuses rather than guess, so it has no review
+ * to describe. The refusal says nothing about the review: no outcome, no reason, no review id.
+ * `fact` names the check that could not be completed (the request or the review; a failed record of
+ * an override is the review's too), a field no client reads: the sentence in `message` is what an
+ * administrator is told.
+ */
+export interface PublicationReviewUnverifiedRefusalBody {
+  error: typeof PUBLICATION_REVIEW_NOT_CLEAR_CODE;
+  refusal: "unverified";
+  /** `REVIEW_UNREADABLE_HEADLINE`. */
+  headline: string;
+  /** `reviewGateRefusalText("unverified", ...)`. */
+  message: string;
+  outcome: null;
+  reasons: [];
+  uncovered: [];
+  review_id: null;
+  fact: "request" | "review";
+}
+
+/**
+ * 409 from `POST /admin/publish/:id/approve` and `approve-dispatch` when the review gate refuses a
+ * review it read: every refusal word but `unverified`. It carries no `fact`. The review's headline
+ * and every live reason in the shared words come with it, except on the `review_changed` fallback
+ * after a re-read that failed, which is bare (the unreadable headline, no outcome, no reasons).
+ */
+export interface PublicationReviewReasonedRefusalBody {
+  error: typeof PUBLICATION_REVIEW_NOT_CLEAR_CODE;
+  refusal: Exclude<ReviewGateRefusal, "unverified">;
+  /** The review's headline (`REVIEW_UNREADABLE_HEADLINE` on the bare `review_changed` fallback). */
+  headline: string;
+  /** `reviewGateRefusalText`, then for `hard_reason` the first hard reason's sentence and cure. */
+  message: string;
+  outcome: PublicationOutcome | null;
+  /** Every live reason in the shared words (`reasonViewsOf`). */
+  reasons: ReasonView[];
+  /**
+   * The override-class codes the override did not name; empty unless the refusal is about them
+   * (`override_not_covering`, `needs_override`).
+   */
+  uncovered: ReasonCode[];
+  review_id: number | null;
+}
+
+/**
+ * 409 from `POST /admin/publish/:id/approve` and `approve-dispatch` when the review gate refuses,
+ * discriminated by `refusal` so a client switches on it exhaustively: `unverified` carries a
+ * `fact` and nothing of a review, every other word carries the review and no `fact`.
+ */
+export type PublicationReviewGateRefusalBody =
+  | PublicationReviewUnverifiedRefusalBody
+  | PublicationReviewReasonedRefusalBody;
+
+/**
+ * 409 from `POST /admin/publish/:id/approve` for a blocked request, whatever the flag says: a
+ * blocked request is refused by the mechanical rules, not by the review. `block_reason` is a
+ * top-level field so the CLI's existing hints for a block reason work unchanged.
+ */
+export interface RequestBlockedRefusalBody {
+  error: typeof REQUEST_BLOCKED_CODE;
+  block_reason: string | null;
+  /** `REASONS.request_blocked.sentence` and its cure; the word is the separate `block_reason`. */
+  message: string;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The administrator's comment
+// ---------------------------------------------------------------------------------------------
+
+/** The most characters a comment may have once trimmed; it must have at least one. */
+export const PUBLICATION_COMMENT_MAX_LENGTH = 2000;
+
+/** `POST /admin/publish/:id/comment`: the administrator's words, which the depositor is mailed. */
+export interface PublicationCommentBody {
+  message: string;
+}
+
+/** HTTP 200: the message was mailed to the depositor and the request stays open. */
+export interface PublicationCommentResponse {
+  dataset_id: string;
+  request_id: number;
+  mailed: true;
+}
+
+/**
+ * Every error word the comment route answers with, in the body's `code`. A send that failed is one
+ * of two, by what the Worker knows of the mail:
+ *
+ *  - `comment_not_sent`: it knows nothing was delivered (the provider refused the message with a
+ *    4xx, the environment's fence refused the recipient, the depositor has no address, or the
+ *    depositor could not be read), so it says so.
+ *  - `comment_not_confirmed`: it cannot know (a provider's server error, an unreachable host or a
+ *    lost answer), so the mail may also have arrived and the sentence tells the administrator to
+ *    check with the depositor before sending it again.
+ *
+ * Both are HTTP 502, and the audit row records the first as `not_sent` and the second as `unknown`.
+ */
+export const PUBLICATION_COMMENT_ERROR_CODES = [
+  "bad_dataset",
+  "not_found",
+  "origin_not_allowed",
+  "invalid_body",
+  "comment_not_sent",
+  "comment_not_confirmed",
+  "internal",
+] as const;
+export type PublicationCommentErrorCode = (typeof PUBLICATION_COMMENT_ERROR_CODES)[number];
+
+/**
+ * The body of every refusal and fault of the comment route: a fixed sentence and a closed code,
+ * the convention of the review routes (`{ error: sentence, code: word }`), unlike the approval
+ * refusals above, which carry their word in `error`.
+ */
+export interface PublicationCommentErrorBody {
+  error: string;
+  code: PublicationCommentErrorCode;
 }

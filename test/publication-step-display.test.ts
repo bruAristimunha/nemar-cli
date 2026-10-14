@@ -89,8 +89,11 @@ describe("PUBLICATION_STEP_LABELS", () => {
 
 describe("neither display builds its own step list", () => {
   test("the approve banner asks what the request is before describing it", () => {
-    const ADMIN = readFileSync(join(SRC, "commands", "admin.ts"), "utf8");
+    const ADMIN = readFileSync(join(SRC, "commands", "admin-publish-approve.ts"), "utf8");
     expect(ADMIN).toContain("stepsForRelease(anonymousRelease)");
+    // The review detail the command just read carries `anonymous` and is the first source; the
+    // status read is the fallback when there is no detail (the CLI tests run both).
+    expect(ADMIN).toContain("read.detail.anonymous");
     expect(ADMIN).toContain("getPublishStatus(datasetId)");
     // The hand-numbered literal that drifted. Its absence is the fix.
     expect(ADMIN).not.toContain("16-step orchestrator:");

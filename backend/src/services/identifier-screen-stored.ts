@@ -4,17 +4,22 @@
  *
  * These two functions are the only way any decision reads the screen's state or its screened
  * commit; the approval gate, the status views and the publication review (ADR 0102) all go
- * through them and `screenGate`. They live in their own module, with nothing else, so the review
- * can import them without importing `identifier-screen.ts`, which in turn waits for the review
- * before it mails. `identifier-screen.ts` re-exports both, so its importers are unchanged.
+ * through them and `screenGate`. They live in a module of their own, with what reads a stored
+ * screen and nothing that mails or writes one, so the review can import them without importing
+ * `identifier-screen.ts`, which in turn waits for the review before it mails.
+ * `identifier-screen.ts` re-exports everything here, so its importers are unchanged.
  *
  * The sandbox exemption lives here too, for the same reason: the review's view must decide it
- * exactly as the screen does, and a copy kept equal by a test is a second place to forget.
+ * exactly as the screen does, and a copy kept equal by a test is a second place to forget. So does
+ * {@link screenView}, which the detail view of the review carries beside the list's: one reading
+ * of a row's screen for every surface that shows it.
  */
 
 import {
+  type ScreenDescription,
   type ScreenReport,
   type ScreenState,
+  describeScreen,
   isScreenState,
   parseScreenReport,
 } from "../../../shared/identifier-screen-report.js";
@@ -51,4 +56,29 @@ export function readStoredReport(raw: unknown): ScreenReport | null {
     console.warn(`[identifier-screen] a stored report does not read back (${code})`);
     return null;
   }
+}
+
+/** What an exempt dataset's email and status say about the screen. Worker-fixed words. */
+export const EXEMPT_SCREEN_DESCRIPTION: ScreenDescription = {
+  headline: "Identifier screen: not applicable (sandbox)",
+  tone: "note",
+  lines: ["Sandbox (xx) datasets never publish real data, so they are not screened."],
+};
+
+/** The screen as a status view shows it. */
+export interface ScreenView {
+  /** The stored state; `exempt` for a sandbox dataset; null when no screen was started. */
+  state: ScreenState | "exempt" | null;
+  headline: string;
+  tone: ScreenDescription["tone"];
+  lines: string[];
+}
+
+/** One reading of a row's screen, for every surface that shows it. */
+export function screenView(datasetId: string, rawStatus: unknown, rawReport: unknown): ScreenView {
+  if (isScreenExempt(datasetId)) return { state: "exempt", ...EXEMPT_SCREEN_DESCRIPTION };
+  const state = readStoredState(rawStatus);
+  const report = state === null ? null : readStoredReport(rawReport);
+  const d = describeScreen(state, report);
+  return { state, headline: d.headline, tone: d.tone, lines: d.lines };
 }

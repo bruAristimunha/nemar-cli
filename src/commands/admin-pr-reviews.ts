@@ -36,6 +36,8 @@ import {
   renderCheck,
   verdictOf,
 } from "../../shared/pr-review.js";
+import { PUBLICATION_DATASET_ID_RE } from "../../shared/publication-limits.js";
+import { say } from "../lib/admin-command.js";
 import {
   clearPrReviewAuthor,
   getPrReview,
@@ -78,8 +80,12 @@ import {
 } from "../lib/pr-review-approve.js";
 import { approveAllowed, parseChoice } from "../lib/pr-review-next.js";
 import { LineReader } from "../lib/prompt-lines.js";
+import { ageOf, clip, plain } from "../lib/terminal-text.js";
 
-const DATASET_ID_RE = /^(nm|xx|on)\d{6}$/;
+// Moved to `lib/terminal-text.ts`; re-exported because `test/pr-reviews-render.unit.test.ts` imports
+// them from here.
+export { ageOf, plain };
+
 /** The Worker keeps this much of a reason; a longer one is refused here rather than cut without a word. */
 const MAX_REASON = 200;
 const LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
@@ -87,31 +93,6 @@ const LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 // ---------------------------------------------------------------------------------------------
 // Plain, safe, aligned text
 // ---------------------------------------------------------------------------------------------
-
-/**
- * Text that came from the network, made safe for a terminal: control characters (an ESC sequence
- * can rewrite the screen), zero-width and bidirectional-override characters are removed. The
- * server already reduces author-controlled text to plain words; this is the second line, because a
- * terminal should not depend on a server's hygiene alone.
- */
-export function plain(s: unknown): string {
-  return typeof s === "string" ? s.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, "") : "";
-}
-
-function clip(s: string, max: number): string {
-  const p = plain(s);
-  return p.length > max ? `${p.slice(0, max - 1)}…` : p;
-}
-
-/** How long ago, in the unit that reads best: `12m`, `5h`, `9d`. */
-export function ageOf(iso: string, now: number = Date.now()): string {
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) return "?";
-  const s = Math.max(0, Math.floor((now - t) / 1000));
-  if (s < 3600) return `${Math.floor(s / 60)}m`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h`;
-  return `${Math.floor(s / 86400)}d`;
-}
 
 const DETAIL_WORDS: Record<string, string> = {
   contributor_paused: "contributor paused",
@@ -359,11 +340,6 @@ function requireAuth(json?: boolean): boolean {
   return true;
 }
 
-/** Where an error goes: stderr when the caller asked for JSON, so stdout stays machine-readable. */
-function say(json: boolean | undefined): (line: string) => void {
-  return json ? (line) => console.error(line) : (line) => console.log(line);
-}
-
 function die(message: string, hint?: string, json?: boolean): never {
   const out = say(json);
   out(chalk.red(message));
@@ -392,7 +368,7 @@ function failApi(err: unknown, spinner: Ora | null, fallback: string, json?: boo
 }
 
 function checkDataset(id: string, json?: boolean): string {
-  if (!DATASET_ID_RE.test(id))
+  if (!PUBLICATION_DATASET_ID_RE.test(id))
     die(`"${plain(id)}" is not a dataset id (like nm000108).`, undefined, json);
   return id;
 }

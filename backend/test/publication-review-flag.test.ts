@@ -8,6 +8,12 @@
  *
  * The test reads the real file and parses it with Bun's TOML parser, so a misplaced line (under
  * another table, or commented out) fails here.
+ *
+ * Production must not be lit until #1604 is fixed in Phase 3: a terminal approval inside a live web
+ * lease is attributed to the administrator who clicked (ADR 0080), and has to be attributed to its
+ * own caller. Until then the Worker refuses an override sent inside a web approval
+ * (`override_inside_web_approval`), which keeps an override from being recorded under another
+ * administrator's name but is not the fix.
  */
 
 import { describe, expect, test } from "bun:test";

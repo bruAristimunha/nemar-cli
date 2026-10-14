@@ -196,8 +196,14 @@ describe("a terminal approval", () => {
     expect(approvedBy()).toBe(executorId);
     const audit = publishedAudit();
     expect(audit?.userId).toBe(executorId);
-    // Byte-for-byte what it was before attribution forked: no executed_by key.
-    expect(audit?.details).toEqual({ approved_by: "approvebot", steps: [...PUBLICATION_STEPS] });
+    // What it was before attribution forked, no executed_by key, plus the two fields ADR 0102 adds
+    // to every approval's row: the review gate is off here (the flag is unset), and no CI skip.
+    expect(audit?.details).toEqual({
+      approved_by: "approvebot",
+      steps: [...PUBLICATION_STEPS],
+      review_gate: "off",
+      skip_ci_check: false,
+    });
   });
 });
 
@@ -214,6 +220,8 @@ describe("a web-queued approval", () => {
       approved_by: "webclicker",
       executed_by: "approvebot",
       steps: [...PUBLICATION_STEPS],
+      review_gate: "off",
+      skip_ci_check: false,
     });
   });
 
@@ -242,6 +250,8 @@ describe("a web-queued approval", () => {
     expect(publishedAudit()?.details).toEqual({
       approved_by: "webclicker",
       steps: [...PUBLICATION_STEPS],
+      review_gate: "off",
+      skip_ci_check: false,
     });
   });
 
@@ -315,6 +325,8 @@ describe("the clicker is honored only while their run is live", () => {
     expect(publishedAudit()?.details).toEqual({
       approved_by: "approvebot",
       steps: [...PUBLICATION_STEPS],
+      review_gate: "off",
+      skip_ci_check: false,
     });
   });
 

@@ -15,15 +15,21 @@
  * from `readStoredReport(...)?.head`, the gate's own reader. A row of another head or flag is
  * history in the detail view and never the outcome here.
  *
- * **Only a request in `requested` is reviewed** (ADR 0102, section 7: the claim requires it). A
- * request in any other state shows its stored review as history and never as a wait: a dispatched
- * row of such a request reads as one that did not report, so no surface says "running" about a
- * review whose result can no longer settle anything. Its live facts are not read either, with one
- * exception, `blocked` ({@link LIVE_FACT_STATUSES}): a blocked request has written nothing of an
- * approval, so a version row or a concept DOI can only belong to an EARLIER release, and is shown
- * beside the hard `request_blocked`. A request that is over (`published`, `denied`) would read as
- * one whose own release "was already released", and an `approving` request has written those facts
- * itself, so both show their stored review only.
+ * **A dispatched review is waited for in two statuses, `requested` and `approving`.** Only a request
+ * in `requested` is claimed for a review (ADR 0102, section 7: the claim requires it), but an
+ * approval that has not started publishing is gated again when it resumes, so a review claimed
+ * before the approval began can still report and settle that gate; none starts once the request is
+ * `approving`. A request in any other state shows its stored review as history and never as a wait:
+ * a dispatched row of such a request reads as one that did not report, so no surface says
+ * "running" about a review whose result can no longer settle anything. Its live facts are not read
+ * either, with one exception, `blocked` ({@link LIVE_FACT_STATUSES}): a blocked request that is not
+ * a run that started publishing has written nothing of an approval, so a version row or a concept
+ * DOI can only belong to an EARLIER release, and is shown beside the hard `request_blocked`. A
+ * request that is over (`published`, `denied`) would read as one whose own release "was already
+ * released", and an `approving` request that has started publishing, or a `blocked` one the
+ * owner-name walk-back stopped half way (`publishingStanding`), has written those facts itself, so
+ * they show their stored review only. An `approving` request that stopped before it published has
+ * written neither, is gated again when it resumes, and reads them like a `requested` one.
  *
  * **What a viewer may read** is counts, closed words and the shared sentences. The model's summary
  * and the notes of its findings, both sanitized by the parser, appear in the detail view and
@@ -35,8 +41,16 @@
  * (the review is off, or the request is over) has no outcome and no reasons, like a mirror, so the
  * outcome never contradicts a headline that says "not reviewed".
  *
- * The module imports the row readers and the stored-screen readers, and nothing of the screen's
- * mail or the review's write path, so `identifier-screen.ts` can import it without a cycle.
+ * **The detail carries what `approve` and `next` show from one read** (Phase 2): the request's screen
+ * ({@link screenView}, the function the list row uses), the acknowledgment on record, the block
+ * reason, whether the approval has started publishing and the dataset's size. The list row carries
+ * one more fact, `start_offered`, the rule `describePublicationReview` uses for its next command.
+ *
+ * The module imports the row readers, the stored-screen readers and the screen's status view, and
+ * nothing of the screen's mail or the review's write path, so `identifier-screen.ts` can import it
+ * without a cycle. That is why `screenView` lives beside those readers, and `hasStartedPublishing`
+ * in `shared/publication-steps.ts` (with `publishingStanding`, the rule over it): both moved out of
+ * `identifier-screen.ts` for it.
  */
 
 import type {
@@ -50,6 +64,7 @@ import type {
 } from "../../../shared/contract/publication-review-admin.js";
 import { type ScreenGate, screenGate } from "../../../shared/identifier-screen-report.js";
 import {
+  type ApprovalStanding,
   type LiveFacts,
   PUBLICATION_REVIEW_DEADLINE_MINUTES,
   type PublicationDeclineDetail,
@@ -75,15 +90,24 @@ import {
   isPublicationOutcome,
   isPublicationReviewState,
   isPublicationRunError,
+  reasonLine,
   reasonsOf,
+  shownBlockReason,
+  startOffered,
   stricterOf,
   verdictOf,
 } from "../../../shared/publication-review.js";
+import { publishingStanding } from "../../../shared/publication-steps.js";
 import type { Bindings } from "../types/bindings.js";
 import { ACTIVE_REQUEST_TAIL_SQL } from "./approval-dispatch.js";
 import type { PublicationReviewSection } from "./email.js";
 import { isNonProductionEnv } from "./environment.js";
-import { isScreenExempt, readStoredReport, readStoredState } from "./identifier-screen-stored.js";
+import {
+  isScreenExempt,
+  readStoredReport,
+  readStoredState,
+  screenView,
+} from "./identifier-screen-stored.js";
 import { SHA40, errorWords } from "./publication-review-log.js";
 import {
   MAX_KEYS_PER_READ,
@@ -125,16 +149,21 @@ export function publicationReviewApplies(dataset: {
  * an EARLIER release, which is what the checks look for.
  *
  *  - `requested`: waiting for its decision.
- *  - `blocked`: a request is blocked before an approval step runs (the one walk back from
- *    `approving`, the owner-name check, is ahead of the first step), so it has written nothing
- *    either. Its facts are informative, and the hard `request_blocked` stands beside them.
+ *  - `blocked`: a request that is not a run that started publishing has written nothing either. Its
+ *    facts are informative, and the hard `request_blocked` stands beside them. One that HAS started
+ *    publishing is a run the owner-name walk-back blocked half way (the check runs on every call
+ *    of a run; `publishingStanding` reads the reason too), so it wrote its own version row and DOI
+ *    and reads none, like `approving`.
  *
- * Not `approving`: the approval run has by then written its own `dataset_versions` row and concept
- * DOI, and read as live facts they would say "already released" and "unexpected DOI" about a run
- * that should be RESUMED, with `approve --force` as its next command. An `approving` request, like
- * every request that is over (`published`, `denied`), shows its stored review and the stored
- * verdict only; the approval gate (Phase 2) skips a resumed run that has started publishing for the
- * same reason (`hasStartedPublishing`).
+ * Not `approving` as such: a run that HAS started publishing has by then written its own
+ * `dataset_versions` row and concept DOI, and read as live facts they would say "already released"
+ * and "unexpected DOI" about a run that should be RESUMED, with `approve --force` as its next
+ * command. It, like every request that is over (`published`, `denied`), shows its stored review and
+ * the stored verdict only; the approval gate skips such a run for the same reason
+ * (`publishingStanding`). An `approving` run that STOPPED before it published (`approval ===
+ * "stopped"`: only the validation-only steps, `ci_check` and `enrichment_check`, completed) is
+ * gated again when it resumes and has written neither a version row nor a DOI, so its facts are
+ * about an earlier release and are read, whatever its status says.
  */
 const LIVE_FACT_STATUSES: ReadonlySet<string> = new Set(["requested", "blocked"]);
 
@@ -159,6 +188,10 @@ export interface ReviewRequestFields {
   identifier_screen_status: string | null;
   identifier_screen_report: string | null;
   identifier_screen_ack_by: number | null;
+  /** When the acknowledgment was recorded; carried to the detail with `identifier_screen_ack_by`. */
+  identifier_screen_ack_at: string | null;
+  /** The approval's completed steps, a JSON list: whether it has started publishing. */
+  steps_completed: string | null;
 }
 
 /** The dataset columns the derivation reads; the whole object is null when the dataset row is gone. */
@@ -168,6 +201,8 @@ export interface ReviewDatasetFields {
   concept_doi: string | null;
   ezid_status: string | null;
   first_published_at: string | null;
+  /** `datasets.total_files`; read for the detail only, so a list passes null. */
+  total_files: number | null;
 }
 
 export interface ReviewContext {
@@ -211,7 +246,7 @@ export interface DerivedPublicationReview {
 }
 
 /** The report of the review in force, when it reported and still parses. */
-function reportOf(view: ReviewRowView): PublicationReviewReport | null {
+export function reportOf(view: ReviewRowView): PublicationReviewReport | null {
   return view.kind === "reported" ? view.report : null;
 }
 
@@ -265,10 +300,12 @@ function reviewKeyOf(
 
 /**
  * Everything a surface shows, re-derived now. Reads the review in force and, for a request whose
- * approval has written nothing yet ({@link LIVE_FACT_STATUSES}), three facts: a version row for
- * the version an approval would publish, an earlier anonymous request and the concept DOI. No
- * GitHub call is made anywhere in this module: `head_current` stays null, and only the approval
- * gate (Phase 2) asks GitHub whether the screened commit is still `main`.
+ * approval has written nothing yet ({@link LIVE_FACT_STATUSES}, or a run that stopped before it
+ * published), three facts: a version row for the version an approval would publish, an earlier
+ * anonymous request and the concept DOI. No GitHub call is made anywhere in this module, and the
+ * review's approval gate makes none either: `head_current` stays null for every caller, so
+ * `identifier_screen_stale` is never derived here. Whether the screened commit is still `main` is
+ * asked by the identifier screen's own gate (`verifyScreenHead`), and the stale refusal is its.
  *
  * Throws when a read fails. It never answers from a fact it could not read.
  */
@@ -283,6 +320,12 @@ export async function derivePublicationReview(
   // An administrator's start is refused for any request that is not waiting for its decision, so
   // only such a request is ever told to start a review.
   const startable = request.status === "requested";
+  // Where an approval stands: a run that has started publishing is continued without a gate, one
+  // that stopped before it did is gated like a fresh run (`describePublicationReview`'s `approval`).
+  // The one rule the approval itself asks (`publishingStanding`), so the words, the next command
+  // and `started_publishing` agree with what the Worker does: a run the owner-name walk-back
+  // blocked half way is `publishing` too, and any other blocked request is `none`.
+  const approval: ApprovalStanding = publishingStanding(request);
 
   const { head, gate } = screenOf(request);
 
@@ -295,8 +338,19 @@ export async function derivePublicationReview(
         : await readReviewByKey(db, request.id, head, anonymous);
     if (row !== null) {
       rowView = rowViewOf(row, ctx.nowMs, ctx.overdueMinutes);
-      // Only `requested` is reviewed: a dispatched row of any other request is not waited for.
-      if (request.status !== "requested" && rowView.kind === "dispatched") {
+      // A review is waited for only while it can still settle something: for a request that is
+      // `requested`, and for one that is `approving`, because an approval that has not started
+      // publishing is gated again when it resumes, and a review claimed before the approval began
+      // can still report before then (the claim requires `requested`, so none starts once the
+      // request is approving). The gate, the detail, the list and the mail therefore read a
+      // dispatched row one way, by time alone. A run that HAS started publishing is never gated again, so its reasons do not
+      // matter to the gate, and reading its row as running is harmless. For any other status a
+      // dispatched row is not waited for.
+      if (
+        request.status !== "requested" &&
+        request.status !== "approving" &&
+        rowView.kind === "dispatched"
+      ) {
         rowView = { kind: "dispatched", overdue: true };
       }
     }
@@ -315,7 +369,14 @@ export async function derivePublicationReview(
   // What an approval would publish: a dataset with no Version is published as 1.0.0, so that is
   // the version whose release the live checks must look for (a malformed one has none).
   const publishedVersion = report === null ? null : effectiveVersionOf(report.evidence);
-  const readFacts = applies && assessed && LIVE_FACT_STATUSES.has(request.status);
+  // A blocked request whose run had started publishing (the owner-name walk-back, which runs on
+  // every call of a run) wrote its own version row and DOI, so it reads no live fact either.
+  const ownRun = request.status === "blocked" && approval === "publishing";
+  const readFacts =
+    applies &&
+    assessed &&
+    !ownRun &&
+    (LIVE_FACT_STATUSES.has(request.status) || approval === "stopped");
   const versionRowExists =
     readFacts && publishedVersion !== null
       ? await exists(db, VERSION_ROW_SQL, request.dataset_id, publishedVersion)
@@ -369,6 +430,7 @@ export async function derivePublicationReview(
         head: null,
         version: null,
         startable,
+        approval,
       }),
     };
   }
@@ -396,6 +458,7 @@ export async function derivePublicationReview(
         version: null,
         startable,
         closed,
+        approval,
       }),
     };
   }
@@ -428,6 +491,7 @@ export async function derivePublicationReview(
       version,
       startable,
       closed,
+      approval,
     }),
   };
 }
@@ -445,6 +509,24 @@ function viewKindOf(d: DerivedPublicationReview): PublicationReviewViewKind {
 }
 
 /**
+ * Whether an administrator's start is offered for this request: the review is on and applies, the
+ * screen has a clear (or acknowledgeable) result for a commit, which is what the start route asks
+ * of the screen before anything else, and {@link startOffered} says so, the rule behind the
+ * detail's next command. A request that is not `requested` is never offered one, because
+ * `startable` is false for it. Never true for a request the route would refuse for a reason this
+ * view can see; the platform's allowance and the Worker's ownership of the dataset it cannot see
+ * (a refusal there is a 409 that writes nothing).
+ */
+function startOfferedFor(d: DerivedPublicationReview): boolean {
+  if (!d.enabled || !d.applies) return false;
+  const { gate, head } = d.live.screen;
+  if ((gate !== "clear" && gate !== "acknowledge") || head === null || !SHA40.test(head)) {
+    return false;
+  }
+  return startOffered({ reasons: d.reasons, row: d.rowView, startable: d.startable });
+}
+
+/**
  * One row of `GET /admin/publish/requests`: the outcome, the headline and the reason codes. No
  * sentence of the model's, and no sentence a client could not take from the shared words.
  */
@@ -457,6 +539,7 @@ function summaryOf(d: DerivedPublicationReview): PublicationReviewSummary {
     headline: d.description.headline,
     tone: d.description.tone,
     reasons: d.reasons.map((r) => r.code),
+    start_offered: startOfferedFor(d),
     review_id: d.row?.id ?? null,
     head_sha: d.row?.headSha ?? null,
   };
@@ -495,6 +578,7 @@ function unreadableSummary(enabled: boolean, datasetId: string): PublicationRevi
       headline: off.headline,
       tone: off.tone,
       reasons: [],
+      start_offered: false,
       review_id: null,
       head_sha: null,
     };
@@ -507,6 +591,7 @@ function unreadableSummary(enabled: boolean, datasetId: string): PublicationRevi
     headline: REVIEW_UNREADABLE_HEADLINE,
     tone: "warn",
     reasons: [],
+    start_offered: false,
     review_id: null,
     head_sha: null,
   };
@@ -525,8 +610,10 @@ export const LIST_CONCURRENCY = 8;
  * The summaries of a whole list, in order, at a cost that does not grow with what each row needs.
  *
  *  - The review in force of every row is read in batches of {@link MAX_KEYS_PER_READ} requests (one
- *    statement each), never once per row. A request that is over, or being approved, then needs no
- *    other statement: its live facts are not read ({@link LIVE_FACT_STATUSES}).
+ *    statement each), never once per row. A request that is over, or that has started
+ *    publishing, then needs no other statement: its live facts are not read
+ *    ({@link LIVE_FACT_STATUSES}). A stopped `approving` run reads up to two live-fact
+ *    statements, like a `requested` one.
  *  - The rest of a row's derivation (a version row, an earlier anonymous request) runs
  *    {@link LIST_CONCURRENCY} rows at a time, so a long list does not put a request for every row
  *    in flight at once.
@@ -623,10 +710,19 @@ export function overrideReasonsOf(raw: string | null): ReasonCode[] {
   return [...new Set(known)];
 }
 
-function reasonViewsOf(
+/**
+ * The reasons in the shared words, each with its cure for this dataset and the whole reason as the
+ * one line `description.lines` prints for it (`reasonLine`, which needs the report of the review in
+ * force for a failed question's findings): the detail's `reasons`, and what the approval gate's
+ * refusal carries, so the two say the same thing. The report is required so that a caller cannot
+ * leave it out by accident: one that has no report passes `null`, and the line then lacks only
+ * what the report adds.
+ */
+export function reasonViewsOf(
   reasons: readonly Reason[],
   datasetId: string,
   startable: boolean,
+  report: PublicationReviewReport | null,
 ): ReasonView[] {
   return reasons.map((r) => {
     const rule = REASONS[r.code];
@@ -637,6 +733,7 @@ function reasonViewsOf(
       detail: r.detail,
       sentence: rule.sentence,
       cure: cureOf(r.code, datasetId, startable),
+      line: reasonLine(r, datasetId, report, startable),
     };
   });
 }
@@ -697,17 +794,22 @@ function historyEntryOf(row: PublicationReviewRow): PublicationReviewHistoryEntr
   };
 }
 
-/** Read one request with its dataset, the columns the derivation needs and no others. */
-async function readContext(
+/**
+ * Read one request with its dataset, the columns the derivation needs and no others (never a
+ * nonce). The approval gate reads the request through this, so it and the detail view derive from
+ * the same read. Null when there is no such request; throws when the read fails.
+ */
+export async function readReviewContext(
   env: Bindings,
   requestId: number,
 ): Promise<{ request: ReviewRequestFields; dataset: ReviewDatasetFields | null } | null> {
   const r = await env.DB.prepare(
     `SELECT pr.id, pr.dataset_id, pr.status, pr.block_reason, pr.anonymous,
             pr.identifier_screen_status, pr.identifier_screen_report, pr.identifier_screen_ack_by,
+            pr.identifier_screen_ack_at, pr.steps_completed,
             d.dataset_id AS ds_id, d.source AS ds_source, d.is_exemplar AS ds_is_exemplar,
             d.concept_doi AS ds_concept_doi, d.ezid_status AS ds_ezid_status,
-            d.first_published_at AS ds_first_published_at
+            d.first_published_at AS ds_first_published_at, d.total_files AS ds_total_files
        FROM publication_requests pr
        LEFT JOIN datasets d ON d.dataset_id = pr.dataset_id
       WHERE pr.id = ?`,
@@ -727,6 +829,8 @@ async function readContext(
       identifier_screen_status: text(r.identifier_screen_status),
       identifier_screen_report: text(r.identifier_screen_report),
       identifier_screen_ack_by: whole(r.identifier_screen_ack_by),
+      identifier_screen_ack_at: text(r.identifier_screen_ack_at),
+      steps_completed: text(r.steps_completed),
     },
     dataset:
       r.ds_id === null || r.ds_id === undefined
@@ -737,6 +841,7 @@ async function readContext(
             concept_doi: text(r.ds_concept_doi),
             ezid_status: text(r.ds_ezid_status),
             first_published_at: text(r.ds_first_published_at),
+            total_files: whole(r.ds_total_files),
           },
   };
 }
@@ -754,7 +859,7 @@ export async function publicationReviewDetail(
     .bind(datasetId)
     .first<{ id: number }>();
   if (!active) return null;
-  const ctx = await readContext(env, active.id);
+  const ctx = await readReviewContext(env, active.id);
   if (!ctx) return null;
   const d = await derivePublicationReview({ env, nowMs, ...ctx });
   const past = await listReviewsOfRequest(env.DB, ctx.request.id, HISTORY_LIMIT + 1);
@@ -765,10 +870,27 @@ export async function publicationReviewDetail(
     request_id: ctx.request.id,
     request_status: ctx.request.status,
     anonymous: ctx.request.anonymous === 1,
+    // The same reading of the screen the list row carries (`screenView`), so the two cannot say
+    // different things about one request.
+    identifier_screen: screenView(
+      ctx.request.dataset_id,
+      ctx.request.identifier_screen_status,
+      ctx.request.identifier_screen_report,
+    ),
+    // Who and when, never why: the reason is the administrator's own text and stays in the row.
+    screen_acknowledgment:
+      ctx.request.identifier_screen_ack_by !== null && ctx.request.identifier_screen_ack_at !== null
+        ? { by: ctx.request.identifier_screen_ack_by, at: ctx.request.identifier_screen_ack_at }
+        : null,
+    // Not read from the reasons: with the review off they are empty, and a blocked request must
+    // still be told apart.
+    block_reason: shownBlockReason(ctx.request),
+    started_publishing: publishingStanding(ctx.request) === "publishing",
+    total_files: ctx.dataset?.total_files ?? null,
     applies: d.applies,
     gate: d.gate,
     outcome: d.outcome,
-    reasons: reasonViewsOf(d.reasons, ctx.request.dataset_id, d.startable),
+    reasons: reasonViewsOf(d.reasons, ctx.request.dataset_id, d.startable, reportOf(d.rowView)),
     description: d.description,
     review: d.row === null ? null : recordOf(d.row, d.rowView),
     history: past.slice(0, HISTORY_LIMIT).map(historyEntryOf),
@@ -813,7 +935,7 @@ export async function publicationReviewEmailSection(
 ): Promise<PublicationReviewSection | null> {
   let datasetId = "";
   try {
-    const ctx = await readContext(env, requestId);
+    const ctx = await readReviewContext(env, requestId);
     if (!ctx) return null;
     datasetId = ctx.request.dataset_id;
     const d = await derivePublicationReview({

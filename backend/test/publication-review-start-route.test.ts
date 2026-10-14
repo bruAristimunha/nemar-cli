@@ -23,6 +23,7 @@ import {
   PUBLICATION_REVIEW_ERROR_CODES,
   type PublicationReviewErrorBody,
   type PublicationReviewErrorCode,
+  type PublicationReviewSummary,
   START_NOT_HANDED_OVER_REASONS,
   START_REASONS,
   START_REFUSED_REASONS,
@@ -30,7 +31,11 @@ import {
   type StartPublicationReviewResponse,
 } from "../../shared/contract/publication-review-admin";
 import { isOneOf } from "../../shared/pr-review";
-import { DEPOSITOR_DAILY_CAP, PLATFORM_DAILY_CAP } from "../../shared/publication-review";
+import {
+  DEPOSITOR_DAILY_CAP,
+  PLATFORM_DAILY_CAP,
+  PUBLICATION_REVIEW_DEADLINE_MINUTES as REVIEW_DEADLINE_MINUTES,
+} from "../../shared/publication-review";
 import { adminRoutes } from "../src/routes/admin";
 import {
   NOT_HANDED_OVER,
@@ -44,7 +49,9 @@ import { realD1, wrapD1 } from "./helpers/d1";
 import { SCREENED_HEAD } from "./helpers/identifier-screen";
 import { logged } from "./helpers/logs";
 import {
+  type SeedReview,
   type SeedScreenedRequest,
+  failingReport,
   seedPublicationReview,
   seedScreenedRequest,
   seedUser,
@@ -470,6 +477,58 @@ describe("starting again", () => {
     });
   }
 
+  // An override is given for what an attempt showed, by reason code. A restart is a new attempt,
+  // whose reasons nobody was shown (an override for `review_could_not_run` over a dispatch that
+  // failed would otherwise cover the next attempt's refusal by the model), so it takes the
+  // override back with the rest of the attempt (ADR 0102 section 9, the gate's binding).
+  test("a restart clears the recorded override: the new attempt is not the one it was given for", async () => {
+    const { requestId } = request();
+    const other = await seedUser(h.db, "startadmin2", "admin", `${ADMIN_KEY}2`);
+    const reviewId = seedPublicationReview(h.db, {
+      requestId,
+      datasetId: PROD_DATASET,
+      state: "errored",
+      detail: "dispatch_failed",
+      claimed: true,
+      override: { by: other, reasons: ["review_could_not_run"] },
+    });
+    expect(h.review(reviewId)).toMatchObject({
+      override_by: other,
+      override_reasons: JSON.stringify(["review_could_not_run"]),
+    });
+    expect((await start(PROD_DATASET)).status).toBe(202);
+    expect(h.review(reviewId)).toMatchObject({
+      state: "dispatched",
+      override_by: null,
+      override_at: null,
+      override_reasons: null,
+    });
+  });
+
+  test("a restart that cannot hand the review over clears the recorded override too", async () => {
+    const { requestId } = request();
+    const reviewId = seedPublicationReview(h.db, {
+      requestId,
+      datasetId: PROD_DATASET,
+      state: "errored",
+      detail: "dispatch_failed",
+      claimed: true,
+      override: { by: adminId, reasons: ["review_could_not_run"] },
+    });
+    const res = await start(PROD_DATASET, {
+      bindings: h.env({ PRESCREEN_CALLBACK_SECRET: undefined } as Partial<Bindings>),
+    });
+    expect(res.status).toBe(502);
+    expect(h.review(reviewId)).toMatchObject({
+      state: "errored",
+      detail: "dispatch_unconfigured",
+      override_by: null,
+      override_at: null,
+      override_reasons: null,
+    });
+    expect(h.dispatches()).toHaveLength(0);
+  });
+
   test("the second start of one commit is refused: the first one is running", async () => {
     request();
     expect((await start(PROD_DATASET)).status).toBe(202);
@@ -818,5 +877,177 @@ describe("what a response carries", () => {
     expect(answeredWith(409)).toEqual([...START_REFUSED_REASONS]);
     expect(answeredWith(502)).toEqual([...START_NOT_HANDED_OVER_REASONS]);
     expect(answeredWith(500)).toEqual(["duplicate", "depositor_limit"]);
+  });
+});
+
+// ============================================================================
+
+describe("the list's start_offered is what this route would do", () => {
+  type Row = Omit<SeedReview, "requestId" | "datasetId">;
+  interface Case {
+    name: string;
+    over?: Omit<SeedScreenedRequest, "datasetId">;
+    datasetId?: string;
+    row?: Row;
+    /**
+     * A start the route would take that the list does not offer: a dispatched row between the
+     * workflow's deadline (30 minutes, which a start restarts after) and the surfaces' bound (60,
+     * which they wait for). The list is conservative there on purpose; the other direction is not.
+     */
+    conservative?: boolean;
+  }
+
+  const overdue = REVIEW_DEADLINE_MINUTES + 1;
+  const CASES: Case[] = [
+    { name: "a clear screen and no review" },
+    { name: "a screen that needs an acknowledgment and no review", over: { status: "review" } },
+    { name: "a clear screen of a named request", over: { anonymous: false } },
+    { name: "an anonymous release with no review", over: { anonymous: true } },
+    { name: "an errored review", row: { state: "errored", detail: "model_refused" } },
+    {
+      name: "an errored review that never started",
+      row: { state: "errored", detail: "dispatch_failed" },
+    },
+    { name: "a declined review", row: { state: "declined", detail: "platform_limit" } },
+    { name: "a review that never reported", row: { state: "unreported" } },
+    {
+      name: "a dispatched review long overdue",
+      row: { state: "dispatched", createdMinutesAgo: 120 },
+    },
+    { name: "a review of another head", row: { state: "reported", head: "f".repeat(40) } },
+    { name: "a review of the other release kind", row: { state: "reported", anonymous: true } },
+    {
+      name: "a dispatched review that is running",
+      row: { state: "dispatched", createdMinutesAgo: 5 },
+    },
+    {
+      name: "a dispatched review past the deadline, inside the surfaces' bound",
+      row: { state: "dispatched", createdMinutesAgo: overdue + 10 },
+      conservative: true,
+    },
+    { name: "a reported pass", row: { state: "reported" } },
+    { name: "a reported fail", row: { state: "reported", report: failingReport() } },
+    {
+      name: "a reported review whose report no longer parses",
+      row: { state: "reported", rawReport: "{not a report", verdict: "pass" },
+    },
+    { name: "a screen still running", over: { status: "pending" } },
+    { name: "a screen that errored", over: { status: "error" } },
+    { name: "a screen that never reported", over: { status: "unreported" } },
+    { name: "a screen that found a direct identifier", over: { status: "direct-identifiers" } },
+    {
+      name: "a blocked request with a review",
+      over: { requestStatus: "blocked", blockReason: "min_requirements_failed" },
+      row: { state: "errored", detail: "model_refused" },
+    },
+    {
+      name: "a blocked request",
+      over: {
+        requestStatus: "blocked",
+        blockReason: "identifier_screen_findings",
+        status: "direct-identifiers",
+      },
+    },
+    {
+      name: "an approving request with an errored review",
+      over: { requestStatus: "approving" },
+      row: { state: "errored", detail: "model_refused" },
+    },
+    { name: "an approving request with no review", over: { requestStatus: "approving" } },
+    { name: "a published request", over: { requestStatus: "published" } },
+    {
+      name: "a denied request with a review",
+      over: { requestStatus: "denied" },
+      row: { state: "errored", detail: "model_refused" },
+    },
+    { name: "a mirror", over: { source: "openneuro" } },
+    { name: "an exemplar", over: { isExemplar: 1 } },
+    {
+      name: "a sandbox dataset, which has no screened commit",
+      datasetId: "xx000323",
+      over: { status: "pending" },
+    },
+  ];
+
+  function seed(): Array<Case & { datasetId: string }> {
+    return CASES.map((c, i) => {
+      const datasetId = c.datasetId ?? ds(700 + i);
+      const { requestId } = request(datasetId, c.over ?? {});
+      if (c.row) seedPublicationReview(h.db, { ...c.row, requestId, datasetId });
+      return { ...c, datasetId };
+    });
+  }
+
+  async function offered(bindings: Bindings): Promise<Map<string, boolean>> {
+    const res = await admin.request(
+      "/admin/publish/requests",
+      { headers: { Authorization: `Bearer ${ADMIN_KEY}` } },
+      bindings,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      requests: Array<{ dataset_id: string; publication_review: PublicationReviewSummary }>;
+    };
+    return new Map(body.requests.map((r) => [r.dataset_id, r.publication_review.start_offered]));
+  }
+
+  test("a start is offered only where the route starts one, and withheld only where it refuses, bar the one conservative gap", async () => {
+    const cases = seed();
+    const list = await offered(h.env());
+    const wrongly: string[] = [];
+    const refusedWith = new Set<string>();
+    let started = 0;
+    let withheld = 0;
+    for (const c of cases) {
+      const res = await start(c.datasetId);
+      const went = res.status === 202;
+      const body = await bodyOf<{ code?: string }>(res);
+      if (!went) refusedWith.add(`${res.status} ${body.code ?? ""}`);
+      const shown = list.get(c.datasetId);
+      if (went) started++;
+      else withheld++;
+      // The dangerous direction: offered, and the route refuses.
+      if (shown === true && !went) wrongly.push(`${c.name}: offered, the route said ${res.status}`);
+      // The other: not offered, and the route would have started it.
+      if (shown === false && went && c.conservative !== true) {
+        wrongly.push(`${c.name}: not offered, the route started it`);
+      }
+      if (c.conservative === true) {
+        expect({ name: c.name, shown, went }).toEqual({ name: c.name, shown: false, went: true });
+      }
+    }
+    expect(wrongly).toEqual([]);
+    // The matrix reaches both answers, and the route's refusals that a list can see.
+    expect(started).toBeGreaterThan(8);
+    expect(withheld).toBeGreaterThan(14);
+    for (const word of [
+      "request_not_requested",
+      "screen_not_ready",
+      "running",
+      "has_result",
+      "not_applicable",
+    ]) {
+      expect([...refusedWith]).toContain(`409 ${word}`);
+    }
+  });
+
+  test("with the review off nothing is offered, and the route starts none", async () => {
+    const cases = seed();
+    const off = h.env({ PUBLICATION_REVIEW_ENABLED: undefined });
+    const list = await offered(off);
+    for (const c of cases) {
+      expect({ name: c.name, offered: list.get(c.datasetId) }).toEqual({
+        name: c.name,
+        offered: false,
+      });
+      const res = await start(c.datasetId, { bindings: off });
+      // A request that is over has no active request to start a review for.
+      const over = c.over?.requestStatus === "published" || c.over?.requestStatus === "denied";
+      expect({ name: c.name, status: res.status }).toEqual({
+        name: c.name,
+        status: over ? 404 : 409,
+      });
+      expect((await bodyOf<ErrorBody>(res)).code).toBe(over ? "not_found" : "review_disabled");
+    }
   });
 });

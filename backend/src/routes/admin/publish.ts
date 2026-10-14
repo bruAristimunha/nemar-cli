@@ -9,6 +9,12 @@ import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
 
 import { screenGate } from "../../../../shared/identifier-screen-report.js";
+import {
+  ACKNOWLEDGMENT_MAX_LENGTH,
+  ACKNOWLEDGMENT_MIN_LENGTH,
+  DENIAL_REASON_MAX_LENGTH,
+} from "../../../../shared/publication-limits.js";
+import { publishingStanding } from "../../../../shared/publication-steps.js";
 import { auditLogStatement } from "../../db/audit-log";
 import { ACTIVE_REQUEST_TAIL_SQL, approvalInFlightSql } from "../../services/approval-dispatch";
 import { resolveEmailConfig, sendPublicationDeniedEmail } from "../../services/email";
@@ -34,8 +40,14 @@ import {
 import {
   acknowledgeIdentifierScreenSchema,
   approveSchema,
+  publicationReviewOverrideSchema,
   runPublicationApproval,
 } from "../../services/publication-orchestrator";
+import {
+  type ReviewGateResult,
+  evaluateApprovalReviewGate,
+  recordApprovalOverride,
+} from "../../services/publication-review-gate";
 import { publicationReviewSummaries } from "../../services/publication-review-view";
 import { errorMessage } from "../../services/repo-metadata";
 import { applyObjectLockBatch } from "../../services/s3";
@@ -52,7 +64,10 @@ const APPROVAL_IN_PROGRESS = {
 
 /** The optional body of the approve-dispatch route. */
 const dispatchBodySchema = z
-  .object({ acknowledge_identifier_screen: acknowledgeIdentifierScreenSchema.optional() })
+  .object({
+    acknowledge_identifier_screen: acknowledgeIdentifierScreenSchema.optional(),
+    override_publication_review: publicationReviewOverrideSchema.optional(),
+  })
   .strict();
 
 export function registerPublishRoutes(admin: AdminRouter): void {
@@ -124,6 +139,7 @@ export function registerPublishRoutes(admin: AdminRouter): void {
         identifier_screen_nonce?: string | null;
         identifier_screen_report?: string | null;
         identifier_screen_ack_by: number | null;
+        identifier_screen_ack_at: string | null;
         review_ds_id: string | null;
         review_ds_source: string | null;
         review_ds_is_exemplar: number | null;
@@ -148,6 +164,8 @@ export function registerPublishRoutes(admin: AdminRouter): void {
           identifier_screen_status: r.identifier_screen_status,
           identifier_screen_report: r.identifier_screen_report ?? null,
           identifier_screen_ack_by: r.identifier_screen_ack_by,
+          identifier_screen_ack_at: r.identifier_screen_ack_at,
+          steps_completed: r.steps_completed ?? null,
         },
         dataset:
           r.review_ds_id === null
@@ -158,6 +176,8 @@ export function registerPublishRoutes(admin: AdminRouter): void {
                 concept_doi: r.review_ds_concept_doi,
                 ezid_status: r.review_ds_ezid_status,
                 first_published_at: r.review_ds_first_published_at,
+                // The detail's field; the summary does not use it.
+                total_files: null,
               },
       })),
       nowMs,
@@ -197,7 +217,10 @@ export function registerPublishRoutes(admin: AdminRouter): void {
    * POST /admin/publish/:id/deny - Deny a publication request
    */
   const denySchema = z.object({
-    reason: z.string().min(1, "Reason is required").max(2000, "Reason too long"),
+    reason: z
+      .string()
+      .min(1, "Reason is required")
+      .max(DENIAL_REASON_MAX_LENGTH, "Reason too long"),
   });
 
   admin.post("/publish/:id/deny", zValidator("json", denySchema), async (c) => {
@@ -262,8 +285,41 @@ export function registerPublishRoutes(admin: AdminRouter): void {
    * POST /admin/publish/:id/approve - Approve and run the publication
    * orchestrator. The 16-step state machine lives in
    * services/publication-orchestrator.ts (#904); this route is a thin adapter.
+   *
+   * The body carries `resume`, `skip_ci_check` and the S3 lock fields as before, and two fields
+   * of an approval that is gated: `acknowledge_identifier_screen` (the identifier screen's
+   * reason, ADR 0086) and `override_publication_review` (the review shown and the reasons shown,
+   * ADR 0102).
+   *
+   * Refusals, each with a stable code in `error` and a sentence in `message`:
+   *   403 origin_not_allowed  an override sent with a session cookie: it is accepted only with
+   *                         an API key, and the website records one through approve-dispatch
+   *   409 request_blocked   the request is `blocked` and is not a run that started publishing
+   *                         (the owner-name walk-back); whatever the flag says
+   *   409 identifier_screen_not_clear  the identifier screen does not allow it (ADR 0086)
+   *   409 publication_review_not_clear  the review does not allow it, with a `refusal` word and
+   *                         the review's words (ADR 0102)
+   *   409 override_inside_web_approval  an override sent inside a live web approval of the
+   *                         request, which would be recorded under the administrator who clicked
+   *   409 request_changed   the request was denied or blocked while the approval was checked
    */
   admin.post("/publish/:id/approve", zValidator("json", approveSchema), async (c) => {
+    const body = c.req.valid("json");
+    // An override of the publication review is an administrator's own act, and a session cookie
+    // rides along with any cross-site request a browser can be made to send, so it is accepted
+    // only with an API key (ADR 0102; the one slice of #1603 this phase needs). The website records
+    // one through approve-dispatch, which asks for a NEMAR origin. Phrased as "not a token", so an
+    // unset `authMethod` fails closed.
+    if (body.override_publication_review !== undefined && c.get("authMethod") !== "token") {
+      return c.json(
+        {
+          error: "origin_not_allowed",
+          message:
+            "An override of the publication review is accepted only with an API key; the website records one through approve-dispatch.",
+        },
+        403,
+      );
+    }
     const result = await runPublicationApproval({
       db: c.env.DB,
       env: c.env,
@@ -272,7 +328,7 @@ export function registerPublishRoutes(admin: AdminRouter): void {
       waitUntil: (p) => c.executionCtx.waitUntil(p),
       datasetId: c.req.param("id"),
       adminUser: c.get("user"),
-      body: c.req.valid("json"),
+      body,
     });
     return c.json(result.body as never, (result.status ?? 200) as never);
   });
@@ -292,8 +348,13 @@ export function registerPublishRoutes(admin: AdminRouter): void {
    * The executor calls `POST /publish/:id/approve` with its own service key; the
    * orchestrator reads `approval_requested_by` as the approver while the run is
    * live, so the record names the admin who clicked rather than the bot.
-   * `/approve`'s request and response contract is unchanged and stays the
-   * contract for every executor, a terminal included.
+   * `/approve` is the contract for every executor, a terminal included: it also
+   * takes the review's override in its body, and answers 403 origin_not_allowed
+   * for an override sent with a cookie, and the 409s `request_blocked`,
+   * `request_changed`, `override_inside_web_approval` and
+   * `publication_review_not_clear`, besides the identifier screen's own
+   * (see its docblock). The executor sends no override: its run rides on the
+   * clicker's, recorded here before the dispatch.
    *
    * A cookie request must come from a NEMAR origin; a bearer key is not asked.
    *
@@ -308,7 +369,12 @@ export function registerPublishRoutes(admin: AdminRouter): void {
    *                         allow approval (epic #1610 phase 4): not run, not
    *                         reported, findings, a review with no reason, or a
    *                         verdict about a commit `main` has moved past
-   *   400 invalid_body      the optional body is not `{ acknowledge_identifier_screen }`
+   *   409 publication_review_not_clear  the publication review does not allow
+   *                         approval (ADR 0102): the gate refuses before the claim, with
+   *                         a `refusal` word and the review's words, and an override that
+   *                         is recorded is recorded after the head check (below)
+   *   400 invalid_body      the optional body is not `{ acknowledge_identifier_screen,
+   *                         override_publication_review }`
    *   502 dispatch_failed   GitHub answered 4xx, or a token could not be
    *                         minted: nothing was sent, the claim is released
    *   502 dispatch_unconfigured  the Worker has no GitHub credential; retrying
@@ -342,10 +408,12 @@ export function registerPublishRoutes(admin: AdminRouter): void {
     const adminUser = c.get("user");
     const db = c.env.DB;
 
-    // The body is optional; it carries only an acknowledgment of the
-    // identifier screen (epic #1610 phase 4). No body, or none that parses as
-    // JSON, is the bodyless click every existing caller sends.
+    // The body is optional; it carries an acknowledgment of the identifier
+    // screen (epic #1610 phase 4) and the administrator's override of the
+    // publication review (ADR 0102). No body, or none that parses as JSON, is
+    // the bodyless click every existing caller sends.
     let acknowledgment: string | undefined;
+    let override: z.infer<typeof publicationReviewOverrideSchema> | undefined;
     const rawBody: unknown = await c.req.json().catch(() => undefined);
     if (rawBody !== undefined) {
       const parsed = dispatchBodySchema.safeParse(rawBody);
@@ -353,13 +421,13 @@ export function registerPublishRoutes(admin: AdminRouter): void {
         return c.json(
           {
             error: "invalid_body",
-            message:
-              "The only field this accepts is acknowledge_identifier_screen, a reason of 10 to 500 characters.",
+            message: `The only fields this accepts are acknowledge_identifier_screen, a reason of ${ACKNOWLEDGMENT_MIN_LENGTH} to ${ACKNOWLEDGMENT_MAX_LENGTH} characters, and override_publication_review, the review shown and the reasons shown.`,
           },
           400,
         );
       }
       acknowledgment = parsed.data.acknowledge_identifier_screen;
+      override = parsed.data.override_publication_review;
     }
 
     const request = await db
@@ -403,11 +471,13 @@ export function registerPublishRoutes(admin: AdminRouter): void {
     // is skipped only for a run that has already started publishing. A run that
     // stopped before that (a failed ci_check leaves the row `approving`) is
     // gated like a fresh one, because the depositor may have pushed since.
-    const gated = !(resume && hasStartedPublishing(request.steps_completed));
+    // A blocked request never gets here (refused above), so the reason is not asked.
+    const gated = publishingStanding({ ...request, block_reason: null }) !== "publishing";
 
     // The state half: no network and no claim, so a refused click changes
     // nothing. The head half needs a GitHub token and runs once one is in hand,
     // below. A reason recorded earlier counts only for the admin who gave it.
+    let review: ReviewGateResult = { ok: true, state: "off" };
     if (gated) {
       const stateGate = screenStateGate(
         datasetId,
@@ -416,6 +486,22 @@ export function registerPublishRoutes(admin: AdminRouter): void {
         adminUser.id,
       );
       if (!stateGate.ok) return c.json(stateGate.refusal, 409);
+      // The publication review's gate (ADR 0102) is asked next, still before the
+      // claim, so a refusal claims nothing and changes nothing. It reads no GitHub
+      // and writes nothing: only the OVERRIDE it says to record waits, until the head
+      // check below has passed, so it is recorded last, only after every gate has passed.
+      // (The screen's acknowledgment is recorded when the screen gate passes,
+      // on its own, and stands whether or not the review then refuses.)
+      // `requireRow`: the executor that follows reads the clicker's override off the
+      // review row, so an override with no row to hold it cannot be carried.
+      review = await evaluateApprovalReviewGate(c.env, {
+        requestId: request.id,
+        datasetId,
+        approverId: adminUser.id,
+        override,
+        requireRow: true,
+      });
+      if (!review.ok) return c.json(review.body, 409);
     }
 
     // One conditional UPDATE is the claim: D1 runs it atomically, so two
@@ -576,6 +662,29 @@ export function registerPublishRoutes(admin: AdminRouter): void {
             },
             409,
           );
+        }
+      }
+      // The override the review gate asked to record, last, now that the screened commit
+      // is still `main`: it attaches to content that is still the content being published,
+      // and is recorded only after every gate has passed. It can remain on its row, bound to
+      // that review, those reasons and its approver, when the dispatch then fails or goes
+      // unconfirmed. The screen's acknowledgment above was recorded when its own check passed
+      // and does not depend on this one. Still before the dispatch, so the executor's run
+      // finds it on the row. A row that moved since the gate read it refuses, and nothing has
+      // been sent.
+      if (review.ok && review.state === "enforced" && review.record !== null) {
+        const recorded = await recordApprovalOverride(c.env, {
+          requestId: request.id,
+          datasetId,
+          approverId: adminUser.id,
+          via: "approve-dispatch",
+          outcome: review.outcome,
+          headSha: review.headSha,
+          record: review.record,
+        });
+        if (!recorded.ok) {
+          await releaseClaim();
+          return c.json(recorded.body, 409);
         }
       }
     }
