@@ -1623,12 +1623,17 @@ authWebRoutes.post(
         return c.json(CODE_EXPIRED_BODY, 401);
       }
 
-      // The change + its audit row in one batch. email_verified=1: the user
-      // just proved control of the new inbox. A concurrent claim of the
-      // address lands here as a UNIQUE violation -> 409, matching the
+      // The change + its audit row in one batch, through the same
+      // transition as /email/verify: the user just proved control of the new
+      // inbox, so a `pending` account becomes `verified` here too. Stamping
+      // `email_verified` alone stranded such an account at `pending`, where
+      // /email/verify then answers `already_verified` and nothing else can
+      // promote it. A concurrent claim of the address lands here as a UNIQUE
+      // violation, which rolls the whole batch back -> 409, matching the
       // pre-checks.
+      let promoted: boolean;
       try {
-        await db.batch([
+        ({ promoted } = await applyEmailVerification(db, actor.id, "email_change", [
           db
             .prepare("UPDATE users SET email = ?, email_verified = 1 WHERE id = ?")
             .bind(email, actor.id),
@@ -1639,7 +1644,7 @@ authWebRoutes.post(
             resourceId: String(actor.id),
             details: JSON.stringify({ from: actor.email, to: email }),
           }),
-        ]);
+        ]));
       } catch (writeErr) {
         // Column-scoped, matching the profile PATCH and signup precedents: a
         // UNIQUE hit on anything OTHER than users.email must not be
@@ -1690,6 +1695,15 @@ authWebRoutes.post(
       // DEV_EMAIL_ALLOWLIST -- the old address is a REAL one on the dev
       // mirror's ~609 rows, and this is the one send in the flow whose
       // target the caller did not choose.
+      if (promoted) {
+        await notifyAdminsOfVerifiedAccount(c.env, {
+          id: actor.id,
+          email,
+          github_username: actor.github_username,
+          description: "Verified their email address by changing it.",
+        });
+      }
+
       const oldAddressNotified = await notifyOldAddressOfEmailChange(
         c,
         actor.id,

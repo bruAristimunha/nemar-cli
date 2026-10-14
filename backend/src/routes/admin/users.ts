@@ -2056,8 +2056,11 @@ export function registerUsersRoutes(admin: AdminRouter): void {
       // where the row already has the desired status.
       if (status) {
         const upd = await db
-          .prepare("UPDATE users SET status = ? WHERE email = ?")
-          .bind(desiredStatus, email)
+          // A pending fixture is unverified (migration 0096 refuses the pair).
+          .prepare(
+            "UPDATE users SET status = ?, email_verified = CASE WHEN ? = 'pending' THEN 0 ELSE email_verified END WHERE email = ?",
+          )
+          .bind(desiredStatus, desiredStatus, email)
           .run();
         // Defend against a silent status mismatch: if the UPDATE matched
         // 0 rows (e.g., the email normalised differently between the

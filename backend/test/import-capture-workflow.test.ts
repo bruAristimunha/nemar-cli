@@ -257,7 +257,7 @@ describe("the reporters survive a log with no failure marker", () => {
       // The fix must not have turned every report into the fallback.
       const { code, out } = await runReporter(
         stage,
-        `some output\n[31m✖[39m Failed to push: remote: Invalid username or token.\nmore\n`,
+        "some output\n[31m✖[39m Failed to push: remote: Invalid username or token.\nmore\n",
       );
       expect(code).toBe(0);
       expect(out).toContain("Failed to push");

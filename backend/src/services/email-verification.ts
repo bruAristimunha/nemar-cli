@@ -159,7 +159,7 @@ export async function issueEmailVerificationCode(
 
 /** How the inbox was proved, recorded in the audit row's details so the two
  *  roads to `verified` stay distinguishable after the fact. */
-export type EmailVerificationRoute = "verify_endpoint" | "code_signin";
+export type EmailVerificationRoute = "verify_endpoint" | "code_signin" | "email_change";
 
 /** Just the half of a D1 batch result anyone here reads. D1's own types do not
  *  narrow `batch()` results per statement, so the cast is unavoidable; naming

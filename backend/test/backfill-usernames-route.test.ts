@@ -553,7 +553,7 @@ describe("backfill-usernames: the verify-retry pass", () => {
 
   test("a verified row is never in the retry population", async () => {
     const id = seedNamedButUnverified("done@nemar.test", "adone");
-    db.query("UPDATE users SET email_verified = 1 WHERE id = ?").run(id);
+    db.query("UPDATE users SET status = 'verified', email_verified = 1 WHERE id = ?").run(id);
 
     const body = await (await withFakeResend(() => run({ apply: true }))).json();
     expect(body.verify_retries).toHaveLength(0);

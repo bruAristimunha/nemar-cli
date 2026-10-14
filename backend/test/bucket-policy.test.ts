@@ -275,7 +275,7 @@ describe("prefixIdFromArn", () => {
   });
 
   test("rejects non-matching ARNs", () => {
-    expect(prefixIdFromArn(BUCKET, `arn:aws:s3:::other/nm000111/*`)).toBeNull();
+    expect(prefixIdFromArn(BUCKET, "arn:aws:s3:::other/nm000111/*")).toBeNull();
     expect(prefixIdFromArn(BUCKET, `arn:aws:s3:::${BUCKET}/nm000111`)).toBeNull();
     expect(prefixIdFromArn(BUCKET, `arn:aws:s3:::${BUCKET}/a/b/*`)).toBeNull();
   });
