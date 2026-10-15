@@ -377,7 +377,15 @@ Examples:
       } else {
         spinner.warn(`The identifier screen for ${datasetId} could not be started`);
         for (const line of screenViewLines(result.identifier_screen, 2)) console.log(line);
-        console.log(chalk.dim("  The admins have been mailed this result."));
+        console.log(
+          chalk.dim(
+            "  Nothing is running. Run this command again once the cause is fixed; the Worker mails the admins when a screen cannot start.",
+          ),
+        );
+        // The Worker answered 202 but nothing was started: a failure, and the Worker's own answer
+        // rather than a crash (ADR 0102, Phase 2 amendment, item 12).
+        process.exitCode = 1;
+        markReportedExit();
       }
     } catch (error) {
       failWith(error, spinner, "Failed to re-run the identifier screen");

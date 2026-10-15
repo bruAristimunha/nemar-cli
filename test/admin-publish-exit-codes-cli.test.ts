@@ -165,6 +165,25 @@ describe("a call the Worker refuses", () => {
     expect(posts().map((c) => c.status)).toEqual([409]);
   });
 
+  test("screen exits 1 when the Worker answers 202 but could not start it, and does not claim the mail was sent", async () => {
+    // The Worker answers 202 with status "error" when the dispatch itself failed (here: it holds
+    // no secret to sign the screen's callback with). Nothing is running, so a script that asked
+    // for a screen must see a failure (ADR 0102, Phase 2 amendment, item 12).
+    h.setEnv({ PRESCREEN_CALLBACK_SECRET: undefined });
+    seedGolden(h.db);
+
+    const r = await h.cli(["admin", "publish", "screen", DATASET]);
+
+    expect(h.requests.at(-1)?.status).toBe(202);
+    expect(r.exitCode).toBe(1);
+    // The Worker's own answer, not a crash: no bug-report hint.
+    expect(output(r)).not.toContain(BUG_HINT);
+    expect(output(r)).toContain(`The identifier screen for ${DATASET} could not be started`);
+    expect(output(r)).not.toContain("have been mailed");
+    expect(output(r)).toContain("Nothing is running");
+    expect(h.github.dispatches).toHaveLength(0);
+  });
+
   test("approve over a screen that found direct identifiers exits 1", async () => {
     const requestId = seedGolden(h.db);
     markScreen(h.db, requestId, DATASET, { status: "direct-identifiers" });
