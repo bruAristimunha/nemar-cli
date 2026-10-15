@@ -1190,9 +1190,9 @@ export const MUTANTS: Mutant[] = [
     id: "H08-publication-hook-wrong-dataset",
     layer: "hooks",
     file: `${SVC}/publication-orchestrator.ts`,
-    find: 'scheduleNeurobagelSync(env, waitUntil, datasetId, "hook:publication");\n\n  // Audit log (non-fatal but warn user if fails)',
+    find: 'scheduleNeurobagelSync(env, waitUntil, datasetId, "hook:publication");\n\n  // The audit row was written with the closing write',
     replace:
-      'scheduleNeurobagelSync(env, waitUntil, "nm000992", "hook:publication");\n\n  // Audit log (non-fatal but warn user if fails)',
+      'scheduleNeurobagelSync(env, waitUntil, "nm000992", "hook:publication");\n\n  // The audit row was written with the closing write',
     note: "the approval's own finalize federates the wrong dataset",
     tests: [`${T}/neurobagel-hooks.test.ts`],
   },
