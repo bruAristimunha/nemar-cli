@@ -341,6 +341,15 @@ function showDetails(card: Card): void {
 }
 
 /**
+ * How long a terminal waits, after the line that answered a prompt for free text, for the rest of
+ * a multi-line paste to arrive before it decides the answer was one line. A paste reaches the
+ * program in pieces a few milliseconds apart, so the window must outlast the slowest gap a loaded
+ * machine produces; 250 ms is far above that and below what a person pressing Enter on a reason
+ * notices.
+ */
+const PASTE_SETTLE_MS = 250;
+
+/**
  * One line the administrator typed, trimmed. An empty line cancels, and so does a line that came
  * with others (a pasted paragraph is one line plus lines that would answer the next questions): a
  * terminal drops them and sends nothing, and a pipe is a script and keeps its lines.
@@ -352,7 +361,7 @@ async function askLine(
 ): Promise<{ kind: "text"; text: string } | { kind: "cancelled" } | { kind: "ended" }> {
   const typed = await reader.ask(prompt);
   if (typed === null) return { kind: "ended" };
-  const extra = await reader.discardTyped(40);
+  const extra = await reader.discardTyped(PASTE_SETTLE_MS);
   if (extra > 0) {
     console.log(
       chalk.yellow(
