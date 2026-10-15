@@ -358,6 +358,7 @@ describe("runApproval against a Worker that answers with hostile text", () => {
         body: {
           message: `Published ${HOSTILE}`,
           dataset_id: ID,
+          status: "published",
           step_results: [
             { step: `ci_check${HOSTILE}`, status: "completed", attempts: 2, duration_ms: 90 },
             { step: "s3_lock", status: "failed", attempts: 1, duration_ms: 1, error: HOSTILE },
@@ -397,7 +398,10 @@ describe("runApproval against a Worker that answers with hostile text", () => {
           },
         },
         { status: 500, body: { error: "a transient fault" } },
-        { status: 200, body: { message: "Published", dataset_id: ID, step_results: [] } },
+        {
+          status: 200,
+          body: { message: "Published", dataset_id: ID, status: "published", step_results: [] },
+        },
       ];
 
       const { value, text } = await printed(() => runApproval(ID, options));
