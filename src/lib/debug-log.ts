@@ -126,7 +126,13 @@ export function unmarkReportedExit(): void {
   possibleBugSeen = true;
 }
 
-/** Starts the exit state over, as a fresh process has it (for tests that run commands in one process). */
+/**
+ * Starts the exit state over, as a fresh process has it. TEST-ONLY: nothing in the CLI calls it.
+ * It lives here because the state it clears is module-private and process-wide, and the unit test
+ * of `admin-command.ts` runs several commands in one process: a second entry point on the module
+ * is the one way to start each case clean without a process per case or a cache-busted import,
+ * which would load a second copy of the module that the code under test does not use.
+ */
 export function resetReportedExit(): void {
   reportedExit = false;
   possibleBugSeen = false;

@@ -354,10 +354,12 @@ An approval is for the request it showed, and the API refuses it when that
 request was denied or filed again since (`--request-id` names it yourself).
 An approval started from the website is run by a workflow that is handed a
 token in the environment variable `NEMAR_APPROVAL_DISPATCH_TOKEN` and runs
-`approve --resume --yes` with it, so the token is never typed at a terminal.
+`approve <dataset> --yes` with it (adding `--resume` when the click resumes a
+request or the request is already approving), so the token is never typed at a
+terminal.
 With the variable set, the API records the administrator who clicked as the
-approver, and `--force`, `--acknowledge-identifier-screen` and
-`--skip-ci-check` are refused.
+approver, and `--force`, `--acknowledge-identifier-screen`, `--skip-ci-check`
+and `--sandbox` are refused.
 Without the variable the command is your own approval, recorded under your
 account, and `next` never reads it.
 
@@ -480,6 +482,7 @@ NEMAR_API_KEY                  # API key (alternative to `nemar auth login -k`)
 NEMAR_NO_BROWSER=1             # Never try to open a browser during sign-in (same as --no-open)
 NEMAR_NO_COLOR                 # Disable colored output
 NEMAR_APPROVAL_DISPATCH_TOKEN  # Dispatch token of a web approval; set only by the web approval executor, never by a person
+NEMAR_APPROVE_RETRY_DELAY_MS   # Whole milliseconds to wait between retries of an approval; it can only shorten the default wait (for tests), never lengthen it
 ```
 
 ### Testing
