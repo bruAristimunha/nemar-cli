@@ -134,7 +134,9 @@ A token that is stale or expired is refused, never quietly downgraded.**
    The second is the safer of the two, because it is the request the administrator chose from the list, and the Worker refuses the call if another request has become the newest since.
    `--request-id` names it for a script, and the CLI refuses locally, before it sends any approval, when the two disagree.
    A call that carries a token binds the request by the token as well.
-   The CLI's `deny` does not send it today, and the website's calls are Phase 4's (#1731).
+   The CLI's `deny` sends it as well: `next`'s `n` sends the id of the card's row, and a standalone `deny` reads the request in force as `approve` does, names it in its question, sends its number and takes `--request-id`, refused locally when it is not the request in force.
+   A depositor's withdrawal followed by a new filing between the look and the denial is then the Worker's 409 `request_mismatch`, and the new request is neither denied nor mailed.
+   The website's calls are Phase 4's (#1731).
 8. **The dispatch route checks the dataset id for its environment before it claims.**
    The ids are `nm` or `on` and six digits on production, and also `xx` anywhere else (`APPROVAL_DISPATCH_ID_RE` in `shared/publication-limits.ts`).
    Anything else is 400 `invalid_dataset_id`, before the body is read, before any read of the request and before the claim (#1583).

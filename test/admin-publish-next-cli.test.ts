@@ -524,13 +524,47 @@ describe("n denies, with a reason the depositor is mailed", () => {
     expect(r.stdout).toContain(`Denied ${A}; the depositor is mailed the reason.`);
     expect(r.stdout).toContain("Done: 1 denied.");
     expect(posted("/deny")).toHaveLength(1);
-    expect(posted("/deny")[0]?.body).toEqual({ reason: "Please add a CHANGES entry." });
+    expect(posted("/deny")[0]?.body).toEqual({
+      reason: "Please add a CHANGES entry.",
+      request_id: requestId,
+    });
     expect(requestRow(requestId)?.status).toBe("denied");
     expect(requestRow(requestId)?.denied_reason).toBe("Please add a CHANGES entry.");
     const sends = h.mail.filter((m) => m.path === "/emails").map((m) => asSend(m));
     expect(sends).toHaveLength(1);
     expect(sends[0]?.to).toEqual([`depositor_${A}@example.org`]);
     expect(textOf(sends[0]?.html ?? "")).toContain("Please add a CHANGES entry.");
+  });
+
+  test("a request withdrawn and filed again after the list was read is not denied by n: the card named the old one", async () => {
+    // The list shows request 1; before its card is drawn the depositor withdrew it and filed
+    // request 2. n sends request 1's number, the Worker refuses, and 2 is neither denied nor mailed.
+    const a = seed(A);
+    notStarted(a.requestId);
+    let second = 0;
+    h.after("GET /admin/publish/requests", () => {
+      h.db.run(
+        "UPDATE publication_requests SET status = 'denied', withdrawn_at = datetime('now') WHERE id = ?",
+        [a.requestId],
+      );
+      second = seed(A).requestId;
+      notStarted(second);
+    });
+
+    const r = await next("n\nNot ready.\n");
+
+    expect(second).toBeGreaterThan(a.requestId);
+    expect(r.exitCode).toBe(1);
+    expect(output(r)).toContain(REQUEST_MISMATCH_MESSAGE);
+    expect(posted("/deny")).toHaveLength(1);
+    expect(posted("/deny")[0]?.body?.request_id).toBe(a.requestId);
+    expect(requestRow(second)).toEqual({
+      status: "requested",
+      approved_by: null,
+      denied_reason: null,
+    });
+    expect(h.mail).toEqual([]);
+    expect(r.stdout).toContain("Done: 1 failed.");
   });
 
   test("an empty or blank reason cancels and asks again; nothing is posted", async () => {

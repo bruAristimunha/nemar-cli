@@ -467,7 +467,8 @@ async function deny(step: Step, card: Card): Promise<Outcome> {
     return "again";
   }
   try {
-    await denyPublication(id, got.text);
+    // The request the card was drawn for, so one filed again since is the Worker's 409.
+    await denyPublication(id, got.text, card.row.id);
   } catch (error) {
     failWith(error, null, `Could not deny ${plain(id)}`);
     step.tally.failed++;

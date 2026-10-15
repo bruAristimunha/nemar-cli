@@ -521,7 +521,7 @@ After Approval:
  * field of the review (a number there, but the client does not check that it is). Undefined for
  * anything else, so a Worker that sends none, or sends something else, names no request.
  */
-function requestNumber(value: unknown): number | undefined {
+export function requestNumber(value: unknown): number | undefined {
   const n = typeof value === "string" && /^[1-9]\d*$/.test(value) ? Number(value) : value;
   return typeof n === "number" && Number.isSafeInteger(n) && n > 0 ? n : undefined;
 }
@@ -610,7 +610,7 @@ interface RunApprovalOptions {
  * network (a Worker's refusal, a body that was not JSON). The message is cleaned in place; the error
  * is about to be reported and dropped.
  */
-function printable(error: unknown): unknown {
+export function printable(error: unknown): unknown {
   if (error instanceof Error) error.message = plain(error.message);
   return error;
 }

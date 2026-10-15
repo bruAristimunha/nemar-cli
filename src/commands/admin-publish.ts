@@ -21,6 +21,7 @@ import chalk from "chalk";
 import { Command } from "commander";
 import inquirer from "inquirer";
 import ora from "ora";
+import { DENIAL_REASON_MAX_LENGTH } from "../../shared/publication-limits.js";
 import { searchLimitProblem } from "../../shared/publish-list-search.js";
 import { checkedDatasetId, failMessage, failWith, requireSignedIn } from "../lib/admin-command.js";
 import { denyPublication, listPublishRequests, rerunIdentifierScreen } from "../lib/api/publish.js";
@@ -34,6 +35,7 @@ import {
 } from "../lib/confirm.js";
 import { markReportedExit } from "../lib/debug-log.js";
 import { LineReader } from "../lib/prompt-lines.js";
+import { readReview } from "../lib/publication-review-approve.js";
 import { reviewListLine, screenViewLines } from "../lib/publication-review-display.js";
 import { needsAdministrator } from "../lib/publication-review-queue.js";
 import {
@@ -43,7 +45,7 @@ import {
   resolveListStatuses,
 } from "../lib/publish-list-filter.js";
 import { plain } from "../lib/terminal-text.js";
-import { registerApproveCommand } from "./admin-publish-approve.js";
+import { printable, registerApproveCommand, requestNumber } from "./admin-publish-approve.js";
 import { registerNextCommand } from "./admin-publish-next.js";
 import { registerReviewCommands } from "./admin-publish-review.js";
 
@@ -276,6 +278,10 @@ publishCommand
   .description("Deny a publication request")
   .argument("<dataset-id>", "Dataset ID")
   .option("-r, --reason <reason>", "Reason for denial")
+  .option(
+    "--request-id <n>",
+    "The request this denial is for (default: the one in force); refused if it is not the request in force",
+  )
   .option(YES_OPTION, YES_DESCRIPTION)
   .option(NO_OPTION, NO_DESCRIPTION)
   .addHelpText(
@@ -297,53 +303,127 @@ Description:
 Requirements:
   - Must provide a reason for denial: --reason or, with no --reason, one typed
     at a terminal or the first line of piped input (in a script, pass --reason)
-  - Reason will be sent to the user via email
+  - Reason will be sent to the user via email (at most 2000 characters)
   - User can fix issues and submit a new request
+
+  The denial is for the request shown in the confirmation: its number is sent,
+  and the API refuses the denial when that request was withdrawn, denied or filed
+  again since, so a request nobody looked at is never denied in its place.
+  --request-id <n> names it yourself (for a script that read the request
+  earlier); it is refused here, before anything is sent, when it is not the
+  request in force.
 
 Examples:
   $ nemar admin publish deny nm000104 --reason "BIDS validation failing"
   $ nemar admin publish deny nm000104 -r "Dataset incomplete - missing subjects"
-  $ nemar admin publish deny nm000104    # Prompts for reason interactively`,
+  $ nemar admin publish deny nm000104    # Prompts for reason interactively
+  $ nemar admin publish deny nm000104 --request-id 42 -r "..."  # Only if request 42 is the one in force`,
   )
-  .action(async (datasetArg: string, options: ConfirmOptions & { reason?: string }) => {
-    if (!requireSignedIn()) return;
-    const datasetId = checkedDatasetId(datasetArg);
-    if (datasetId === null) return;
+  .action(
+    async (
+      datasetArg: string,
+      options: ConfirmOptions & { reason?: string; requestId?: string },
+    ) => {
+      if (!requireSignedIn()) return;
+      const datasetId = checkedDatasetId(datasetArg);
+      if (datasetId === null) return;
 
-    let reason = options.reason;
-    if (!reason) {
-      reason = (await askReason()) ?? undefined;
-      if (!reason) {
-        failMessage("Reason is required", {
-          answered: true,
-          hint: process.stdin.isTTY
-            ? undefined
-            : `Pass --reason "<why>"; there is no terminal to ask on and nothing was piped in.`,
-        });
+      // The request number the administrator gave, and a reason the Worker would refuse for its
+      // length, are both refused before anything is read or sent.
+      const named = options.requestId === undefined ? undefined : requestNumber(options.requestId);
+      if (options.requestId !== undefined && named === undefined) {
+        console.log(
+          chalk.red(
+            `--request-id needs a request number (a positive whole number); "${plain(options.requestId)}" is not one.`,
+          ),
+        );
+        process.exitCode = 1;
+        markReportedExit();
         return;
       }
-    }
+      if (!reasonFits(options.reason)) return;
 
-    const confirmResult = await confirm(`Deny publication of ${datasetId}?`, options);
-    if (confirmResult !== "confirmed") {
-      console.log(chalk.dim(confirmResult === "declined" ? "Skipped" : "Cancelled"));
-      // Nothing was denied, and a script that asked for a denial has to be able to tell. The
-      // administrator's own answer is not a crash, so no bug-report hint.
-      process.exitCode = 1;
-      markReportedExit();
-      return;
-    }
+      let reason = options.reason;
+      if (!reason) {
+        reason = (await askReason()) ?? undefined;
+        if (!reason) {
+          failMessage("Reason is required", {
+            answered: true,
+            hint: process.stdin.isTTY
+              ? undefined
+              : `Pass --reason "<why>"; there is no terminal to ask on and nothing was piped in.`,
+          });
+          return;
+        }
+      }
 
-    const spinner = ora(`Denying publication for ${datasetId}...`).start();
+      if (!reasonFits(reason)) return;
 
-    try {
-      await denyPublication(datasetId, reason);
-      spinner.succeed(`Publication denied for ${datasetId}`);
-      console.log(chalk.dim("  User has been notified."));
-    } catch (error) {
-      failWith(error, spinner, "Failed to deny publication");
-    }
-  });
+      // The request this denial is for: the one in force, as `approve` finds it, named in the
+      // question and sent with the denial, so a request withdrawn or denied and filed again since
+      // is the Worker's 409 and not denied in its place (#1579, ADR 0105 decision 7). A name that is
+      // not the request in force is refused here, before anything is sent. A read that cannot say
+      // (no such route, a body this CLI cannot read) names none, and the Worker denies the newest
+      // active request, as it always did.
+      const read = await readReview(datasetId);
+      if (read.kind === "unreadable" && read.refused !== undefined) {
+        failWith(printable(read.refused), ora(), "The publication review could not be read");
+        return;
+      }
+      const shown = read.kind === "detail" ? requestNumber(read.detail.request_id) : undefined;
+      if (named !== undefined && shown !== undefined && named !== shown) {
+        console.log(
+          chalk.red(
+            `--request-id names request #${named}, but the request in force for ${plain(datasetId)} is #${shown}. Nothing was denied.`,
+          ),
+        );
+        process.exitCode = 1;
+        markReportedExit();
+        return;
+      }
+      const requestId = named ?? shown;
+
+      const confirmResult = await confirm(
+        `Deny publication of ${datasetId}${requestId === undefined ? "" : ` (request #${requestId})`}?`,
+        options,
+      );
+      if (confirmResult !== "confirmed") {
+        console.log(chalk.dim(confirmResult === "declined" ? "Skipped" : "Cancelled"));
+        // Nothing was denied, and a script that asked for a denial has to be able to tell. The
+        // administrator's own answer is not a crash, so no bug-report hint.
+        process.exitCode = 1;
+        markReportedExit();
+        return;
+      }
+
+      const spinner = ora(`Denying publication for ${datasetId}...`).start();
+
+      try {
+        await denyPublication(datasetId, reason, requestId);
+        spinner.succeed(`Publication denied for ${datasetId}`);
+        console.log(chalk.dim("  User has been notified."));
+      } catch (error) {
+        failWith(error, spinner, "Failed to deny publication");
+      }
+    },
+  );
+
+/**
+ * Whether a denial reason is short enough for the Worker (`DENIAL_REASON_MAX_LENGTH`), saying so
+ * and setting the exit code when it is not; `next` makes the same check before it sends. A missing
+ * reason fits: it is asked for next.
+ */
+function reasonFits(reason: string | undefined): boolean {
+  if (reason === undefined || reason.length <= DENIAL_REASON_MAX_LENGTH) return true;
+  console.log(
+    chalk.red(
+      `A denial reason is at most ${DENIAL_REASON_MAX_LENGTH} characters; this one is ${reason.length}. Nothing was sent.`,
+    ),
+  );
+  process.exitCode = 1;
+  markReportedExit();
+  return false;
+}
 
 publishCommand
   .command("screen")

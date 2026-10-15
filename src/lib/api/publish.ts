@@ -271,18 +271,25 @@ export async function listPublishRequests(
 }
 
 /**
- * Deny publication request (admin)
+ * Deny publication request (admin). `requestId` is the request the administrator looked at: the
+ * Worker refuses (409 `request_mismatch`) when it is not the newest active one, so a request
+ * withdrawn or denied and filed again since is never denied in its place (#1579, ADR 0105
+ * decision 7). Left out, the newest active request is denied, as before.
  */
 export async function denyPublication(
   datasetId: string,
   reason: string,
+  requestId?: number,
 ): Promise<{ message: string }> {
   return request<{ message: string }>(
     `/admin/publish/${datasetId}/deny`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ reason }),
+      body: JSON.stringify({
+        reason,
+        ...(requestId !== undefined ? { request_id: requestId } : {}),
+      }),
     },
     true,
   );
