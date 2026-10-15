@@ -212,6 +212,8 @@ describe("verification case 5: cache degradation", () => {
 
 describe("readCompletionCache() directly (supplements the subprocess tests above)", () => {
   let directDir: string;
+  // `bun test` runs every file in one process: put the variable back as found, gone if unset.
+  const previousConfigDir = process.env.NEMAR_CONFIG_DIR;
 
   beforeAll(() => {
     directDir = freshDir();
@@ -226,8 +228,9 @@ describe("readCompletionCache() directly (supplements the subprocess tests above
   });
 
   afterAll(() => {
-    // biome-ignore lint/performance/noDelete: env var cleanup, matches test/config-migrate-api-url.test.ts's convention
-    delete process.env.NEMAR_CONFIG_DIR;
+    // Never `= undefined`: Bun would store the literal string "undefined".
+    if (previousConfigDir === undefined) Reflect.deleteProperty(process.env, "NEMAR_CONFIG_DIR");
+    else process.env.NEMAR_CONFIG_DIR = previousConfigDir;
     rmSync(directDir, { recursive: true, force: true });
   });
 

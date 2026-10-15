@@ -41,9 +41,10 @@ afterEach(() => {
 
 afterAll(() => {
   server.stop(true);
-  if (originalTestApiUrl === undefined) process.env.TEST_API_URL = undefined;
+  // Reflect.deleteProperty, not `= undefined`: Bun would store the STRING "undefined".
+  if (originalTestApiUrl === undefined) Reflect.deleteProperty(process.env, "TEST_API_URL");
   else process.env.TEST_API_URL = originalTestApiUrl;
-  if (originalConfigDir === undefined) process.env.NEMAR_CONFIG_DIR = undefined;
+  if (originalConfigDir === undefined) Reflect.deleteProperty(process.env, "NEMAR_CONFIG_DIR");
   else process.env.NEMAR_CONFIG_DIR = originalConfigDir;
   rmSync(tmpConfigDir, { recursive: true, force: true });
 });
