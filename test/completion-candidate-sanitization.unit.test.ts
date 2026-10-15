@@ -8,7 +8,7 @@
  * (shared/contract/dataset.ts) is an unconstrained `z.string()` sourced from
  * live dataset metadata and cached verbatim (src/lib/completion/cache.ts),
  * so a value containing "\n" reaches `run.ts`'s `${candidate}\n` write and
- * splits into an extra line -- which every consumer (bash's `mapfile`,
+ * splits into an extra line -- which every consumer (bash's `read` loop,
  * zsh's `${(@f)...}` split, fish's newline-split `$lines`) reads as its own,
  * unrelated candidate. A value shaped like `"rest\n:4"` is worse: the
  * injected line is byte-identical to the real trailing directive, so a
