@@ -310,20 +310,30 @@ describe("nothing of the review reaches the depositor", () => {
       NOTE_SENTINEL,
       detail.description.headline,
       ...detail.description.lines,
-      ...detail.reasons.flatMap((r) => [r.sentence, r.cure]),
-      ...(detail.review?.findings ?? []).map((f) => f.note),
+      detail.description.next ?? "",
+      ...detail.reasons.flatMap((r) => [
+        r.sentence,
+        r.cure,
+        r.line ?? "",
+        r.statement ?? "",
+        r.command ?? "",
+      ]),
+      ...(detail.review?.findings ?? []).flatMap((f) => [f.note, f.label, f.document_label ?? ""]),
       ...(detail.review?.fact_notes ?? []).map((f) => f.text),
     ].filter((w) => w.trim() !== "");
     expect(detail.description.headline.length).toBeGreaterThan(10);
     expect(reviewWords.length).toBeGreaterThan(4);
 
     const { res, calls } = await send(PROD_DATASET, {
-      message: "Please describe the recording setup in the README.",
+      message: "Please describe the recording setup before we continue.",
     });
     expect(res.status).toBe(200);
     expect(calls).toHaveLength(1);
     const mail = asSend(calls[0]);
     const text = textOf(mail.html);
+    // The typed words share none of the review's own, short ones included (a document label such
+    // as "README" would collide with a message that mentions it).
+    expect(reviewWords).toContain(detail.review?.findings[0]?.label ?? "");
     for (const word of reviewWords) {
       expect(mail.html).not.toContain(word);
       expect(text).not.toContain(word);
@@ -331,7 +341,7 @@ describe("nothing of the review reaches the depositor", () => {
     // And the subject is only the fixed one.
     expect(mail.subject).toBe(`About your publication request: ${PROD_DATASET}`);
     // What does arrive: the typed words and the frame.
-    expect(text).toContain("Please describe the recording setup in the README.");
+    expect(text).toContain("Please describe the recording setup before we continue.");
     expect(text).toContain(`${FRAME_SENTENCE}.`);
   });
 });

@@ -14,11 +14,13 @@
  * Types and closed vocabularies only, so the Worker that answers and the CLI that prints read ONE
  * definition. Every sentence comes from `shared/publication-review.ts`: `describePublicationReview`,
  * `describeUnreadableReview` and the reasons table; a client renders the server's words and decides
- * nothing itself.
+ * nothing itself. The CLI prints `description.lines`, `description.next` and each reason's `line`
+ * and `command`, which are terminal text. A web page prints each reason's `statement` and its
+ * neutral `cure` and never those.
  * No shape here carries a nonce, a token, a path, a file name or a screen finding.
  */
 
-import type { ScreenState } from "../identifier-screen-report.js";
+import type { ScreenGate, ScreenState } from "../identifier-screen-report.js";
 import type {
   Answer,
   PublicationDeclineDetail,
@@ -91,15 +93,38 @@ export interface ReasonView {
   code: ReasonCode;
   class: "fail" | "unknown";
   cleared_by: "nothing" | "screen_acknowledgment" | "override";
-  /** The closed word or words behind the reason, or null. */
+  /**
+   * The closed word or words behind the reason, or null. Not words for a person: print `statement`,
+   * which words the detail where a table of words exists for it. Where none does (a block reason,
+   * a failed minimum, an unknown word) `statement` prints the closed word itself, as the CLI's
+   * `line` does; it is a snake-case word, never a command.
+   */
   detail: string | null;
+  /**
+   * The reason in words with its detail (`reasonStatement`): what `line` says before the cure,
+   * with no command in it, so a web page prints it and composes nothing from `detail`. Held on the
+   * Worker side by `backend/test/publication-review-admin-routes.test.ts`, not by the type. Absent
+   * from a Worker that predates the field; a page then withholds the reasons rather than print
+   * `line`. The Worker always sends it.
+   */
+  statement?: string;
   sentence: string;
+  /**
+   * What clears the reason, in words a reader with no terminal can use: no command, flag or
+   * placeholder (`neutralCureOf`). A web page prints this. A Worker that predates the field
+   * answers the terminal's text here, which is why a page checks `statement` first.
+   */
   cure: string;
   /**
-   * The whole reason as one line in the shared words (`reasonLine`: the sentence, the detail in
-   * words and the cure), the line `description.lines` carries for it. A client prints this and
-   * composes nothing from `detail`, whose closed words are not words for a person. Absent from a
-   * Worker that predates the field; a client then falls back to the sentence and the cure.
+   * The command the CLI's line names for this cure (`commandOf`), the dataset id filled, or null
+   * when the cure in force names none. A terminal's: a web page never prints it. Absent from a
+   * Worker that predates the field; the Worker always sends it.
+   */
+  command?: string | null;
+  /**
+   * The whole reason as the CLI prints it (`reasonLine`: the sentence, the detail in words and
+   * the terminal's cure), the line `description.lines` carries for it. Never a page's. Absent
+   * from a Worker that predates the field; the CLI then falls back to the sentence and the cure.
    */
   line?: string;
 }
@@ -123,10 +148,12 @@ export interface PublicationReviewSummary {
   reasons: ReasonCode[];
   /**
    * An administrator's `start` is offered for this request: the one rule `describePublicationReview`
-   * uses for its next command (`startOffered`), and the route's own screen precondition. False
-   * unless the review is on and applies. A start the platform's allowance or the Worker's
-   * ownership refuses is still offered here, and answers 409; a client that starts many stops on
-   * `platform_limit`.
+   * uses for its next command (`startOffered`), and the route's own screen precondition. True only
+   * when the review is on and applies, the request is `requested`, the review row is one a start
+   * can create or restart, a reason whose cure is "start it" stands with no hard reason, and the
+   * screen's gate is `clear` or `acknowledge` with a commit. A start the platform's allowance or
+   * the Worker's ownership refuses is still offered here, and answers 409; a client that starts
+   * many stops on `platform_limit`.
    */
   start_offered: boolean;
   /** The review in force, when there is one. */
@@ -161,12 +188,19 @@ export interface PublicationReviewRecord {
    * an older client.
    */
   fact_notes: Array<{ question: Question; fact: string; result: "fail" | "unknown"; text: string }>;
-  /** Severity and code are plain strings so a newer server's word does not break an older client. */
+  /**
+   * Severity and code are plain strings so a newer server's word does not break an older client.
+   * `label` is the shared words for the code (`PUBLICATION_FINDING_LABEL`) and `document_label`
+   * those for the document, null for a finding about none (`DOCUMENT_LABEL`): what the CLI
+   * prints, so a page prints them and never the closed words. `note` is the model's.
+   */
   findings: Array<{
     question: Question;
     severity: string;
     code: string;
+    label: string;
     document: string | null;
+    document_label: string | null;
     note: string;
   }>;
   /** The model's summary, sanitized. */
@@ -228,6 +262,27 @@ export interface PublicationReviewDetail {
   gate: PublicationReviewGateState;
   /** Null when the request is not assessed; see {@link PublicationReviewSummary.outcome}. */
   outcome: PublicationOutcome | null;
+  /**
+   * An administrator's start is offered for this request: the list row's `start_offered`, from
+   * the one rule behind both (`startOffered`), so the detail and the list cannot disagree. The
+   * conditions are listed on {@link PublicationReviewSummary.start_offered}.
+   */
+  start_offered: boolean;
+  /**
+   * What the approval does with the request's identifier screen, whether the review is on or off:
+   * `clear` (nothing to act on), `blocks` (a direct identifier; nothing acknowledges it),
+   * `acknowledge` (an administrator approves with a recorded reason), `rerun` (no verdict; the
+   * screen runs again), `wait` (a run is in flight), or `exempt` (a sandbox dataset is not
+   * screened). It is the screen's gate for an approval of this request. The 409
+   * `identifier_screen_not_clear` that `approve-dispatch` answers reports the same `gate` for the
+   * cases that refuse, and adds `stale` and `unverified`, which this field cannot say (the detail
+   * reads no GitHub): `exempt` never refuses, but `clear` can still refuse as `stale` or
+   * `unverified` when the screened head is no longer `main`. An `acknowledge` passes when this
+   * approver's own acknowledgment is already on the row. `reasons` cannot say this: it is empty
+   * when the review is off and no row is on record, yet the screen's gate still applies to an
+   * approval.
+   */
+  screen_gate: ScreenGate | "exempt";
   reasons: ReasonView[];
   /** Headline, tone, lines (the standing line last) and the next command. */
   description: PublicationReviewDescription;
@@ -413,10 +468,17 @@ export interface PublicationReviewReasonedRefusalBody {
   refusal: Exclude<ReviewGateRefusal, "unverified">;
   /** The review's headline (`REVIEW_UNREADABLE_HEADLINE` on the bare `review_changed` fallback). */
   headline: string;
-  /** `reviewGateRefusalText`, then for `hard_reason` the first hard reason's sentence and cure. */
+  /**
+   * `reviewGateRefusalText`, then for `hard_reason` the first hard reason's sentence and the
+   * TERMINAL's cure (`cureOf`, with its command). Terminal text: a web page words the refusal
+   * from `refusal` and prints the reasons below instead.
+   */
   message: string;
   outcome: PublicationOutcome | null;
-  /** Every live reason in the shared words (`reasonViewsOf`). */
+  /**
+   * Every live reason in the shared words (`reasonViewsOf`), each with the `statement`, the
+   * neutral `cure` and the `command` the detail's reasons carry.
+   */
   reasons: ReasonView[];
   /**
    * The override-class codes the override did not name; empty unless the refusal is about them

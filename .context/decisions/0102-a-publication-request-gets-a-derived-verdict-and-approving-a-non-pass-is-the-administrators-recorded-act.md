@@ -477,12 +477,13 @@ the authors half of its question is answered by the fact that ADR 0065's inverte
   `next` has no `--yes`, and the question cannot be answered by type-ahead (Phase 2 amendment, item 10).
   This differs from ADR 0093 on purpose: there an uncertain or missing review only asks for confirmation,
   and here every non-pass needs the force path, because the act that follows publishes a DOI.
-- **The web page shows the same words.**
+- **The web page shows the same reasons, in words a page can use.**
   The list route carries each request's review as a summary (a headline, a tone, the closed reason codes, whether a start is offered, and ids), not as sentences;
   the sentences, the cures and the next command come from `GET /admin/publish/:id/review`, which renders `describePublicationReview`.
-  So the page either fetches that detail for the request being decided or renders the reasons from the shared words,
-  transcribed into `nemarOrg/website` and pinned by a drift test on each side (ADR 0045's pattern); Phase 4 chooses and records which.
-  The small fixed vocabulary the page needs to decide by itself is declared once in `shared/contract/publication-review-copy.ts` (Phase 4).
+  The page fetches that detail for the request being decided and prints the Worker's words; it does not transcribe the reasons
+  (Phase 4 decided: see the Phase 4 amendment, item 1).
+  The small fixed vocabulary the page needs is words and closed vocabularies, never logic, and is declared once in `shared/contract/publication-review-copy.ts`
+  (Phase 4 decided: see the Phase 4 amendment, item 4).
   A non-pass needs the same explicit confirmation on the page,
   sent as the review id and the reasons shown in `approve-dispatch`'s body.
 - **The Worker is the gate; the command-line tool explains.**
@@ -583,7 +584,8 @@ and each has a closed word and a sentence in the shared module.
 ## Consequences
 
 - An administrator sees one outcome and its reasons for every request,
-  in the same words in the email, the terminal and the web page,
+  in the same words in the email and the terminal, and the same reasons on the web page
+  (worded for a page, not a terminal: see the Phase 4 amendment),
   and cannot approve over a non-pass without saying so on the record.
 - A model is in the approval path of every native publication as a gate the administrator can pass,
   never as a judge of identifiers and never as the last word,
@@ -975,3 +977,129 @@ Where the two differ, this is the later text.
    The code is fixed.
    What remains is the executor's workflow sending the token, which only the maintainer can change, and the staging audit query showing web approvals attributed to their clickers.
    A valid token whose clicker is no longer an active administrator falls back to the caller, as ADR 0080 decided, and the maintainer has not decided whether such a click should publish at all (ADR 0103).
+
+## Amendment 2026-10-14 (#1731): Phase 4, what the web page decided
+
+Phase 4 puts the review on the administrator's web approval page: the same reasons the command-line interface (CLI) prints, in words a reader with no terminal can act on.
+The Worker half is in this repository and the page is in `nemarOrg/website`.
+Section 8's bullet, which was titled "The web page shows the same words", was corrected in place and retitled, because it left the choice between fetching and transcribing to this phase
+and promised the CLI's own words, which a page cannot print;
+this amendment records the choice and what follows from it.
+Where the two differ, this is the later text.
+A sentence is called web-safe here when it names no terminal command, flag or placeholder and does not tell its reader to act in a terminal.
+
+1. **The page fetches the detail and prints the Worker's words; it does not transcribe the reasons.**
+   This is the choice section 8 left open.
+   The cures change with the request (the dataset id, whether a start can reach it, the detail words of a failed question),
+   so a transcription would be a second copy of every reason's sentence and of the rules that compose it, which is what ADR 0045's drift tests exist to catch,
+   and `GET /admin/publish/:id/review` already derives them for one request in one read.
+   The rule, in one line: **the page prints each reason's `statement` and `cure` (the `sentence` only as the fallback for an empty `statement`, which the Worker never sends), and never `command`, `line`, `description.lines`, `description.next` or a gate refusal's `message`.**
+   The same holds for the words the Worker sends that are web-safe, which the page prints as they arrive:
+   `description.headline`, the identifier screen's `headline` and `lines`, the facts' notes, the findings' labels,
+   the `headline` of the 409 refusals of the review gate and of the identifier screen (printed above the page's own words for the refusal),
+   the `message` of the five refusals that name no terminal step (`request_mismatch`, `invalid_dataset_id`, `origin_not_allowed`, `deny_after_publishing` and `approval_in_flight`),
+   and the `error` of the review start's refusals.
+   The model's own text is printed as text, never as markup, and only under its label.
+   The page computes no verdict: whatever the Worker derived is what the page shows.
+
+2. **A cure is a neutral sentence and, for eight reasons, a command; the split is additive.**
+   `cureOf` and `REASONS[].cure` stay the terminal's text, byte for byte, because the CLI's output must not move.
+   The neutral cure is a new function, `neutralCureOf`, which removes exactly the command and the `(--force)` flag;
+   `commandOf` returns the command, and `reasonStatement` returns the reason in words, with the detail of the failed question.
+   A first design made `cureOf` itself the neutral text; it was not used,
+   because many existing tests read the composed terminal text through `cureOf` and `REASONS[].cure`, and the CLI's output must not move.
+   Every existing test that pins that text stays green and unedited, except two old-Worker fixtures:
+   the approve test for a hard reason (test 5) and the `next` test for a card that a Worker sent without a `line`.
+   Both stand for a Worker that sent the terminal's text as `cure` and no `statement` or `command`, so they now rebuild their reasons that way with `cureOf`.
+   The other test edits follow the one meaning that changed, or only add: the backend route tests that read `ReasonView.cure` on the wire now expect the neutral text,
+   and a test helper and the depositor-mail test gain the new fields.
+   On the wire, `ReasonView.cure` is neutral, which is the one meaning that changed;
+   `command` and `statement` are added and are optional in the type, as `line` already is; `line` stays the CLI's text.
+   A golden capture of the CLI's text, taken before the change, holds the terminal side.
+   A web-safety test over the real producer of the detail holds the page's side, with one list of forbidden words (`test/helpers/terminal-words.ts`) in which `nemar ` is case-sensitive,
+   because `NEMAR` appears legitimately in a reason sentence and in a screen line.
+   A future caller who wants a sentence for a page and reaches for `cureOf` gets terminal text; the web-safety test over the producer is what guards that.
+
+3. **The detail gains additive fields, and there is no migration.**
+   They are `start_offered` (whether Start review is offered for this request), `screen_gate`, the reasons' `statement` and `command`, and a `label` and a `document_label` on the findings.
+   `screen_gate` exists because with the review off `reasons` is empty while the identifier screen's gate still applies, which is production today;
+   without it the page could not know whether an acknowledgment is needed.
+   The two reason fields are tolerated as absent.
+   A Worker that predates this phase sends the old `cure`, with a command inside it, and no `statement`;
+   the page treats a missing `statement` as "this Worker predates the page" and withholds the reasons panel.
+   It never prints `line` instead, because `line` is the CLI's text.
+   The page treats the Worker as out of step with it, and withholds Approve and the reasons, for more than a missing `statement`:
+   a missing `start_offered` or `screen_gate`, a `gate` or `screen_gate` word it does not know, a `request_id` that is not an integer, or an `anonymous` that is not a boolean.
+   That is why `start_offered`, `screen_gate` and the finding labels are required in the contract's type while the website's copy of the type makes them optional:
+   the website reads a Worker that may predate them, and this repository writes only the current one.
+
+4. **The page-owned words are declared once, in `shared/contract/publication-review-copy.ts`, under ADR 0045's rules.**
+   The table has 22 keys, in five groups: the review gate's six refusals (`gate.*`, by the `refusal` of a 409 `publication_review_not_clear`),
+   the identifier screen's six refusals (`screen_gate.*`, by the `gate` of a 409 `identifier_screen_not_clear`),
+   the approve control's four states (`approve.*`), the review's standing words and the labels on the model's text (`review.*`), and the three successes of a review start (`start.*`).
+   A key exists only where the page cannot print the Worker's words: the Worker words a refusal for a terminal, or sends no sentence at all (the control's states, the standing words, the successes of a start).
+   So the table does not repeat the words that are printed as they arrive and are pinned web-safe by the test of item 2;
+   the refusals the page's existing friendly-message map already words (an unconfigured dispatch, an approval already running) stay there.
+   A blocked request is not one of them: `not_dispatchable` is the mirrored key `approve.blocked`, and the map no longer carries it.
+   Four Phase 3 codes have no key, `decision_with_dispatch_token`, `dispatch_superseded`, `dispatch_expired` and `approval_closed_during_run`:
+   only `/approve` answers them and only the executor calls it, so a key would be copy with no reader.
+   Every value is a complete sentence with no placeholder and no template, except the two labels on the model's text (`review.model_summary_label` and `review.model_findings_label`),
+   which are phrases the page puts in parentheses after a heading.
+   Each repository tests the same table against the other's copy, on the pattern of the account copy:
+   here a test reads the website's file through an environment variable or a sibling checkout, with a strict mode when the variable is set and a visible skip when it is not,
+   and tests the table against the code's own sentences and sets of words so that it cannot become dead copy.
+   Wiring the strict mode into the continuous integration workflow waits until the website's file exists on its `staging` branch.
+
+5. **What the page may do.**
+   Approve, with the same explicit confirmation as the terminal: the review id and the reasons shown, sent in the body of `approve-dispatch`,
+   and, when the screen's gate is `acknowledge`, a reason of 10 to 500 characters that is recorded with the administrator's account.
+   Deny, and start the review.
+   Approve and deny carry `request_id`, so a click is refused when the request it was for is no longer the active one.
+   The start does not, because its route reads no body and acts on the request that is active;
+   a start made after the request changed reviews the current request, which is harmless, and its own refusals cover a request that cannot be reviewed.
+   The page offers no Approve for a hard reason, for a blocked request (even one walked back from a started run, because `approve-dispatch` refuses every blocked request),
+   or when the screen's gate is `blocks`, `rerun` or `wait`.
+   It never sends a body the route does not accept.
+
+   Five choices of the page follow from that rule, each a decision of the page and not of the Worker.
+   - **The acknowledgment is always asked for.**
+     Whenever `screen_gate` is `acknowledge`, the page asks for the acknowledgment reason, even when this administrator's own acknowledgment is already on the row.
+     The Worker would pass without it, and sending it again is accepted and recorded again;
+     the page chooses a fresh recorded reason over inferring from the row what the Worker would accept.
+   - **A stopped approval is offered as a fresh approve.**
+     An `approving` request that stopped before it published is offered the typed confirmation, with an override or an acknowledgment when the gates need one,
+     because the Worker gates a stopped run like a fresh one.
+     The row's own button keeps its "Resume approval" label; only an approval that has started publishing is continued without the gates.
+   - **No review row and no start: the page says so and offers no Approve.**
+     When an override-class reason stands, no review row is on record to attach the override to, and the Worker offers no start (an `approving` request that never started publishing),
+     the page prints its own line instead of the mirrored `gate.no_review_row`, which tells the reader to start a review.
+     The case is rare, and the cure is a command-line step.
+   - **A hard reason withholds Approve whatever the review's gate says.**
+     The page withholds Approve for a reason that no override or acknowledgment clears, also when the review's gate is `off` or `n/a`.
+     That is stricter than the Worker, which does not gate on an advice-only review.
+     A reason whose `cleared_by` word the page does not know counts as hard, and an approval that has started publishing is exempt, because it passes no gate.
+   - **There is no fallback to the old bodyless Approve.**
+     When the detail cannot be read, or the API is older than the page, the page withholds Approve and says which of the two it is;
+     it does not send the click the page sent before this phase.
+     So the API deploys before the page, as item 3 requires.
+
+6. **Staleness is learned from the refusals, not the detail.**
+   The detail reads no GitHub, so it cannot say that the screen is stale;
+   the page learns it from a 409 `identifier_screen_not_clear` with `gate: "stale"`, and learns that the review changed from `review_changed` and `request_mismatch`.
+   Each gate or screen refusal is shown in the page's own words by item 4 (`request_mismatch` in the Worker's own sentence, which names no terminal),
+   and the page reads the detail again by itself, so the administrator sees the current state without a reload.
+
+7. **Left open.**
+   The page has no control to run the identifier screen again; the Worker has the route, and an administrator uses the terminal for that one step.
+   The `gate: "wait"` answer for an acknowledgment that lost a race says "wait" about a state that is not waiting, and `screen_gate.wait` is worded to cover both; a gate word of its own would widen a Phase 3 contract.
+   Mailing the depositor a comment from the page is not done.
+   The strict parity path is not yet in the continuous integration workflow (two small edits to its unit-pure job, once the website file is on `staging`).
+   The executor workflow edit of Phase 3 stays the maintainer's, as the Phase 3 amendment says.
+   `description.next` shows `nemar admin publish start <id>` for a clean sandbox (`xx`) request, although `start_offered` is false for it and the route refuses a start there.
+   That is CLI behavior from before this phase, tracked in #1773, and the page never prints `description.next`.
+   The neutral cure of a reason whose cure is "start it" has the same limit, because the cure and `command` decide from whether the request is `requested` alone, while `start_offered` also needs a restartable row, no hard reason standing, and a screen with a clear or acknowledgeable result and a head.
+   So the cure can say to start the review while `start_offered` is false: beside any standing hard reason (the commonest case: `review_not_started` beside `submission_minimum_failed` or `identifier_screen_pending`), for a report that no longer parses (`review_could_not_run`, whose stored review is no longer restartable), for a sandbox request, and for a screen with no head.
+   The page's Start button follows `start_offered` only, so it can print that cure beside no button.
+   That is an intentional design choice: a code fix would give the neutral path its own input and leave `cureOf` byte for byte, a change this phase did not take on; it is also tracked in #1773.
+   A sentence in AGENTS.md about the new copy file, beside the one on the account copy, is the maintainer's to write.
+   The website is promoted to production only after the Worker that carries this phase, as item 3 requires.

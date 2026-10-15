@@ -1905,6 +1905,27 @@ describe("what the gate cannot decide it refuses", () => {
     expect(overrideRows()).toHaveLength(0);
   });
 
+  test("18. a hard reason's refusal message keeps the terminal's command, whatever the detail's `cure` says", async () => {
+    // A `clean` screen with no stored report has no verdict about the commit: the hard reason
+    // `identifier_screen_not_run`, whose cure names a command. Called directly, not through
+    // `/approve`: there the screen's own gate answers first for a report that names no commit.
+    const { requestId } = seed();
+    db.run("UPDATE publication_requests SET identifier_screen_report = NULL WHERE id = ?", [
+      requestId,
+    ]);
+    const out = await evaluateApprovalReviewGate(env(), {
+      requestId,
+      datasetId: DATASET,
+      approverId: adminA,
+    });
+    expect(out.ok).toBe(false);
+    if (out.ok) return;
+    expect(out.body).toMatchObject({ refusal: "hard_reason" });
+    expect(out.body.message).toBe(
+      `The publication review gives a reason that no override clears, so the approval is refused. The identifier screen has no verdict about the current commit. An administrator runs the screen again: nemar admin publish screen ${DATASET}.`,
+    );
+  });
+
   test("18. an override with no review row is recorded nowhere but the audit row, so a failed audit write approves nothing", async () => {
     // A terminal's `--force` over `review_not_started`: there is no row to hold the override, so
     // the audit row is the ONLY record of it. Best effort here would approve over a non-pass with

@@ -189,7 +189,8 @@ function refusal(
   let message = reviewGateRefusalText(kind, datasetId);
   if (kind === "hard_reason") {
     const first = hardReasonsOf(reasons)[0];
-    if (first) message = `${message} ${first.sentence} ${first.cure}`;
+    if (first)
+      message = `${message} ${first.sentence} ${cureOf(first.code, datasetId, d.startable)}`;
   }
   return {
     ok: false,

@@ -14,7 +14,8 @@ import type {
   PublicationReviewGateState,
   PublicationReviewRecord,
 } from "../../shared/contract/publication-review-admin";
-import { NOT_ASSESSED_LINE, type ReasonCode } from "../../shared/publication-review";
+import type { ScreenGate } from "../../shared/identifier-screen-report";
+import { NOT_ASSESSED_LINE, type ReasonCode, startOffered } from "../../shared/publication-review";
 import type { PublicationReviewSummary, PublishRequestsResponse } from "../../src/lib/api/publish";
 import type { ReviewRead } from "../../src/lib/publication-review-approve";
 
@@ -38,6 +39,21 @@ export interface Spec {
   totalFiles?: number | null;
   evidence?: PublicationReviewRecord["evidence"];
   headline?: string;
+  /** Overrides the derived `start_offered` (see {@link detailOf}). */
+  startOffered?: boolean;
+  /** Overrides the derived `screen_gate` (see {@link detailOf}). */
+  screenGate?: PublicationReviewDetail["screen_gate"];
+}
+
+/** The screen gate the Worker reports for the screen reasons a spec lists, `clear` for none. */
+function screenGateOf(codes: readonly ReasonCode[]): ScreenGate {
+  if (codes.includes("identifier_screen_blocks")) return "blocks";
+  if (codes.includes("identifier_screen_needs_acknowledgment")) return "acknowledge";
+  if (codes.includes("identifier_screen_pending")) return "wait";
+  if (codes.includes("identifier_screen_not_run") || codes.includes("identifier_screen_stale")) {
+    return "rerun";
+  }
+  return "clear";
 }
 
 export function recordOf(id: number, spec: Spec): PublicationReviewRecord {
@@ -62,6 +78,18 @@ export function recordOf(id: number, spec: Spec): PublicationReviewRecord {
   };
 }
 
+/**
+ * The detail as the Worker words it. `start_offered` and `screen_gate` are derived the way the
+ * Worker derives them from the same reasons, so a fixture never claims a start the reasons do not
+ * offer; a test that needs another answer names it in the spec.
+ *
+ * `start_offered` follows the Worker's `startOfferedFor`: false unless the review is on and
+ * applies (`gate` is `enforced`) and the screen's gate is `clear` or `acknowledge`, then the shared
+ * `startOffered` for a request with no review row. The one condition not modelled is the screen's
+ * head: the fixture has none, so it is taken as present. `screen_gate` is derived from the screen
+ * reasons only and is never `exempt`: the fixture's dataset is not a sandbox one, and a test of
+ * an exempt dataset names the word in `screenGate`.
+ */
 export function detailOf(spec: Spec = {}): PublicationReviewDetail {
   const status = spec.status ?? "requested";
   const reasons = reasonViewsOf(
@@ -74,9 +102,19 @@ export function detailOf(spec: Spec = {}): PublicationReviewDetail {
     null,
   );
   const reviewId = spec.reviewId === undefined ? 11 : spec.reviewId;
+  const gate = spec.gate ?? "enforced";
+  const screenGate = spec.screenGate ?? screenGateOf(reasons.map((r) => r.code));
+  const startOfferedByRule =
+    gate === "enforced" &&
+    (screenGate === "clear" || screenGate === "acknowledge") &&
+    startOffered({
+      reasons: reasons.map((r) => ({ code: r.code, detail: r.detail })),
+      row: { kind: "none" },
+      startable: status === "requested",
+    });
   return {
     environment: "production",
-    enabled: (spec.gate ?? "enforced") !== "off",
+    enabled: gate !== "off",
     dataset_id: ID,
     request_id: 7,
     request_status: status,
@@ -91,9 +129,11 @@ export function detailOf(spec: Spec = {}): PublicationReviewDetail {
     block_reason: spec.blockReason ?? null,
     started_publishing: spec.startedPublishing ?? false,
     total_files: spec.totalFiles ?? null,
-    applies: (spec.gate ?? "enforced") !== "n/a",
-    gate: spec.gate ?? "enforced",
+    applies: gate !== "n/a",
+    gate,
     outcome: reasons.length === 0 ? "pass" : "action_required",
+    start_offered: spec.startOffered ?? startOfferedByRule,
+    screen_gate: screenGate,
     reasons,
     description: {
       headline: spec.headline ?? "Publication review: action required",

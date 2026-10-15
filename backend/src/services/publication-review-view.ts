@@ -65,7 +65,9 @@ import type {
 import { type ScreenGate, screenGate } from "../../../shared/identifier-screen-report.js";
 import {
   type ApprovalStanding,
+  DOCUMENT_LABEL,
   type LiveFacts,
+  PUBLICATION_FINDING_LABEL,
   PUBLICATION_REVIEW_DEADLINE_MINUTES,
   type PublicationDeclineDetail,
   type PublicationOutcome,
@@ -81,7 +83,7 @@ import {
   type ReasonCode,
   type ReviewRowView,
   answersOf,
-  cureOf,
+  commandOf,
   describePublicationReview,
   describeUnreadableReview,
   effectiveVersionOf,
@@ -90,7 +92,9 @@ import {
   isPublicationOutcome,
   isPublicationReviewState,
   isPublicationRunError,
+  neutralCureOf,
   reasonLine,
+  reasonStatement,
   reasonsOf,
   shownBlockReason,
   startOffered,
@@ -711,10 +715,15 @@ export function overrideReasonsOf(raw: string | null): ReasonCode[] {
 }
 
 /**
- * The reasons in the shared words, each with its cure for this dataset and the whole reason as the
- * one line `description.lines` prints for it (`reasonLine`, which needs the report of the review in
- * force for a failed question's findings): the detail's `reasons`, and what the approval gate's
- * refusal carries, so the two say the same thing. The report is required so that a caller cannot
+ * The reasons in the shared words, each with the statement of it, its cure for this dataset
+ * without a command or a flag (`neutralCureOf`), the command the terminal's cure names
+ * (`commandOf`), and the whole reason as the one line `description.lines` prints for it
+ * (`reasonLine`, which needs the report of the review in force for a failed question's findings):
+ * the detail's `reasons`, and what the approval gate's refusal carries, so the two say the same
+ * thing. A web page prints `statement` and `cure`; `command` and `line` are the terminal's. Every
+ * reason carries `statement` and `command` always, because a page reads a missing `statement` as
+ * a Worker that predates it. `cure` and `command` follow `startable`, not the detail's
+ * `start_offered`, by design (see `neutralCureOf`). The report is required so that a caller cannot
  * leave it out by accident: one that has no report passes `null`, and the line then lacks only
  * what the report adds.
  */
@@ -731,8 +740,10 @@ export function reasonViewsOf(
       class: rule.class,
       cleared_by: rule.clearedBy,
       detail: r.detail,
+      statement: reasonStatement(r, report),
       sentence: rule.sentence,
-      cure: cureOf(r.code, datasetId, startable),
+      cure: neutralCureOf(r.code, datasetId, startable),
+      command: commandOf(r.code, datasetId, startable),
       line: reasonLine(r, datasetId, report, startable),
     };
   });
@@ -773,7 +784,9 @@ function recordOf(row: PublicationReviewRow, view: ReviewRowView): PublicationRe
       question: f.question,
       severity: f.severity,
       code: f.code,
+      label: PUBLICATION_FINDING_LABEL[f.code],
       document: f.document,
+      document_label: f.document === null ? null : DOCUMENT_LABEL[f.document],
       note: f.note,
     })),
     summary: report === null || report.summary === "" ? null : report.summary,
@@ -890,6 +903,11 @@ export async function publicationReviewDetail(
     applies: d.applies,
     gate: d.gate,
     outcome: d.outcome,
+    // The list row's flag, from the same function, so the detail and the list cannot disagree.
+    start_offered: startOfferedFor(d),
+    // The screen's gate for an approval, review on or off: `reasons` is empty with the review off
+    // and no row, yet the approval is still refused or asked for a reason by the screen.
+    screen_gate: d.live.screen.gate,
     reasons: reasonViewsOf(d.reasons, ctx.request.dataset_id, d.startable, reportOf(d.rowView)),
     description: d.description,
     review: d.row === null ? null : recordOf(d.row, d.rowView),
