@@ -48,5 +48,6 @@ Where the two differ, this is the later text.
 3. **The two statements of "publishing has started" are held together by a test.**
    Decision 3 states the rule once as `publishingHasStarted` and once as terms of the UPDATE (`NO_PUBLISHING_STARTED_SQL`).
    They agree on every well-formed row.
-   On a `steps_completed` that is valid JSON but not an array of strings, the SQL counts the request as started and the function does not, so the statement only ever refuses where the function would allow.
+   On a `steps_completed` that is valid JSON but not an array of strings (an object, a scalar, a nested element), the SQL counts the request as started and the function does not, so the statement only ever refuses where the function would allow.
+   JSON `null` and a `null` element are the exception: `json_each` yields NULL for them and `NULL NOT IN (...)` is not true, so neither says started.
    It is not aligned the other way, because `hasStartedPublishing` also decides which gates a resumed run may skip, and counting an unreadable row as started there would widen an exemption.

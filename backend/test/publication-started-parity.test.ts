@@ -7,9 +7,10 @@
  * two spellings of one rule and nothing but this file keeps them together. Run on a real SQLite
  * engine over a row of every step name, every `current_step` and every malformed shape.
  *
- * What is pinned: on every well-formed row they give the same answer; on the rows only SQL reads
- * differently (valid JSON that is not an array of strings) the SQL refuses where the function would
- * allow, and never the other way, which is the direction a refusal may err in.
+ * What is pinned: on every well-formed row they give the same answer; on valid JSON that is not an
+ * array of strings the SQL refuses (counts as started) where the function would allow, except JSON
+ * null and null elements, where both say not started, and never the other way, which is the
+ * direction a refusal may err in.
  *
  * CI TIER: unit-pure. A bun:sqlite engine in memory, nothing else.
  */
@@ -95,10 +96,30 @@ describe("publishingHasStarted and NO_PUBLISHING_STARTED_SQL", () => {
         }
       }
     }
-    // And where it is stricter, it is stricter on purpose: a scalar step name or a nested one is
-    // read as a started step.
-    expect(sqlSaysStarted('"s3_public_read"', null)).toBe(true);
-    expect(sqlSaysStarted("[1]", null)).toBe(true);
-    expect(fnSaysStarted("[1]", null)).toBe(false);
+    // And where it is stricter, it is stricter on purpose: a scalar, an object's value, a nested
+    // array or a number is read as a started step, which the function ignores.
+    for (const steps of [
+      '"s3_public_read"',
+      "42",
+      '{"s3_public_read":true}',
+      "[1]",
+      '[["s3_public_read"]]',
+      '[{"step":"s3_public_read"}]',
+    ]) {
+      expect(sqlSaysStarted(steps, null), steps).toBe(true);
+      expect(fnSaysStarted(steps, null), steps).toBe(false);
+    }
+  });
+
+  test("JSON null and a null element are NOT started in either: json_each yields NULL, and NULL NOT IN (...) is not true", () => {
+    // The exact outcome, not the one-way implication above: the two agree here, and the SQL is
+    // not stricter, so the comment that says what the SQL counts as started must not list these.
+    for (const steps of ["null", "[null]", '[null, "ci_check"]']) {
+      expect(sqlSaysStarted(steps, null), steps).toBe(false);
+      expect(fnSaysStarted(steps, null), steps).toBe(false);
+    }
+    // A null beside a step that has started is still started: the null changes nothing.
+    expect(sqlSaysStarted('[null, "s3_public_read"]', null)).toBe(true);
+    expect(fnSaysStarted('[null, "s3_public_read"]', null)).toBe(true);
   });
 });

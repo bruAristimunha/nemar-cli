@@ -146,8 +146,10 @@ function blockMessage(reason: string | null | undefined): string {
  * The two agree on every well-formed row (a JSON array of step names), and a test holds them
  * together over every step name, `current_step` and the malformed shapes. They differ on one
  * kind of row, and in the safe direction: a `steps_completed` that is valid JSON but not an array
- * of strings (an object, a scalar string, an element that is not a string) counts as STARTED here,
- * because `json_each` reads every value it holds, whereas `hasStartedPublishing` ignores it.
+ * of strings (an object, a scalar string or number, a nested array or object as an element) counts
+ * as STARTED here, because `json_each` reads every value it holds, whereas `hasStartedPublishing`
+ * ignores it. JSON `null` and a `null` element are the exception: `json_each` yields NULL for
+ * them, and `NULL NOT IN (...)` is not true, so they are NOT started in either.
  * This statement therefore only ever refuses where the function would have allowed, never the
  * reverse, and it is not aligned the other way: `hasStartedPublishing` also decides which gates a
  * resume may skip, where treating an unreadable row as started would widen an exemption.
