@@ -312,6 +312,69 @@ describe("the override's statement on D1", () => {
     },
   );
 
+  d1Test(
+    "22. an override that landed after the gate's read is not overwritten by a call that read none",
+    async (d1) => {
+      const started = await startPublicationReview(env(d1), { requestId: 1, datasetId: DATASET });
+      const id = started.reviewId as number;
+      const input = { id, reasons: ["review_running"] };
+      const recordWith = async (approverId: number, gate: Awaited<ReturnType<typeof evaluate>>) => {
+        if (!gate.ok || gate.state !== "enforced" || gate.record === null) {
+          throw new Error("the gate did not hand back a record");
+        }
+        return recordApprovalOverride(env(d1), {
+          requestId: 1,
+          datasetId: DATASET,
+          approverId,
+          via: "approve",
+          outcome: gate.outcome,
+          headSha: gate.headSha,
+          record: gate.record,
+        });
+      };
+
+      // Both administrators read the review while no override is on it.
+      const readByAdmin = await evaluate(d1, ADMIN, input);
+      const readByOther = await evaluate(d1, OTHER_ADMIN, input);
+
+      // ADMIN's call records first (a web click's override, which its executor reads off the row).
+      expect(await recordWith(ADMIN, readByAdmin)).toEqual({ ok: true });
+      expect(await review(d1, id)).toMatchObject({ override_by: ADMIN });
+
+      // The other administrator's call read "no override": it is refused, and ADMIN's stands.
+      const refused = await recordWith(OTHER_ADMIN, readByOther);
+      expect(refused.ok).toBe(false);
+      if (!refused.ok) expect(refused.body.refusal).toBe("review_changed");
+      expect(await review(d1, id)).toMatchObject({
+        override_by: ADMIN,
+        override_reasons: JSON.stringify(["review_running"]),
+      });
+      const audits = async () =>
+        (
+          await d1
+            .prepare(
+              "SELECT COUNT(*) AS n FROM audit_log WHERE action = 'publication_review_overridden'",
+            )
+            .first<{ n: number }>()
+        )?.n;
+      expect(await audits()).toBe(1);
+
+      // Read again, the other administrator sees ADMIN's override and may replace it on purpose
+      // (ADR 0102, ADR 0105 decision 6): the same statement matches what that read held.
+      expect(await recordWith(OTHER_ADMIN, await evaluate(d1, OTHER_ADMIN, input))).toEqual({
+        ok: true,
+      });
+      expect(await review(d1, id)).toMatchObject({ override_by: OTHER_ADMIN });
+
+      // The administrator whose override stands records it again from a read that held it:
+      // idempotent, it matches once more.
+      expect(await recordWith(OTHER_ADMIN, await evaluate(d1, ADMIN, input))).toEqual({
+        ok: true,
+      });
+      expect(await review(d1, id)).toMatchObject({ override_by: OTHER_ADMIN });
+    },
+  );
+
   d1Test("22. each pin of the statement refuses on its own, on D1", async (d1) => {
     const started = await startPublicationReview(env(d1), { requestId: 1, datasetId: DATASET });
     const id = started.reviewId as number;
@@ -324,6 +387,7 @@ describe("the override's statement on D1", () => {
         state: row.state,
         created_at: row.created_at,
         decided_at: row.decided_at,
+        override_by: row.override_by,
         ...over,
       };
       const res = await d1
@@ -338,6 +402,7 @@ describe("the override's statement on D1", () => {
           b.state,
           b.created_at,
           b.decided_at,
+          b.override_by,
         )
         .run();
       return res.meta.changes;
@@ -349,6 +414,7 @@ describe("the override's statement on D1", () => {
     expect(await run({ head_sha: "e".repeat(40) })).toBe(0);
     expect(await run({ request_id: 99 })).toBe(0);
     expect(await run({ anonymous: 1 })).toBe(0);
+    expect(await run({ override_by: OTHER_ADMIN })).toBe(0);
     expect((await review(d1, id)).override_by).toBeNull();
     // ... and the row as read matches, once.
     expect(await run({})).toBe(1);

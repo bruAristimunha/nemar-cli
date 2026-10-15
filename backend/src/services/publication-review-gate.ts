@@ -363,6 +363,7 @@ export async function recordApprovalOverride(
           row.state,
           row.createdAt,
           row.decidedAt,
+          row.overrideBy,
         )
         .run();
       changes = res.meta.changes ?? 0;
@@ -436,10 +437,20 @@ async function movedRefusal(
  * is compared with `IS`, which is how a bound NULL matches the `NULL` of a row still running.
  * Zero changes means the row moved, and the override is refused (`review_changed`).
  *
+ * `override_by` is pinned too, as the gate read it (`IS`, so a bound NULL matches no override yet):
+ * an administrator replaces the override they were shown, never one that landed after their read.
+ * Without that pin, a call that read "no override" would overwrite another administrator's override
+ * recorded in between (a web click's, which its executor reads off the row), and then, if its own
+ * mark refused, leave that executor refused `needs_override`. Replacing an override another
+ * administrator's gate read is still allowed (ADR 0102, section 8, item 4): a terminal approval
+ * takes a live claim over with its own override (ADR 0105, decision 6). The same administrator
+ * recording the override they read again is idempotent.
+ *
  * Binds, in order: the administrator, the reason codes as JSON, then the row as read: its id, its
- * request, its screened head, its release kind (0 or 1), its state, `created_at` and `decided_at`.
+ * request, its screened head, its release kind (0 or 1), its state, `created_at`, `decided_at`
+ * and the administrator whose override it held (or null).
  */
 export const RECORD_OVERRIDE_SQL = `UPDATE publication_reviews
      SET override_by = ?, override_at = datetime('now'), override_reasons = ?
    WHERE id = ? AND request_id = ? AND head_sha = ? AND anonymous = ?
-     AND state = ? AND created_at = ? AND decided_at IS ?`;
+     AND state = ? AND created_at = ? AND decided_at IS ? AND override_by IS ?`;

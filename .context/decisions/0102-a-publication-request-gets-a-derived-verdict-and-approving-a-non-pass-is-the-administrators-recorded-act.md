@@ -781,7 +781,9 @@ Where the two differ, this is the later text.
    It is recorded by one conditional statement that pins the review row as the gate read it (`RECORD_OVERRIDE_SQL`: its state, its creation time and its decision time),
    so it attaches only to the result the administrator was shown, and zero changes refuse `review_changed`.
    A restart of a review clears the recorded override, because a restart is a new attempt.
-   The override columns hold one administrator's act: another administrator's override of the same review replaces it.
+   The override columns hold one administrator's act: another administrator's override of the same review replaces it,
+   but only the override that administrator was shown: the statement pins `override_by` as the gate read it,
+   so a call that read no override cannot overwrite one that landed after its read, and is refused `review_changed`.
    A recorded override counts only for a run attributed to the administrator who recorded it,
    and the same override sent on every call of a run is recorded once when a review row holds it.
    With no review row (a terminal's override of `review_not_started`) nothing is written to the review table and the audit row is the only record,
