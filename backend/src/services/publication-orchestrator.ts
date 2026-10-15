@@ -2340,6 +2340,18 @@ export async function completeConcealedEraVersionDois(
 }
 
 /**
+ * Mark a request `approving`. `last_error = NULL`: a new attempt begins, so the
+ * previous attempt's error is history (the caller's own output has it), and the
+ * row reads as running, not failed, from this moment
+ * (services/approval-dispatch.ts). Guarded on the request still being active: a
+ * depositor can withdraw it between the read and this write, and a finished
+ * request must not be started again. Exported so a test can run it against a
+ * request in each state.
+ */
+export const MARK_APPROVING_SQL =
+  "UPDATE publication_requests SET status = 'approving', approved_by = ?, last_error = NULL, updated_at = datetime('now') WHERE id = ? AND status IN ('requested', 'approving', 'blocked')";
+
+/**
  * One place that both records and phrases a failed completion, so the audit row
  * and the admin's copy cannot say different things. Every early return above
  * goes through it.
@@ -2510,15 +2522,16 @@ export async function runPublicationApproval(args: ApproveRunArgs): Promise<Resp
   }
 
   // Mark as approving
-  await db
-    .prepare(
-      // `last_error = NULL`: a new attempt begins, so the previous attempt's
-      // error is history (the caller's own output has it), and the row reads as
-      // running, not failed, from this moment (services/approval-dispatch.ts).
-      "UPDATE publication_requests SET status = 'approving', approved_by = ?, last_error = NULL, updated_at = datetime('now') WHERE id = ?",
-    )
-    .bind(c.approver.id, request.id)
-    .run();
+  const claimed = await db.prepare(MARK_APPROVING_SQL).bind(c.approver.id, request.id).run();
+  if ((claimed.meta?.changes ?? 0) === 0) {
+    return c.json(
+      {
+        error: `The publication request for ${datasetId} was ended before it could be approved (the depositor may have withdrawn it).`,
+        code: "request_ended",
+      },
+      409,
+    );
+  }
 
   // Get dataset info
   const dataset = await db

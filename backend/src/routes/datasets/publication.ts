@@ -15,6 +15,7 @@ import {
   isCiPendingReason,
 } from "../../../../shared/contract/publication.js";
 import { publicationRequestNotice } from "../../../../shared/identifier-screen-report.js";
+import { applyEditWithAudit } from "../../db/audit-log";
 import { authMiddleware } from "../../middleware/auth";
 import {
   FIRST_PUBLICATION_STAMP_SQL,
@@ -22,6 +23,7 @@ import {
   hasEverBeenPublished,
   isAnonymous,
 } from "../../services/anonymity";
+import { approvalInFlightSql } from "../../services/approval-dispatch";
 import { isValidDatasetId } from "../../services/datasetId";
 import { isExemplarPublishAllowed } from "../../services/exemplar";
 import {
@@ -35,8 +37,10 @@ import {
 } from "../../services/github";
 import { getDatasetsToken } from "../../services/github-auth";
 import {
+  PRE_PUBLICATION_STEPS,
   RESET_SCREEN_COLUMNS_SQL,
   type ScreenView,
+  hasStartedPublishing,
   mailPublicationRequest,
   screenEmailSection,
   screenView,
@@ -119,6 +123,37 @@ function blockMessage(reason: string | null | undefined): string {
   }
   return "Publication request blocked.";
 }
+
+/**
+ * True once a run has done, or been cut off inside, a step that changes
+ * something: a step outside the validation-only ones in `steps_completed`
+ * (`hasStartedPublishing`), or `current_step` naming one. A step is recorded as
+ * done only after it has run, and `current_step` is kept when a step fails or is
+ * cut off, so a run interrupted inside `s3_public_read` has only validation steps
+ * recorded and may still have made the data public.
+ */
+function publishingHasStarted(row: {
+  steps_completed: string | null;
+  current_step: string | null;
+}): boolean {
+  const interrupted = !!row.current_step && !PRE_PUBLICATION_STEPS.includes(row.current_step);
+  return hasStartedPublishing(row.steps_completed) || interrupted;
+}
+
+/**
+ * {@link publishingHasStarted} as terms of a conditional UPDATE, so the write
+ * re-reads the row it is about to end. The step names are this repository's own
+ * constants, never request input. Malformed `steps_completed` reads as no steps,
+ * as it does in `hasStartedPublishing`.
+ */
+const PRE_PUBLICATION_STEPS_SQL = PRE_PUBLICATION_STEPS.map((step) => `'${step}'`).join(", ");
+const NO_PUBLISHING_STARTED_SQL = `(
+  NOT EXISTS (
+    SELECT 1 FROM json_each(CASE WHEN json_valid(steps_completed) THEN steps_completed ELSE '[]' END)
+    WHERE value NOT IN (${PRE_PUBLICATION_STEPS_SQL})
+  )
+  AND (current_step IS NULL OR current_step = '' OR current_step IN (${PRE_PUBLICATION_STEPS_SQL}))
+)`;
 
 export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
   // ============================================================================
@@ -707,6 +742,7 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
         approved_at: string | null;
         denied_at: string | null;
         denied_reason: string | null;
+        withdrawn_at: string | null;
         block_reason: string | null;
         min_requirements_reasons: string | null;
         prescreen_status: string | null;
@@ -776,6 +812,10 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
       approved_at: request.approved_at,
       denied_at: request.denied_at,
       denied_reason: request.denied_reason,
+      // The requester ended this one themselves (migration 0097). `status`
+      // stays 'denied' so older clients still read a finished request.
+      withdrawn: request.status === "denied" && request.withdrawn_at !== null,
+      withdrawn_at: request.status === "denied" ? request.withdrawn_at : null,
       block_reason: request.block_reason,
       // The explanation is gated on the STATUS only. It used to also require
       // a repo, which is right for the CI-shaped reasons that link to a
@@ -808,6 +848,130 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
       current_step: request.current_step,
       last_error: request.last_error,
       updated_at: request.updated_at,
+    });
+  });
+
+  /**
+   * POST /datasets/:id/publish/withdraw - The requester takes the request back
+   *
+   * No administrator is involved. It is allowed only while nothing has started
+   * acting on the request, which is three questions asked of the row, not one:
+   *
+   *   1. its status is `requested` or `blocked` (not `approving`);
+   *   2. no approval is in flight (the lease, `approvalInFlightSql`);
+   *   3. publishing has not started: no step after the validation-only ones is
+   *      recorded in `steps_completed`, and none is the interrupted
+   *      `current_step`. A request keeps its steps when a run is walked back
+   *      (the owner's name cleared, a screen finding), so a `blocked` or
+   *      `requested` row can sit over data that is already public, and
+   *      withdrawing it would close the request over a public dataset.
+   *
+   * The claim is ONE conditional UPDATE carrying all three terms and an
+   * `updated_at` guard, so an approval that begins at the same moment either
+   * wins (this answers 409) or finds the request already ended (the
+   * orchestrator's own update is guarded the same way). The column terms are not
+   * redundant with `updated_at`: it has one-second resolution, so a step recorded
+   * in the same second as the read leaves it unchanged. The audit row rides in
+   * the same batch and is written only if the UPDATE changed a row.
+   *
+   * Only the dataset owner may withdraw, although an administrator may file a
+   * request on someone else's dataset (ADR 0104). An administrator ends a
+   * request with `deny`.
+   *
+   * Recorded as a finished request with `withdrawn_at` set. A later
+   * `publish request` inserts a NEW row (it matches only active statuses), and
+   * the other readers of `status = 'denied'` keep working (migration 0097).
+   */
+  datasetRoutes.post("/:id/publish/withdraw", authMiddleware, async (c) => {
+    const datasetId = c.req.param("id");
+    const currentUser = c.get("user");
+    const db = c.env.DB;
+
+    const dataset = await db
+      .prepare("SELECT id, owner_user_id FROM datasets WHERE dataset_id = ?")
+      .bind(datasetId)
+      .first<{ id: number; owner_user_id: number }>();
+
+    if (!dataset) {
+      return c.json({ error: "Dataset not found" }, 404);
+    }
+
+    if (dataset.owner_user_id !== currentUser.id) {
+      return c.json(
+        {
+          error:
+            "Only the dataset owner can withdraw a publication request. An administrator ends one with 'nemar admin publish deny'.",
+        },
+        403,
+      );
+    }
+
+    const request = await db
+      .prepare(
+        `SELECT id, status, steps_completed, current_step, updated_at,
+                ${approvalInFlightSql()} AS approval_in_flight
+         FROM publication_requests
+         WHERE dataset_id = ? AND status IN ('requested', 'approving', 'blocked')
+         ORDER BY requested_at DESC LIMIT 1`,
+      )
+      .bind(datasetId)
+      .first<{
+        id: number;
+        status: string;
+        steps_completed: string | null;
+        current_step: string | null;
+        updated_at: string;
+        approval_in_flight: number;
+      }>();
+
+    if (!request) {
+      return c.json(
+        { error: "No active publication request found", code: "no_active_request" },
+        404,
+      );
+    }
+
+    // `error` carries the sentence, as the other routes do, so every client
+    // prints it without knowing the code; `code` is for a client that branches.
+    const tooLate = {
+      error:
+        "Publishing this dataset has already started, so the request can no longer be withdrawn. Ask an administrator if it should be stopped.",
+      code: "withdraw_too_late",
+    };
+    if (
+      request.status === "approving" ||
+      request.approval_in_flight === 1 ||
+      publishingHasStarted(request)
+    ) {
+      return c.json(tooLate, 409);
+    }
+
+    const applied = await applyEditWithAudit(
+      db,
+      db
+        .prepare(
+          `UPDATE publication_requests
+           SET status = 'denied', withdrawn_at = datetime('now'), updated_at = datetime('now')
+           WHERE id = ? AND status IN ('requested', 'blocked') AND NOT ${approvalInFlightSql()}
+             AND ${NO_PUBLISHING_STARTED_SQL} AND updated_at = ?`,
+        )
+        .bind(request.id, request.updated_at),
+      {
+        userId: currentUser.id,
+        action: "publication_request_withdrawn",
+        resourceType: "dataset",
+        resourceId: datasetId,
+        details: JSON.stringify({ request_id: request.id }),
+      },
+    );
+
+    if (!applied) {
+      return c.json(tooLate, 409);
+    }
+
+    return c.json({
+      message: "Publication request withdrawn",
+      dataset_id: datasetId,
     });
   });
 

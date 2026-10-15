@@ -216,14 +216,26 @@ export function registerPublishRoutes(admin: AdminRouter): void {
       return c.json({ error: "No active publication request found" }, 404);
     }
 
-    await db
+    // Guarded on the request still being active: the depositor can withdraw it
+    // between the read above and this write, and a withdrawal must not be
+    // overwritten (nor the depositor mailed a denial of a request they took back).
+    const ended = await db
       .prepare(
         `UPDATE publication_requests
        SET status = 'denied', denied_at = datetime('now'), denied_by = ?, denied_reason = ?, updated_at = datetime('now')
-       WHERE id = ?`,
+       WHERE id = ? AND status IN ('requested', 'approving', 'blocked')`,
       )
       .bind(adminUser.id, reason, request.id)
       .run();
+    if ((ended.meta?.changes ?? 0) === 0) {
+      return c.json(
+        {
+          error:
+            "The publication request was ended before it could be denied (the depositor may have withdrawn it).",
+        },
+        409,
+      );
+    }
 
     // Notify the requesting user
     try {

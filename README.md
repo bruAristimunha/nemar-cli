@@ -318,6 +318,7 @@ nemar dataset collaborators <id>           # List collaborators
 nemar dataset publish request <dataset-id> # Submit publication request
 nemar dataset publish status <dataset-id>  # Check publication status
 nemar dataset publish resend <dataset-id>  # Resend admin notification
+nemar dataset publish withdraw <dataset-id> # Take back your request (a withdrawn request; no admin step)
 
 # Admin: Manage publication requests
 nemar admin publish list                   # List active publication requests

@@ -29,6 +29,11 @@ export interface PublishStatusResponse {
   approved_at?: string | null;
   denied_at?: string | null;
   denied_reason?: string | null;
+  // True when the depositor ended the request themselves; `status` is still
+  // "denied" so older clients read a finished request. Absent from an older
+  // backend, which means unknown, never "no".
+  withdrawn?: boolean;
+  withdrawn_at?: string | null;
   steps_completed?: string[];
   current_step?: string | null;
   last_error?: string | null;
@@ -62,6 +67,8 @@ export interface PublishRequestsResponse {
     requested_at: string;
     requested_by_username: string;
     requested_by_email: string;
+    // Set when the depositor withdrew the request; its status is "denied".
+    withdrawn_at?: string | null;
     dataset_name?: string | null;
     steps_completed: string[];
     current_step: string | null;
@@ -191,6 +198,19 @@ export interface PublishListFilter {
   statuses?: string[];
   /** Substring of the dataset id, requester username or dataset name. */
   search?: string;
+}
+
+/**
+ * Withdraw the caller's own publication request (dataset owner; no admin step)
+ */
+export async function withdrawPublishRequest(
+  datasetId: string,
+): Promise<{ message: string; dataset_id: string }> {
+  return request<{ message: string; dataset_id: string }>(
+    `/datasets/${datasetId}/publish/withdraw`,
+    { method: "POST" },
+    true,
+  );
 }
 
 /**

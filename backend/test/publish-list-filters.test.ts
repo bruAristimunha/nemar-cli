@@ -225,3 +225,48 @@ describe("search length is bounded by D1's LIKE pattern limit", () => {
     expect((await get(`?search=%20%20${"a".repeat(48)}%20`)).status).toBe(200);
   });
 });
+
+describe("a withdrawn request (stored as denied, with withdrawn_at)", () => {
+  // The depositor's own ending is `denied` plus `withdrawn_at` (ADR 0104), so it
+  // follows the `denied` filter everywhere and has no status value of its own.
+  type Row = { dataset_id: string; status: string; withdrawn_at: string | null };
+
+  beforeEach(() => {
+    seed("nm000109", "denied", aliceId, "Withdrawn data");
+    db.run(
+      "UPDATE publication_requests SET withdrawn_at = datetime('now') WHERE dataset_id = 'nm000109'",
+    );
+  });
+
+  async function rows(query: string): Promise<Row[]> {
+    return ((await get(query)).body as { requests: Row[] }).requests;
+  }
+
+  test("is listed under status=denied next to an administrator's denial, marked by withdrawn_at", async () => {
+    const found = await rows("?status=denied");
+    expect(found.map((r) => r.dataset_id).sort()).toEqual(["nm000107", "nm000109"]);
+    expect(found.find((r) => r.dataset_id === "nm000109")).toMatchObject({ status: "denied" });
+    expect(found.find((r) => r.dataset_id === "nm000109")?.withdrawn_at).toBeTruthy();
+    expect(found.find((r) => r.dataset_id === "nm000107")?.withdrawn_at).toBeNull();
+  });
+
+  test("is not in the active states the CLI asks for by default", async () => {
+    const { ids } = await get("?status=requested,approving,blocked");
+    expect(ids).not.toContain("nm000109");
+  });
+
+  test("is listed when no status is given (--all)", async () => {
+    expect((await get("")).ids).toContain("nm000109");
+  });
+
+  test("is found by search within the denied state, and not within the published one", async () => {
+    expect((await get("?status=denied&search=withdrawn")).ids).toEqual(["nm000109"]);
+    expect((await get("?status=published&search=withdrawn")).ids).toEqual([]);
+  });
+
+  test("withdrawn is not a status: asking for it is a 400, not an empty list", async () => {
+    const r = await get("?status=withdrawn");
+    expect(r.status).toBe(400);
+    expect(JSON.stringify(r.body)).toContain("withdrawn");
+  });
+});

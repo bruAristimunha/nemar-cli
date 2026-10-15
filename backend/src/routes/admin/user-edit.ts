@@ -30,7 +30,7 @@ import {
 } from "../../../../shared/contract/admin-user.js";
 import type { IdentityConflictCode } from "../../../../shared/contract/identity.js";
 import type { ProfileEditErrorCode } from "../../../../shared/contract/user.js";
-import { type AuditLogEntry, auditLogParams } from "../../db/audit-log";
+import { applyEditWithAudit } from "../../db/audit-log";
 import { flag } from "../../db/flag";
 import {
   type AdminUserCurrent,
@@ -95,33 +95,6 @@ type EditTarget = AdminUserCurrent & {
   orcid: string | null;
   orcid_verified: number;
 };
-
-/**
- * The audit insert that only happens if the statement before it changed a row.
- * `changes()` reads the previous statement's effect inside the same batch, so an
- * UPDATE that matched nothing (the account was deleted after it was read)
- * leaves no audit row claiming an edit that did not happen.
- */
-export const AUDIT_IF_PREVIOUS_CHANGED_SQL = `INSERT INTO audit_log (user_id, action, resource_type, resource_id, details)
-   SELECT ?, ?, ?, ?, ? WHERE changes() > 0`;
-
-/**
- * Run `update` and, only if it changed a row, its audit row, as one batch.
- * Returns whether the update applied. Exported so the "matched nothing" case,
- * which a request cannot reach on a single-writer test engine, is tested on the
- * exact statements the route runs.
- */
-export async function applyEditWithAudit(
-  db: D1Database,
-  update: D1PreparedStatement,
-  audit: AuditLogEntry,
-): Promise<boolean> {
-  const results = await db.batch([
-    update,
-    db.prepare(AUDIT_IF_PREVIOUS_CHANGED_SQL).bind(...auditLogParams(audit)),
-  ]);
-  return (results[0]?.meta?.changes ?? 0) > 0;
-}
 
 /** The three "someone else holds it" refusals, each taken FROM the vocabulary
  *  that declares it: if a code leaves its vocabulary this type shrinks and the
