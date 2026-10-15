@@ -138,9 +138,18 @@ function blockMessage(reason: string | null | undefined): string {
  * re-reads the row it is about to end. The step names are this repository's own
  * constants, never request input. Malformed `steps_completed` reads as no steps,
  * as it does in `hasStartedPublishing`.
+ *
+ * The two agree on every well-formed row (a JSON array of step names), and a test holds them
+ * together over every step name, `current_step` and the malformed shapes. They differ on one
+ * kind of row, and in the safe direction: a `steps_completed` that is valid JSON but not an array
+ * of strings (an object, a scalar string, an element that is not a string) counts as STARTED here,
+ * because `json_each` reads every value it holds, whereas `hasStartedPublishing` ignores it.
+ * This statement therefore only ever refuses where the function would have allowed, never the
+ * reverse, and it is not aligned the other way: `hasStartedPublishing` also decides which gates a
+ * resume may skip, where treating an unreadable row as started would widen an exemption.
  */
 const PRE_PUBLICATION_STEPS_SQL = PRE_PUBLICATION_STEPS.map((step) => `'${step}'`).join(", ");
-const NO_PUBLISHING_STARTED_SQL = `(
+export const NO_PUBLISHING_STARTED_SQL = `(
   NOT EXISTS (
     SELECT 1 FROM json_each(CASE WHEN json_valid(steps_completed) THEN steps_completed ELSE '[]' END)
     WHERE value NOT IN (${PRE_PUBLICATION_STEPS_SQL})
