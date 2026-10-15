@@ -937,10 +937,24 @@ function rearmOverdueMailSql(needsClaim: boolean): string {
  */
 export const STORE_RESULT_SQL_MARKER = "SET state = ?, verdict = ?";
 
-/** The write of a result, keyed on the nonce and on the state the row waits in. */
+/**
+ * The write of a result, keyed on the nonce and on the state the row waits in.
+ *
+ * `stale_head` is the word for an attempt that was refused its claim, and so never reached a model
+ * (it is in `NEVER_REACHED_MODEL`, which gives the attempt's slot back to the caps). A job can post
+ * it, because it is not a Worker-only word, but only before it has claimed: once `claimed_at` is
+ * set the run may have called the model, and the word would make that call free. The word is read
+ * against the row in the same statement (so a claim that lands between the read and the write is
+ * seen) and a claimed row records `workflow_failed` instead, which counts.
+ *
+ * Binds, in order: the state, the verdict, the detail (twice), the report, then `waitingRow`'s.
+ */
 function storeSql(from: "unreported" | "dispatched", needsClaim: boolean): string {
   return `UPDATE publication_reviews
-      ${STORE_RESULT_SQL_MARKER}, detail = ?, report = ?, nonce = NULL,
+      ${STORE_RESULT_SQL_MARKER},
+          detail = CASE WHEN claimed_at IS NOT NULL AND ? = 'stale_head'
+                        THEN 'workflow_failed' ELSE ? END,
+          report = ?, nonce = NULL,
           decided_at = datetime('now')
     WHERE ${waitingRow([from], needsClaim)}`;
 }
@@ -1004,6 +1018,7 @@ export async function storePublicationReviewResult(
   const binds = [
     reported ? "reported" : "errored",
     reported ? verdictOf(reportReasons(reported)) : null,
+    outcomeToStore.kind === "error" ? outcomeToStore.error : null,
     outcomeToStore.kind === "error" ? outcomeToStore.error : null,
     reported ? JSON.stringify(reported) : null,
     reviewId,

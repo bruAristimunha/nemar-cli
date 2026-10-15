@@ -682,6 +682,41 @@ describe("the result", () => {
     }
   });
 
+  test("stale_head from a run that took its claim is workflow_failed, so it still costs its call", async () => {
+    // `stale_head` is the Worker's word for an attempt that never reached a model, and the claim
+    // is the point a model may be called from. A job that posts it AFTER its claim has spent (or
+    // may have spent) a call, and the word would give the slot back: free calls through the
+    // callback. The claimed row is recorded as `workflow_failed` and counts; an unclaimed row
+    // keeps the word and stays free.
+    const costOf = (id: number) =>
+      (
+        h.db
+          .query(`SELECT ${CAP_CALLS_SQL} AS n FROM publication_reviews WHERE id = ?`)
+          .get(id) as { n: number }
+      ).n;
+    const claimed = dispatched({ claimed: true, dataset: ds(150) });
+    await h.result(
+      claimed.reviewId,
+      { outcome: "error", error: "stale_head" },
+      undefined,
+      undefined,
+      ds(150),
+    );
+    expect(state(claimed.reviewId)).toMatchObject({ state: "errored", detail: "workflow_failed" });
+    expect(costOf(claimed.reviewId)).toBe(1);
+
+    const unclaimed = dispatched({ dataset: ds(151) });
+    await h.result(
+      unclaimed.reviewId,
+      { outcome: "error", error: "stale_head" },
+      undefined,
+      undefined,
+      ds(151),
+    );
+    expect(state(unclaimed.reviewId)).toMatchObject({ state: "errored", detail: "stale_head" });
+    expect(costOf(unclaimed.reviewId)).toBe(0);
+  });
+
   test("a report about another commit or another release kind is refused", async () => {
     const wrongHead = dispatched({ claimed: true });
     await h.result(wrongHead.reviewId, {
