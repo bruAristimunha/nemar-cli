@@ -23,6 +23,25 @@ export function freshDb(): Database {
   return db;
 }
 
+/**
+ * {@link freshDb} with foreign keys ENFORCED while the migrations run and afterwards, as D1 does.
+ * The difference is visible in the schema: SQLite rewrites the `REFERENCES` clauses of child
+ * tables when a parent is renamed only if foreign keys are on at that moment, so migration 0026's
+ * rename of `users_new` leaves every child pointing at a table that no longer exists in the
+ * default `freshDb()` (and any write to one then fails), and converges to `users(id)` here, as it
+ * does in D1 (probed on Miniflare). For a test of what a foreign key refuses.
+ */
+export function freshDbWithForeignKeys(): Database {
+  const db = new Database(":memory:");
+  db.exec("PRAGMA foreign_keys = ON");
+  for (const file of readdirSync(MIGRATIONS_DIR)
+    .filter((f) => f.endsWith(".sql"))
+    .sort()) {
+    db.exec(readFileSync(join(MIGRATIONS_DIR, file), "utf-8"));
+  }
+  return db;
+}
+
 export function realD1(db: Database): D1Database {
   return {
     prepare(sql: string) {

@@ -35,7 +35,7 @@ import {
 import { OWNER_NAME_MISSING_REASON, PUBLICATION_STEPS } from "../../shared/publication-steps";
 import { adminRoutes } from "../src/routes/admin";
 import type { Bindings, Variables } from "../src/types/bindings";
-import { freshDb, interceptingD1, realD1 } from "./helpers/d1";
+import { freshDb, freshDbWithForeignKeys, interceptingD1, realD1 } from "./helpers/d1";
 import {
   WEB_CLAIM_SECRET,
   seedScreenedRequest,
@@ -346,6 +346,51 @@ describe("the call that closes an all-steps-done request writes the dataset_publ
     // A call after the close finds no active request and writes no second row.
     expect((await approve()).status).toBe(404);
     expect(auditRows("dataset_published")).toHaveLength(1);
+  });
+
+  test("a clicker whose users row vanishes inside the closing call: the batch faults on the row's foreign key, nothing closes, and the retry closes it under the executor", async () => {
+    // `audit_log.user_id` references `users(id)` with no ON DELETE, and D1 enforces it, so the
+    // closing batch cannot write a row for an approver whose row is gone. An administrator's row
+    // is never deleted by any product path (the account is soft-deleted and the row stays), so the
+    // only way here is a deletion inside the one call, between the approver's resolution at its
+    // start and the batch. It does not strand the request: the retry resolves the approver again,
+    // finds no clicker and attributes the run to the executing account, whose row exists. The
+    // foreign key is enforced on this database (`freshDbWithForeignKeys`), which bun:sqlite does
+    // not do by default.
+    db = freshDbWithForeignKeys();
+    terminalId = await seedUser(db, "allDoneTerminal", "admin", TERMINAL_KEY);
+    await seedUser(db, "allDoneExecutor", "admin", EXECUTOR_KEY);
+    clickerId = await seedUser(db, "allDoneClicker", "admin", CLICKER_KEY);
+    const id = seedAllDone("approving");
+    const token = await webClaim(db, { requestId: id, clickerId });
+    let armed = true;
+    const bindings = env({
+      DB: hookedD1(realD1(db), {
+        batch: (sqls) => {
+          if (armed && sqls.some((sql) => /changes\(\)/.test(sql))) {
+            armed = false;
+            db.run("DELETE FROM tokens WHERE user_id = ?", [clickerId]);
+            db.run("DELETE FROM users WHERE id = ?", [clickerId]);
+          }
+        },
+      }),
+    });
+
+    const first = await approve({ key: EXECUTOR_KEY, token, bindings });
+
+    expect(first.status).toBe(500);
+    expect(requestRow(id).status).toBe("approving");
+    expect(auditRows("dataset_published")).toHaveLength(0);
+
+    const retry = await approve({ key: EXECUTOR_KEY, token, bindings });
+
+    expect(retry.status).toBe(200);
+    expect(requestRow(id).status).toBe("published");
+    const rows = auditRows("dataset_published");
+    expect(rows).toHaveLength(1);
+    // Under the executor, whose row exists, and it is not recorded as the clicker's own act.
+    expect(rows[0].user_id).not.toBe(clickerId);
+    expect(rows[0].details).toMatchObject({ approved_by: "allDoneExecutor" });
   });
 
   // The row records the review gate's state for the dataset, read from the dataset's row. A run

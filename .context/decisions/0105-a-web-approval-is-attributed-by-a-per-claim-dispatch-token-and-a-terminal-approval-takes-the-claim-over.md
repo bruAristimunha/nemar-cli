@@ -222,6 +222,7 @@ A token that is stale or expired is refused, never quietly downgraded.**
       A read that fails, and a read that finds no row, are both a warning in the answer and no audit row, never a row with a guessed state.
       A failed audit write fails the batch, so neither write takes effect: the request stays `approving`, the answer is a 500, and the retry (every step is done) closes it and writes the row.
       The warning above is only for a row that cannot be built.
+      One deterministic cause of that fault is accepted and tested: `audit_log.user_id` has a foreign key to `users` with no ON DELETE, which D1 enforces, so a closing batch fails if the approver's row was removed inside the same call, but no product path removes an administrator's row (the account is soft-deleted and the row stays), and the retry, which is `approve --resume` running the same closing batch, resolves the approver again, finds no clicker, attributes the run to the executing account and closes the request with its one row.
     - The answer carries its warnings under the singular key `warning`, joined with ` | ` as the step loop's answer joins its own:
       the tail jobs' warnings, then the audit warning.
       Its `status` is `approving` when the request was left so, and `published` when this call or a concurrent one marked it.
