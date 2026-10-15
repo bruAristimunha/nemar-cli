@@ -1933,7 +1933,10 @@ describe("what the gate cannot decide it refuses", () => {
     const { requestId } = seed();
     const noAudit = hookedD1(realD1(db), {
       statement: (sql) => {
-        if (/INSERT INTO audit_log/.test(sql)) throw new Error("the audit write failed");
+        // The override's own audit row: not the closing batch's, which carries `changes()`.
+        if (/INSERT INTO audit_log/.test(sql) && !/changes\(\)/.test(sql)) {
+          throw new Error("the audit write failed");
+        }
       },
     });
     const res = await approve(
@@ -1967,7 +1970,10 @@ describe("what the gate cannot decide it refuses", () => {
     const { requestId, reviewId } = seedFailing();
     const noAudit = hookedD1(realD1(db), {
       statement: (sql) => {
-        if (/INSERT INTO audit_log/.test(sql)) throw new Error("the audit write failed");
+        // The override's own audit row: not the closing batch's, which carries `changes()`.
+        if (/INSERT INTO audit_log/.test(sql) && !/changes\(\)/.test(sql)) {
+          throw new Error("the audit write failed");
+        }
       },
     });
     const res = await approve(

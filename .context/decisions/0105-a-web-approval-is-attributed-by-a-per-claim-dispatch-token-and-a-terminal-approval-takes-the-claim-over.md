@@ -200,7 +200,7 @@ A token that is stale or expired is refused, never quietly downgraded.**
     The run answers 409 `approval_closed_during_run`, a word of its own because `request_changed` means that nothing ran and here the steps have run and cannot be taken back,
     and writes one audit row, `approval_finished_on_closed_request`, of ids and words.
     A request that is already `published` was finished by a concurrent call of the same run, and counts as finished.
-    A call writes the `dataset_published` audit row only when its own write changed the row, so a publication has one row, whichever call finished it:
+    A call writes the `dataset_published` audit row only when its own write changed the row, in the same batch as that write (one statement guarded on `changes()`), so a publication has one row, whichever call finished it, and a published request always has its row:
     the step loop's closing path follows the same rule, so a terminal resume that finished the request leaves no second row when the executor's loop then finds it `published`.
     The branch for a resumed run whose steps are all done follows the same rule, in this order.
     - A request that is not `approving` is refused with `approval_closed_during_run` before any tail job runs.
@@ -217,7 +217,8 @@ A token that is stale or expired is refused, never quietly downgraded.**
       The mark leaves `approved_by` as it was, so the audit row, not that column, names who finished the run.
     - The audit row records the review gate's state, which this branch has not read, so the helper reads the `datasets` row itself.
       A read that fails, and a read that finds no row, are both a warning in the answer and no audit row, never a row with a guessed state.
-      A failed audit write is a warning in the answer and changes nothing else.
+      A failed audit write fails the batch, so neither write takes effect: the request stays `approving`, the answer is a 500, and the retry (every step is done) closes it and writes the row.
+      The warning above is only for a row that cannot be built.
     - The answer carries its warnings under the singular key `warning`, joined with ` | ` as the step loop's answer joins its own:
       the tail jobs' warnings, then the audit warning.
       Its `status` is `approving` when the request was left so, and `published` when this call or a concurrent one marked it.

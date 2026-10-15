@@ -32,7 +32,12 @@ import {
   ACKNOWLEDGMENT_MIN_LENGTH,
 } from "../../../shared/publication-limits.js";
 import { REASON_CODES } from "../../../shared/publication-review.js";
-import { auditLogStatement } from "../db/audit-log";
+import {
+  AUDIT_IF_PREVIOUS_CHANGED_SQL,
+  type AuditLogEntry,
+  auditLogParams,
+  auditLogStatement,
+} from "../db/audit-log";
 import { getS3Config } from "../routes/admin/shared";
 import type { AuthUser, Bindings } from "../types/bindings";
 import {
@@ -2502,6 +2507,25 @@ async function recordPreLoopFailure(
   }
 }
 
+/** The write that ends an approval: `published`, and only from `approving`. One statement. */
+const MARK_PUBLISHED_SQL = `UPDATE publication_requests
+     SET status = 'published', approved_at = datetime('now'), current_step = NULL, last_error = NULL, updated_at = datetime('now')
+     WHERE id = ? AND status = 'approving'`;
+
+type RequestEnded =
+  | { finished: true; changed: boolean }
+  | { finished: false; status: string | null };
+
+/** What a closing write that changed nothing found: already published (finished), or closed. */
+async function readEndedStatus(db: D1Database, requestId: number): Promise<RequestEnded> {
+  const closed = await db
+    .prepare("SELECT status FROM publication_requests WHERE id = ?")
+    .bind(requestId)
+    .first<{ status: string }>();
+  if (closed?.status === "published") return { finished: true, changed: false };
+  return { finished: false, status: closed?.status ?? null };
+}
+
 /**
  * The write that ends an approval (ADR 0105, decision 12): the request becomes `published`, and
  * ONLY if it is still `approving`, the state the run marked it in and every step since has kept it
@@ -2514,86 +2538,126 @@ async function recordPreLoopFailure(
  * `changed` says whether THIS call made the request `published`, as against finding it already so:
  * the one call that changes the row is the one that records the publication, so a concurrent
  * finisher does not write a second row.
+ *
+ * With `audit` the publication's `dataset_published` row is written in the SAME batch, by a
+ * statement that fires only if the closing write changed the row (`changes()`), so the row exists
+ * exactly when this call published the request: no crash, and no fault on the second statement,
+ * can leave a published request with no row, or a row for a request that was not published, and a
+ * concurrent finisher whose write changed nothing writes none. D1 runs a batch as one transaction,
+ * so a fault on either statement leaves the request `approving` and the call throws, which the
+ * route answers as a 500 and the caller retries (a retry finds every step done and closes the
+ * request). Without `audit` (a run whose dataset row could not be read, so no row can be built) it
+ * is the lone write.
  */
 async function markRequestPublished(
   db: D1Database,
   requestId: number,
-): Promise<{ finished: true; changed: boolean } | { finished: false; status: string | null }> {
-  const published = await db
-    .prepare(
-      `UPDATE publication_requests
-     SET status = 'published', approved_at = datetime('now'), current_step = NULL, last_error = NULL, updated_at = datetime('now')
-     WHERE id = ? AND status = 'approving'`,
-    )
-    .bind(requestId)
-    .run();
-  if ((published.meta.changes ?? 0) === 1) return { finished: true, changed: true };
-  const closed = await db
-    .prepare("SELECT status FROM publication_requests WHERE id = ?")
-    .bind(requestId)
-    .first<{ status: string }>();
-  if (closed?.status === "published") return { finished: true, changed: false };
-  return { finished: false, status: closed?.status ?? null };
+  audit?: AuditLogEntry,
+): Promise<RequestEnded> {
+  const mark = db.prepare(MARK_PUBLISHED_SQL).bind(requestId);
+  if (audit === undefined) {
+    const published = await mark.run();
+    if ((published.meta.changes ?? 0) === 1) return { finished: true, changed: true };
+    return readEndedStatus(db, requestId);
+  }
+  const [published] = await db.batch([
+    mark,
+    db.prepare(AUDIT_IF_PREVIOUS_CHANGED_SQL).bind(...auditLogParams(audit)),
+  ]);
+  if ((published?.meta?.changes ?? 0) === 1) return { finished: true, changed: true };
+  return readEndedStatus(db, requestId);
 }
 
 /**
  * The audit row of a publication, `dataset_published`, naming the approver of record (the
  * clicker for a run the web started, otherwise the account that called) and, when the caller is
- * someone else, the executing account. Best effort: a failure to write it is returned as the
- * sentence the administrator is told, and never changes the run.
+ * someone else, the executing account. It is built here and written with the closing write
+ * ({@link markRequestPublished}), never alone.
  *
  * `dataset` is the row the run already read; a run that never read it (every step was already done)
- * passes none and the row is read here, inside the same best-effort block, so a failed read, and a
- * dataset whose row is gone, are a warning and no row, never a row with a guessed review gate.
- * `finishedByResume` marks the row of a request that a resumed run with every step already done
- * closed: the steps ran in an earlier call, so the row names who finished the request, and says so.
+ * passes none and the row is read here, so a failed read, and a dataset whose row is gone, throw
+ * and the caller publishes with the warning and no row ({@link auditUnavailableWarning}), never a
+ * row with a guessed review gate. `finishedByResume` marks the row of a request that a resumed run
+ * with every step already done closed: the steps ran in an earlier call, so the row names who
+ * finished the request, and says so.
  */
-async function recordPublicationAudit(
+async function publicationAuditEntry(
   c: ApproveStepContext,
   dataset: { source?: string | null; is_exemplar?: number | null } | undefined,
   allSteps: readonly PublicationStep[],
   finishedByResume = false,
-): Promise<string | undefined> {
+): Promise<AuditLogEntry> {
+  const row =
+    dataset ??
+    (await c.db
+      .prepare("SELECT source, is_exemplar FROM datasets WHERE dataset_id = ?")
+      .bind(c.datasetId)
+      .first<{ source: string | null; is_exemplar: number | null }>());
+  // `first()` answers null for a row that is not there: that is no state to record, and an empty
+  // object would read as a dataset with no source.
+  if (!row) throw new Error("no dataset row to read the review gate's state from");
+  return {
+    userId: c.approver.id,
+    action: "dataset_published",
+    resourceType: "dataset",
+    resourceId: c.datasetId,
+    details: JSON.stringify({
+      approved_by: c.approver.username,
+      // Only when the executor is not the approver, so a terminal approval's
+      // row is byte-identical to what it always was.
+      ...(c.approver.id !== c.adminUser.id ? { executed_by: executorName(c.adminUser) } : {}),
+      steps: allSteps,
+      // The review gate's state for this environment and dataset when the row is written, and
+      // the flag of the call that finished the run. A skip is also its own row when it happens
+      // (`publication_ci_check_skipped`), which survives a resume with another flag.
+      review_gate: reviewGateStateOf(c.env, row),
+      skip_ci_check: c.body.skip_ci_check,
+      ...(finishedByResume ? { finished_by_resume: true } : {}),
+    }),
+  };
+}
+
+/** The warning of a publication whose audit row could not be built, so none was written. */
+function auditUnavailableWarning(c: ApproveStepContext, auditError: unknown): string {
+  const message = auditError instanceof Error ? auditError.message : String(auditError);
+  console.error(
+    "AUDIT LOG FAILURE: Dataset publication for",
+    c.datasetId,
+    "was not logged:",
+    message,
+  );
+  return `Audit log write failed: ${message}. Publication succeeded but was not logged for compliance.`;
+}
+
+/**
+ * End the approval of this request: the closing write and the `dataset_published` row as one
+ * batch ({@link markRequestPublished}), with the row built first. When it cannot be built (the
+ * dataset's row cannot be read, or is gone) the request is still closed, by the lone write, and
+ * the answer carries the warning: nothing can be written that would not be guessed. The warning is
+ * returned only when this call made the request `published`.
+ */
+async function endApproval(
+  c: ApproveStepContext,
+  requestId: number,
+  dataset: { source?: string | null; is_exemplar?: number | null } | undefined,
+  allSteps: readonly PublicationStep[],
+  finishedByResume = false,
+): Promise<{ ended: RequestEnded; auditWarning?: string }> {
+  let entry: AuditLogEntry | undefined;
+  let unbuilt: unknown;
   try {
-    const row =
-      dataset ??
-      (await c.db
-        .prepare("SELECT source, is_exemplar FROM datasets WHERE dataset_id = ?")
-        .bind(c.datasetId)
-        .first<{ source: string | null; is_exemplar: number | null }>());
-    // `first()` answers null for a row that is not there: that is no state to record, and an empty
-    // object would read as a dataset with no source.
-    if (!row) throw new Error("no dataset row to read the review gate's state from");
-    await auditLogStatement(c.db, {
-      userId: c.approver.id,
-      action: "dataset_published",
-      resourceType: "dataset",
-      resourceId: c.datasetId,
-      details: JSON.stringify({
-        approved_by: c.approver.username,
-        // Only when the executor is not the approver, so a terminal approval's
-        // row is byte-identical to what it always was.
-        ...(c.approver.id !== c.adminUser.id ? { executed_by: executorName(c.adminUser) } : {}),
-        steps: allSteps,
-        // The review gate's state for this environment and dataset when the row is written, and
-        // the flag of the call that finished the run. A skip is also its own row when it happens
-        // (`publication_ci_check_skipped`), which survives a resume with another flag.
-        review_gate: reviewGateStateOf(c.env, row),
-        skip_ci_check: c.body.skip_ci_check,
-        ...(finishedByResume ? { finished_by_resume: true } : {}),
-      }),
-    }).run();
-    return undefined;
-  } catch (auditError) {
-    const message = auditError instanceof Error ? auditError.message : String(auditError);
-    console.error(
-      "AUDIT LOG FAILURE: Dataset publication for",
-      c.datasetId,
-      "was not logged:",
-      message,
-    );
-    return `Audit log write failed: ${message}. Publication succeeded but was not logged for compliance.`;
+    entry = await publicationAuditEntry(c, dataset, allSteps, finishedByResume);
+  } catch (err) {
+    unbuilt = err;
   }
+  const ended = await markRequestPublished(c.db, requestId, entry);
+  return {
+    ended,
+    auditWarning:
+      entry === undefined && ended.finished && ended.changed
+        ? auditUnavailableWarning(c, unbuilt)
+        : undefined,
+  };
 }
 
 /**
@@ -2851,7 +2915,16 @@ export async function runPublicationApproval(args: ApproveRunArgs): Promise<Resp
     // "approve the request again to retry", which finds only an active request, so closing it
     // here would turn the remedy into a 404. A run with a warning leaves the request `approving`
     // and says so in its answer, below.
-    const ended = retryWarnings.length === 0 ? await markRequestPublished(db, request.id) : null;
+    // The publication's audit row is written in the same batch as the closing write, by the call
+    // that changes the request and only by it: the steps ran in an earlier call, which never
+    // reached the write that records it, so this one does, naming who finished the request. A
+    // concurrent finisher found the request already published and records nothing; a call that
+    // left the request `approving` records nothing yet.
+    const closing =
+      retryWarnings.length === 0
+        ? await endApproval(c, request.id, undefined, allSteps, true)
+        : null;
+    const ended = closing?.ended ?? null;
     if (ended && !ended.finished) {
       return refuseApprovalOnClosedRequest(c, request.id, ended.status);
     }
@@ -2860,14 +2933,7 @@ export async function runPublicationApproval(args: ApproveRunArgs): Promise<Resp
     // never a step: it does nothing unless the writer is enabled, runs in `waitUntil`,
     // and cannot fail or delay this response.
     scheduleNeurobagelSync(env, waitUntil, datasetId, "hook:publication");
-    // The publication is recorded by the call that changes the request, and only by it: the
-    // steps ran in an earlier call, which never reached the write that records it, so this one
-    // does, naming who finished the request. A concurrent finisher found the request already
-    // published and records nothing; a call that left the request `approving` records nothing yet.
-    const auditWarning =
-      ended?.finished && ended.changed
-        ? await recordPublicationAudit(c, undefined, allSteps, true)
-        : undefined;
+    const auditWarning = closing?.auditWarning;
     // The answer is the step loop's in shape (ADR 0105 decision 12): the warnings under the one key
     // the CLI prints, `warning`, joined as the loop joins its own, and a `status` that says what
     // the row says. A call that left the request `approving` (a tail job warned) says so, so an
@@ -3229,7 +3295,7 @@ export async function runPublicationApproval(args: ApproveRunArgs): Promise<Resp
   // or a resume that found every step done), and this one carries on exactly as before, except
   // that it records nothing: the call that changed the request records the publication (ADR 0105
   // decision 12), so there is one `dataset_published` row per publication.
-  const ended = await markRequestPublished(db, request.id);
+  const { ended, auditWarning } = await endApproval(c, request.id, dataset, allSteps);
   if (!ended.finished) {
     return refuseApprovalOnClosedRequest(c, request.id, ended.status);
   }
@@ -3242,11 +3308,8 @@ export async function runPublicationApproval(args: ApproveRunArgs): Promise<Resp
   // runs the same hook when it does.
   scheduleNeurobagelSync(env, waitUntil, datasetId, "hook:publication");
 
-  // Audit log (non-fatal but warn user if fails), written only by the call that made the request
+  // The audit row was written with the closing write, by the call that made the request
   // published: a concurrent finisher has recorded it, or is recording it.
-  const auditWarning = ended.changed
-    ? await recordPublicationAudit(c, dataset, allSteps)
-    : undefined;
 
   // Combine all non-fatal warnings into the response so operators can act
   // without tailing logs. Both warnings are optional and independent.

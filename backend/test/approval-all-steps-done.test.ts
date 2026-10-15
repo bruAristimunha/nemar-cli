@@ -42,6 +42,7 @@ import {
   seedUser,
   webClaim,
 } from "./helpers/publication-review";
+import { hookedD1 } from "./helpers/publication-review-harness";
 
 const TERMINAL_KEY = "all-done-terminal-0123456789abcdef0123456789abcdef";
 const EXECUTOR_KEY = "all-done-executor-0123456789abcdef0123456789abcdef";
@@ -312,25 +313,39 @@ describe("the call that closes an all-steps-done request writes the dataset_publ
     });
   });
 
-  test("a row that cannot be written is a warning in the answer, and the request is still closed", async () => {
+  test("the audit row is written with the closing write: a fault on the row leaves the request approving, and a retry closes it once", async () => {
+    // The two writes are one batch (ADR 0105, decision 12), so a publication has its row exactly
+    // when the request is `published`: a fault between them cannot leave a published request with
+    // no row, because there is no gap. The fault is aimed at the row's statement inside the batch.
     const id = seedAllDone("approving");
+    let armed = true;
     const failing = env({
-      DB: interceptingD1(realD1(db), (sql, binds) => {
-        if (/INSERT INTO audit_log/.test(sql) && binds.includes("dataset_published")) {
-          throw new Error("the audit table is unwritable");
-        }
+      DB: hookedD1(realD1(db), {
+        statement: (sql, inBatch) => {
+          if (armed && inBatch && /INSERT INTO audit_log/.test(sql) && /changes\(\)/.test(sql)) {
+            throw new Error("the audit table is unwritable");
+          }
+        },
       }),
     });
 
     const res = await approve({ bindings: failing });
 
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { status: string; warning?: string };
-    expect(body.status).toBe("published");
-    expect(body.warning).toContain("Audit log write failed");
-    expect(body.warning).toContain("the audit table is unwritable");
-    expect(requestRow(id).status).toBe("published");
+    expect(res.status).toBe(500);
+    // Neither write took effect: the request is still the one an approval can retry.
+    expect(requestRow(id).status).toBe("approving");
     expect(auditRows("dataset_published")).toHaveLength(0);
+
+    armed = false;
+    const retry = await approve({ bindings: failing });
+    expect(retry.status).toBe(200);
+    expect(((await retry.json()) as { status: string }).status).toBe("published");
+    expect(requestRow(id).status).toBe("published");
+    expect(auditRows("dataset_published")).toHaveLength(1);
+
+    // A call after the close finds no active request and writes no second row.
+    expect((await approve()).status).toBe(404);
+    expect(auditRows("dataset_published")).toHaveLength(1);
   });
 
   // The row records the review gate's state for the dataset, read from the dataset's row. A run
@@ -376,12 +391,15 @@ describe("the call that closes an all-steps-done request writes the dataset_publ
   test("a finisher that lost the race to a concurrent call writes no row of its own", async () => {
     const id = seedAllDone("approving");
     const racing = env({
-      DB: interceptingD1(realD1(db), (sql) => {
-        // The concurrent call of the same run closes the request between this call's read and its
-        // own closing write, which then finds the request already published.
-        if (/SET status = 'published'/.test(sql)) {
-          db.run("UPDATE publication_requests SET status = 'published' WHERE id = ?", [id]);
-        }
+      DB: hookedD1(realD1(db), {
+        statement: (sql) => {
+          // The concurrent call of the same run closes the request between this call's read and
+          // its own closing write (a statement of the batch), which then finds it already
+          // published, and whose audit insert, guarded on that write, writes nothing.
+          if (/SET status = 'published'/.test(sql)) {
+            db.run("UPDATE publication_requests SET status = 'published' WHERE id = ?", [id]);
+          }
+        },
       }),
     });
 

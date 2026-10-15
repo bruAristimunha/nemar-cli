@@ -33,6 +33,7 @@ import { hashApiKey } from "../src/services/token";
 import type { Bindings, Variables } from "../src/types/bindings";
 import { freshDb, realD1 } from "./helpers/d1";
 import { mainRefAnswer, markDatasetScreensClean } from "./helpers/identifier-screen";
+import { hookedD1 } from "./helpers/publication-review-harness";
 
 const ADMIN_KEY = "golden-admin-key-0123456789abcdef0123456789abcdef";
 const DATASET = "nm098765";
@@ -204,6 +205,47 @@ describe("POST /admin/publish/:id/approve (golden characterization)", () => {
       .get();
     expect(audit?.action).toBe("dataset_published");
     expect(audit?.resource_id).toBe(DATASET);
+  });
+
+  test("the step loop's closing write and its audit row are one batch: a fault on the row leaves the request approving, and the retry writes the row once", async () => {
+    const done = ALL_STEPS.filter((s) => s !== "upload_to_zenodo" && s !== "sync_nemar");
+    await seed(done);
+    let armed = true;
+    const failing = {
+      ...env,
+      DB: hookedD1(realD1(db), {
+        statement: (sql, inBatch) => {
+          if (armed && inBatch && /INSERT INTO audit_log/.test(sql) && /changes\(\)/.test(sql)) {
+            throw new Error("the audit table is unwritable");
+          }
+        },
+      }),
+    } as Bindings;
+    const rows = () =>
+      db.query("SELECT user_id FROM audit_log WHERE action = 'dataset_published'").all();
+    const call = (bindings: Bindings) =>
+      app.request(
+        `/admin/publish/${DATASET}/approve`,
+        {
+          method: "POST",
+          headers: { Authorization: `Bearer ${ADMIN_KEY}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ resume: true }),
+        },
+        bindings,
+      );
+
+    expect((await call(failing)).status).toBe(500);
+    expect(requestRow()?.status).toBe("approving");
+    expect(rows()).toHaveLength(0);
+
+    // The steps were all recorded by then, so the retry is the all-steps-done branch, which ends
+    // with the same batch and writes the one row.
+    armed = false;
+    expect((await call(failing)).status).toBe(200);
+    expect(requestRow()?.status).toBe("published");
+    expect(rows()).toHaveLength(1);
+    expect((await call(failing)).status).toBe(404);
+    expect(rows()).toHaveLength(1);
   });
 
   test("all-completed short-circuit on a requested request: refused, the request is not touched", async () => {
