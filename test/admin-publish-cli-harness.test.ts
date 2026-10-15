@@ -610,11 +610,16 @@ describe.skipIf(process.platform === "win32")("a command run on a terminal", () 
       return Date.now() - start;
     };
 
-    h.githubDelayMs.value = 400;
-    expect(await timed()).toBeGreaterThanOrEqual(380);
+    // A delay long enough that a local fetch on a loaded machine is still far below it: the
+    // bound after the reset is half the delay, so it holds under load and still fails if the
+    // delay survived the reset (a surviving delay takes the whole second).
+    const delay = 1000;
+    h.githubDelayMs.value = delay;
+    const delayed = await timed();
+    expect(delayed).toBeGreaterThanOrEqual(delay - 20);
 
     h.reset();
     expect(h.githubDelayMs.value).toBe(0);
-    expect(await timed()).toBeLessThan(380);
+    expect(await timed()).toBeLessThan(delay / 2);
   });
 });
