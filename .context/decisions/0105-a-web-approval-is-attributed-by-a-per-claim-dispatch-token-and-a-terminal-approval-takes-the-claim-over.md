@@ -114,7 +114,12 @@ A token that is stale or expired is refused, never quietly downgraded.**
    where the other two flags are refused because the click already made that decision.
    This retires the Phase 2 stop-gap `override_inside_web_approval`, which is removed from the contract.
    Its guarantee is now structural, and stronger:
-   an override, an acknowledgment or a skipped CI check is recorded only under the credential that sent it, and the first two also at the clicker's own dispatch.
+   an override, an acknowledgment or a skipped CI check is recorded only under the credential that sent it, and the first two also at the clicker's own dispatch,
+   and the fourth refused decision, the sandbox, is not recorded under anyone: it is refused for a run carrying a token, and a run that sends none is the sender's own call.
+   A consequence on a non-production Worker is checked against the orchestrator's `doi_create` step:
+   it creates a concept DOI only when the dataset has none, and without `sandbox` it refuses to create one outside production (400), while `sandbox: true` is refused for a run carrying a token,
+   so a web-dispatched approval there cannot create a concept DOI, and can only finish a dataset that already has one (a staging exemplar, for instance).
+   A staging approval that needs a new DOI is run from a terminal with `--sandbox`.
 6. **A terminal approval takes the claim over.**
    The mark that moves a request to `approving` clears `approval_requested_by` and `approval_dispatched_at` in the same statement, for a call that carried no token.
    It is the last write before any work, so a call that is refused earlier leaves the claim standing.

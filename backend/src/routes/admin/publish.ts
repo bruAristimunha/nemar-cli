@@ -501,8 +501,8 @@ export function registerPublishRoutes(admin: AdminRouter): void {
    *                         the mark). Nothing was changed.
    *   409 dispatch_expired  the token is genuine, but its run sat idle past the 15 minute lease
    *   409 decision_with_dispatch_token  a call that carries a valid token sent an override, an
-   *                         acknowledgment or a skipped CI check: nothing was recorded under
-   *                         anybody
+   *                         acknowledgment, a skipped CI check or the sandbox: nothing was
+   *                         recorded under anybody (the sandbox is refused, never recorded)
    *   409 request_changed   the request was denied, blocked or withdrawn while the approval was checked:
    *                         nothing ran, and the request is read again
    *   409 approval_closed_during_run  the request was closed (denied, blocked again or filed
