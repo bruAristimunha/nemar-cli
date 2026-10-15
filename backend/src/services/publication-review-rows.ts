@@ -1,5 +1,5 @@
 /**
- * The publication review's rows (ADR 0102, migration 0096): how a `publication_reviews` row is
+ * The publication review's rows (ADR 0102, migration 0098): how a `publication_reviews` row is
  * read, and the SQL fragments the statements that must be atomic share.
  *
  * Read-only and dependency-light on purpose. The write path (start, claim, store, watchdog) and the

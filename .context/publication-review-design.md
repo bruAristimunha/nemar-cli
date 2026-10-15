@@ -364,7 +364,7 @@ Files:
   Three other places disagree with it today and are not changed by this epic, so each is filed as its own issue: enrichment (`enrich-dataset.ts`: `README.md`, `README`, `readme.md`, so a `.rst` or `.txt` README is "No README found"),
   the reindex (`dataset-reindex.ts`: `README`, `README.md`) and the webhook's trigger list (`routes/webhooks/github.ts`: `README.md`).
   Publishing renames a `.rst` or `.txt` README to `README.md` (`publication-orchestrator.ts`, step `update_readme`); the review reads the file as the depositor wrote it.
-- Migration `0096_publication_reviews.sql` (the next free number at the time; check `ls backend/src/db/migrations`).
+- Migration `0098_publication_reviews.sql` (the next free number at the time; check `ls backend/src/db/migrations`).
 - `backend/src/services/publication-review.ts`: start (from `storeScreenResult` and an admin start), the applicability wrapper
   `publicationReviewApplies`, caps ranked after insert, dispatch, claim, store, the re-block on a failed minimum, the production-only watchdog,
   and the flag-off behaviour of section 7 of the ADR.

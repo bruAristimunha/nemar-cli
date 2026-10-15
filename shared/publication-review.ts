@@ -930,7 +930,7 @@ export function factNotesOf(report: PublicationReviewReport): QuestionFactNote[]
 // Rows, run errors and outcomes
 // ---------------------------------------------------------------------------------------------
 
-/** A stored review's lifecycle. Kept equal to the CHECK in migration 0096 by a test. */
+/** A stored review's lifecycle. Kept equal to the CHECK in migration 0098 by a test. */
 export const PUBLICATION_REVIEW_STATES = [
   "dispatched",
   "reported",

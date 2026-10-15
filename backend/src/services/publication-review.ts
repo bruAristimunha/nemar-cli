@@ -3,7 +3,7 @@
  *
  * When the identifier screen of a publication request reports for a commit and its gate is clear
  * or needs an acknowledgment, the Worker starts a review of that commit: it records the attempt in
- * `publication_reviews` (migration 0096) and dispatches a workflow to `nemarDatasets/.github`.
+ * `publication_reviews` (migration 0098) and dispatches a workflow to `nemarDatasets/.github`.
  * The workflow CLAIMS the review (the Worker accepts the one-shot token, checks the request is
  * still the one it was dispatched for, and records the time) before it spends anything, reads the
  * root documents at the commit as git data, asks a model four questions and posts a report. The

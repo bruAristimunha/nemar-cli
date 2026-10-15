@@ -1,5 +1,5 @@
 /**
- * Migration 0096 (`publication_reviews`) and the row module that reads it (ADR 0102).
+ * Migration 0098 (`publication_reviews`) and the row module that reads it (ADR 0102).
  *
  * Real engines only: every migration applied in order to bun:sqlite (`freshDb`), and the SQL
  * fragments the claim and the mail lease will share run again on Miniflare's D1, the
@@ -49,7 +49,7 @@ import {
   seedScreenedRequest,
 } from "./helpers/publication-review";
 
-const SQL = readFileSync(join(MIGRATIONS_DIR, "0096_publication_reviews.sql"), "utf8");
+const SQL = readFileSync(join(MIGRATIONS_DIR, "0098_publication_reviews.sql"), "utf8");
 const OTHER_HEAD = "fedcba9876543210fedcba9876543210fedcba98";
 
 interface ColumnInfo {
@@ -60,18 +60,18 @@ interface ColumnInfo {
   pk: number;
 }
 
-/** Every migration before 0096, applied in order: the schema this migration starts from. */
-function dbBefore0096(): Database {
+/** Every migration before 0098, applied in order: the schema this migration starts from. */
+function dbBefore0098(): Database {
   const db = new Database(":memory:");
   for (const file of readdirSync(MIGRATIONS_DIR)
-    .filter((f) => f.endsWith(".sql") && f < "0096")
+    .filter((f) => f.endsWith(".sql") && f < "0098")
     .sort()) {
     db.exec(readFileSync(join(MIGRATIONS_DIR, file), "utf-8"));
   }
   return db;
 }
 
-describe("0096 publication_reviews: columns", () => {
+describe("0098 publication_reviews: columns", () => {
   const db = freshDb();
   const info = db.query("PRAGMA table_info(publication_reviews)").all() as ColumnInfo[];
 
@@ -126,9 +126,9 @@ describe("0096 publication_reviews: columns", () => {
   });
 });
 
-describe("0096 adds one table and two indexes, and no column anywhere else", () => {
-  test("datasets and publication_requests have the columns they had before 0096", () => {
-    const before = dbBefore0096();
+describe("0098 adds one table and two indexes, and no column anywhere else", () => {
+  test("datasets and publication_requests have the columns they had before 0098", () => {
+    const before = dbBefore0098();
     const after = freshDb();
     for (const table of ["datasets", "publication_requests", "users", "dataset_versions"]) {
       const cols = (db: Database) =>
@@ -144,7 +144,7 @@ describe("0096 adds one table and two indexes, and no column anywhere else", () 
           .filter((o) => !o.name.startsWith("sqlite_"))
           .map((o) => `${o.type}:${o.name}`),
       );
-    const before = objects(dbBefore0096());
+    const before = objects(dbBefore0098());
     const added = [...objects(freshDb())].filter((o) => !before.has(o)).sort();
     expect(added).toEqual([
       "index:idx_publication_reviews_depositor",
@@ -154,7 +154,7 @@ describe("0096 adds one table and two indexes, and no column anywhere else", () 
   });
 });
 
-describe("0096: the vocabularies of the migration and the code are the same lists", () => {
+describe("0098: the vocabularies of the migration and the code are the same lists", () => {
   const listAfter = (re: RegExp): string[] => {
     const m = SQL.match(re);
     if (!m) throw new Error(`no match for ${re}`);
@@ -184,7 +184,7 @@ describe("0096: the vocabularies of the migration and the code are the same list
   });
 });
 
-describe("0096: a CHECK for every pairing a row must not have", () => {
+describe("0098: a CHECK for every pairing a row must not have", () => {
   const db = freshDb();
   let n = 0;
   /** Insert a row: a valid dispatched one, with `over` applied. Each gets its own request. */

@@ -477,7 +477,7 @@ describe("with the review off, the mail is what it was before the review existed
   });
 
   test("with the review off and no review row, a failed read of the review rows leaves the mail exactly as it was", async () => {
-    // A deploy before migration 0096 is applied: the table is not there, and the review is off, so
+    // A deploy before migration 0098 is applied: the table is not there, and the review is off, so
     // the mail has nothing to say about it. It must not gain a "could not be read" section.
     const { requestId, datasetId } = unmailed();
     const row = db
