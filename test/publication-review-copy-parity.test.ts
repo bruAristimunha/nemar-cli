@@ -26,8 +26,8 @@
  *    The comparison itself is proved on in-memory fixtures (always runs), so the failure modes of
  *    the strict path are exercised without the other repository.
  *
- * Wiring the strict path into the CI workflow is a follow-up that needs the website file on its
- * `staging` branch first; it is recorded in ADR 0102, Phase 4 amendment, items 4 and 7.
+ * The unit-pure CI job checks out the website file from its `staging` branch and sets the variable
+ * (#1787), so on CI this test is strict; ADR 0102, Phase 4 amendment, items 4 and 7.
  */
 
 import { describe, expect, test } from "bun:test";

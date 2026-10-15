@@ -9,6 +9,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawn } from "bun";
+import { ABSENT_DATASET_ID } from "../backend/src/services/datasetId";
 import { TEST_CONFIG, sleep } from "./setup";
 
 interface TestContext {
@@ -298,10 +299,12 @@ describe("publish workflow - admin operations", () => {
     });
 
     const { stdout, stderr } = await runCli(
-      ["admin", "publish", "deny", "nm999999", "-r", "test reason", "-y"],
+      ["admin", "publish", "deny", ABSENT_DATASET_ID, "-r", "test reason", "-y"],
       ctx,
     );
-    // Backend returns "No active publication request found" or generic 404
+    // ABSENT_DATASET_ID, not nm999999: that id is outside the 0-99999 cap, so the
+    // id check (#1583) now refuses it before any lookup. Backend returns
+    // "No active publication request found" or generic 404
     // Error message appears in stderr (via ora spinner.fail) or stdout
     const output = stdout + stderr;
     expect(
@@ -321,7 +324,10 @@ describe("publish workflow - admin operations", () => {
       username: "test-admin",
     });
 
-    const { stdout, stderr } = await runCli(["admin", "publish", "approve", "nm999999", "-y"], ctx);
+    const { stdout, stderr } = await runCli(
+      ["admin", "publish", "approve", ABSENT_DATASET_ID, "-y"],
+      ctx,
+    );
     // Error message appears in stderr (via ora spinner.fail) or stdout
     const output = stdout + stderr;
     expect(

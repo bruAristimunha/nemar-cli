@@ -1050,7 +1050,7 @@ A sentence is called web-safe here when it names no terminal command, flag or pl
    Each repository tests the same table against the other's copy, on the pattern of the account copy:
    here a test reads the website's file through an environment variable or a sibling checkout, with a strict mode when the variable is set and a visible skip when it is not,
    and tests the table against the code's own sentences and sets of words so that it cannot become dead copy.
-   Wiring the strict mode into the continuous integration workflow waits until the website's file exists on its `staging` branch.
+   The strict mode is wired into the continuous integration workflow now that the website's file exists on its `staging` branch (#1787).
 
 5. **What the page may do.**
    Approve, with the same explicit confirmation as the terminal: the review id and the reasons shown, sent in the body of `approve-dispatch`,
@@ -1095,7 +1095,7 @@ A sentence is called web-safe here when it names no terminal command, flag or pl
    The page has no control to run the identifier screen again; the Worker has the route, and an administrator uses the terminal for that one step.
    The `gate: "wait"` answer for an acknowledgment that lost a race says "wait" about a state that is not waiting, and `screen_gate.wait` is worded to cover both; a gate word of its own would widen a Phase 3 contract.
    Mailing the depositor a comment from the page is not done.
-   The strict parity path is not yet in the continuous integration workflow (two small edits to its unit-pure job, once the website file is on `staging`).
+   The strict parity path was left out of the continuous integration workflow until the website file was on `staging`; it is there now (#1787).
    The executor workflow edit of Phase 3 stays the maintainer's, as the Phase 3 amendment says.
    `description.next` shows `nemar admin publish start <id>` for a clean sandbox (`xx`) request, although `start_offered` is false for it and the route refuses a start there.
    That is CLI behavior from before this phase, tracked in #1773, and the page never prints `description.next`.

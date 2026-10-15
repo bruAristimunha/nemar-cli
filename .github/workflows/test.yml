@@ -855,14 +855,15 @@ jobs:
       - name: Install backend dependencies
         run: cd backend && bun install
 
-      # The website's transcription of shared/contract/account-copy.ts, so
-      # test/account-copy-parity.test.ts can actually compare the two here
+      # The website's transcriptions of shared/contract/account-copy.ts and
+      # shared/contract/publication-review-copy.ts, so test/account-copy-parity.test.ts
+      # and test/publication-review-copy-parity.test.ts can actually compare them here
       # (#1268, ADR 0045). Without it that test found no checkout and returned
       # early: the parity claim was enforced on developer machines and nowhere
       # else, while reporting green as a required check.
       #
-      # nemarOrg/website is PUBLIC, so no token is needed. Sparse, non-cone, one
-      # file: a table of string constants, not that repo's module graph. It
+      # nemarOrg/website is PUBLIC, so no token is needed. Sparse, non-cone, two
+      # files: tables of string constants, not that repo's module graph. It
       # lands in website-copy/ at the repo root, which the unit-pure file glob
       # below cannot reach (it lists test/*.test.ts and backend/test/*.test.ts
       # only) and .gitignore covers.
@@ -894,7 +895,9 @@ jobs:
         with:
           repository: nemarOrg/website
           path: website-copy
-          sparse-checkout: src/lib/account-copy.ts
+          sparse-checkout: |
+            src/lib/account-copy.ts
+            src/lib/publication-review-copy.ts
           sparse-checkout-cone-mode: false
           ref: staging
 
@@ -974,6 +977,9 @@ jobs:
           # contract: a path that is not there FAILS rather than skipping, so a
           # broken checkout step cannot silently disable the check.
           NEMAR_WEBSITE_ACCOUNT_COPY: website-copy/src/lib/account-copy.ts
+          # Same checkout, same rule, for the page-owned words of the publication
+          # review (ADR 0102, #1780): a path that is not there FAILS.
+          NEMAR_WEBSITE_REVIEW_COPY: website-copy/src/lib/publication-review-copy.ts
           NEMAR_DATASET_WORKFLOW_LIVE: dataset-workflows-live/.github/workflows/onboard-openneuro.yml
           NEMAR_PR_REVIEW_WORKFLOW_LIVE: dataset-workflows-live/.github/workflows/run-pr-review.yml
           # Empty on a fork, where the checkout above is skipped, so the guard
