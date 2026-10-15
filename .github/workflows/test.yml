@@ -901,15 +901,16 @@ jobs:
           sparse-checkout-cone-mode: false
           ref: staging
 
-      # The deployed copies of onboard-openneuro.yml and run-pr-review.yml, for the
-      # same reason and with the same shape (#1309). Both are authored in this repo
-      # beside the code they invoke, then deployed by copying them whole into
-      # nemarDatasets/.github -- and the first pair had already drifted by one merged
+      # The deployed copies of onboard-openneuro.yml, run-pr-review.yml and
+      # run-publication-review.yml, for the same reason and with the same shape
+      # (#1309). All three are authored in this repo beside the code they invoke,
+      # then deployed by copying them whole into nemarDatasets/.github -- and the
+      # first pair (onboard-openneuro.yml and run-pr-review.yml) had already drifted by one merged
       # PR before anyone noticed, because nothing compared them. `main`, not a
       # pre-release branch: that repo has no release train, so what is on main is
       # what runs.
       #
-      # nemarDatasets/.github is PUBLIC, so no token is needed. Sparse, non-cone, two
+      # nemarDatasets/.github is PUBLIC, so no token is needed. Sparse, non-cone, three
       # files (non-cone mode takes file paths, one per line). They land in
       # dataset-workflows-live/ at the repo root, which the unit-pure file glob does
       # not reach, so they cannot be mistaken for test files. A workflow added to
@@ -922,6 +923,7 @@ jobs:
           sparse-checkout: |
             .github/workflows/onboard-openneuro.yml
             .github/workflows/run-pr-review.yml
+            .github/workflows/run-publication-review.yml
           sparse-checkout-cone-mode: false
           ref: main
 
@@ -982,6 +984,7 @@ jobs:
           NEMAR_WEBSITE_REVIEW_COPY: website-copy/src/lib/publication-review-copy.ts
           NEMAR_DATASET_WORKFLOW_LIVE: dataset-workflows-live/.github/workflows/onboard-openneuro.yml
           NEMAR_PR_REVIEW_WORKFLOW_LIVE: dataset-workflows-live/.github/workflows/run-pr-review.yml
+          NEMAR_PUBLICATION_REVIEW_WORKFLOW_LIVE: dataset-workflows-live/.github/workflows/run-publication-review.yml
           # Empty on a fork, where the checkout above is skipped, so the guard
           # skips VISIBLY instead of failing on a checkout that could never have
           # worked. On any run from this repository it is set, and a missing

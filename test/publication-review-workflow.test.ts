@@ -5,9 +5,10 @@
  * The workflow is authored in this repository and deployed by copying it whole into
  * `nemarDatasets/.github` (the same arrangement and the same drift risk as the pull-request review
  * workflow, see `test/pr-review-workflow.test.ts`). The check at the bottom compares the two byte
- * for byte, and SKIPS VISIBLY when there is no deployed copy: the deployed copy does not exist until
- * the release that ships the script has happened (ADR 0102, "Before it is switched on"), so unlike
- * the pull-request review's, this check is not wired into CI's required job yet.
+ * for byte, and SKIPS VISIBLY when there is no deployed copy. The unit-pure CI job checks the
+ * deployed copy out of `nemarDatasets/.github` `main` and names it in
+ * `NEMAR_PUBLICATION_REVIEW_WORKFLOW_LIVE`, so there the check is strict, as the pull-request
+ * review's is (ADR 0102, "Before it is switched on", item 4).
  *
  * Two checks read the Worker's own files: the event type it dispatches and the callback routes it
  * registers (under "what triggers it"), the pair `test/pr-review-workflow.test.ts` makes for the
