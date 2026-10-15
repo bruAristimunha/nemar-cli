@@ -13,10 +13,14 @@
  * and a recorded version with no concept identifier to relate it to), which warns from rows alone,
  * with no network.
  *
+ * A call that leaves the request `approving` is not a success: it exits 1 and says the request is
+ * not published yet (`runApproval` reads the answer's `status`), where it used to print a success
+ * line and exit 0 with the warning as the only sign.
+ *
  * Mutation checks (each turns a named test red): answer the warnings under a plural key again
  * (the "prints the warning" row); close the request despite the warning, or answer `published` for
  * a request the call left approving (the "left approving" row); print a warning for a call that
- * had none (the control row).
+ * had none (the control row); ignore the answer's `status` in `runApproval` (the exit-code rows).
  *
  * CI TIER: unit-pure. Hermetic: an in-process backend over a local database, the CLI spawned
  * against it, stand-ins only at GitHub and Resend, no live network; it sets its own default
@@ -81,8 +85,14 @@ describe("approving a request whose steps are all done", () => {
 
     const r = await approve();
 
-    expect(r.exitCode).toBe(0);
+    // Not a success: the request is not published, and a script that asked for an approval has to
+    // be able to tell (the Worker's answer says `approving`, not `published`).
+    expect(r.exitCode).toBe(1);
+    expect(output(r)).not.toContain("attach the log to a new issue");
     expect(output(r)).toContain("All steps already completed");
+    expect(output(r)).toContain("Not published yet");
+    expect(output(r)).toContain("the request is approving");
+    expect(output(r)).toContain(`nemar admin publish approve ${DATASET} --resume`);
     // The warning says what to do, and it is on the console: the operator is told, not left to
     // read a success line.
     const warning = output(r)
@@ -95,11 +105,11 @@ describe("approving a request whose steps are all done", () => {
 
   test("the retry the warning asks for is real: approving again finds the request and warns again while the cause stands", async () => {
     const id = seedAllDone({ concealedEra: true });
-    expect((await approve()).exitCode).toBe(0);
+    expect((await approve()).exitCode).toBe(1);
 
     const again = await approve();
 
-    expect(again.exitCode).toBe(0);
+    expect(again.exitCode).toBe(1);
     expect(output(again)).toContain("Warning:");
     expect(requestStatus(id)).toBe("approving");
 
@@ -108,6 +118,7 @@ describe("approving a request whose steps are all done", () => {
     const closing = await approve();
     expect(closing.exitCode).toBe(0);
     expect(output(closing)).not.toContain("Warning:");
+    expect(output(closing)).not.toContain("Not published yet");
     expect(requestStatus(id)).toBe("published");
   });
 

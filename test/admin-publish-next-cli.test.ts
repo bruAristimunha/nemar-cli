@@ -53,6 +53,7 @@ import {
   REVIEW_GATE_REFUSAL_TEXT,
   cureOf,
 } from "../shared/publication-review";
+import { PUBLICATION_STEPS } from "../shared/publication-steps";
 import { type CliResult, startPublishCli } from "./helpers/admin-publish-cli";
 import { hardReport, twoReasons, withheldReport } from "./helpers/approve-seeds";
 
@@ -892,6 +893,37 @@ describe("a large dataset says what the lock will take, before the answer", () =
 // ---------------------------------------------------------------------------------------------
 // The exit code, and what the Worker refuses
 // ---------------------------------------------------------------------------------------------
+
+describe("an approval that leaves the request approving is not an approval", () => {
+  test("y on a request whose steps are done but whose tail job warned: counted as failed, exit 1, and the request is not published", async () => {
+    // Every step is recorded and a de-anonymization's tail job warns (a concealed era whose
+    // version has no concept identifier to relate to), so the Worker leaves the request
+    // `approving` and answers so. The walk must not count that as an approval.
+    const { requestId } = seed(A, goodPublicationReport(), { requestStatus: "approving" });
+    h.db.run(
+      "UPDATE publication_requests SET steps_completed = ?, updated_at = datetime('now', '-3 hours') WHERE id = ?",
+      [JSON.stringify(PUBLICATION_STEPS), requestId],
+    );
+    h.db.run(
+      `INSERT INTO publication_requests (dataset_id, requested_by, status, anonymous, requested_at)
+       VALUES (?, (SELECT owner_user_id FROM datasets WHERE dataset_id = ?), 'denied', 1,
+               datetime('now', '-10 days'))`,
+      [A, A],
+    );
+    h.db.run("INSERT INTO dataset_versions (dataset_id, version, doi) VALUES (?, '1.0.0', ?)", [
+      A,
+      "10.5072/FK2next-approving",
+    ]);
+
+    const r = await next("y\n");
+
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toContain("Done: 1 failed.");
+    expect(r.stdout).not.toContain("approved");
+    expect(output(r)).toContain("Not published yet");
+    expect(requestRow(requestId)?.status).toBe("approving");
+  });
+});
 
 describe("what fails exits 1, and the walk goes on", () => {
   test("an approval the Worker refuses is printed with its reasons, counted, and the exit code is 1", async () => {

@@ -798,6 +798,24 @@ export async function runApproval(
       opts.override ?? undefined,
       { requestId: opts.requestId, dispatchToken: opts.dispatchToken },
     );
+    // The Worker answers 200 for a run whose steps are all done but whose tail job warned, and
+    // leaves the request `approving` (ADR 0105, decision 12): the warning's remedy is to approve
+    // again. That is not an approval, so it is not a success line and not exit 0, and `next` does
+    // not count it as approved. Only an answer that says `published` is one.
+    if (result.status !== "published") {
+      spinner.warn(plain(result.message));
+      for (const line of resultLines(result)) console.log(line);
+      console.log(
+        chalk.yellow(
+          `  Not published yet: the request is ${plain(String(result.status ?? "not published"))}. Do what the warning says, then run: nemar admin publish approve ${plain(datasetId)} --resume`,
+        ),
+      );
+      // A script that asked for an approval has to be able to tell, and this is the Worker's own
+      // answer rather than a crash, so no bug-report hint.
+      process.exitCode = 1;
+      markReportedExit();
+      return { ok: false };
+    }
     spinner.succeed(plain(result.message));
     for (const line of resultLines(result)) console.log(line);
     return { ok: true };
