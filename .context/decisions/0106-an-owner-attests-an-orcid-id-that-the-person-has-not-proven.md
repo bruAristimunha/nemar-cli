@@ -67,7 +67,7 @@ callback finds the account already on that iD and adds the sign-in record; nothi
 
 ## Receipts
 
-- Account 19 (`bruaristimunha`), 2026-10-15: iD `0000-0001-5258-2995` on the account from DOI enrichment,
+- Account 19, 2026-10-15: an iD on the account from DOI enrichment,
   `orcid_verified` 0, no `oauth_identities` row, one link intent expired unconsumed. Attested by hand before this
   route existed; the audit row's `details` carries the reason.
 - ADR 0022 (relink needs a post-minted intent), ADR 0041 (ORCID owns names once verified), ADR 0043 (one iD, one

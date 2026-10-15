@@ -1,6 +1,6 @@
 # ADR 0105: A web approval is attributed by a per-claim dispatch token, and a terminal approval takes the claim over
 
-**Status:** proposed
+**Status:** accepted
 **Date:** 2026-10-13
 **Owner:** Seyed Yahya Shirazi
 

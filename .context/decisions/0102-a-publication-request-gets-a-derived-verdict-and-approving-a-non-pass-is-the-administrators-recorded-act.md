@@ -1,6 +1,6 @@
 # ADR 0102: A publication request gets a derived verdict, and approving over a non-pass is the administrator's recorded act
 
-**Status:** proposed
+**Status:** accepted
 **Date:** 2026-10-12
 **Owner:** Seyed Yahya Shirazi
 

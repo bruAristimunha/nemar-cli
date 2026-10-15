@@ -760,7 +760,7 @@ describe("documented edit invariants", () => {
 });
 
 describe("ORCID attestation: owners only, marked verified, never replacing a proven iD (ADR 0106)", () => {
-  const IID = "0000-0001-5258-2995";
+  const IID = "0000-0000-0000-001X";
 
   test("an owner attests an iD the account has none of: stored, verified, and audited as attested", async () => {
     const id = seedTarget("attestnone", { orcid: null, orcidVerified: 0 });

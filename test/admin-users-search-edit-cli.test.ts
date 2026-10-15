@@ -472,7 +472,7 @@ describe("nemar admin users edit", () => {
   test("an iD already on the account but not verified is attested, not reported as nothing to change", async () => {
     useKey(OWNER_KEY);
     const id = seedUser("unverifiedlovelace", {
-      orcid: "0000-0001-5258-2995",
+      orcid: "0000-0002-1825-0097",
       orcidVerified: 0,
     });
     const result = await runCli([
@@ -481,7 +481,7 @@ describe("nemar admin users edit", () => {
       "edit",
       "unverifiedlovelace",
       "--orcid",
-      "0000-0001-5258-2995",
+      "0000-0002-1825-0097",
       "-y",
     ]);
     expect(result.exitCode).toBe(0);
@@ -494,7 +494,7 @@ describe("nemar admin users edit", () => {
   test("an iD already on the account and verified is nothing to change", async () => {
     useKey(OWNER_KEY);
     const id = seedUser("verifiedlovelace", {
-      orcid: "0000-0001-5258-2995",
+      orcid: "0000-0002-1825-0097",
       orcidVerified: 1,
     });
     const result = await runCli([
@@ -503,7 +503,7 @@ describe("nemar admin users edit", () => {
       "edit",
       "verifiedlovelace",
       "--orcid",
-      "0000-0001-5258-2995",
+      "0000-0002-1825-0097",
       "-y",
     ]);
     expect(result.exitCode).toBe(0);
@@ -521,7 +521,7 @@ describe("nemar admin users edit", () => {
       "edit",
       "adminattest",
       "--orcid",
-      "0000-0001-5258-2995",
+      "0000-0002-1825-0097",
       "-y",
     ]);
     expect(result.exitCode).not.toBe(0);
