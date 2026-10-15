@@ -325,7 +325,7 @@ nemar admin publish list                   # List active publication requests
 nemar admin publish list --all             # Every request, whatever its state
 nemar admin publish list --denied          # One state (also --published, --requested, ...)
 nemar admin publish list -s denied         # Same as --denied (--status, as before)
-nemar admin publish list --search nm000104 --all
+nemar admin publish list --search nm099999 --all
                                            # Look up a dataset by ID, user or name
 nemar admin publish list --needs-me        # Only the requests you can act on now
 nemar admin publish show <dataset-id>      # The automated review of one request, in full
@@ -339,6 +339,8 @@ nemar admin publish approve <dataset-id> --acknowledge-identifier-screen "<reaso
 nemar admin publish approve <dataset-id> --request-id <n>
                                            # Approve only if request n is the one in force
 nemar admin publish deny <dataset-id>      # Deny publication request
+nemar admin publish deny <dataset-id> --request-id <n>
+                                           # Deny only if request n is the one in force
 nemar admin publish screen <dataset-id>    # Re-run the identifier screen
 ```
 
@@ -362,6 +364,12 @@ approver, and `--force`, `--acknowledge-identifier-screen`, `--skip-ci-check`
 and `--sandbox` are refused.
 Without the variable the command is your own approval, recorded under your
 account, and `next` never reads it.
+Every failure of `admin publish` exits 1, and so does an outcome that is not
+what was asked: `publish screen` exits 1 when the API accepted the call but
+could not start the screen (the dispatch failed), and `publish approve` exits 1
+when the API's answer is not `published` (a tail job's warning leaves the
+request `approving`; run it again once the cause the warning names is fixed).
+`next` counts such an approval as failed, not approved.
 
 ### Admin Commands
 
