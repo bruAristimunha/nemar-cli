@@ -406,6 +406,26 @@ describe("with a token in the environment, the administrator's own decisions are
     expect(requestRow(requestId)).toEqual(claim);
   });
 
+  test("--sandbox: exit 1 with nothing sent, the click has no such option", async () => {
+    const { requestId, token } = await click();
+    const claim = requestRow(requestId);
+
+    const r = await executor(token, ["--sandbox"]);
+
+    expect(r.exitCode).toBe(1);
+    expect(output(r)).toContain("--sandbox");
+    expect(output(r)).toContain(TOKEN_ENV);
+    // Its own reason, as the skip's: the click made no sandbox decision, and a DOI in the test
+    // shoulder is not what it was for.
+    expect(output(r)).toContain("never uses the sandbox");
+    expect(output(r)).toContain("the click has no such option");
+    expect(output(r)).not.toContain("carries the decision its click made");
+    expect(output(r)).not.toContain(token);
+    expect(h.posted).toEqual([]);
+    expect(h.requests).toEqual([]);
+    expect(requestRow(requestId)).toEqual(claim);
+  });
+
   test("the refusal does not touch a person's command: --force with no token (or a blank one) is the decision it always was", async () => {
     const requestId = seedGolden(h.db);
     const reviewId = seedReport(h.db, requestId, twoReasons());
@@ -696,7 +716,7 @@ describe("the help says the variable and the rule", () => {
     expect(help).toContain(`${TOKEN_ENV}, and presents it on every approval call`);
     expect(help).toContain("the reads of the review and the status carry none");
     expect(help).toContain(
-      "--force, --acknowledge-identifier-screen and --skip-ci-check are refused here",
+      "--force, --acknowledge-identifier-screen, --skip-ci-check and --sandbox are refused here",
     );
     expect(help).toContain("'next' never reads the variable");
     // A terminal approval is the stronger act, and it takes a live web approval over only once it

@@ -121,7 +121,10 @@ export function registerApproveCommand(group: Command): void {
     .description("Approve and publish a dataset (runs orchestrator)")
     .argument("<dataset-id>", "Dataset ID")
     .option("--resume", "Resume from last failed step")
-    .option("--sandbox", "Use Zenodo sandbox for testing")
+    .option(
+      "--sandbox",
+      `Use Zenodo sandbox for testing (refused while ${DISPATCH_TOKEN_ENV} is set)`,
+    )
     .option(
       "--skip-ci-check",
       `Skip the orchestrator's live BIDS validation check (recorded; clears no review reason; refused while ${DISPATCH_TOKEN_ENV} is set)`,
@@ -181,8 +184,8 @@ Description:
   With it the API records the administrator who clicked Approve as the approver,
   and you are only the executor. Such a run carries the
   decision its click made, so while the variable is set --force,
-  --acknowledge-identifier-screen and --skip-ci-check are refused here, before
-  anything is sent.
+  --acknowledge-identifier-screen, --skip-ci-check and --sandbox are refused
+  here, before anything is sent.
   Without the variable the command is your own approval, recorded under your
   account. Once it passes the gates it takes the claim over, and the website's
   run is refused at its next call. 'next' never reads the variable.
@@ -193,7 +196,8 @@ Description:
   --skip-ci-check skips the orchestrator's live CI check, and the approval's audit
   row records that it was used. It never clears a review reason: a failed or
   unconcluded BIDS validation at the reviewed commit needs --force. It is your
-  own decision, so a run that presents a dispatch token never uses it.
+  own decision, so a run that presents a dispatch token never uses it, and the
+  same holds for --sandbox.
 
   An ANONYMOUS RELEASE runs a smaller step set: the GitHub repository stays
   private, no identifier is published, and the depositor is not named. The
@@ -338,7 +342,9 @@ After Approval:
               ? "--acknowledge-identifier-screen"
               : options.skipCiCheck
                 ? "--skip-ci-check"
-                : null;
+                : options.sandbox
+                  ? "--sandbox"
+                  : null;
           if (decision !== null) {
             // The click recorded an override and an acknowledgment, and made no CI decision at all:
             // it has no option for one, so a run the website started never skips the CI check.
@@ -346,7 +352,9 @@ After Approval:
             const why =
               decision === "--skip-ci-check"
                 ? "a run the website started never skips the CI check (the click has no such option), and the API refuses a run that asks to"
-                : "a run the website started carries the decision its click made, and the API refuses a run that sends one of its own";
+                : decision === "--sandbox"
+                  ? "a run the website started never uses the sandbox (the click has no such option, and a test DOI is not what it was for), and the API refuses a run that asks to"
+                  : "a run the website started carries the decision its click made, and the API refuses a run that sends one of its own";
             console.log(
               chalk.red(
                 `${decision} cannot be used while ${DISPATCH_TOKEN_ENV} is set: ${why}. Unset ${DISPATCH_TOKEN_ENV} to approve as yourself. Nothing was sent.`,

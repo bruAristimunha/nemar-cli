@@ -136,7 +136,7 @@ export const APPROVAL_REFUSAL_ERROR_CODES: readonly string[] = [
   "dispatch_superseded",
   /** The token is genuine, but its run sat idle past the lease. */
   "dispatch_expired",
-  /** A run the web started sent a decision (an override, an acknowledgment, a skipped CI check). */
+  /** A run the web started sent a decision (an override, an acknowledgment, a skipped CI check, the sandbox). */
   "decision_with_dispatch_token",
   /** A denial of a request an approval is running for (the deny route's word). */
   "approval_in_flight",
@@ -198,10 +198,10 @@ export const DISPATCH_EXPIRED_MESSAGE =
 /**
  * The sentence of the 409 `decision_with_dispatch_token`: a run the web started carries the
  * decision made at the click (the override and the screen acknowledgment were recorded then) and
- * may not send one of its own: an override, an acknowledgment or a skipped CI check.
+ * may not send one of its own: an override, an acknowledgment, a skipped CI check or the sandbox.
  */
 export const DECISION_WITH_DISPATCH_TOKEN_MESSAGE =
-  "A run started by a web approval carries the decision made at the click and may not send its own (an override, an identifier-screen acknowledgment or a skipped CI check). Nothing was recorded.";
+  "A run started by a web approval carries the decision made at the click and may not send its own (an override, an identifier-screen acknowledgment, a skipped CI check or the sandbox). Nothing was recorded.";
 
 /**
  * The sentence of the deny route's 409 `approval_in_flight`: an approval of the request is

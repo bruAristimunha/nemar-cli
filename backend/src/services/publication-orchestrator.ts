@@ -2848,14 +2848,16 @@ export async function runPublicationApproval(args: ApproveRunArgs): Promise<Resp
   // gates below read them there. It may not send one of its own, because it would be recorded
   // under the approver of record, who is the clicker and not the sender. A skipped CI check is a
   // decision of the same kind (it waives a check, and is recorded under the approver), and the
-  // click has no such option, so a run that sends one is not the click's. An explicit `false` is
-  // no decision: the CLI sends it on every call. So an override, an acknowledgment or a skip is
+  // click has no such option, so a run that sends one is not the click's. The sandbox is the same
+  // kind of decision (a DOI in the test shoulder, which the click has no option for). An explicit
+  // `false` is no decision: the CLI sends it on every call. So an override, an acknowledgment or a skip is
   // recorded only under the credential that sent it, or at the clicker's own dispatch.
   if (
     verifiedClaim !== null &&
     (body.override_publication_review !== undefined ||
       body.acknowledge_identifier_screen !== undefined ||
-      body.skip_ci_check === true)
+      body.skip_ci_check === true ||
+      body.sandbox === true)
   ) {
     console.warn(
       `[publish] ${datasetId}: approval refused for request ${request.id}, a run carrying a dispatch token sent a decision of its own`,

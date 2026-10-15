@@ -554,6 +554,36 @@ describe("a skipped CI check is a decision, and a decision is recorded under the
     expect(published().details).toMatchObject({ approved_by: "gateadmina", skip_ci_check: false });
   });
 
+  test("19. the sandbox is a decision of the same kind: sandbox true with a web run's token is refused, and sandbox false is not", async () => {
+    // The click has no sandbox option (a DOI in the EZID test shoulder is not what the click was
+    // for), so a run that asks for one is not the click's.
+    const { requestId } = seed({
+      requestStatus: "approving",
+      steps: DONE.filter((s) => s !== "ci_check"),
+    });
+    seedPublicationReview(db, { requestId, datasetId: DATASET, state: "reported" });
+    const token = await claim(requestId, adminA);
+    const claimBefore = claimOf(requestId);
+    const before = requestRow(requestId);
+
+    const res = await approve({ resume: true, sandbox: true }, { key: ADMIN_B_KEY, token });
+
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: string; message: string };
+    expect(body).toEqual({
+      error: "decision_with_dispatch_token",
+      message: DECISION_WITH_DISPATCH_TOKEN_MESSAGE,
+    });
+    expect(auditRows("dataset_published")).toHaveLength(0);
+    expect(requestRow(requestId)).toEqual(before);
+    expect(claimOf(requestId)).toEqual(claimBefore);
+
+    // The CLI sends `sandbox: false` on every call: an explicit false is no decision.
+    const ok = await approve({ resume: true, sandbox: false }, { key: ADMIN_B_KEY, token });
+    expect(ok.status).toBe(200);
+    expect(requestRow(requestId).approved_by).toBe(adminA);
+  });
+
   test("19. without the token a skip is its sender's own, claim or no claim: B's skip inside A's live claim is B's, and B takes the claim over", async () => {
     const { requestId } = seed({
       requestStatus: "approving",

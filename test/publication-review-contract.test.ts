@@ -3228,7 +3228,7 @@ describe("the sentences the Worker's tests import are pinned here, once", () => 
       "The web approval this run was started for has expired: the run sat idle longer than its lease, so a click made then is not honored now. Nothing was changed. Click Approve again to start a fresh run.",
     );
     expect(DECISION_WITH_DISPATCH_TOKEN_MESSAGE).toBe(
-      "A run started by a web approval carries the decision made at the click and may not send its own (an override, an identifier-screen acknowledgment or a skipped CI check). Nothing was recorded.",
+      "A run started by a web approval carries the decision made at the click and may not send its own (an override, an identifier-screen acknowledgment, a skipped CI check or the sandbox). Nothing was recorded.",
     );
     expect(APPROVAL_IN_FLIGHT_MESSAGE).toBe(
       "An approval of this request is running, so it cannot be denied right now. If the run stalls before it publishes anything, the request can be denied then.",
