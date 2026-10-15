@@ -152,12 +152,12 @@ export const APPROVAL_REFUSAL_ERROR_CODES: readonly string[] = [
 ];
 
 /**
- * The sentence of the 409 `request_changed`: the request moved (a denial, a re-block) between the
- * gates' read of it and the write that marks it `approving`. Declared here so the Worker, the
- * clients and the tests say the one sentence.
+ * The sentence of the 409 `request_changed`: the request moved (a denial, a re-block, a withdrawal
+ * by its depositor) between the gates' read of it and the write that marks it `approving`.
+ * Declared here so the Worker, the clients and the tests say the one sentence.
  */
 export const REQUEST_CHANGED_MESSAGE =
-  "The request changed while the approval was being checked (it was denied or blocked). Read it again before approving.";
+  "The request changed while the approval was being checked (it was denied, blocked or withdrawn by its depositor). Read it again before approving.";
 
 /**
  * The sentence of the 409 `approval_closed_during_run`, which an approval answers when its LAST

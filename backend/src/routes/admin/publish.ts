@@ -503,7 +503,7 @@ export function registerPublishRoutes(admin: AdminRouter): void {
    *   409 decision_with_dispatch_token  a call that carries a valid token sent an override, an
    *                         acknowledgment or a skipped CI check: nothing was recorded under
    *                         anybody
-   *   409 request_changed   the request was denied or blocked while the approval was checked:
+   *   409 request_changed   the request was denied, blocked or withdrawn while the approval was checked:
    *                         nothing ran, and the request is read again
    *   409 approval_closed_during_run  the request was closed (denied, blocked again or filed
    *                         again) while the run ran, or when a resumed run whose steps are all

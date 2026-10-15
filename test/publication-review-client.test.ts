@@ -37,6 +37,7 @@ import {
   DISPATCH_SUPERSEDED_MESSAGE,
   IDENTIFIER_SCREEN_ERROR_CODES,
   INVALID_DATASET_ID_MESSAGE,
+  REQUEST_CHANGED_MESSAGE,
   REQUEST_MISMATCH_MESSAGE,
 } from "../shared/contract/publication";
 import {
@@ -591,8 +592,7 @@ describe("how the client reads an approval refusal (the gate's bodies, scripted)
   test("a 409 request_changed leads with the sentence, not the bare word", async () => {
     const body = {
       error: "request_changed",
-      message:
-        "The request changed while the approval was being checked (it was denied or blocked). Read it again before approving.",
+      message: REQUEST_CHANGED_MESSAGE,
     };
     scripted = [{ status: 409, body }];
     const err = await thrown(() =>

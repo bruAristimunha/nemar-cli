@@ -3213,7 +3213,7 @@ describe("the sentences the Worker's tests import are pinned here, once", () => 
   // pass them by also editing a hand-copied literal. These literals are the one oracle.
   test("the approval refusal the orchestrator words itself", () => {
     expect(REQUEST_CHANGED_MESSAGE).toBe(
-      "The request changed while the approval was being checked (it was denied or blocked). Read it again before approving.",
+      "The request changed while the approval was being checked (it was denied, blocked or withdrawn by its depositor). Read it again before approving.",
     );
   });
 
