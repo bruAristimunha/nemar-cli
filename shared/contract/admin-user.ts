@@ -31,13 +31,19 @@ export const ADMIN_USER_DESCRIPTIVE_FIELDS = [
 ] as const;
 
 /**
- * The fields only an OWNER may edit: the three that decide who can act as the
+ * The fields only an OWNER may edit: the ones that decide who can act as the
  * account (the username keys approval, the email receives sign-in codes, the
- * GitHub handle receives repository access). Owner-only for the same reason
+ * GitHub handle receives repository access) and the ORCID iD, which is the
+ * identity every citation names (ADR 0106). Owner-only for the same reason
  * `role`, `kind` and key minting are (ADR 0048): a role-`admin` credential
  * should not be enough to take over another account, an owner's included.
  */
-export const ADMIN_USER_IDENTITY_FIELDS = ["username", "github_username", "email"] as const;
+export const ADMIN_USER_IDENTITY_FIELDS = [
+  "username",
+  "github_username",
+  "email",
+  "orcid",
+] as const;
 
 export const ADMIN_USER_EDITABLE_FIELDS = [
   ...ADMIN_USER_DESCRIPTIVE_FIELDS,
@@ -84,6 +90,7 @@ const editBodyShape = {
   username: z.string().max(100).optional(),
   github_username: z.string().max(100).optional(),
   email: z.string().max(320).optional(),
+  orcid: z.string().max(40).optional(),
 } satisfies Record<AdminUserEditableField, z.ZodOptional<z.ZodString>>;
 export const adminUserEditBodySchema = z.object(editBodyShape);
 export type AdminUserEditBody = z.infer<typeof adminUserEditBodySchema>;
@@ -95,10 +102,8 @@ export type AdminUserEditBody = z.infer<typeof adminUserEditBodySchema>;
  * database.
  */
 const NOT_EDITABLE_HINTS: Readonly<Record<string, string>> = {
-  orcid:
-    "an ORCID iD is proven by signing in with ORCID and is never typed in; the person links it in Settings (ADR 0043)",
   orcid_verified:
-    "the verified flag is set only by the ORCID sign-in flow; the person links or unlinks the iD in Settings",
+    "the flag is set by attesting the iD with --orcid (owners only, ADR 0106) or by the person linking it with ORCID sign-in",
   role: "use 'nemar admin role <username> <role>' (owner only)",
   status: "use 'nemar admin approve' or 'nemar admin revoke'",
   service_access: "upload access is granted only by 'nemar admin approve' (ADR 0040)",
@@ -148,8 +153,14 @@ export function notEditableHint(key: string): string | undefined {
  *                       negative id). 400.
  *   invalid_edit        a value the route cannot read at all (not a string, not
  *                       an address). 400.
+ *   orcid_already_proven the account already holds an ORCID iD the person proved
+ *                       by signing in, so an admin attestation does not replace
+ *                       it. 409.
  *   invalid_search      `?q=` was empty, too long or had too many words. 400.
  *   invalid_user_id     the `:id` in the path is not a whole number. 400.
+ *
+ * The ORCID iD's uniqueness refusal (`orcid_in_use`) is declared in ./identity.ts
+ * with the other identity conflicts.
  */
 export const adminUserErrorCodeSchema = z.enum([
   "field_not_editable",
@@ -158,6 +169,7 @@ export const adminUserErrorCodeSchema = z.enum([
   "owner_account",
   "system_account",
   "invalid_edit",
+  "orcid_already_proven",
   "invalid_search",
   "invalid_user_id",
 ]);
@@ -175,6 +187,8 @@ export const ADMIN_USER_ERROR_MESSAGES = {
   owner_account:
     "An owner account's username, email address and GitHub handle are not changed here, so that the highest privilege cannot be redirected through this route. The owner changes them in Settings.",
   system_account: "This is NEMAR's internal system account and cannot be edited.",
+  orcid_already_proven:
+    "This account already holds an ORCID iD the person proved by signing in, so an admin cannot replace it. The person relinks it in Settings or with 'nemar auth profile orcid relink' (ADR 0022).",
   invalid_user_id: "The user id must be a whole number",
 } as const satisfies Partial<Record<AdminUserErrorCode, string>>;
 
@@ -262,7 +276,9 @@ export type AdminUserFieldChange = z.infer<typeof adminUserFieldChangeSchema>;
  * `PATCH /admin/users/by-id/:id`. `changed` holds ONLY the fields that differ
  * from what the account held; re-sending a current value is not a change, and
  * a request that changes nothing answers 200 with `changed: {}` and writes no
- * audit row. `notes` are side effects and caveats the editor should read.
+ * audit row. The one key that is not an editable field is `orcid_verified`,
+ * reported when an ORCID attestation marks an iD verified (ADR 0106). `notes`
+ * are side effects and caveats the editor should read.
  */
 export const adminUserEditResponseSchema = z
   .object({

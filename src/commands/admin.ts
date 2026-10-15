@@ -893,6 +893,10 @@ adminUsersCommand
   .option("--github <handle>", "GitHub handle (owner only)")
   .option("--clear-github", "Remove the GitHub handle (owner only)")
   .option("--email <address>", "Email address (owner only; marks it unconfirmed)")
+  .option(
+    "--orcid <iD>",
+    "ORCID iD, attested by an owner and marked verified (owner only; ADR 0106)",
+  )
   .option(YES_OPTION, YES_DESCRIPTION)
   .option(NO_OPTION, NO_DESCRIPTION)
   .addHelpText(
@@ -910,11 +914,17 @@ Who can change what:
 What this does NOT change (each has its own command):
   role / status / upload access   nemar admin role | approve | revoke
   account kind                    nemar admin kind
-  ORCID iD                        proven by signing in with ORCID, never typed in
+  ORCID iD sign-in record         the person links it in Settings or with
+                                  'nemar auth profile orcid link'; --orcid records
+                                  an owner's attestation without that record, and
+                                  never replaces an iD the person proved (ADR 0106)
   names on an ORCID-verified account: ORCID owns them and rewrites them at the
   next sign-in, so the edit is refused (the person updates orcid.org)
 
 Safeguards:
+  - An attested iD is marked verified with no sign-in record behind it, and the
+    audit row says so (orcid_attested). Use it only when the iD is confirmed for
+    that person, for example against their own message.
   - The account is shown with the exact changes and you confirm (-y skips the
     prompt, but only when the text names the account exactly).
   - Every edit is written to the audit log with the old and new values.

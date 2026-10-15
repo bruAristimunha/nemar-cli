@@ -171,6 +171,7 @@ invisible one — which is why it is checked rather than trusted.
   one router-wide cookie Origin guard (its refusal carries the sentence in `message`), `/deny` gated by the lease and refused once publishing has started, a failed first mutation included (`approval_in_flight`, `deny_after_publishing`),
   the final write guarded by status, with the all-steps-done branch refusing a closed request before any tail job and leaving the request `approving` when a tail job warned (`approval_closed_during_run`), and #1580 deferred;
   the executor's workflow edit and the rollout order are in the ADR
+- [ADR 0106](0106-an-owner-attests-an-orcid-id-that-the-person-has-not-proven.md) - An owner may attest an ORCID iD on an account, marked verified with no sign-in record behind it (accepted, maintainer, 2026-10-15): `nemar admin users edit --orcid` sets `users.orcid` and `orcid_verified`, writes no `oauth_identities` row, and audits `orcid_attested`; refused when another live account holds the iD, when the person has already proven one, and on owner accounts; partially supersedes ADR 0096's exclusion of the iD
 
 ## Backfill note (2026-07-31)
 

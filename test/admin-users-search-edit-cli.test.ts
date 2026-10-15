@@ -469,6 +469,66 @@ describe("nemar admin users edit", () => {
     expect(auditCount()).toBe(0);
   });
 
+  test("an iD already on the account but not verified is attested, not reported as nothing to change", async () => {
+    useKey(OWNER_KEY);
+    const id = seedUser("unverifiedlovelace", {
+      orcid: "0000-0001-5258-2995",
+      orcidVerified: 0,
+    });
+    const result = await runCli([
+      "admin",
+      "users",
+      "edit",
+      "unverifiedlovelace",
+      "--orcid",
+      "0000-0001-5258-2995",
+      "-y",
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain("Nothing to change");
+    expect(result.stdout).toContain("orcid_verified");
+    expect(column(id, "orcid_verified")).toBe(1);
+    expect(auditCount()).toBe(1);
+  });
+
+  test("an iD already on the account and verified is nothing to change", async () => {
+    useKey(OWNER_KEY);
+    const id = seedUser("verifiedlovelace", {
+      orcid: "0000-0001-5258-2995",
+      orcidVerified: 1,
+    });
+    const result = await runCli([
+      "admin",
+      "users",
+      "edit",
+      "verifiedlovelace",
+      "--orcid",
+      "0000-0001-5258-2995",
+      "-y",
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("Nothing to change");
+    expect(column(id, "orcid_verified")).toBe(1);
+    expect(auditCount()).toBe(0);
+  });
+
+  test("an admin who is not an owner cannot attest an iD, and is told why", async () => {
+    useKey(ADMIN_KEY);
+    const id = seedUser("adminattest", { orcid: null, orcidVerified: 0 });
+    const result = await runCli([
+      "admin",
+      "users",
+      "edit",
+      "adminattest",
+      "--orcid",
+      "0000-0001-5258-2995",
+      "-y",
+    ]);
+    expect(result.exitCode).not.toBe(0);
+    expect(result.all).toContain("owner");
+    expect(column(id, "orcid")).toBeNull();
+  });
+
   test("without --yes and without a terminal the edit is not applied", async () => {
     useKey(ADMIN_KEY);
     const id = seedUser("alovelace");

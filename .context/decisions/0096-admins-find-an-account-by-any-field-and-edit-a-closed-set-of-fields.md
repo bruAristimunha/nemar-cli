@@ -4,6 +4,10 @@
 **Date:** 2026-10-09
 **Owner:** Seyed Yahya Shirazi
 
+Partially superseded by [ADR 0106](0106-an-owner-attests-an-orcid-id-that-the-person-has-not-proven.md),
+decision on the ORCID iD only: an owner may now attest an iD with `--orcid`, marked verified with no sign-in
+record behind it. An iD the person proved by signing in is still never replaced here.
+
 ## Context
 
 `nemar admin users` listed accounts and filtered them by status, role, kind and tier.
