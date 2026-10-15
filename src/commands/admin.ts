@@ -171,6 +171,7 @@ import {
   uploadTierOf,
   validateCi,
   verifyImport,
+  verifyUserById,
   withdrawDataset,
   zarrFidelitySweep,
 } from "../lib/api/admin.js";
@@ -1355,6 +1356,70 @@ Examples:
         404: "User not found",
         409: "User already has that role",
       });
+    }
+  });
+
+// ============================================================================
+// Force Verify (Owner Only)
+// ============================================================================
+
+adminCommand
+  .command("verify")
+  .description("Mark a pending account's email as verified (owner only)")
+  .argument("<id>", "Numeric user id (find it with 'nemar admin users --pending')")
+  .option(YES_OPTION, YES_DESCRIPTION)
+  .option(NO_OPTION, NO_DESCRIPTION)
+  .addHelpText(
+    "after",
+    `
+Moves a pending account to verified (the base tier) without the person
+redeeming an email code. It is the same transition the code flow makes, and the
+audit log records who did it.
+
+Find the numeric id with 'nemar admin users --pending'.
+No admin notification mail is sent: the owner is acting directly, unlike the
+self-verify flows where the person proved their own inbox.
+
+Rules:
+  - Only owners; it asserts an inbox the person did not prove
+  - Only pending accounts; use approve or revoke for the other tiers
+  - It grants no upload access: that is still 'nemar admin approve'
+
+Examples:
+  $ nemar admin verify 80
+  $ nemar admin verify 80 -y`,
+  )
+  .action(async (idArg: string, options: ConfirmOptions) => {
+    const id = Number.parseInt(idArg, 10);
+    if (!Number.isInteger(id) || id <= 0 || String(id) !== idArg.trim()) {
+      console.error(chalk.red(`Error: invalid user id: ${idArg}`));
+      process.exit(1);
+    }
+    if (!requireAuth()) return;
+
+    const confirmResult = await confirm(
+      `Mark user id ${id}'s email as verified without a code?`,
+      options,
+    );
+    if (confirmResult !== "confirmed") {
+      console.log(chalk.dim(confirmResult === "declined" ? "Skipped" : "Canceled"));
+      return;
+    }
+
+    const spinner = ora(`Verifying user id ${id}...`).start();
+    try {
+      const result = await verifyUserById(id);
+      spinner.succeed(result.message);
+    } catch (error) {
+      handleCommandError(error, spinner, "Failed to verify the account", {
+        400: "Invalid user id",
+        403: "Owner access required",
+        404: "User not found",
+        409: "Only a pending account can be force-verified",
+      });
+      // handleCommandError only reports. A refused force verify must not exit 0,
+      // or a script that checks the status code reads a refusal as a success.
+      process.exitCode = 1;
     }
   });
 
