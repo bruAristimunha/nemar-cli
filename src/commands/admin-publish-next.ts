@@ -30,7 +30,7 @@ import {
 } from "../../shared/publication-limits.js";
 import { checkedDatasetId, failWith, requireSignedIn } from "../lib/admin-command.js";
 import { commentOnPublication, denyPublication, listPublishRequests } from "../lib/api/publish.js";
-import { LineReader } from "../lib/prompt-lines.js";
+import { LineReader, PASTE_SETTLE_MS } from "../lib/prompt-lines.js";
 import { type ReviewRead, readReview, reasonViewLine } from "../lib/publication-review-approve.js";
 import { NON_PRODUCTION_NOTE, reviewDetailLines } from "../lib/publication-review-display.js";
 import {
@@ -339,15 +339,6 @@ function showDetails(card: Card): void {
       : "The Worker has no review to show for this request.";
   console.log(chalk.dim(`  ${why}`));
 }
-
-/**
- * How long a terminal waits, after the line that answered a prompt for free text, for the rest of
- * a multi-line paste to arrive before it decides the answer was one line. A paste reaches the
- * program in pieces a few milliseconds apart, so the window must outlast the slowest gap a loaded
- * machine produces; 250 ms is far above that and below what a person pressing Enter on a reason
- * notices.
- */
-const PASTE_SETTLE_MS = 250;
 
 /**
  * One line the administrator typed, trimmed. An empty line cancels, and so does a line that came

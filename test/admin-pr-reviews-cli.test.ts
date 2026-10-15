@@ -139,10 +139,8 @@ afterEach(() => {
   rmSync(emptyPath, { recursive: true, force: true });
 });
 
-async function cli(
-  args: string[],
-  opts: { env?: Record<string, string | undefined>; input?: string } = {},
-): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+/** The environment a command runs in: this suite's API, GitHub stand-in and configuration. */
+function cliEnv(extra: Record<string, string | undefined> = {}): Record<string, string> {
   const childEnv: Record<string, string | undefined> = {
     ...process.env,
     NEMAR_CONFIG_DIR: configDir,
@@ -153,10 +151,80 @@ async function cli(
     GH_TOKEN: ADMIN_TOKEN,
     FORCE_COLOR: undefined,
     CLICOLOR_FORCE: undefined,
-    ...opts.env,
+    ...extra,
   };
   const clean: Record<string, string> = {};
   for (const [k, v] of Object.entries(childEnv)) if (v !== undefined) clean[k] = v;
+  return clean;
+}
+
+/** What a command on a terminal shows and how a person answers it. */
+interface Terminal {
+  type(text: string): void;
+  /** Wait until the transcript holds `text` after offset `after`; returns where it ended. */
+  waitFor(text: string, after?: number): Promise<number>;
+}
+
+/**
+ * Run a command on a real pseudo-terminal (`process.stdin.isTTY` is true, so the type-ahead and
+ * paste rules of a person's terminal apply), driven by `drive`. Returns the transcript (line ends
+ * as LF) and the exit code. A command that stops listening fails the test rather than hanging it.
+ */
+async function cliOnTerminal(
+  args: string[],
+  drive: (t: Terminal) => Promise<void>,
+): Promise<{ transcript: string; exitCode: number }> {
+  const env = { ...cliEnv({ TERM: "xterm-256color", CI: undefined }) };
+  const decoder = new TextDecoder();
+  let raw = "";
+  const view = () => raw.replaceAll("\r\n", "\n");
+  const proc = spawn({
+    cmd: [process.execPath, "run", CLI_ENTRY, ...args],
+    cwd: REPO_ROOT,
+    env,
+    terminal: {
+      cols: 200,
+      rows: 50,
+      data(_t, chunk) {
+        raw += decoder.decode(chunk, { stream: true });
+      },
+    },
+  });
+  const t: Terminal = {
+    type: (text) => {
+      proc.terminal?.write(text);
+    },
+    async waitFor(text, after = 0) {
+      const deadline = Date.now() + 20_000;
+      for (;;) {
+        const at = view().indexOf(text, after);
+        if (at >= 0) return at + text.length;
+        if (Date.now() > deadline) {
+          proc.kill();
+          throw new Error(`no ${JSON.stringify(text)} in time; the terminal shows:\n${view()}`);
+        }
+        await Bun.sleep(25);
+      }
+    },
+  };
+  try {
+    await drive(t);
+  } catch (error) {
+    proc.kill();
+    throw error;
+  }
+  const hung = setTimeout(() => proc.kill(), 20_000);
+  const exitCode = await proc.exited;
+  clearTimeout(hung);
+  await Bun.sleep(100);
+  return { transcript: view(), exitCode };
+}
+
+async function cli(
+  args: string[],
+  opts: { env?: Record<string, string | undefined>; input?: string } = {},
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const clean = cliEnv(opts.env);
   const proc = spawn({
     cmd: [process.execPath, "run", CLI_ENTRY, ...args],
     cwd: REPO_ROOT,
@@ -1407,6 +1475,30 @@ describe("nemar admin pr-reviews next", () => {
   const next = (input: string, extra: string[] = [], opts: Parameters<typeof cli>[1] = {}) =>
     cli([...PR, "next", ...extra], { ...opts, input });
   const writes = () => gh.seen.filter((s) => s.method !== "GET" && s.token === ADMIN_TOKEN);
+
+  test("on a terminal, a pasted comment of several lines is cancelled and nothing is sent", async () => {
+    // A pasted paragraph is one line plus lines that would answer the next cards. On a terminal
+    // the first line is not the answer: the walk waits a moment for the rest of the paste (the
+    // second line comes a few milliseconds behind the first, as a real paste does), drops it, says
+    // so and writes nothing to GitHub. With no wait the first line would be posted.
+    nodes(ready("nm000201", 7));
+
+    const r = await cliOnTerminal([...PR, "next"], async (t) => {
+      const shown = await t.waitFor("c comment");
+      t.type("c\n");
+      const asked = await t.waitFor("Comment (empty cancels): ", shown);
+      t.type("The first line of a pasted paragraph\n");
+      await Bun.sleep(10);
+      t.type("and a second line that would answer the next question\n");
+      await t.waitFor("Nothing was sent.", asked);
+      await t.waitFor("q quit > ", asked);
+      t.type("q\n");
+    });
+
+    expect(r.exitCode).toBe(0);
+    expect(r.transcript).toContain("A comment is one line; 1 more line(s) arrived with it.");
+    expect(adminWrites()).toEqual([]);
+  });
 
   test("shows who, the review's summary and the checks, then y approves as you and squash-merges", async () => {
     nodes(ready("nm000201", 7, { title: "Add two subjects" }));

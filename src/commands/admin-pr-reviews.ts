@@ -79,7 +79,7 @@ import {
   whoAmI,
 } from "../lib/pr-review-approve.js";
 import { approveAllowed, parseChoice } from "../lib/pr-review-next.js";
-import { LineReader } from "../lib/prompt-lines.js";
+import { LineReader, PASTE_SETTLE_MS } from "../lib/prompt-lines.js";
 import { ageOf, clip, plain } from "../lib/terminal-text.js";
 
 // Moved to `lib/terminal-text.ts`; re-exported because `test/pr-reviews-render.unit.test.ts` imports
@@ -1769,7 +1769,7 @@ an impatient Enter cannot answer a pull request you have not seen; piped answers
           }
           // A pasted comment of several lines is one line plus lines that would answer the next
           // cards. A terminal drops them and sends nothing; a pipe is a script and keeps its lines.
-          const extra = await reader.discardTyped(40);
+          const extra = await reader.discardTyped(PASTE_SETTLE_MS);
           if (extra > 0) {
             console.log(
               chalk.yellow(

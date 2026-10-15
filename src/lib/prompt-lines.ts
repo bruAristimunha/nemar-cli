@@ -22,6 +22,15 @@ export interface LineReaderOptions {
   typeAhead?: "keep" | "discard";
 }
 
+/**
+ * How long a terminal waits, after the line that answered a prompt for free text, for the rest of
+ * a multi-line paste to arrive before it decides the answer was one line (`discardTyped`). A paste
+ * reaches the program in pieces a few milliseconds apart, so the window must outlast the slowest
+ * gap a loaded machine produces; 250 ms is far above that and below what a person pressing Enter
+ * on a reason or a comment notices. One value for every command that asks for free text.
+ */
+export const PASTE_SETTLE_MS = 250;
+
 export class LineReader {
   private readonly rl: Interface;
   private readonly lines: string[] = [];
