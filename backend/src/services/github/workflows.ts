@@ -130,10 +130,16 @@ export function getWorkflowTemplates(): Array<{ path: string; content: string }>
   // central workflow's check-run.
   const bidsValidation = `name: BIDS Validation
 
+# pull_request_target, not pull_request: GitHub gives a pull_request run from a fork no
+# secrets, so the token step failed ("Input required and not supplied: app-id") on every
+# fork pull request and the central check was never asked for. pull_request_target runs
+# this file as it is on main, with the secrets. That is safe only because this job runs
+# nothing from the pull request: no checkout, and the event fields reach the shell through
+# env (never \${{ }} inside run:) and are checked before use.
 on:
   push:
     branches: [main]
-  pull_request:
+  pull_request_target:
     branches: [main]
   workflow_dispatch:
 
@@ -159,15 +165,25 @@ jobs:
       - name: Dispatch run-bids-validation
         env:
           GH_TOKEN: \${{ steps.app-token.outputs.token }}
+          DATASET_ID: \${{ github.event.repository.name }}
+          # On pull_request_target events the head is the PR's head; on push
+          # events it's the pushed commit. Fall back so both shapes work.
+          HEAD_SHA: \${{ github.event.pull_request.head.sha || github.sha }}
+          REF: \${{ github.event.pull_request.head.ref || github.ref_name }}
+          PR_NUMBER: \${{ github.event.pull_request.number || '' }}
         run: |
           set -euo pipefail
-          DATASET_ID="\${{ github.event.repository.name }}"
-          # On pull_request events the head is the PR's head; on push
-          # events it's the pushed commit. Fall back so both shapes work.
-          HEAD_SHA="\${{ github.event.pull_request.head.sha || github.sha }}"
-          REF="\${{ github.event.pull_request.head.ref || github.ref_name }}"
-          PR_NUMBER="\${{ github.event.pull_request.number || '' }}"
-          echo "Dispatching run-bids-validation for $DATASET_ID @ $HEAD_SHA (ref=$REF, PR=$PR_NUMBER)"
+          if ! [[ "$DATASET_ID" =~ ^(nm|on|xx)[0-9]{6}$ ]]; then
+            echo "::error::Not a dataset repository name"; exit 1
+          fi
+          if ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::The head is not a commit id"; exit 1
+          fi
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]*$ ]]; then
+            echo "::error::The pull request number is not a number"; exit 1
+          fi
+          # REF is the PR author's branch name: passed on as data, never echoed.
+          echo "Dispatching run-bids-validation for $DATASET_ID @ $HEAD_SHA (PR=$PR_NUMBER)"
           gh api "repos/nemarDatasets/.github/dispatches" \\
             -f event_type=run-bids-validation \\
             -f "client_payload[dataset_id]=$DATASET_ID" \\
@@ -192,8 +208,14 @@ jobs:
   // `version-check` for the ruleset to accept it.
   const versionCheck = `name: Version Check
 
+# pull_request_target, not pull_request: GitHub gives a pull_request run from a fork no
+# secrets, so the token step failed ("Input required and not supplied: app-id") on every
+# fork pull request and the central check was never asked for. pull_request_target runs
+# this file as it is on main, with the secrets. That is safe only because this job runs
+# nothing from the pull request: no checkout, and the event fields reach the shell through
+# env (never \${{ }} inside run:) and are checked before use.
 on:
-  pull_request:
+  pull_request_target:
     branches: [main]
   workflow_dispatch:
 
@@ -211,18 +233,33 @@ jobs:
           app-id: \${{ secrets.NEMAR_APP_ID }}
           private-key: \${{ secrets.NEMAR_APP_PRIVATE_KEY }}
           owner: nemarDatasets
+          # The dispatch target is the .github repo; the token needs
+          # actions:write on .github. The central workflow mints a
+          # separate per-dataset token internally for the checkout step.
           repositories: .github
 
       - name: Dispatch run-version-check
         env:
           GH_TOKEN: \${{ steps.app-token.outputs.token }}
+          DATASET_ID: \${{ github.event.repository.name }}
+          # On pull_request_target events the head is the PR's head; on push
+          # events it's the pushed commit. Fall back so both shapes work.
+          HEAD_SHA: \${{ github.event.pull_request.head.sha || github.sha }}
+          REF: \${{ github.event.pull_request.head.ref || github.ref_name }}
+          PR_NUMBER: \${{ github.event.pull_request.number || '' }}
         run: |
           set -euo pipefail
-          DATASET_ID="\${{ github.event.repository.name }}"
-          HEAD_SHA="\${{ github.event.pull_request.head.sha || github.sha }}"
-          REF="\${{ github.event.pull_request.head.ref || github.ref_name }}"
-          PR_NUMBER="\${{ github.event.pull_request.number || '' }}"
-          echo "Dispatching run-version-check for $DATASET_ID @ $HEAD_SHA (ref=$REF, PR=$PR_NUMBER)"
+          if ! [[ "$DATASET_ID" =~ ^(nm|on|xx)[0-9]{6}$ ]]; then
+            echo "::error::Not a dataset repository name"; exit 1
+          fi
+          if ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::The head is not a commit id"; exit 1
+          fi
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]*$ ]]; then
+            echo "::error::The pull request number is not a number"; exit 1
+          fi
+          # REF is the PR author's branch name: passed on as data, never echoed.
+          echo "Dispatching run-version-check for $DATASET_ID @ $HEAD_SHA (PR=$PR_NUMBER)"
           gh api "repos/nemarDatasets/.github/dispatches" \\
             -f event_type=run-version-check \\
             -f "client_payload[dataset_id]=$DATASET_ID" \\
