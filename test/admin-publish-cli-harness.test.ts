@@ -69,7 +69,7 @@ describe("the real command against the real backend", () => {
     const r = await h.cli(["admin", "publish", "list"]);
 
     expect(r.exitCode).toBe(0);
-    expect(r.stdout).toContain("Publication Requests (2)");
+    expect(r.stdout).toContain("Publication Requests (2, active requests)");
     expect(r.stdout).toContain(DATASET);
     expect(r.stdout).toContain("nm000461");
     expect(r.stdout).toContain("depositor_nm000460");
@@ -88,9 +88,112 @@ describe("the real command against the real backend", () => {
     const r = await h.cli(["admin", "publish", "list", "--status", "denied"]);
 
     expect(r.exitCode).toBe(0);
-    expect(r.stdout).toContain("Publication Requests (1)");
+    expect(r.stdout).toContain("Publication Requests (1, requests with status denied)");
     expect(r.stdout).toContain("nm000461");
     expect(r.stdout).not.toContain(DATASET);
+  });
+
+  describe("the list's scope and search (#1774, #1775, #1778) against the real route", () => {
+    function seedHistory() {
+      seedScreenedRequest(h.db, { datasetId: DATASET });
+      seedScreenedRequest(h.db, { datasetId: "nm000461", requestStatus: "published" });
+      const denied = seedScreenedRequest(h.db, { datasetId: "nm000462", requestStatus: "denied" });
+      const withdrawn = seedScreenedRequest(h.db, {
+        datasetId: "nm000463",
+        requestStatus: "denied",
+      });
+      h.db.run("UPDATE publication_requests SET withdrawn_at = datetime('now') WHERE id = ?", [
+        withdrawn.requestId,
+      ]);
+      return { denied: denied.requestId, withdrawn: withdrawn.requestId };
+    }
+
+    test("a bare list is the active requests: published, denied and withdrawn ones are history", async () => {
+      seedHistory();
+
+      const r = await h.cli(["admin", "publish", "list"]);
+
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout).toContain("Publication Requests (1, active requests)");
+      expect(r.stdout).toContain(DATASET);
+      for (const hidden of ["nm000461", "nm000462", "nm000463"]) {
+        expect(r.stdout).not.toContain(hidden);
+      }
+      // The count line is over the rows on the screen.
+      expect(r.stdout).toContain("1 request, 1 you can act on.");
+    });
+
+    test("--all shows every request, and a withdrawn one reads as withdrawn, not as a refusal", async () => {
+      seedHistory();
+
+      const r = await h.cli(["admin", "publish", "list", "--all"]);
+
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout).toContain("Publication Requests (4, all requests)");
+      const lineOf = (id: string) => r.stdout.split("\n").find((l) => l.includes(id)) ?? "";
+      expect(lineOf("nm000463")).toContain("withdrawn");
+      expect(lineOf("nm000463")).not.toContain("denied");
+      expect(lineOf("nm000462")).toContain("denied");
+      expect(lineOf("nm000461")).toContain("published");
+      // History is not the administrator's to act on.
+      expect(r.stdout).toContain("4 requests, 1 you can act on.");
+    });
+
+    test("state flags and -s name the same states, and --denied lists the withdrawn request too", async () => {
+      seedHistory();
+
+      const flag = await h.cli(["admin", "publish", "list", "--denied"]);
+      const short = await h.cli(["admin", "publish", "list", "-s", "denied"]);
+      const both = await h.cli(["admin", "publish", "list", "--published", "--denied"]);
+
+      for (const r of [flag, short]) {
+        expect(r.exitCode).toBe(0);
+        expect(r.stdout).toContain("Publication Requests (2, requests with status denied)");
+        expect(r.stdout).toContain("nm000462");
+        expect(r.stdout).toContain("nm000463");
+        expect(r.stdout).not.toContain("nm000461");
+      }
+      expect(both.stdout).toContain("(3, requests with status published or denied)");
+    });
+
+    test("--search finds a dataset by id, name or depositor, in the states being shown", async () => {
+      seedHistory();
+
+      const byId = await h.cli(["admin", "publish", "list", "--search", "nm000461", "--all"]);
+      expect(byId.stdout).toContain("Publication Requests (1, all requests)");
+      expect(byId.stdout).toContain("nm000461");
+      // The dataset's name rides along on the wire and is printed beside the row.
+      expect(byId.stdout).toContain("A sufficiently descriptive title for nm000461");
+
+      const byUser = await h.cli([
+        "admin",
+        "publish",
+        "list",
+        "--search",
+        "depositor_nm000462",
+        "--all",
+      ]);
+      expect(byUser.stdout).toContain("nm000462");
+      expect(byUser.stdout).not.toContain("nm000463");
+
+      // Inside the default scope an id of a request in history is not found, and the line says
+      // how to widen the search.
+      const hidden = await h.cli(["admin", "publish", "list", "--search", "nm000461"]);
+      expect(hidden.exitCode).toBe(0);
+      expect(hidden.stdout).toContain('No active requests found matching "nm000461".');
+      expect(hidden.stdout).toContain("Use --all");
+    });
+
+    test("--needs-me keeps its meaning under the default scope", async () => {
+      seedHistory();
+
+      const r = await h.cli(["admin", "publish", "list", "--needs-me"]);
+
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout).toContain("Publication Requests (1, active requests)");
+      expect(r.stdout).toContain(DATASET);
+      expect(r.stdout).toContain("1 request, 1 you can act on.");
+    });
   });
 
   test("a write lands in the real database, attributed to the signed-in account", async () => {

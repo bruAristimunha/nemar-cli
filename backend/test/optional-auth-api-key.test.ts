@@ -157,7 +157,7 @@ describe("optionalAuthMiddleware with an API key", () => {
 
   test("a key on an inactive account is ignored", async () => {
     await seedKey();
-    db.run("UPDATE users SET status = 'pending' WHERE id = ?", [userId]);
+    db.run("UPDATE users SET status = 'pending', email_verified = 0 WHERE id = ?", [userId]);
     expect(await probe(`Bearer ${KEY}`)).toEqual({ user: null, attempted: true });
   });
 

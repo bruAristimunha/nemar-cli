@@ -172,7 +172,7 @@ async function withFakeGithub<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 afterAll(() => {
-  delete (globalThis as { NEMAR_EZID_API_URL?: string }).NEMAR_EZID_API_URL;
+  (globalThis as { NEMAR_EZID_API_URL?: string }).NEMAR_EZID_API_URL = undefined;
   for (const s of servers) s.stop(true);
 });
 

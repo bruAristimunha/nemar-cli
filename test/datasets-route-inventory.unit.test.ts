@@ -72,6 +72,7 @@ const EXPECTED_ENTRIES: Record<string, number> = {
   "POST /:id/publish/request": 2,
   "GET /:id/publish/status": 2,
   "POST /:id/publish/resend": 2,
+  "POST /:id/publish/withdraw": 2,
   "GET /:id/ci/status": 2,
   "POST /:id/publish": 2,
 
@@ -109,6 +110,7 @@ const EXPECTED_CHAINS: Record<string, string[]> = {
   "POST /:id/publish/request": ["auth", "handler"],
   "GET /:id/publish/status": ["auth", "handler"],
   "POST /:id/publish/resend": ["auth", "handler"],
+  "POST /:id/publish/withdraw": ["auth", "handler"],
   "GET /:id/ci/status": ["auth", "handler"],
   "POST /:id/publish": ["auth", "handler"],
   "GET /:id/manifest": ["optionalAuth", "handler"],
@@ -134,7 +136,7 @@ describe("datasets route inventory", () => {
   });
 
   test("entry total is pinned", () => {
-    expect(datasetRoutes.routes.length).toBe(62);
+    expect(datasetRoutes.routes.length).toBe(64);
   });
 
   test("middleware identity per chain slot is pinned", () => {

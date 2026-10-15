@@ -164,7 +164,7 @@ describe("list with the review", () => {
     const r = await h.cli(LIST);
 
     expect(r.exitCode).toBe(0);
-    expect(r.stdout).toContain("Publication Requests (7)");
+    expect(r.stdout).toContain("Publication Requests (7, active requests)");
 
     const failing = blockOf(r.stdout, "nm000480");
     expect(failing[0].trimEnd().endsWith("*")).toBe(true);
@@ -203,7 +203,7 @@ describe("list with the review", () => {
     const r = await h.cli([...LIST, "--needs-me"]);
 
     expect(r.exitCode).toBe(0);
-    expect(r.stdout).toContain("Publication Requests (3)");
+    expect(r.stdout).toContain("Publication Requests (3, active requests)");
     for (const id of ["nm000480", "nm000484", "nm000486"]) expect(r.stdout).toContain(id);
     for (const id of ["nm000481", "nm000482", "nm000483", "nm000485"]) {
       expect(r.stdout).not.toContain(id);
@@ -257,7 +257,7 @@ describe("list with the review", () => {
     const r = await h.cli([...LIST, "--status", "blocked"]);
 
     expect(r.exitCode).toBe(0);
-    expect(r.stdout).toContain("Publication Requests (1)");
+    expect(r.stdout).toContain("Publication Requests (1, requests with status blocked)");
     expect(r.stdout).toContain("nm000482");
     const help = await h.cli([...LIST, "--help"]);
     expect(help.stdout).toContain("blocked");
@@ -336,7 +336,7 @@ describe("list with the review off", () => {
 
     const mine = await h.cli([...LIST, "--needs-me"]);
 
-    expect(mine.stdout).toContain("Publication Requests (1)");
+    expect(mine.stdout).toContain("Publication Requests (1, active requests)");
     expect(mine.stdout).toContain("nm000481");
     expect(mine.stdout).not.toContain("nm000480");
   });

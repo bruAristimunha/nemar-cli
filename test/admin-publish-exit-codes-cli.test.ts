@@ -461,7 +461,7 @@ describe("success still exits 0", () => {
   test("list when there are none", async () => {
     const r = await h.cli(["admin", "publish", "list"]);
     expect(r.exitCode).toBe(0);
-    expect(r.stdout).toContain("No publication requests found");
+    expect(r.stdout).toContain("No active requests found");
   });
 
   test("deny --yes of an active request", async () => {

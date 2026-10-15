@@ -559,6 +559,28 @@ describe("when the write after the code is consumed fails", () => {
     expect(codeRow(NEW_EMAIL).used_at).toBeNull();
   });
 
+  test("/auth/email/change/verify promotes a pending account whose inbox it just proved", async () => {
+    // A web sign-up lands `pending` with email_verified=0. Changing the
+    // address and redeeming the code proves the inbox, so it must reach
+    // `verified` like /email/verify does. Stamping the flag alone left the
+    // account at `pending` with a verified email, where /email/verify then
+    // answers already_verified and no road out of `pending` remained.
+    const id = seedWebUser(USER_EMAIL);
+    const cookie = await sessionCookie(id);
+    await plantCode(NEW_EMAIL, id, "654321");
+
+    const res = await post("/auth/email/change/verify", cookie, {
+      email: NEW_EMAIL,
+      code: "654321",
+    });
+
+    expect(res.status).toBe(200);
+    const row = userRow(id);
+    expect(row.status).toBe("verified");
+    expect(row.email_verified).toBe(1);
+    expect(row.service_access).toBe(0);
+  });
+
   test("the restored email-change code really is redeemable once the fault clears", async () => {
     // Reads the column above; drives it here, so "usable again" is a claim the
     // route itself has honoured rather than one a SELECT infers.

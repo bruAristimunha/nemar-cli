@@ -68,6 +68,26 @@ export function hasStartedPublishing(stepsCompletedJson: string | null | undefin
 }
 
 /**
+ * True once a request's run has done, or been cut off inside, a step that changes something: a
+ * step outside the validation-only ones in `steps_completed` ({@link hasStartedPublishing}), or
+ * `current_step` naming one. A step is recorded as done only after it has run, and the run keeps
+ * `current_step` when a step fails or is cut off, so a run interrupted inside `s3_public_read`
+ * (the first step that changes anything: its bucket-policy write may have landed without being
+ * acknowledged) has only validation steps recorded and may still have made the data public.
+ *
+ * The rule of the two routes that end a request without publishing it, so they cannot disagree:
+ * an administrator's denial and the depositor's withdrawal both refuse once it holds. (Their
+ * withdrawal also states it as terms of an UPDATE, kept in step with {@link PRE_PUBLICATION_STEPS}.)
+ */
+export function publishingHasStarted(row: {
+  steps_completed: string | null | undefined;
+  current_step: string | null | undefined;
+}): boolean {
+  const interrupted = !!row.current_step && !PRE_PUBLICATION_STEPS.includes(row.current_step);
+  return hasStartedPublishing(row.steps_completed) || interrupted;
+}
+
+/**
  * `publication_requests.block_reason` of a request whose owner has no real name. The one reason
  * that walks a run that started publishing back to `blocked` (the check runs on every call of a
  * run), so it is the one blocked request that is still a run ({@link publishingStanding}). The

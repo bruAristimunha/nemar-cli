@@ -1,7 +1,8 @@
 /**
  * `nemar admin publish`: the publication workflow, from the administrator's side.
  *
- *   nemar admin publish list [--status <s>]    the publication requests, with the identifier screen
+ *   nemar admin publish list [--all|--<state>|-s <s>] [--search <t>]
+ *                                              the publication requests, with the identifier screen
  *   nemar admin publish show <ds>              the automated review of one request (admin-publish-review.ts)
  *   nemar admin publish start <ds> | --all     start the automated review (admin-publish-review.ts)
  *   nemar admin publish next                   the requests that need you, one card each (admin-publish-next.ts)
@@ -20,6 +21,7 @@ import chalk from "chalk";
 import { Command } from "commander";
 import inquirer from "inquirer";
 import ora from "ora";
+import { searchLimitProblem } from "../../shared/publish-list-search.js";
 import { checkedDatasetId, failMessage, failWith, requireSignedIn } from "../lib/admin-command.js";
 import { denyPublication, listPublishRequests, rerunIdentifierScreen } from "../lib/api/publish.js";
 import {
@@ -34,6 +36,12 @@ import { markReportedExit } from "../lib/debug-log.js";
 import { LineReader } from "../lib/prompt-lines.js";
 import { reviewListLine, screenViewLines } from "../lib/publication-review-display.js";
 import { needsAdministrator } from "../lib/publication-review-queue.js";
+import {
+  type ListFilterOptions,
+  choseListScope,
+  describeListScope,
+  resolveListStatuses,
+} from "../lib/publish-list-filter.js";
 import { plain } from "../lib/terminal-text.js";
 import { registerApproveCommand } from "./admin-publish-approve.js";
 import { registerNextCommand } from "./admin-publish-next.js";
@@ -43,18 +51,27 @@ export const publishCommand = new Command("publish").description("Publication wo
 
 publishCommand
   .command("list")
-  .description("List publication requests")
+  .description("List publication requests (active ones by default)")
+  .option("--all", "Show every request, whatever its state")
+  .option("--requested", "Show requests awaiting admin action")
+  .option("--approving", "Show requests being processed by the orchestrator")
+  .option("--blocked", "Show requests blocked on the depositor")
+  .option("--published", "Show published requests")
+  .option("--denied", "Show denied requests")
   .option(
     "-s, --status <status>",
-    "Filter by status (requested, approving, blocked, published, denied)",
+    "Show one exact status (requested, approving, blocked, published, denied)",
   )
+  .option("--search <text>", "Match dataset ID, requester username or dataset name")
   .option("--needs-me", "Only the requests you can act on now (marked *)")
   .option("--json", "Output the response as JSON instead of the list")
   .addHelpText(
     "after",
     `
 Description:
-  List all publication requests from users, with optional filtering by status.
+  List publication requests from users. By default only the active ones are
+  shown (requested, approving and blocked); the state flags, or -s/--status with
+  one status, narrow the list to those states, and --all shows every request.
   Shows dataset ID, status, requesting user, the identifier screen and the
   automated review of each (ADR 0102): its outcome, then the reasons it is not a
   pass, as codes. 'nemar admin publish show <dataset>' says what each one means.
@@ -64,130 +81,171 @@ Description:
   stopped and can be resumed. It is not marked when it is blocked (the depositor
   acts) or an approval is running.
 
-Filter Options:
+States:
   requested  - Pending requests awaiting admin action
   approving  - Currently being processed by orchestrator
   blocked    - Held until the depositor fixes something and requests again
   published  - Successfully published datasets
-  denied     - Denied requests with reasons
+  denied     - Denied requests, with reasons. Also lists the requests their
+               depositor withdrew, shown as "withdrawn" (stored as denied).
 
-  --needs-me keeps only the requests marked *, after any --status filter.
+Search:
+  --search matches a substring (case-insensitive for ASCII letters) of the
+  dataset ID, the requester's username or the dataset name, within the states being shown.
+  An exact dataset ID is listed first.
+
+  --needs-me keeps only the requests marked *, after the states and --search.
   --json prints the response (with --needs-me, the rows it keeps) and nothing else
   on standard output; errors go to standard error.
 
 Examples:
-  $ nemar admin publish list                # All requests
-  $ nemar admin publish list --status requested   # Pending only
-  $ nemar admin publish list --needs-me     # What is yours to act on
-  $ nemar admin publish list --status approving   # In progress
-  $ nemar admin publish list --status denied      # View denied`,
+  $ nemar admin publish list                       # Active requests
+  $ nemar admin publish list --all                 # Every request
+  $ nemar admin publish list --denied              # Denied only
+  $ nemar admin publish list -s denied             # Same as --denied
+  $ nemar admin publish list --published --denied  # Both states
+  $ nemar admin publish list --needs-me            # What is yours to act on
+  $ nemar admin publish list --search nm000104 --all   # Look up one dataset, any state`,
   )
-  .action(async (options: { status?: string; needsMe?: boolean; json?: boolean }) => {
-    const json = options.json === true;
-    if (!requireSignedIn(json)) return;
+  .action(
+    async (options: ListFilterOptions & { search?: string; needsMe?: boolean; json?: boolean }) => {
+      const json = options.json === true;
+      if (!requireSignedIn(json)) return;
 
-    const spinner = json ? null : ora("Fetching publication requests...").start();
-
-    try {
-      const result = await listPublishRequests(options.status);
-      spinner?.stop();
-
-      const rows = options.needsMe ? result.requests.filter(needsAdministrator) : result.requests;
-      if (json) {
-        console.log(JSON.stringify({ ...result, requests: rows, count: rows.length }, null, 2));
+      // The server cannot run a longer pattern (D1's LIKE limit); say so here
+      // rather than after a round trip.
+      const search = options.search?.trim() || undefined;
+      const tooLong = search ? searchLimitProblem(search) : null;
+      if (tooLong) {
+        // A mistyped argument is the command's answer: on standard error (as under `--json`), exit
+        // 1, and no "attach the log" hint.
+        console.error(chalk.red(plain(tooLong)));
+        process.exitCode = 1;
+        markReportedExit();
         return;
       }
 
-      if (result.requests.length === 0) {
-        console.log(chalk.dim("\n  No publication requests found.\n"));
-        return;
-      }
+      const spinner = json ? null : ora("Fetching publication requests...").start();
 
-      console.log(`\n${chalk.cyan("Publication Requests")} (${rows.length})\n`);
-      if (rows.length === 0) console.log(chalk.dim("  No publication request needs you now.\n"));
+      try {
+        const result = await listPublishRequests({
+          statuses: resolveListStatuses(options),
+          search,
+        });
+        spinner?.stop();
 
-      for (const req of rows) {
-        const statusColor =
-          req.status === "published"
-            ? chalk.green
-            : req.status === "denied"
-              ? chalk.red
-              : req.status === "approving"
-                ? chalk.yellow
-                : chalk.white;
-
-        // `*` is the CLI's reading of what the Worker said (`needsAdministrator`); an approval that
-        // is running says so instead, because it is neither the administrator's nor stopped.
-        const mark = needsAdministrator(req)
-          ? `  ${chalk.bold.cyan("*")}`
-          : req.approval_in_flight === true
-            ? `  ${chalk.yellow("(approval running)")}`
-            : "";
-        console.log(
-          `  ${chalk.bold(plain(req.dataset_id))}  ${statusColor(plain(req.status))}  by ${plain(req.requested_by_username)}  ${chalk.dim(plain(req.requested_at))}${mark}`,
-        );
-        // #1408: an anonymous release and a publication reach this list
-        // looking identical, and approving the wrong one is not reversible in
-        // either direction -- publishing names a depositor who asked to be
-        // concealed; releasing anonymously withholds a DOI someone needs.
-        if (req.anonymous === 1) {
-          console.log(
-            `    ${chalk.yellow("! anonymous release:")} ${chalk.dim(
-              "repository stays private, DOI stays reserved, depositor is not named",
-            )}`,
-          );
+        const rows = options.needsMe ? result.requests.filter(needsAdministrator) : result.requests;
+        if (json) {
+          console.log(JSON.stringify({ ...result, requests: rows, count: rows.length }, null, 2));
+          return;
         }
-        // Epic #1610 phase 4: the identifier screen, in the backend's words.
-        for (const line of screenViewLines(req.identifier_screen, 4)) console.log(line);
-        // ADR 0102: the automated review, in the backend's words; nothing for a request it did
-        // not assess.
-        const review = reviewListLine(req.publication_review, 4);
-        if (review !== null) console.log(review);
-        if (req.current_step && req.status === "approving") {
+
+        const scope = describeListScope(options);
+        if (result.requests.length === 0) {
+          const widen = choseListScope(options) ? "" : " Use --all to include every state.";
           console.log(
-            `    ${chalk.yellow(">")} ${plain(req.current_step).replace(/_/g, " ")}${req.last_error ? chalk.red(` (${plain(req.last_error)})`) : ""}`,
+            chalk.dim(
+              `\n  No ${scope} found${search ? ` matching "${plain(search)}"` : ""}.${widen}\n`,
+            ),
           );
+          return;
         }
-        // Non-blocking pre-screen advisory (#756): a concern for the admin to
-        // weigh before approving, NOT a block.
-        if (req.prescreen_status === "concern") {
-          let reasons: string[] = [];
-          try {
-            const parsed = JSON.parse(req.prescreen_reasons || "[]");
-            if (Array.isArray(parsed))
-              reasons = parsed.filter((x) => typeof x === "string").map(plain);
-          } catch {
-            // malformed -> show the flag without inline reasons
+
+        console.log(`\n${chalk.cyan("Publication Requests")} (${rows.length}, ${scope})\n`);
+        if (rows.length === 0) console.log(chalk.dim("  No publication request needs you now.\n"));
+
+        for (const req of rows) {
+          const statusColor =
+            req.status === "published"
+              ? chalk.green
+              : req.status === "denied"
+                ? chalk.red
+                : req.status === "approving"
+                  ? chalk.yellow
+                  : chalk.white;
+
+          // A request its depositor took back is stored as finished (denied), but an administrator
+          // should not read it as a refusal. It is listed wherever `denied` is in scope
+          // (`--denied`, `-s denied`, `--all`). It is history: no longer active, so the review
+          // never gates it and nothing below marks it.
+          const withdrawn = req.status === "denied" && Boolean(req.withdrawn_at);
+          // The dataset name and the username are typed by the depositor: an escape sequence in
+          // either would run in this administrator's terminal.
+          const name = plain(req.dataset_name ?? "");
+          // `*` is the CLI's reading of what the Worker said (`needsAdministrator`); an approval
+          // that is running says so instead, because it is neither the administrator's nor stopped.
+          const mark = needsAdministrator(req)
+            ? `  ${chalk.bold.cyan("*")}`
+            : req.approval_in_flight === true
+              ? `  ${chalk.yellow("(approval running)")}`
+              : "";
+          console.log(
+            `  ${chalk.bold(plain(req.dataset_id))}  ${withdrawn ? chalk.yellow("withdrawn") : statusColor(plain(req.status))}  by ${plain(req.requested_by_username)}  ${chalk.dim(plain(req.requested_at))}${name ? `  ${chalk.dim(name)}` : ""}${mark}`,
+          );
+          // #1408: an anonymous release and a publication reach this list
+          // looking identical, and approving the wrong one is not reversible in
+          // either direction -- publishing names a depositor who asked to be
+          // concealed; releasing anonymously withholds a DOI someone needs.
+          if (req.anonymous === 1) {
+            console.log(
+              `    ${chalk.yellow("! anonymous release:")} ${chalk.dim(
+                "repository stays private, DOI stays reserved, depositor is not named",
+              )}`,
+            );
           }
-          const summary = reasons.length ? reasons.join("; ") : "see pre-screen";
-          console.log(`    ${chalk.yellow("! pre-screen advisory:")} ${chalk.dim(summary)}`);
+          // Epic #1610 phase 4: the identifier screen, in the backend's words.
+          for (const line of screenViewLines(req.identifier_screen, 4)) console.log(line);
+          // ADR 0102: the automated review, in the backend's words; nothing for a request it did
+          // not assess.
+          const review = reviewListLine(req.publication_review, 4);
+          if (review !== null) console.log(review);
+          if (req.current_step && req.status === "approving") {
+            console.log(
+              `    ${chalk.yellow(">")} ${plain(req.current_step).replace(/_/g, " ")}${req.last_error ? chalk.red(` (${plain(req.last_error)})`) : ""}`,
+            );
+          }
+          // Non-blocking pre-screen advisory (#756): a concern for the admin to
+          // weigh before approving, NOT a block.
+          if (req.prescreen_status === "concern") {
+            let reasons: string[] = [];
+            try {
+              const parsed = JSON.parse(req.prescreen_reasons || "[]");
+              if (Array.isArray(parsed))
+                reasons = parsed.filter((x) => typeof x === "string").map(plain);
+            } catch {
+              // malformed -> show the flag without inline reasons
+            }
+            const summary = reasons.length ? reasons.join("; ") : "see pre-screen";
+            console.log(`    ${chalk.yellow("! pre-screen advisory:")} ${chalk.dim(summary)}`);
+          }
         }
-      }
 
-      const total = result.requests.length;
-      const count =
-        rows.length === total
-          ? `${total} request${total === 1 ? "" : "s"}`
-          : `Showing ${rows.length} of ${total} request${total === 1 ? "" : "s"}`;
-      const mine = result.requests.filter(needsAdministrator).length;
-      console.log();
-      console.log(
-        `${count}, ${chalk.bold(String(mine))} you can act on.  ${chalk.dim("nemar admin publish next | show <dataset> | approve <dataset>")}`,
-      );
-      // Said once, and only when every row says it: a Worker answers for one flag, so a mix would
-      // mean an older backend, whose rows carry no summary at all.
-      if (result.requests.every((req) => req.publication_review?.enabled === false)) {
+        const total = result.requests.length;
+        const count =
+          rows.length === total
+            ? `${total} request${total === 1 ? "" : "s"}`
+            : `Showing ${rows.length} of ${total} request${total === 1 ? "" : "s"}`;
+        // Counted over what is on the screen, so the line cannot disagree with the rows above it.
+        const mine = rows.filter(needsAdministrator).length;
+        console.log();
         console.log(
-          chalk.dim(
-            "  The automated review is off on this Worker, so no review gates an approval.",
-          ),
+          `${count}, ${chalk.bold(String(mine))} you can act on.  ${chalk.dim("nemar admin publish next | show <dataset> | approve <dataset>")}`,
         );
+        // Said once, and only when every row says it: a Worker answers for one flag, so a mix would
+        // mean an older backend, whose rows carry no summary at all.
+        if (result.requests.every((req) => req.publication_review?.enabled === false)) {
+          console.log(
+            chalk.dim(
+              "  The automated review is off on this Worker, so no review gates an approval.",
+            ),
+          );
+        }
+        console.log();
+      } catch (error) {
+        failWith(error, spinner, "Failed to list publication requests", undefined, { json });
       }
-      console.log();
-    } catch (error) {
-      failWith(error, spinner, "Failed to list publication requests", undefined, { json });
-    }
-  });
+    },
+  );
 
 registerReviewCommands(publishCommand);
 

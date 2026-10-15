@@ -256,3 +256,27 @@ describe("screenView", () => {
     }
   });
 });
+
+describe("publishingHasStarted: the rule of the two routes that end a request unpublished", () => {
+  test("reads steps_completed and the interrupted current_step, and nothing else", () => {
+    const quiet = '["ci_check","enrichment_check"]';
+    expect(steps.publishingHasStarted({ steps_completed: quiet, current_step: null })).toBe(false);
+    expect(steps.publishingHasStarted({ steps_completed: quiet, current_step: "" })).toBe(false);
+    expect(steps.publishingHasStarted({ steps_completed: quiet, current_step: "ci_check" })).toBe(
+      false,
+    );
+    expect(steps.publishingHasStarted({ steps_completed: null, current_step: undefined })).toBe(
+      false,
+    );
+    // Cut off inside the first mutation: nothing recorded as done, and the data may be public.
+    expect(
+      steps.publishingHasStarted({ steps_completed: quiet, current_step: "s3_public_read" }),
+    ).toBe(true);
+    expect(
+      steps.publishingHasStarted({
+        steps_completed: '["ci_check","enrichment_check","s3_public_read"]',
+        current_step: null,
+      }),
+    ).toBe(true);
+  });
+});

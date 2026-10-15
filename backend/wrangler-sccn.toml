@@ -224,6 +224,9 @@ invocation_logs = true
 # Environment variables
 [vars]
 ENVIRONMENT = "production"
+# Dataset pull-request review (ADR 0092). On in production from 2026-10-13. It lives in this
+# file because `wrangler deploy` drops dashboard-only variables (see [env.dev.vars]).
+PR_REVIEW_ENABLED = "1"
 # Claude Platform on AWS (Anthropic-operated Messages API, AWS Marketplace
 # billing; NOT Bedrock). Used by LLM enrichment. The paired ANTHROPIC_API_KEY
 # is a worker secret; both of these are required alongside it — requests
@@ -568,9 +571,7 @@ PRESCREEN_ENABLED = "true"
 # and first-published, so an anonymous deposit such as nm099998, and production's private
 # nm099999, never are. It does nothing until the NEMAR App is subscribed to Pull request events
 # and that workflow is deployed (both done on 2026-10-12); it needs PRESCREEN_CALLBACK_SECRET
-# (set on dev and on production). Production is dark: PR_REVIEW_ENABLED is neither in [vars] nor
-# a Worker secret there (checked 2026-10-12). Add PR_REVIEW_ENABLED = "1" to [vars] to turn it on
-# there.
+# (set on dev and on production). Production turns it on in [vars] too (2026-10-13).
 # The variable lives in this file and not in the dashboard because `wrangler deploy` replaces
 # the Worker's variables with the ones in this file (no keep_vars), so a dashboard-only value
 # is dropped by the next deploy.

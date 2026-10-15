@@ -730,7 +730,7 @@ describe("account status", () => {
     // a status the API's own cookie path refuses. An admin-only surface must not be
     // easier to enter than the API it documents.
     const userId = seedUser("admin-pending@nemar.test", "admin");
-    db.run("UPDATE users SET status = 'pending' WHERE id = ?", [userId]);
+    db.run("UPDATE users SET status = 'pending', email_verified = 0 WHERE id = ?", [userId]);
     const cookie = await appSession(userId);
     const granted = await grant(cookie);
     expect(granted.status).toBe(200);
@@ -750,7 +750,7 @@ describe("account status", () => {
     const session = await signInToDocs(userId);
     expect((await verify(session)).status).toBe(200);
 
-    db.run("UPDATE users SET status = 'pending' WHERE id = ?", [userId]);
+    db.run("UPDATE users SET status = 'pending', email_verified = 0 WHERE id = ?", [userId]);
     const res = await verify(session);
     expect(res.status).toBe(401);
     expect(((await res.json()) as { error: string }).error).toBe("invalid_session");
@@ -983,7 +983,7 @@ describe("POST /auth/docs/cli-session", () => {
     // reading surface must never be easier to enter than the API it documents.
     const userId = seedUser("admin-cli-pending@nemar.test", "admin");
     await seedApiKey(userId, KEY);
-    db.run("UPDATE users SET status = 'pending' WHERE id = ?", [userId]);
+    db.run("UPDATE users SET status = 'pending', email_verified = 0 WHERE id = ?", [userId]);
 
     const res = await cliSession(KEY);
     expect(res.status).toBe(403);
@@ -1096,7 +1096,7 @@ describe("POST /auth/docs/cli-session", () => {
 
     test("inserts nothing for an admin whose account is not active", () => {
       const userId = seedUser("stmt-pending@nemar.test", "admin");
-      db.run("UPDATE users SET status = 'pending' WHERE id = ?", [userId]);
+      db.run("UPDATE users SET status = 'pending', email_verified = 0 WHERE id = ?", [userId]);
       expect(mintDirect(userId)).toBe(0);
     });
 

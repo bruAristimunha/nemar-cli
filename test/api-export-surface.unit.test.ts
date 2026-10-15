@@ -98,6 +98,7 @@ const MODULE_EXPORTS: Record<string, string[]> = {
     "reviewErrorCode",
     "startPublicationReview",
     "stepIndexFor",
+    "withdrawPublishRequest",
   ],
   data: [
     "applyS3Lock",
@@ -186,6 +187,7 @@ const MODULE_EXPORTS: Record<string, string[]> = {
     "uploadTierOf",
     "validateCi",
     "verifyImport",
+    "verifyUserById",
     "withdrawDataset",
     "zarrFidelitySweep",
   ],
@@ -216,6 +218,7 @@ const POST_SPLIT_ADDITIONS = [
   "NOTICE_LEVELS", // #1025, notice level vocabulary
   "approveUserById", // #1012, id-keyed approve for web/ORCID accounts
   "revokeUserById", // #1274, ADR 0040: id-keyed revoke, the approve twin's eraser
+  "verifyUserById", // ADR 0103: owner force verify, POST /admin/users/by-id/:id/verify
   "backfillUserNames", // #1255, epic #1250: POST /admin/users/backfill-names
   "backfillUsernames", // #1253, epic #1250: POST /admin/users/backfill-usernames
   "checkOrcidName", // #1255, epic #1250: GET /auth/orcid-name pre-signup lookup
@@ -372,6 +375,7 @@ const MONOLITH_EXPORTS = [
   "validateDataset",
   "verifyImport",
   "withdrawDataset",
+  "withdrawPublishRequest",
 ];
 
 describe("lib/api export surface", () => {

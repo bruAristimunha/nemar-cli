@@ -808,7 +808,7 @@ describe("GET /admin/publish/requests: the review of each request", () => {
 // ============================================================================
 
 describe("what the list carries", () => {
-  test("a row gains one key, and the joined dataset columns and every nonce stay off the wire", async () => {
+  test("a row gains the review and the dataset name, and the other joined dataset columns and every nonce stay off the wire", async () => {
     const { requestId, datasetId } = request();
     seedPublicationReview(db, {
       requestId,
@@ -832,6 +832,7 @@ describe("what the list carries", () => {
       ...columns.filter((c) => !withheld.includes(c)),
       "requested_by_username",
       "requested_by_email",
+      "dataset_name",
       "approval_in_flight",
       "identifier_screen",
       "publication_review",

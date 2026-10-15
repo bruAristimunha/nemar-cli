@@ -31,6 +31,8 @@ const EXPECTED_ENTRIES: Record<string, number> = {
   "POST /users/:username/role": 3,
   // #1284, epic #1272 phase 4 (ADR 0048): account kinds.
   "POST /users/:username/kind": 3,
+  // Owner recovery for a stuck pending account: ownerMiddleware plus the handler.
+  "POST /users/by-id/:id/verify": 2,
   "GET /users/:username/keys": 2,
   "POST /users/:username/keys": 3,
   "DELETE /users/:username/keys/:id": 2,
@@ -223,7 +225,7 @@ describe("admin route inventory", () => {
   });
 
   test("entry total is pinned", () => {
-    expect(adminRoutes.routes.length).toBe(146);
+    expect(adminRoutes.routes.length).toBe(148);
   });
 
   // The count pin above can't see a SWAP of the router-level middleware

@@ -220,6 +220,23 @@ export async function revokeUserById(id: number): Promise<{ message: string }> {
   );
 }
 
+/**
+ * Mark a pending account's email as verified and move it to `verified`
+ * (owner only). The recovery for an account the inbox flow cannot reach; it
+ * grants nothing above the base tier, upload access stays with approval.
+ */
+export async function verifyUserById(
+  id: number,
+): Promise<{ message: string; user: { id: number; status: string } }> {
+  return request<{ message: string; user: { id: number; status: string } }>(
+    `/admin/users/by-id/${id}/verify`,
+    {
+      method: "POST",
+    },
+    true,
+  );
+}
+
 export interface ChangeRoleResponse {
   message: string;
   user: { username: string; role: string };

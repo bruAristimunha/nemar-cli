@@ -18,7 +18,9 @@
  * metadata files that fit a budget, never recordings. A file it needs to read to rule out a loss
  * (a MODIFIED or REMOVED metadata file) that it was not shown in full makes the evidence
  * `truncated`, which stops a clean pass about nothing being lost. An unread ADDED file does not:
- * a new file cannot remove anything.
+ * a new file cannot remove anything. Nor does a MODIFIED `.json` or `.tsv` file whose change the
+ * platform itself proved cosmetic (see {@link GitFacts.cosmeticOnlyFiles}); such a file is not
+ * shown either, because there is nothing in it to read.
  */
 
 import { execFileSync } from "node:child_process";
@@ -56,6 +58,7 @@ export const EVIDENCE_ERRORS = [
   "bad_commit_id",
   "tree_unreadable",
   "description_unreadable",
+  "changelog_unreadable",
   "no_merge_base",
   "changes_unreadable",
   "commits_unreadable",
@@ -146,11 +149,71 @@ export interface GitFacts {
   /** True when the change list was longer than {@link MAX_MODEL_FILES}. */
   listCut: boolean;
   /**
-   * True when a MODIFIED or REMOVED metadata file the reviewer needed was not shown in full: it
-   * did not fit the file or character budget, its diff was cut, or reading it failed.
+   * True when a MODIFIED or REMOVED metadata file with a real change was not shown in full: it did
+   * not fit the file or character budget, its diff was cut, or reading it failed. A file the
+   * platform proved cosmetic-only ({@link cosmeticOnlyFiles}) is not counted.
    */
   readIncomplete: boolean;
+  /**
+   * How many MODIFIED metadata files the platform proved differ only cosmetically. Decided from
+   * the two blobs, not by the model, and only for a regular file whose mode did not change:
+   *  - a `.json` file whose text is identical once whitespace outside strings is removed (a
+   *    reindent or a change of line endings; a key moved, a number respelled or a key repeated or
+   *    dropped is NOT cosmetic, because the token text differs);
+   *  - a `.tsv` file whose text is identical once spaces and carriage returns at the end of each
+   *    line are removed (a trailing TAB is a column, so it is NOT cosmetic).
+   * Such a file needs no reading to know that nothing was lost, so it never makes
+   * {@link readIncomplete} true and does not use the patch budget.
+   */
+  cosmeticOnlyFiles: number;
+  /**
+   * Changed metadata files grouped by the shape of their path, so a bulk edit reads as one line.
+   * Removed shapes first, then modified, then added; within a status the largest first. At most
+   * {@link MAX_GROUPS} are kept; {@link groupsOmittedFiles} counts the files in the rest.
+   */
+  groups: PathGroup[];
+  /** Changed metadata files that belong to a path shape cut by {@link MAX_GROUPS}. */
+  groupsOmittedFiles: number;
+  /**
+   * A file named CHANGES or CHANGELOG (any case, optionally `.md`, `.txt` or `.rst`) at the dataset
+   * root was added or modified. A deleted one does not count.
+   */
+  changelogTouched: boolean;
+  /** Whether this pull request adds an entry for the new version to the change log. */
+  changelogEntry: ChangelogEntry;
 }
+
+/**
+ * What the change log says about the new version:
+ *  - `added`: a heading for the new version is in the head's change log and was not in the merge
+ *    base's (a heading is a line that starts with the version, after any `#` or `[`, and an
+ *    optional `v`, `version` or `release`; a bullet is not a heading);
+ *  - `not_added`: the head has a change log but no new heading for the new version, which includes
+ *    a heading that was already there, a date-only heading, and a version only mentioned in prose;
+ *  - `no_file`: the head has no change log file;
+ *  - `unknown_version`: the new version is unknown (absent or not `X.Y.Z`), so the platform cannot
+ *    tell what to look for. This is decided first, so it wins over `no_file`.
+ */
+export type ChangelogEntry = "added" | "not_added" | "no_file" | "unknown_version";
+
+/** One shape of changed path: `sub-*` and `ses-*` and `run-*` stand for any value. */
+export interface PathGroup {
+  status: ChangeStatus;
+  pattern: string;
+  files: number;
+  /** How many of the group's files had their diff shown to the reviewer in full. */
+  shown: number;
+  /** How many of the group's files differ only cosmetically. */
+  cosmeticOnly: number;
+}
+
+/** The most path shapes reported, largest first within a status; the files of any others are counted in `groupsOmittedFiles`. */
+export const MAX_GROUPS = 12;
+
+/** The most modified `.json` and `.tsv` files compared for a cosmetic-only change. The rest are treated as really changed (read, or counted as unread). */
+const MAX_COSMETIC_CHECKS = 2_000;
+
+const CHANGELOG_NAME = /^(CHANGES|CHANGELOG)(\.(md|txt|rst))?$/i;
 
 function git(dir: string, args: string[]): string {
   return execFileSync(
@@ -174,6 +237,40 @@ function git(dir: string, args: string[]): string {
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
+}
+
+/**
+ * The same call as {@link tryGit} but with the bytes kept: each byte becomes the one character with
+ * that code (latin1), so two blobs that differ only in bytes that are not valid UTF-8 (`caf\xe9`
+ * and `caf\xe8`) are still different strings. Decoding them as UTF-8 would turn both into the same
+ * replacement characters.
+ */
+function tryGitBytes(dir: string, args: string[]): string | null {
+  try {
+    return execFileSync(
+      "git",
+      [
+        "--literal-pathspecs",
+        "-C",
+        dir,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "protocol.ext.allow=never",
+        ...args,
+      ],
+      {
+        encoding: "latin1",
+        maxBuffer: 256 * 1024 * 1024,
+        env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0" },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+  } catch {
+    return null;
+  }
 }
 
 function tryGit(dir: string, args: string[]): string | null {
@@ -241,6 +338,11 @@ function clip(text: string, max: number): { text: string; truncated: boolean } {
     : { text: text.slice(0, max), truncated: true };
 }
 
+/** An order that does not depend on the runtime's locale, so every machine reads files in the same order. */
+function codeUnitOrder(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 const STATUS_RANK: Record<ChangeStatus, number> = { removed: 0, modified: 1, added: 2 };
 
 /** The order a reviewer would open files in: removed, then modified, then added; within each, the files that describe the dataset first and recordings last. */
@@ -248,8 +350,153 @@ function byReviewOrder(a: RawChange, b: RawChange): number {
   return (
     STATUS_RANK[a.status] - STATUS_RANK[b.status] ||
     AREA_PRIORITY[classifyPath(a.path)] - AREA_PRIORITY[classifyPath(b.path)] ||
-    a.path.localeCompare(b.path)
+    codeUnitOrder(a.path, b.path)
   );
+}
+
+/** The shape of a path: subject, session and run labels replaced by `*`. `task-` and `acq-` are kept. */
+export function pathPattern(path: string): string {
+  return path
+    .replace(/(?<![A-Za-z0-9-])sub-[^/_.]+/g, "sub-*")
+    .replace(/(?<![A-Za-z0-9-])ses-[^/_.]+/g, "ses-*")
+    .replace(/(?<![A-Za-z0-9-])run-[^/_.]+/g, "run-*");
+}
+
+/** A regular file: the only kind whose text can be compared for a cosmetic change. */
+const REGULAR_FILE_MODES: ReadonlySet<string> = new Set(["100644", "100755"]);
+
+/**
+ * The modes of every changed path, old and new, from `git diff --raw`. Null when git could not
+ * say, in which case no file is treated as cosmetic.
+ */
+function modesByPath(
+  dir: string,
+  mergeBase: string,
+  headSha: string,
+): Map<string, { before: string; after: string }> | null {
+  const raw = tryGit(dir, ["diff", "--raw", "-z", "--no-renames", mergeBase, headSha]);
+  if (raw === null) return null;
+  const parts = raw.split("\0");
+  const out = new Map<string, { before: string; after: string }>();
+  for (let i = 0; i + 1 < parts.length; i += 2) {
+    const meta = parts[i]?.match(/^:(\d{6}) (\d{6}) /);
+    const path = parts[i + 1];
+    if (meta?.[1] && meta[2] && path) out.set(path, { before: meta[1], after: meta[2] });
+  }
+  return out;
+}
+
+/** JSON text with the whitespace outside strings removed: two texts that agree are the same token stream. */
+export function stripJsonWhitespace(text: string): string {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  for (const ch of text) {
+    if (inString) {
+      out += ch;
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') {
+      inString = true;
+      out += ch;
+    } else if (ch !== " " && ch !== "\t" && ch !== "\n" && ch !== "\r") {
+      out += ch;
+    }
+  }
+  return out;
+}
+
+/** Whether `text` is valid JSON. The value is not used: a change that breaks the file is never cosmetic. */
+function parsesAsJson(text: string): boolean {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether `before` and `after` differ only cosmetically for the kind of file `path` is. Both are
+ * the blobs' bytes as latin1 (see {@link tryGitBytes}), so a byte that is not valid UTF-8 is a
+ * difference like any other.
+ *  - `.json`: both parse, and they are the same once whitespace outside strings is removed. A
+ *    change that merges tokens (`[1 2]` to `[12]`) breaks the JSON and so is not cosmetic.
+ *  - `.tsv`: the same once spaces and carriage returns at the end of each line are removed, where
+ *    the run is not preceded by a tab: a trailing tab, and a cell holding only spaces, are data.
+ */
+export function isCosmeticChange(path: string, before: string, after: string): boolean {
+  if (path.endsWith(".json")) {
+    return (
+      parsesAsJson(before) &&
+      parsesAsJson(after) &&
+      stripJsonWhitespace(before) === stripJsonWhitespace(after)
+    );
+  }
+  if (path.endsWith(".tsv")) {
+    const trim = (t: string) =>
+      t
+        .split("\n")
+        .map((line) => line.replace(/(?<!\t)[ \r]+$/, ""))
+        .join("\n");
+    return trim(before) === trim(after);
+  }
+  return false;
+}
+
+/**
+ * The text of the dataset's change log at `rev`: every CHANGES or CHANGELOG blob at the root,
+ * joined. Null when there is none. A name that is a directory, a symlink or a submodule is not a
+ * change log. An unreadable tree or blob is an {@link EvidenceError}, never "no change log".
+ */
+function changelogAt(dir: string, rev: string): string | null {
+  const listing = tryGit(dir, ["ls-tree", "-z", rev]);
+  if (listing === null) throw new EvidenceError("tree_unreadable");
+  const texts: string[] = [];
+  for (const entry of listing.split("\0").filter(Boolean)) {
+    const m = entry.match(/^(\d{6}) blob [0-9a-f]+\t(.+)$/s);
+    if (!m?.[1] || !m[2] || !REGULAR_FILE_MODES.has(m[1]) || !CHANGELOG_NAME.test(m[2])) continue;
+    const text = tryGit(dir, ["show", `${rev}:${m[2]}`]);
+    if (text === null) throw new EvidenceError("changelog_unreadable");
+    texts.push(text);
+  }
+  return texts.length === 0 ? null : texts.join("\n");
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * A heading for `version`: a line that starts with it, after any spaces, `#` marks or `[`, and an
+ * optional `v`, `version` or `release` (with an optional `:`). A bullet that happens to start with
+ * the number is not a heading, and neither is `1.0.1-beta` or `1.0.10`. The text is tested one line
+ * at a time, so a hostile file of blank lines cannot make the match quadratic.
+ */
+function hasHeadingFor(text: string, version: string): boolean {
+  const re = new RegExp(
+    `^[ \\t#\\[]*(?:(?:v|version|release):?[ \\t]*)?${escapeRegExp(version)}(?![0-9A-Za-z_-]|\\.[0-9])`,
+    "i",
+  );
+  return text.split("\n").some((line) => re.test(line));
+}
+
+function changelogEntryFor(
+  dir: string,
+  mergeBase: string,
+  headSha: string,
+  version: string | null,
+): ChangelogEntry {
+  // With no version to look for the platform cannot tell, whatever the log holds: an unknown is
+  // never turned into a failure.
+  if (version === null) return "unknown_version";
+  const after = changelogAt(dir, headSha);
+  if (after === null) return "no_file";
+  const before = changelogAt(dir, mergeBase);
+  return hasHeadingFor(after, version) && !hasHeadingFor(before ?? "", version)
+    ? "added"
+    : "not_added";
 }
 
 /**
@@ -275,10 +522,45 @@ export function gatherGitFacts(dir: string, baseSha: string, headSha: string): G
     .filter((c) => READABLE_AREAS.has(classifyPath(c.path)))
     .sort(byReviewOrder);
 
+  // A modified file that differs only cosmetically needs no reading: nothing in it was lost. The
+  // test is exact (see GitFacts.cosmeticOnlyFiles) and falls back to "not cosmetic" whenever git
+  // cannot say, a mode changed, or the cap on comparisons is reached.
+  // The review job works in a partial clone, where reading a missing blob is a network round trip
+  // of its own: 124 seconds for 89 changed files when each `git show` fetched alone. One diff over
+  // the whole range asks for every blob it needs in a single batched fetch, so the reads below are
+  // local. Its output is not used, and a failure here only makes the reads slower.
+  tryGit(dir, [
+    "diff",
+    "--numstat",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    mergeBase,
+    headSha,
+  ]);
+  const modes = modesByPath(dir, mergeBase, headSha);
+  let cosmeticChecks = 0;
+  const cosmeticOnly = new Set<string>();
+  for (const c of wanted) {
+    if (c.status !== "modified" || modes === null) continue;
+    if (!c.path.endsWith(".json") && !c.path.endsWith(".tsv")) continue;
+    const m = modes.get(c.path);
+    if (!m || m.before !== m.after || !REGULAR_FILE_MODES.has(m.before)) continue;
+    if (cosmeticChecks >= MAX_COSMETIC_CHECKS) continue;
+    cosmeticChecks++;
+    const before = tryGitBytes(dir, ["show", `${mergeBase}:${c.path}`]);
+    const after = tryGitBytes(dir, ["show", `${headSha}:${c.path}`]);
+    if (before !== null && after !== null && isCosmeticChange(c.path, before, after)) {
+      cosmeticOnly.add(c.path);
+    }
+  }
+
   const patches: Patch[] = [];
   const read = new Map<string, Patch>();
   let budget = MAX_PATCH_TOTAL_CHARS;
-  for (const c of wanted.slice(0, MAX_PATCH_FILES)) {
+  // The read budget goes to files that are not cosmetic-only.
+  const toRead = wanted.filter((c) => !cosmeticOnly.has(c.path));
+  for (const c of toRead.slice(0, MAX_PATCH_FILES)) {
     if (budget <= 0) break;
     const diff = tryGit(dir, [
       "diff",
@@ -301,9 +583,43 @@ export function gatherGitFacts(dir: string, baseSha: string, headSha: string): G
 
   const readIncomplete = wanted.some((c) => {
     if (c.status === "added") return false;
+    if (cosmeticOnly.has(c.path)) return false;
     const patch = read.get(c.path);
     return patch === undefined || patch.truncated;
   });
+
+  const groupMap = new Map<string, PathGroup>();
+  for (const c of wanted) {
+    const pattern = pathPattern(c.path);
+    const key = `${c.status}\t${pattern}`;
+    const g = groupMap.get(key) ?? {
+      status: c.status,
+      pattern,
+      files: 0,
+      shown: 0,
+      cosmeticOnly: 0,
+    };
+    g.files++;
+    const patch = read.get(c.path);
+    if (patch !== undefined && !patch.truncated) g.shown++;
+    if (cosmeticOnly.has(c.path)) g.cosmeticOnly++;
+    groupMap.set(key, g);
+  }
+  // Removed shapes first: that is where a loss hides, and the cut must never take them.
+  const ordered = [...groupMap.values()].sort(
+    (a, b) =>
+      STATUS_RANK[a.status] - STATUS_RANK[b.status] ||
+      b.files - a.files ||
+      codeUnitOrder(a.pattern, b.pattern),
+  );
+  const groups = ordered.slice(0, MAX_GROUPS);
+  const groupsOmittedFiles = ordered.slice(MAX_GROUPS).reduce((n, g) => n + g.files, 0);
+
+  const changelogTouched = changes.some(
+    (c) => c.status !== "removed" && CHANGELOG_NAME.test(c.path),
+  );
+  const versionAfter = versionAt(dir, headSha);
+  const changelogEntry = changelogEntryFor(dir, mergeBase, headSha, versionAfter);
 
   // An empty list would read to the model as "no commits", so a failed read is an error.
   const log = tryGit(dir, ["log", "--format=%s", `-n${MAX_COMMITS}`, `${mergeBase}..${headSha}`]);
@@ -313,11 +629,16 @@ export function gatherGitFacts(dir: string, baseSha: string, headSha: string): G
     patches,
     commits: log.split("\n").filter(Boolean),
     versionBefore: versionAt(dir, mergeBase),
-    versionAfter: versionAt(dir, headSha),
+    versionAfter,
     subjectsBefore: subjectsAt(dir, mergeBase),
     subjectsAfter: subjectsAt(dir, headSha),
     listCut: changes.length > MAX_MODEL_FILES,
     readIncomplete,
+    cosmeticOnlyFiles: cosmeticOnly.size,
+    groups,
+    groupsOmittedFiles,
+    changelogTouched,
+    changelogEntry,
   };
 }
 

@@ -326,7 +326,7 @@ describe("exchangePrivateGrant", () => {
 
   for (const [what, change] of [
     ["revoked", "UPDATE users SET status = 'revoked' WHERE id = ?"],
-    ["left pending", "UPDATE users SET status = 'pending' WHERE id = ?"],
+    ["left pending", "UPDATE users SET status = 'pending', email_verified = 0 WHERE id = ?"],
     ["deleted", "UPDATE users SET deleted_at = datetime('now') WHERE id = ?"],
   ] as const) {
     test(`an account ${what} between grant and exchange gets invalid_grant`, async () => {
@@ -511,7 +511,7 @@ describe("resolvePrincipal: a private-site session", () => {
     // `findSessionByCookieId` admits `pending`, so the rule is re-applied.
     const userId = seedUser("status-drop@nemar.test");
     const session = await signInToPrivate(userId);
-    db.run("UPDATE users SET status = 'pending' WHERE id = ?", [userId]);
+    db.run("UPDATE users SET status = 'pending', email_verified = 0 WHERE id = ?", [userId]);
     expect(await resolveSession(session)).toEqual({ ok: false, error: "inactive_account" });
   });
 
