@@ -53,7 +53,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  process.env.PATH = realPath;
+  // Reflect.deleteProperty, not `= undefined`: Bun would store the STRING "undefined" as PATH.
+  if (realPath === undefined) Reflect.deleteProperty(process.env, "PATH");
+  else process.env.PATH = realPath;
   while (scratch.length > 0) {
     const dir = scratch.pop();
     if (dir && existsSync(dir)) rmSync(dir, { recursive: true, force: true });

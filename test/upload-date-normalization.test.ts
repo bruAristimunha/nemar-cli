@@ -340,7 +340,8 @@ describe("the plan reads and changes nothing", () => {
       expect(plan.items).toEqual([]);
       expect(plan.left["tracking-unknown"]).toBe(1);
     } finally {
-      process.env.PATH = path;
+      if (path === undefined) Reflect.deleteProperty(process.env, "PATH");
+      else process.env.PATH = path;
     }
   });
 });
