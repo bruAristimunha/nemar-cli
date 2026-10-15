@@ -27,7 +27,11 @@ import {
   hasEverBeenPublished,
   isAnonymous,
 } from "../../services/anonymity";
-import { APPROVAL_CLAIM_CLEAR_SQL, approvalInFlightSql } from "../../services/approval-dispatch";
+import {
+  ACTIVE_REQUEST_TAIL_SQL,
+  APPROVAL_CLAIM_CLEAR_SQL,
+  approvalInFlightSql,
+} from "../../services/approval-dispatch";
 import { isValidDatasetId } from "../../services/datasetId";
 import { isExemplarPublishAllowed } from "../../services/exemplar";
 import {
@@ -302,9 +306,7 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
 
     // Check for existing active request (allow re-checking blocked requests)
     const existing = await db
-      .prepare(
-        "SELECT id, status, block_reason FROM publication_requests WHERE dataset_id = ? AND status IN ('requested', 'approving', 'blocked') ORDER BY requested_at DESC LIMIT 1",
-      )
+      .prepare(`SELECT id, status, block_reason ${ACTIVE_REQUEST_TAIL_SQL}`)
       .bind(datasetId)
       .first<{ id: number; status: string; block_reason: string | null }>();
 
@@ -926,9 +928,7 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
       .prepare(
         `SELECT id, status, steps_completed, current_step, updated_at,
                 ${approvalInFlightSql()} AS approval_in_flight
-         FROM publication_requests
-         WHERE dataset_id = ? AND status IN ('requested', 'approving', 'blocked')
-         ORDER BY requested_at DESC LIMIT 1`,
+         ${ACTIVE_REQUEST_TAIL_SQL}`,
       )
       .bind(datasetId)
       .first<{
