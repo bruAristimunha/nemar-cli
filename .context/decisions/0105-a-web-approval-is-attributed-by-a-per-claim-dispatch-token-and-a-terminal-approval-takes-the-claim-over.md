@@ -88,7 +88,7 @@ A token that is stale or expired is refused, never quietly downgraded.**
    What is left must be what a header can carry: printable American Standard Code for Information Interchange (ASCII) characters, with no whitespace inside it.
    Otherwise `approve` refuses it before it sends anything, with a sentence that names the problem and never the value.
    Left to the client library, such a value throws, and the command would report a network failure and retry it for a while.
-   With the variable set, `approve` refuses `--force`, `--acknowledge-identifier-screen` and `--skip-ci-check` before it sends anything (decision 5),
+   With the variable set, `approve` refuses `--force`, `--acknowledge-identifier-screen`, `--skip-ci-check` and `--sandbox` before it sends anything (decision 5),
    and says on standard error that the run presents a token.
 4. **The approver forks on the proof, in this order, in the prelude of `runPublicationApproval`.**
    A call that carries no token, or an empty or blank header, is its caller's own act whatever claim is on the row and whatever its lease says: the caller is the approver.
@@ -103,13 +103,14 @@ A token that is stale or expired is refused, never quietly downgraded.**
    then, for a run whose steps are all complete, the all-steps-done branch of decision 12 (the closed-request refusal, the tail jobs and the closing write), which runs neither gate and records no override;
    for any other run, the identifier screen's gate, the review's gate, the recording of the override, and the conditional mark.
 5. **A call that carries a valid token carries no decision.**
-   An override of the review, an acknowledgment of the identifier screen or a skipped continuous integration (CI) check (`skip_ci_check`) in the body of such a call is refused, 409 `decision_with_dispatch_token`, and nothing is recorded under anybody.
+   An override of the review, an acknowledgment of the identifier screen, a skipped continuous integration (CI) check (`skip_ci_check`) or the sandbox (`sandbox`) in the body of such a call is refused, 409 `decision_with_dispatch_token`, and nothing is recorded under anybody.
    The override and the acknowledgment were recorded at the click, under the clicker's id, and the gates read them there.
    A skipped CI check was never part of the click: it is a decision of its own, and it would be recorded under the approver, which for a token call is the clicker, who skipped nothing.
-   Only `skip_ci_check: true` is a decision: an explicit `false` is allowed, because the CLI sends it on every call.
-   The executor workflow sends none of the three, and the CLI refuses all three flags locally while the variable is set (decision 3).
-   The CLI's refusal of `--skip-ci-check` has a sentence of its own:
-   a run the website started never skips the CI check, because the click has no such option,
+   The sandbox is a decision of the same kind as the skip: the click has no option for a test DOI, so a run that asks for one is not the click's.
+   Only `skip_ci_check: true` and `sandbox: true` are decisions: an explicit `false` is allowed, because the CLI sends both on every call.
+   The executor workflow sends none of the four, and the CLI refuses all four flags locally while the variable is set (decision 3).
+   The CLI's refusals of `--skip-ci-check` and `--sandbox` have sentences of their own:
+   a run the website started never skips the CI check and never uses the sandbox, because the click has no such option,
    where the other two flags are refused because the click already made that decision.
    This retires the Phase 2 stop-gap `override_inside_web_approval`, which is removed from the contract.
    Its guarantee is now structural, and stronger:
@@ -225,6 +226,7 @@ A token that is stale or expired is refused, never quietly downgraded.**
       the tail jobs' warnings, then the audit warning.
       Its `status` is `approving` when the request was left so, and `published` when this call or a concurrent one marked it.
       The CLI reads only the singular key, and prints it, so the warning that tells an operator to approve again reaches them.
+      It also reads the answer's `status`: an answer that is not `published` is not an approval, so `approve` exits 1 with a line that says the request is not published yet and what to run, and `next` counts it as failed and not as approved.
       A plural key would never be read, and the CLI would report a success without the warning.
     - The step loop's own end has the same dead end after a warning, and it is not changed here.
       It marks the request `published` and then answers with the tail jobs' warnings, which still say to approve again, and that finds no active request (404).

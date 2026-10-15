@@ -1105,3 +1105,29 @@ A sentence is called web-safe here when it names no terminal command, flag or pl
    That is an intentional design choice: a code fix would give the neutral path its own input and leave `cureOf` byte for byte, a change this phase did not take on; it is also tracked in #1773.
    A sentence in AGENTS.md about the new copy file, beside the one on the account copy, is the maintainer's to write.
    The website is promoted to production only after the Worker that carries this phase, as item 3 requires.
+
+## Amendment 2026-10-15 (#1726): what the integrated epic found in the review's own paths
+
+Three reviews of the integrated branch found faults in how the review and the approval around it fail.
+The text above was corrected in place only for the override's statement (section 9, item 4);
+this amendment states what the rest changed.
+Where the two differ, this is the later text.
+
+1. **An override attaches to the override the administrator was shown, or to none.**
+   `RECORD_OVERRIDE_SQL` pins `override_by` as the gate read it, beside the review's state, creation time and decision time.
+   A call that read no override cannot overwrite one that landed after its read (a web click's, which its executor reads off the row), and is refused `review_changed`.
+   An administrator who read another's override may still replace it on purpose, as a terminal approval takes a live claim over with its own override (ADR 0105, decision 6).
+   The accepted residue is unchanged: an override recorded before a mark that then refuses stays on its row, bound to its review, reasons and approver.
+2. **A claimed run cannot make its model call free.**
+   `stale_head` means an attempt that never reached a model, and it gives the attempt's slot back to the caps.
+   A job may post it, but only before it has claimed: the store of a result records `workflow_failed` in its place when `claimed_at` is set, in the same statement, so a claim that lands between the read and the write is seen.
+   An unclaimed attempt keeps `stale_head` and stays free.
+3. **A failed dispatch claim is released on every way out.**
+   The web approval's claim is released if anything throws between the claim and the dispatch (a failed acknowledgment or override write, a failed read), not only on the failures the route names.
+   From the moment the dispatch is attempted a throw keeps the claim, because the event may be queued.
+4. **`nemar admin publish screen` exits 1 when the Worker answers 202 with status `error`.**
+   The screen could not be started, nothing is running, and item 12 of the Phase 2 amendment (every failure exits non-zero) holds for it.
+   The text no longer says the admins have been mailed this result as a fact about the call.
+5. **An approval that leaves the request `approving` is not a success.**
+   See ADR 0105, decision 12: `approve` exits 1 and `next` counts it as failed.
+
