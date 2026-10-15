@@ -39,7 +39,7 @@ import { verifyApprovalDispatchToken } from "../src/services/github/callback-tok
 import { hashApiKey } from "../src/services/token";
 import { issueSession } from "../src/services/web-session";
 import type { Bindings, Variables } from "../src/types/bindings";
-import { freshDb, interceptingD1, realD1, yieldingD1 } from "./helpers/d1";
+import { freshDb, interceptingD1, realD1, wrapD1, yieldingD1 } from "./helpers/d1";
 import { SCREENED_HEAD, mainRefAnswer, markScreen } from "./helpers/identifier-screen";
 import { WEB_CLAIM_SECRET, webClaim } from "./helpers/publication-review";
 
@@ -668,6 +668,43 @@ describe("the dispatch token (#1604, ADR 0105 decisions 1 to 3)", () => {
     expect(row(id)?.approval_dispatched_at).toBeNull();
     // Released, so the next click (with a sane clock) goes through.
     expect((await dispatchWith(ADMIN_KEY)).status).toBe(202);
+  });
+});
+
+describe("a claim whose own checks throw", () => {
+  // The claim is taken before the gates that follow it write, and a write that throws there
+  // (a transient D1 error) must not strand the claim for the whole lease on a run that was never
+  // sent. The fault is a real D1 error raised ahead of the real statement: every other statement,
+  // the claim and the release included, runs for real against the migrated database.
+  test("a failed acknowledgment write releases the claim, so the administrator can click again", async () => {
+    const id = seedRequest();
+    markScreen(db, id, DATASET, { status: "review" });
+    const before = row(id);
+    let armed = true;
+    const faulty = wrapD1(realD1(db), (sql) => {
+      if (armed && sql.includes("identifier_screen_ack_by = ?")) {
+        throw new Error("D1_ERROR: transient fault on the acknowledgment write");
+      }
+    });
+    const reason = "Read every flagged file by hand, nothing to remove";
+
+    const res = await dispatchBody(
+      ADMIN_KEY,
+      { acknowledge_identifier_screen: reason },
+      DATASET,
+      { ...env(), DB: faulty } as Bindings,
+    );
+
+    expect(res.status).toBe(500);
+    expect(dispatches).toHaveLength(0);
+    // Nothing is held: the claim is cleared and the row is as it was read.
+    expect(row(id)).toEqual(before);
+
+    // The same click, with the fault gone, goes through at once rather than after the lease.
+    armed = false;
+    const again = await dispatchBody(ADMIN_KEY, { acknowledge_identifier_screen: reason });
+    expect(again.status).toBe(202);
+    expect(dispatches).toHaveLength(1);
   });
 });
 

@@ -847,168 +847,29 @@ export function registerPublishRoutes(admin: AdminRouter): void {
       }
     };
 
-    // The token the executor presents on every `/approve` call of this run: a MAC over this
-    // claim's dataset, request, clicker and instant (#1604, ADR 0105 decision 1). It is handed to
-    // the dispatch and to nothing else: never logged, audited, listed or answered. A claim that
-    // cannot be signed (the signer refuses a field that holds a line break) was not sent, so it is
-    // released.
-    let dispatchToken: string;
+    // Everything from here to the dispatch can throw (a database fault on an acknowledgment or
+    // override write, a lookup that rejects): the claim is released on every such exit, so a
+    // click that was never sent does not hold the lease for fifteen minutes. From the moment
+    // the dispatch is attempted the claim is kept on any throw, because the event may already be
+    // queued and releasing would let a second click start a second run beside it.
+    let dispatchAttempted = false;
     try {
-      dispatchToken = await signApprovalDispatchToken(
-        { datasetId, requestId: request.id, clickerId: adminUser.id, claimedAt },
-        signingSecret,
-      );
-    } catch (err) {
-      console.error(
-        `[approve-dispatch] could not sign the dispatch token for ${datasetId}:`,
-        errorMessage(err),
-      );
-      await releaseClaim();
-      return c.json(
-        {
-          error: "dispatch_failed",
-          message: "The approval could not be started. Nothing was changed; try again.",
-        },
-        502,
-      );
-    }
-
-    // 1. A credential. Absent entirely is a configuration fault that retrying
-    // cannot fix, so it has its own code; failing to MINT one (an App token
-    // request GitHub refused) is transient and is an ordinary failed dispatch.
-    // Neither sent anything, so both release.
-    let auth: ReturnType<typeof getDatasetsAuth>;
-    try {
-      auth = getDatasetsAuth(c.env);
-    } catch (err) {
-      console.error(`[approve-dispatch] no GitHub credential for ${datasetId}:`, errorMessage(err));
-      await releaseClaim();
-      return c.json(
-        {
-          error: "dispatch_unconfigured",
-          message:
-            "This server has no GitHub credential configured, so an approval cannot be dispatched from the web. Retrying will not help. Approve from a terminal, and ask an administrator to fix the configuration.",
-        },
-        502,
-      );
-    }
-    let pat: string;
-    try {
-      pat = auth.kind === "app" ? await auth.getToken() : auth.token;
-    } catch (err) {
-      console.error(
-        `[approve-dispatch] could not obtain a GitHub token for ${datasetId}:`,
-        errorMessage(err),
-      );
-      await releaseClaim();
-      return c.json(
-        {
-          error: "dispatch_failed",
-          message: "The approval could not be started. Nothing was changed; try again.",
-        },
-        502,
-      );
-    }
-
-    // The identifier screen, content half (epic #1610 phase 4): the screened
-    // commit must still be `main`, and a lookup that fails refuses (fail
-    // closed). Nothing has been sent, so a refusal releases the claim. A
-    // reason given for a screen that needs one is recorded only once this has
-    // passed, so it attaches to the verdict the admin was shown.
-    if (gated) {
-      const headGate = await verifyScreenHead(c.env, datasetId, request, pat);
-      if (!headGate.ok) {
-        await releaseClaim();
-        return c.json(headGate.refusal, 409);
-      }
-      if (
-        acknowledgment !== undefined &&
-        screenGate(readStoredState(request.identifier_screen_status)) === "acknowledge"
-      ) {
-        const recorded = await recordScreenAcknowledgment(db, {
-          requestId: request.id,
-          datasetId,
-          adminUserId: adminUser.id,
-          reason: acknowledgment,
-          state: request.identifier_screen_status as string,
-        });
-        if (!recorded) {
-          await releaseClaim();
-          return c.json(
-            {
-              error: "identifier_screen_not_clear",
-              gate: "wait",
-              headline: "Identifier screen: changed",
-              message:
-                "The identifier screen's result changed while this approval was being checked. Read it again before approving.",
-            },
-            409,
-          );
-        }
-      }
-      // The override the review gate asked to record, last, now that the screened commit
-      // is still `main`: it attaches to content that is still the content being published,
-      // and is recorded only after every gate has passed. It can remain on its row, bound to
-      // that review, those reasons and its approver, when the dispatch then fails or goes
-      // unconfirmed. The screen's acknowledgment above was recorded when its own check passed
-      // and does not depend on this one. Still before the dispatch, so the executor's run
-      // finds it on the row. A row that moved since the gate read it refuses, and nothing has
-      // been sent.
-      if (review.ok && review.state === "enforced" && review.record !== null) {
-        const recorded = await recordApprovalOverride(c.env, {
-          requestId: request.id,
-          datasetId,
-          approverId: adminUser.id,
-          via: "approve-dispatch",
-          outcome: review.outcome,
-          headSha: review.headSha,
-          record: review.record,
-        });
-        if (!recorded.ok) {
-          await releaseClaim();
-          return c.json(recorded.body, 409);
-        }
-      }
-    }
-
-    // The audit row for this click's dispatch. A missing row must never change
-    // what the admin is told about a run, so a failed write is only logged.
-    const audit = async (action: string, extra: Record<string, unknown> = {}): Promise<void> => {
+      // The token the executor presents on every `/approve` call of this run: a MAC over this
+      // claim's dataset, request, clicker and instant (#1604, ADR 0105 decision 1). It is handed to
+      // the dispatch and to nothing else: never logged, audited, listed or answered. A claim that
+      // cannot be signed (the signer refuses a field that holds a line break) was not sent, so it is
+      // released.
+      let dispatchToken: string;
       try {
-        await auditLogStatement(db, {
-          userId: adminUser.id,
-          action,
-          resourceType: "dataset",
-          resourceId: datasetId,
-          details: JSON.stringify({ request_id: request.id, resume, environment, ...extra }),
-        }).run();
-      } catch (auditErr) {
-        console.error(
-          `[approve-dispatch] audit write failed (${action}) for ${datasetId}:`,
-          errorMessage(auditErr),
+        dispatchToken = await signApprovalDispatchToken(
+          { datasetId, requestId: request.id, clickerId: adminUser.id, claimedAt },
+          signingSecret,
         );
-      }
-    };
-
-    // 2. The dispatch itself. GitHub refusing the request (a 4xx) means nothing
-    // was sent: release. Anything else means UNKNOWN: a dropped connection, a
-    // timeout, or a 5xx from GitHub's edge, any of which can follow an event that
-    // was already queued. Releasing then would let the next click start a second
-    // run beside it. KEEP the lease; it lapses on its own if nothing started, and
-    // the audit row records that a run may exist that the lease alone would not
-    // explain.
-    try {
-      await triggerApprovePublication(
-        datasetId,
-        request.id,
-        resume,
-        environment,
-        pat,
-        dispatchToken,
-      );
-    } catch (err) {
-      console.error(`[approve-dispatch] dispatch failed for ${datasetId}:`, errorMessage(err));
-      if (err instanceof DispatchRejectedError && err.definitelyNotSent) {
+      } catch (err) {
+        console.error(
+          `[approve-dispatch] could not sign the dispatch token for ${datasetId}:`,
+          errorMessage(err),
+        );
         await releaseClaim();
         return c.json(
           {
@@ -1018,28 +879,188 @@ export function registerPublishRoutes(admin: AdminRouter): void {
           502,
         );
       }
-      await audit("approval_dispatch_unconfirmed", {
-        // The status only: never GitHub's body, which the error text carries.
-        reason: err instanceof DispatchRejectedError ? `http_${err.httpStatus}` : "no_answer",
-      });
+
+      // 1. A credential. Absent entirely is a configuration fault that retrying
+      // cannot fix, so it has its own code; failing to MINT one (an App token
+      // request GitHub refused) is transient and is an ordinary failed dispatch.
+      // Neither sent anything, so both release.
+      let auth: ReturnType<typeof getDatasetsAuth>;
+      try {
+        auth = getDatasetsAuth(c.env);
+      } catch (err) {
+        console.error(
+          `[approve-dispatch] no GitHub credential for ${datasetId}:`,
+          errorMessage(err),
+        );
+        await releaseClaim();
+        return c.json(
+          {
+            error: "dispatch_unconfigured",
+            message:
+              "This server has no GitHub credential configured, so an approval cannot be dispatched from the web. Retrying will not help. Approve from a terminal, and ask an administrator to fix the configuration.",
+          },
+          502,
+        );
+      }
+      let pat: string;
+      try {
+        pat = auth.kind === "app" ? await auth.getToken() : auth.token;
+      } catch (err) {
+        console.error(
+          `[approve-dispatch] could not obtain a GitHub token for ${datasetId}:`,
+          errorMessage(err),
+        );
+        await releaseClaim();
+        return c.json(
+          {
+            error: "dispatch_failed",
+            message: "The approval could not be started. Nothing was changed; try again.",
+          },
+          502,
+        );
+      }
+
+      // The identifier screen, content half (epic #1610 phase 4): the screened
+      // commit must still be `main`, and a lookup that fails refuses (fail
+      // closed). Nothing has been sent, so a refusal releases the claim. A
+      // reason given for a screen that needs one is recorded only once this has
+      // passed, so it attaches to the verdict the admin was shown.
+      if (gated) {
+        const headGate = await verifyScreenHead(c.env, datasetId, request, pat);
+        if (!headGate.ok) {
+          await releaseClaim();
+          return c.json(headGate.refusal, 409);
+        }
+        if (
+          acknowledgment !== undefined &&
+          screenGate(readStoredState(request.identifier_screen_status)) === "acknowledge"
+        ) {
+          const recorded = await recordScreenAcknowledgment(db, {
+            requestId: request.id,
+            datasetId,
+            adminUserId: adminUser.id,
+            reason: acknowledgment,
+            state: request.identifier_screen_status as string,
+          });
+          if (!recorded) {
+            await releaseClaim();
+            return c.json(
+              {
+                error: "identifier_screen_not_clear",
+                gate: "wait",
+                headline: "Identifier screen: changed",
+                message:
+                  "The identifier screen's result changed while this approval was being checked. Read it again before approving.",
+              },
+              409,
+            );
+          }
+        }
+        // The override the review gate asked to record, last, now that the screened commit
+        // is still `main`: it attaches to content that is still the content being published,
+        // and is recorded only after every gate has passed. It can remain on its row, bound to
+        // that review, those reasons and its approver, when the dispatch then fails or goes
+        // unconfirmed. The screen's acknowledgment above was recorded when its own check passed
+        // and does not depend on this one. Still before the dispatch, so the executor's run
+        // finds it on the row. A row that moved since the gate read it refuses, and nothing has
+        // been sent.
+        if (review.ok && review.state === "enforced" && review.record !== null) {
+          const recorded = await recordApprovalOverride(c.env, {
+            requestId: request.id,
+            datasetId,
+            approverId: adminUser.id,
+            via: "approve-dispatch",
+            outcome: review.outcome,
+            headSha: review.headSha,
+            record: review.record,
+          });
+          if (!recorded.ok) {
+            await releaseClaim();
+            return c.json(recorded.body, 409);
+          }
+        }
+      }
+
+      // The audit row for this click's dispatch. A missing row must never change
+      // what the admin is told about a run, so a failed write is only logged.
+      const audit = async (action: string, extra: Record<string, unknown> = {}): Promise<void> => {
+        try {
+          await auditLogStatement(db, {
+            userId: adminUser.id,
+            action,
+            resourceType: "dataset",
+            resourceId: datasetId,
+            details: JSON.stringify({ request_id: request.id, resume, environment, ...extra }),
+          }).run();
+        } catch (auditErr) {
+          console.error(
+            `[approve-dispatch] audit write failed (${action}) for ${datasetId}:`,
+            errorMessage(auditErr),
+          );
+        }
+      };
+
+      // 2. The dispatch itself. GitHub refusing the request (a 4xx) means nothing
+      // was sent: release. Anything else means UNKNOWN: a dropped connection, a
+      // timeout, or a 5xx from GitHub's edge, any of which can follow an event that
+      // was already queued. Releasing then would let the next click start a second
+      // run beside it. KEEP the lease; it lapses on its own if nothing started, and
+      // the audit row records that a run may exist that the lease alone would not
+      // explain.
+      dispatchAttempted = true;
+      try {
+        await triggerApprovePublication(
+          datasetId,
+          request.id,
+          resume,
+          environment,
+          pat,
+          dispatchToken,
+        );
+      } catch (err) {
+        console.error(`[approve-dispatch] dispatch failed for ${datasetId}:`, errorMessage(err));
+        if (err instanceof DispatchRejectedError && err.definitelyNotSent) {
+          await releaseClaim();
+          return c.json(
+            {
+              error: "dispatch_failed",
+              message: "The approval could not be started. Nothing was changed; try again.",
+            },
+            502,
+          );
+        }
+        await audit("approval_dispatch_unconfirmed", {
+          // The status only: never GitHub's body, which the error text carries.
+          reason: err instanceof DispatchRejectedError ? `http_${err.httpStatus}` : "no_answer",
+        });
+        return c.json(
+          {
+            error: "dispatch_unconfirmed",
+            message:
+              "GitHub did not confirm the request. It may have started; check again in a few minutes before trying again.",
+          },
+          502,
+        );
+      }
+
+      // The run is already launched; a missing audit row must not report the
+      // launch as failed (`audit` only logs).
+      await audit("approval_dispatched");
+
       return c.json(
-        {
-          error: "dispatch_unconfirmed",
-          message:
-            "GitHub did not confirm the request. It may have started; check again in a few minutes before trying again.",
-        },
-        502,
+        { status: "dispatched", dataset_id: datasetId, request_id: request.id, resume },
+        202,
       );
+    } catch (err) {
+      if (!dispatchAttempted) {
+        console.error(
+          `[approve-dispatch] an unexpected failure after the claim on request ${request.id}:`,
+          errorMessage(err),
+        );
+        await releaseClaim();
+      }
+      throw err;
     }
-
-    // The run is already launched; a missing audit row must not report the
-    // launch as failed (`audit` only logs).
-    await audit("approval_dispatched");
-
-    return c.json(
-      { status: "dispatched", dataset_id: datasetId, request_id: request.id, resume },
-      202,
-    );
   });
 
   /**
