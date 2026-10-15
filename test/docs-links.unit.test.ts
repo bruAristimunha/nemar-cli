@@ -75,7 +75,7 @@ const DOCS_CANDIDATES = [join(REPO_ROOT, "..", "docs"), join(REPO_ROOT, "..", ".
  * An allowlist of paths was the first design and it was wrong in both
  * directions: it missed `README.md`'s four pointers until review caught it, and
  * it missed the ones that matter most, which are not in markdown at all --
- * `SUBMISSION_POLICY_URL` in `backend/src/services/submission-minimums.ts` and
+ * `SUBMISSION_POLICY_URL` in `shared/submission-minimums.ts` and
  * `CONTRIBUTOR_TERMS_URL` in `src/lib/attestation.ts` are quoted to users in
  * refusals. A grep over tracked files covers those, covers `.context/` where
  * this epic is adding pointers, and keeps covering files nobody has written

@@ -131,8 +131,12 @@ export function refreshWouldStripAttribution(
  * reason DOES need is an entry in the BLOCK_MESSAGES vocabulary in
  * routes/datasets/publication.ts, which is what renders it to the user both
  * in the 422 and later in GET /publish/status.
+ *
+ * Declared in `shared/publication-steps.ts`, beside the rule that treats it as the one block
+ * that is still a run (`publishingStanding`), and re-exported here for the importers that
+ * already read it from this module.
  */
-export const OWNER_NAME_MISSING_REASON = "owner_name_missing";
+export { OWNER_NAME_MISSING_REASON } from "../../../shared/publication-steps.js";
 
 /**
  * User-facing explanation for {@link OWNER_NAME_MISSING_REASON}.

@@ -223,6 +223,73 @@ describe("--debug log content is redacted (real request, real failure)", () => {
   });
 });
 
+describe("--debug never writes the approval dispatch token (ADR 0105 decision 2)", () => {
+  // The executor of a web approval hands the CLI a per-claim token (env var, then a header on
+  // every `/approve` call). The token is not the API key, so the log's header redaction did not
+  // know it, and the debug log is the file users are told to drag onto a public issue. This runs
+  // the real client and the real log writer in a real process: a request that carries the header
+  // against a real local server, in debug mode, and then reads the file back. The CLI command
+  // that sends the header at its call site is covered where that command is.
+  test("the header is redacted in the log file, and the rest of the request still is there", async () => {
+    const configDir = makeConfigDir();
+    const seen: string[] = [];
+    const server = Bun.serve({
+      port: 0,
+      fetch(request) {
+        seen.push(request.headers.get("x-approval-dispatch-token") ?? "");
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    });
+    const token = "5ecb4c0ffee0123456789abcdef0123456789abcdef0123456789abcdefd1ce";
+    const script = `
+      const { enableDebug, writeDebugLogSync } = await import(${JSON.stringify(join(REPO_ROOT, "src/lib/debug-log"))});
+      const { request } = await import(${JSON.stringify(join(REPO_ROOT, "src/lib/api/client"))});
+      enableDebug();
+      await request("/admin/publish/nm000123/approve", {
+        method: "POST",
+        headers: { "X-Approval-Dispatch-Token": process.env.DEBUG_PROBE_TOKEN },
+        body: JSON.stringify({ resume: true }),
+      }, false);
+      console.log(writeDebugLogSync(["admin", "publish", "approve", "nm000123"], 0));
+    `;
+    const proc = spawn({
+      cmd: ["bun", "-e", script],
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        NEMAR_CONFIG_DIR: configDir,
+        TEST_API_URL: `http://localhost:${server.port}`,
+        DEBUG_PROBE_TOKEN: token,
+        NEMAR_NO_UPDATE_CHECK: "1",
+        NO_COLOR: "1",
+      },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stdout = await new Response(proc.stdout).text();
+    const stderr = await new Response(proc.stderr).text();
+    const exitCode = await proc.exited;
+    server.stop(true);
+
+    // Debug mode narrates each exchange on stderr, so the live output must not hold it either.
+    expect(stderr).not.toContain(token);
+    expect(exitCode).toBe(0);
+    // The control: the server received the real token, so the request is the one that was logged.
+    expect(seen).toEqual([token]);
+    const logPath = stdout.trim().split("\n").pop() as string;
+    const content = readFileSync(logPath, "utf8");
+    expect(content).toContain("POST ");
+    expect(content).toContain("/admin/publish/nm000123/approve");
+    expect(content).not.toContain(token);
+    expect(content).toMatch(/"X-Approval-Dispatch-Token":"\[REDACTED\]"/);
+    rmSync(configDir, { recursive: true, force: true });
+  });
+});
+
 describe("--debug redacts attached-value flag spellings (#1257 item 24)", () => {
   // CRITICAL, reviewer-reproduced: redactArgv/stripSecretFlagValues matched
   // SECRET_FLAGS by exact token equality, so the two attached-value

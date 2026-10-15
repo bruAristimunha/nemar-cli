@@ -13,7 +13,6 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import { Hono } from "hono";
 import { adminRoutes } from "../src/routes/admin";
 import { datasetRoutes } from "../src/routes/datasets";
-import { MARK_APPROVING_SQL } from "../src/services/publication-orchestrator";
 import { hashApiKey } from "../src/services/token";
 import type { Bindings, Variables } from "../src/types/bindings";
 import { freshDb, realD1 } from "./helpers/d1";
@@ -89,18 +88,26 @@ function row(id: number) {
       {
         status: string;
         withdrawn_at: string | null;
+        approved_by: number | null;
         denied_by: number | null;
         denied_reason: string | null;
+        approval_requested_by: number | null;
+        approval_dispatched_at: string | null;
       },
       [number]
     >(
-      "SELECT status, withdrawn_at, denied_by, denied_reason FROM publication_requests WHERE id = ?",
+      `SELECT status, withdrawn_at, approved_by, denied_by, denied_reason,
+              approval_requested_by, approval_dispatched_at
+       FROM publication_requests WHERE id = ?`,
     )
     .get(id) as {
     status: string;
     withdrawn_at: string | null;
+    approved_by: number | null;
     denied_by: number | null;
     denied_reason: string | null;
+    approval_requested_by: number | null;
+    approval_dispatched_at: string | null;
   };
 }
 
@@ -183,6 +190,21 @@ describe("a request nobody has acted on", () => {
   test("a stale dispatch (lease lapsed, nothing followed) does not block a withdrawal", async () => {
     const id = seedRequest("requested", { dispatchedAt: "-16 minutes" });
     expect((await withdraw()).status).toBe(200);
+    expect(row(id).withdrawn_at).not.toBeNull();
+  });
+
+  test("a withdrawal clears the lapsed claim a web click left, as a denial does", async () => {
+    const id = seedRequest("requested", { dispatchedAt: "-16 minutes" });
+    db.run(`UPDATE publication_requests SET approval_requested_by = ${ownerId} WHERE id = ${id}`);
+    expect(row(id)).toMatchObject({ approval_requested_by: ownerId });
+    expect(row(id).approval_dispatched_at).not.toBeNull();
+    expect((await withdraw()).status).toBe(200);
+    // Nothing is left on a closed row for a late executor to present a token against.
+    expect(row(id)).toMatchObject({
+      status: "denied",
+      approval_requested_by: null,
+      approval_dispatched_at: null,
+    });
     expect(row(id).withdrawn_at).not.toBeNull();
   });
 
@@ -463,21 +485,29 @@ describe("how a withdrawal reads afterwards", () => {
 });
 
 describe("a withdrawn request stays withdrawn", () => {
-  test("the orchestrator's mark-approving write leaves a withdrawn request alone", async () => {
+  // Through the route, which is the entry point: the mark itself is private to the orchestrator.
+  // The write that loses a withdrawal landing after the route's read is in
+  // publish-withdraw-approve-race.test.ts; this one is the withdrawal landing before it.
+  test("an approval after the withdrawal finds nothing to approve and marks nothing", async () => {
     const id = seedRequest("requested");
     await withdraw();
-    const ran = db.query(MARK_APPROVING_SQL).run(ownerId, id);
-    expect(ran.changes).toBe(0);
+    const res = await app.request(
+      `/admin/publish/${DATASET}/approve`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${ADMIN_KEY}`,
+          "Content-Type": "application/json",
+          "X-CLI-Version": "99.0.0",
+        },
+        body: JSON.stringify({ resume: false }),
+      },
+      env,
+    );
+    expect(res.status).toBe(404);
     expect(row(id)).toMatchObject({ status: "denied" });
     expect(row(id).withdrawn_at).not.toBeNull();
-  });
-
-  test("the same write still starts an active request", async () => {
-    for (const status of ["requested", "blocked", "approving"]) {
-      const id = seedRequest(status);
-      expect(db.query(MARK_APPROVING_SQL).run(ownerId, id).changes).toBe(1);
-      expect(row(id).status).toBe("approving");
-    }
+    expect(row(id).approved_by).toBeNull();
   });
 
   test("a web approval dispatched after the withdrawal finds nothing to approve", async () => {

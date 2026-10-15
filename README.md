@@ -325,19 +325,51 @@ nemar admin publish list                   # List active publication requests
 nemar admin publish list --all             # Every request, whatever its state
 nemar admin publish list --denied          # One state (also --published, --requested, ...)
 nemar admin publish list -s denied         # Same as --denied (--status, as before)
-nemar admin publish list --search nm000104 --all
+nemar admin publish list --search nm099999 --all
                                            # Look up a dataset by ID, user or name
+nemar admin publish list --needs-me        # Only the requests you can act on now
+nemar admin publish show <dataset-id>      # The automated review of one request, in full
+nemar admin publish start <dataset-id>     # Start the automated review (--all: every request waiting)
+nemar admin publish next                   # One card per request that needs you: y approves, n denies, c comments
 nemar admin publish approve <dataset-id>   # Approve and publish dataset
+nemar admin publish approve <dataset-id> --force
+                                           # Approve over a review that is not a pass
 nemar admin publish approve <dataset-id> --acknowledge-identifier-screen "<reason>"
                                            # Approve over a screen that needs review
-nemar admin publish screen <dataset-id>    # Re-run the identifier screen
+nemar admin publish approve <dataset-id> --request-id <n>
+                                           # Approve only if request n is the one in force
 nemar admin publish deny <dataset-id>      # Deny publication request
+nemar admin publish deny <dataset-id> --request-id <n>
+                                           # Deny only if request n is the one in force
+nemar admin publish screen <dataset-id>    # Re-run the identifier screen
 ```
 
 A publication request is screened for identifying information before the
 admins are mailed; the mail, `publish status` and `admin publish list` state
 the result, and approval waits for a screen that is clear for the current
 `main`.
+Each request also gets an automated review of what the depositor submitted,
+which `admin publish list` and `admin publish show` state.
+An approval over a review that is not a pass needs `--force` and is recorded
+with your account.
+An approval is for the request it showed, and the API refuses it when that
+request was denied or filed again since (`--request-id` names it yourself).
+An approval started from the website is run by a workflow that is handed a
+token in the environment variable `NEMAR_APPROVAL_DISPATCH_TOKEN` and runs
+`approve <dataset> --yes` with it (adding `--resume` when the click resumes a
+request or the request is already approving), so the token is never typed at a
+terminal.
+With the variable set, the API records the administrator who clicked as the
+approver, and `--force`, `--acknowledge-identifier-screen`, `--skip-ci-check`
+and `--sandbox` are refused.
+Without the variable the command is your own approval, recorded under your
+account, and `next` never reads it.
+Every failure of `admin publish` exits 1, and so does an outcome that is not
+what was asked: `publish screen` exits 1 when the API accepted the call but
+could not start the screen (the dispatch failed), and `publish approve` exits 1
+when the API's answer is not `published` (a tail job's warning leaves the
+request `approving`; run it again once the cause the warning names is fixed).
+`next` counts such an approval as failed, not approved.
 
 ### Admin Commands
 
@@ -454,9 +486,11 @@ See [the Zenodo testing guide](https://docs.nemar.org/develop/zenodo-testing/) f
 ### CLI Usage
 
 ```bash
-NEMAR_API_KEY          # API key (alternative to `nemar auth login -k`)
-NEMAR_NO_BROWSER=1     # Never try to open a browser during sign-in (same as --no-open)
-NEMAR_NO_COLOR         # Disable colored output
+NEMAR_API_KEY                  # API key (alternative to `nemar auth login -k`)
+NEMAR_NO_BROWSER=1             # Never try to open a browser during sign-in (same as --no-open)
+NEMAR_NO_COLOR                 # Disable colored output
+NEMAR_APPROVAL_DISPATCH_TOKEN  # Dispatch token of a web approval; set only by the web approval executor, never by a person
+NEMAR_APPROVE_RETRY_DELAY_MS   # Whole milliseconds to wait between retries of an approval; it can only shorten the default wait (for tests), never lengthen it
 ```
 
 ### Testing

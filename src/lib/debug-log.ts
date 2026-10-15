@@ -42,6 +42,7 @@ export const MAX_BODY_BYTES = 2048;
 let debugEnabled = false;
 let usageExit = false;
 let reportedExit = false;
+let possibleBugSeen = false;
 let lastStep: string | undefined;
 let cachedEnvironmentSection: string | undefined;
 const httpEntries: HttpLogEntry[] = [];
@@ -107,7 +108,34 @@ export function wasUsageExit(): boolean {
  * make both harder to read later.
  */
 export function markReportedExit(): void {
+  // A failure that may be a bug was already seen in this run ({@link unmarkReportedExit}), and an
+  // answer after it does not hide it.
+  if (possibleBugSeen) return;
   reportedExit = true;
+}
+
+/**
+ * Records that a failure that may be a bug was seen, for a command that can fail more than once in
+ * one run: it clears the mark and, from then on, {@link markReportedExit} does nothing. The state
+ * is process-wide, so a walk that has one request fail for a reason that may be a bug must keep
+ * the exit hook's invitation to attach the log, whatever answers (refusals the Worker made) come
+ * before or after it. Only answers suppress the hint.
+ */
+export function unmarkReportedExit(): void {
+  reportedExit = false;
+  possibleBugSeen = true;
+}
+
+/**
+ * Starts the exit state over, as a fresh process has it. TEST-ONLY: nothing in the CLI calls it.
+ * It lives here because the state it clears is module-private and process-wide, and the unit test
+ * of `admin-command.ts` runs several commands in one process: a second entry point on the module
+ * is the one way to start each case clean without a process per case or a cache-busted import,
+ * which would load a second copy of the module that the code under test does not use.
+ */
+export function resetReportedExit(): void {
+  reportedExit = false;
+  possibleBugSeen = false;
 }
 
 export function wasReportedExit(): boolean {
@@ -130,7 +158,19 @@ export function dlog(message: string): void {
 // in this set so redaction is correct by construction the day a caller does
 // start passing response headers through, rather than something someone has
 // to remember to add then.
-const REDACT_HEADER_NAMES = new Set(["authorization", "cookie", "set-cookie", "x-api-key"]);
+//
+// "x-approval-dispatch-token" is the per-claim token the executor of a web approval presents on
+// `/approve` (shared/contract/publication.ts, APPROVAL_DISPATCH_TOKEN_HEADER). It authorizes
+// nothing alone, but it is what lets that call be recorded as the administrator who clicked, and
+// the debug log is the file users are told to attach to public issues. A test holds this spelling
+// to the shared constant.
+const REDACT_HEADER_NAMES = new Set([
+  "authorization",
+  "cookie",
+  "set-cookie",
+  "x-api-key",
+  "x-approval-dispatch-token",
+]);
 
 /** Redact sensitive header values. Exported for direct unit testing. */
 export function redactHeaders(headers: Record<string, string>): Record<string, string> {

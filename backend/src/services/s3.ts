@@ -1305,19 +1305,24 @@ export interface ObjectLockFailure {
   error: string;
 }
 
+/**
+ * Objects one `applyObjectLockBatch` call locks by default. Sized for Cloudflare Workers Paid plan
+ * (1,000 subrequests per invocation). Per-invocation cost: ~7 D1 + 1 LIST + 100 PUTs + ~15 hidden
+ * runtime overhead = ~123 subrequests, leaving 8× headroom before the cap. Halves CLI round-trips
+ * from the previous 25-batch value (e.g. nm000103: 36 batches instead of 141) and lets most
+ * approvals complete in a single invocation without using the retry loop. Note: this requires the
+ * deployed worker to be on Workers Paid (Free plan caps at 50 subrequests, which doesn't fit 100
+ * PUTs). The CLI quotes it as `OBJECTS_PER_LOCK_CALL` (`src/lib/publication-review-next.ts`),
+ * which does not import the backend, and `test/object-lock-batch-size.unit.test.ts` holds the two
+ * together.
+ */
+export const OBJECT_LOCK_BATCH_SIZE = 100;
+
 export async function applyObjectLockBatch(
   options: PresignedUrlOptions,
   datasetId: string,
   continuationToken?: string,
-  // Sized for Cloudflare Workers Paid plan (1,000 subrequests per
-  // invocation). Per-invocation cost: ~7 D1 + 1 LIST + 100 PUTs +
-  // ~15 hidden runtime overhead = ~123 subrequests, leaving 8× headroom
-  // before the cap. Halves CLI round-trips from the previous 25-batch
-  // value (e.g. nm000103: 36 batches instead of 141) and lets most
-  // approvals complete in a single invocation without using the retry
-  // loop. Note: this requires the deployed worker to be on Workers Paid
-  // (Free plan caps at 50 subrequests, which doesn't fit 100 PUTs).
-  batchSize = 100,
+  batchSize = OBJECT_LOCK_BATCH_SIZE,
 ): Promise<{
   locked: number;
   failed: ObjectLockFailure[];

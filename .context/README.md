@@ -66,6 +66,7 @@ here, since an index that misses a document cannot classify it either.
 | [draft-anonymous-deposit-analysis.md](draft-anonymous-deposit-analysis.md) | Pseudonymous deposit for double-blind review: the leak inventory, and what the chosen design (public data, private repository) requires. ADR still to be written. | public |
 | [draft-eegdash-zarr-issues.sh](draft-eegdash-zarr-issues.sh) | Script drafting the EEGDash Zarr issues. The one non-markdown document here, which is why a markdown-only sweep missed it. | public |
 | [plans/spec-pr1.md](plans/spec-pr1.md) | Column-budget rebuild spec (issue #1182). In `plans/`, which a top-level sweep missed. | public |
+| [publication-review-design.md](publication-review-design.md) | The analysis behind ADR 0102 (epic #1726): what was read, the pull-request review compared with the publication review, the data flow, the screen-first options, the cost arithmetic, the calibration plan, the initial vocabularies, the refined phase plan and the risks. Analysis, not a ruling. | public |
 
 ## Research — point-in-time findings
 
@@ -83,6 +84,7 @@ Measurements and investigations. Accurate as of their date; re-verify before rel
 | [plan-multi-archive-importer.md](plan-multi-archive-importer.md) | Architecture RFC for multi-archive import (-> ADR 0013, **proposed**). | public |
 | [research-make-vs-take-audit.md](research-make-vs-take-audit.md) | 2026-09-03 audit of bespoke code an established library or platform feature already covers, with replace / wrap / keep verdicts (-> ADR 0037). | public |
 | [research-agent-findability.md](research-agent-findability.md) | 2026-09-03: how AI agents and crawlers actually find datasets (robots tokens, sitemaps, JSON-LD, registries, DataCite); evidence that llms.txt and markdown mirrors are not read; Zarr guidance for agents (-> OSCAR epic). | public |
+| [research-publication-review-calibration.md](research-publication-review-calibration.md) | How often the publication review's model is judged wrong on published datasets and how many seeded defects it catches, so the model for the soak can be chosen (-> ADR 0102, call 6). Method and empty results tables; **awaiting the operator's run**. | public |
 
 ## Historical — completed work
 

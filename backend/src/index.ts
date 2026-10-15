@@ -89,6 +89,7 @@ import {
 } from "./services/neurobagel-verify";
 import { getActiveNotices } from "./services/notices";
 import { sweepStalePrReviews } from "./services/pr-review";
+import { sweepPublicationReviews } from "./services/publication-review";
 import { sweepBlockedBidsValidationRequests } from "./services/publication-sweep";
 import { runRecordingStatsSweepCron } from "./services/recording-stats-sweep";
 import { runSignalDefaultsSweepCron } from "./services/signal-defaults-sweep";
@@ -942,6 +943,34 @@ export default {
             .catch((err) =>
               console.error(
                 "[pr-review-sweep] sweep failed:",
+                err instanceof Error ? (err.stack ?? err.message) : err,
+              ),
+            ),
+        );
+        // ADR 0102: the publication-review watchdog. A review handed to GitHub that never
+        // reports is marked unreported, its nonce kept so a late report still lands, and the
+        // request's admin mail (which waits for the review) is tried, because a dispatch is
+        // answered 204 whether or not a workflow listens. Its deadline is 30 minutes, so it
+        // rides this tick. PRODUCTION-ONLY, by AGENTS.md's default for a new cron job: it
+        // mails administrators, and the dev worker shares the `users` table with production.
+        // It is therefore not in DEV_CRON_ALLOWLIST, and the sweep also refuses outside
+        // production on its own; the dev worker never ages a row, so every surface reads a
+        // row dispatched longer ago than the deadline plus one tick as "did not report". It
+        // does NOT read PUBLICATION_REVIEW_ENABLED: switching the review off must not strand
+        // a request whose mail waits on a review already in flight. D1 and the mail only: no
+        // GitHub call.
+        ctx.waitUntil(
+          sweepPublicationReviews(env)
+            .then((r) => {
+              if (r.timedOut + r.mailed + r.errors > 0) {
+                console.log(
+                  `[publication-review-sweep] timedOut=${r.timedOut} mailed=${r.mailed} errors=${r.errors}`,
+                );
+              }
+            })
+            .catch((err) =>
+              console.error(
+                "[publication-review-sweep] sweep failed:",
                 err instanceof Error ? (err.stack ?? err.message) : err,
               ),
             ),

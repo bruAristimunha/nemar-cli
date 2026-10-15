@@ -24,6 +24,7 @@ import type { Database } from "bun:sqlite";
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import type { Server } from "bun";
 import { Hono } from "hono";
+import { REQUEST_CHANGED_MESSAGE } from "../../shared/contract/publication";
 import { adminRoutes } from "../src/routes/admin";
 import { datasetRoutes } from "../src/routes/datasets";
 import { hashApiKey } from "../src/services/token";
@@ -165,36 +166,49 @@ function row() {
 }
 
 describe("an approval that loses to a withdrawal", () => {
-  test("answers 409 request_ended and leaves the withdrawal as it was", async () => {
+  test("answers 409 request_changed and leaves the withdrawal as it was", async () => {
+    // The approval's conditional mark (`status IN ('requested', 'approving', 'blocked')`) is the
+    // write that loses: a withdrawal is a denied row, so the mark changes nothing and the route
+    // answers with the contract's word for a request that moved while it was checked.
     const res = await post(
       `/admin/publish/${DATASET}/approve`,
       { resume: false },
       withdrawBefore("SET status = 'approving'"),
     );
     expect(res.status).toBe(409);
-    const body = (await res.json()) as { code: string; error: string };
-    expect(body.code).toBe("request_ended");
-    expect(body.error).toContain("withdrawn");
+    const body = (await res.json()) as { error: string; message: string };
+    expect(body.error).toBe("request_changed");
+    expect(body.message).toBe(REQUEST_CHANGED_MESSAGE);
     // The withdrawal stands: not re-opened as approving, nobody recorded as approver.
     expect(row()).toMatchObject({ status: "denied", approved_by: null, denied_by: null });
     expect(row().withdrawn_at).not.toBeNull();
     // And nothing ran after the lost claim: no publication audit row.
     expect(db.query("SELECT 1 FROM audit_log WHERE action = 'dataset_published'").get()).toBeNull();
   });
+
+  test("the same route still marks a request nobody withdrew (the control)", async () => {
+    // Without the withdrawal the identical call passes the mark: the request is `approving` and
+    // the approver is recorded, which is what the test above must not see.
+    await post(`/admin/publish/${DATASET}/approve`, { resume: false }, env);
+    expect(row().approved_by).not.toBeNull();
+    expect(row().withdrawn_at).toBeNull();
+  });
 });
 
 describe("a denial that loses to a withdrawal", () => {
-  test("answers 409 and records no denier and no reason", async () => {
-    // The first look finds the request active (so this is not the 404 a request
-    // withdrawn BEFORE the deny gets); the guarded UPDATE is the one that loses.
+  test("answers 404 not found and records no denier and no reason", async () => {
+    // The first look finds the request active; the guarded UPDATE is the one that loses. The
+    // deny route re-reads after a lost write: a request that is no longer deniable (a withdrawal
+    // is a denied row) is answered as "no active request", the answer of a withdrawal that came
+    // BEFORE the deny, so the administrator is never told the request was denied by them.
     const res = await post(
       `/admin/publish/${DATASET}/deny`,
       { reason: "too late" },
       withdrawBefore("SET status = 'denied', denied_at"),
     );
-    expect(res.status).toBe(409);
-    expect(((await res.json()) as { error: string }).error).toContain(
-      "ended before it could be denied",
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { error: string }).error).toBe(
+      "No active publication request found",
     );
     expect(row()).toMatchObject({ status: "denied", denied_by: null, denied_reason: null });
     expect(row().withdrawn_at).not.toBeNull();

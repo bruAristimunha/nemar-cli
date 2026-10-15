@@ -313,7 +313,9 @@ describe("the repository does not follow the catalog row", () => {
 
 describe("anonymity is requested at publication, not refused there", () => {
   const PUBLICATION = readFileSync(join(SRC, "routes", "datasets", "publication.ts"), "utf8");
-  const MINIMUMS = readFileSync(join(SRC, "services", "submission-minimums.ts"), "utf8");
+  // The minimums moved to `shared/` (ADR 0102) so the review job evaluates the
+  // same rules; the backend module only re-exports them, so the pin follows.
+  const MINIMUMS = readFileSync(join(SRC, "..", "..", "shared", "submission-minimums.ts"), "utf8");
   // The gate moved out of the route into one function the request route and
   // the blocked-request sweep both call, so the two cannot disagree. The
   // behavior is driven through both in publish-request-ci-pending.test.ts;

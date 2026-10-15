@@ -27,6 +27,12 @@
  * The parser throws a fixed-word {@link PrReviewReportError}; it never quotes its input.
  */
 
+import { sanitizeNote } from "./untrusted-text.js";
+
+// The sanitizer lives in `shared/untrusted-text.ts`, shared with the publication review
+// (ADR 0102); it is re-exported so every importer of this module keeps working.
+export { sanitizeNote };
+
 export const REPORT_VERSION = 1;
 
 /** The check-run's name. Stable: a ruleset that requires the check names it. */
@@ -245,51 +251,6 @@ function hasExactKeys(o: Record<string, unknown>, keys: readonly string[]): bool
   return own.length === keys.length && keys.every((k) => Object.hasOwn(o, k));
 }
 
-/**
- * Free text from a model or a pull request, made safe to put in a check-run.
- *
- * Removes what could notify a person (`@name`, `GH-12`), cross-reference an issue (`#12`), link
- * somewhere (URLs, `[text](url)`, images, HTML entities that decode to `@` or `#`), inject markup
- * (HTML tags, emphasis, table pipes, backslash escapes), or hide itself (control, zero-width and
- * bidirectional-override characters). What is left is plain words, cut to `max` characters.
- *
- * The order matters, and it is the lesson of a real bug: deleting special characters AFTER finding
- * links rebuilt them (`ht@tp://x` became `http://x`). So the special characters go first, in a
- * loop until nothing changes (removing one can reveal another), and links are found LAST. The
- * replacement text contains none of the characters stripped, so the result is a fixed point:
- * `sanitizeNote(sanitizeNote(x))` equals `sanitizeNote(x)`, which a test pins.
- */
-export function sanitizeNote(input: unknown, max: number = NOTE_MAX): string {
-  if (typeof input !== "string") return "";
-  // The loop below is quadratic on input like "![![![...", and a callback body may be 256 KB.
-  // Only the start of a note is ever shown, so cut it before the work begins. The cut may split a
-  // surrogate pair; \p{Cs} removes a lone half.
-  const bounded = input.length > max * 8 ? input.slice(0, max * 8) : input;
-  let s = bounded.normalize("NFKC").replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/gu, " ");
-  for (let i = 0; i < 8; i++) {
-    const before = s;
-    s = s
-      .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
-      .replace(/<[^>]*>/g, " ")
-      .replace(/&#?\w+;/g, " ")
-      .replace(/[@#`*_~|\\<>[\]{}]/g, "")
-      .replace(/\bGH-\d+/gi, "");
-    if (s === before) break;
-  }
-  s = s
-    .replace(/\b(?:https?|ftp|file|data|javascript):\/*\S*/gi, "(link removed)")
-    .replace(/\bwww\.\S+/gi, "(link removed)")
-    .replace(/\s+/g, " ")
-    .trim();
-  const chars = Array.from(s);
-  return chars.length > max
-    ? `${chars
-        .slice(0, max - 3)
-        .join("")
-        .trimEnd()}...`
-    : s;
-}
-
 function parseFinding(raw: unknown): ReviewFinding {
   if (!isRecord(raw) || !hasExactKeys(raw, ["criterion", "severity", "code", "path", "note"])) {
     throw new PrReviewReportError("bad_findings");
@@ -304,7 +265,7 @@ function parseFinding(raw: unknown): ReviewFinding {
   }
   if (path !== null && typeof path !== "string") throw new PrReviewReportError("bad_findings");
   if (typeof note !== "string") throw new PrReviewReportError("bad_findings");
-  return { criterion, severity, code, path: safePath(path), note: sanitizeNote(note) };
+  return { criterion, severity, code, path: safePath(path), note: sanitizeNote(note, NOTE_MAX) };
 }
 
 /** A count of files or subjects: a non-negative integer no larger than {@link MAX_FILES}. */

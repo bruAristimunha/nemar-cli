@@ -271,6 +271,8 @@ describe("explicitDatasetIdGate (ADR 0068, #1432)", () => {
     // has no row for, the dev worker refusing its own dataset, and
     // delete-dataset refused on the only worker that could rebuild it.
     expect(explicitDatasetIdGate({ ...ok, datasetId: "nm099998" })).toBeNull();
+    // nm099997 is the soak fixture of ADR 0102, declared before it exists.
+    expect(explicitDatasetIdGate({ ...ok, datasetId: "nm099997" })).toBeNull();
 
     // Reserved `xx` ids are dev-range, so they are dev-owned without being
     // named in the set.
@@ -280,9 +282,10 @@ describe("explicitDatasetIdGate (ADR 0068, #1432)", () => {
   });
 
   test("an UNDECLARED reserved nm id is refused, and says what to do", () => {
-    // ADR 0068 names nm099997 as the next standing fixture, so this is the
-    // documented next step rather than a hypothetical.
-    for (const datasetId of ["nm099900", "nm099997"]) {
+    // nm099997 was the next standing fixture ADR 0068 named, and is declared now;
+    // nm099996 is the one after it, so this is the documented next step rather
+    // than a hypothetical.
+    for (const datasetId of ["nm099900", "nm099996"]) {
       expect(explicitDatasetIdGate({ ...ok, datasetId })).toEqual(EXPLICIT_ID_NOT_DEV_OWNED_ERROR);
     }
     expect(EXPLICIT_ID_NOT_DEV_OWNED_ERROR.message).toMatch(/DEV_OWNED_FIXTURE_IDS/);

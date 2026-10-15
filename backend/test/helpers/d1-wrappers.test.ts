@@ -65,4 +65,21 @@ describe("interceptingD1", () => {
     expect(seen).toEqual(["SELECT username FROM users WHERE email = 'hooked@example.org'"]);
     expect(row?.username).toBe("hooked");
   });
+
+  test("hands the hook the values the statement was bound with, so a fault can aim at one row", async () => {
+    const db = freshDb();
+    const seen: Array<[string, readonly unknown[]]> = [];
+    const d1 = interceptingD1(realD1(db), (sql, binds) => {
+      seen.push([sql, binds]);
+      if (binds.includes("poisoned@example.org")) throw new Error("aimed fault");
+    });
+    await d1.prepare("SELECT ? AS n").bind(1).first();
+    await expect(
+      d1.prepare("SELECT username FROM users WHERE email = ?").bind("poisoned@example.org").first(),
+    ).rejects.toThrow("aimed fault");
+    expect(seen).toEqual([
+      ["SELECT ? AS n", [1]],
+      ["SELECT username FROM users WHERE email = ?", ["poisoned@example.org"]],
+    ]);
+  });
 });

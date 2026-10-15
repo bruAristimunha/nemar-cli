@@ -12,6 +12,7 @@
  */
 
 import type { Context, Next } from "hono";
+import type { OriginNotAllowedBody } from "../../../shared/contract/publication-review-admin.js";
 import type { AccountKind } from "../../../shared/contract/user.js";
 import {
   type ActiveAccountStatus,
@@ -520,6 +521,54 @@ export async function adminMiddleware(c: AuthContext, next: Next) {
     return c.json({ error: "Admin access required" }, 403);
   }
 
+  await next();
+}
+
+/**
+ * The sentence of a refused cookie write. The contract (`publication-review-admin.ts`) lists the
+ * code `origin_not_allowed` and holds no sentence; this one is shared only with
+ * `PUBLICATION_COMMENT_SENTENCES.origin_not_allowed`, and the review route has no sentence table
+ * for it.
+ */
+export const ORIGIN_NOT_ALLOWED_MESSAGE =
+  "This request did not come from a NEMAR page, so it was not accepted.";
+
+/** The methods that only read. Every other method, a lowercase spelling included, is a write. */
+const READ_ONLY_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+/**
+ * Middleware: a write made with a session cookie must come from a NEMAR page (#1603, #1584; ADR
+ * 0105, decision 10).
+ *
+ * A session cookie rides along with any cross-site request a browser can be tricked into making,
+ * and a write on the admin router publishes datasets, mails real people and spends the platform's
+ * money. A bearer key cannot be forged cross-site and a terminal sends no Origin, so it is not
+ * asked for one. This is the one rule for the whole admin router; four routes used to carry a
+ * private copy and every other write had none.
+ *
+ * Phrased as "not a token" rather than "is a cookie", so that an `authMethod` nothing set fails
+ * closed. The methods are the read-only ones by name, so a method this does not know is a write.
+ * Reads pass: a cross-site page can send one but cannot read its answer (CORS).
+ *
+ * Must be used after authMiddleware, which sets `authMethod`. The body carries `code` as well as
+ * `error`: the publication review's and the depositor comment's contracts read the code of a
+ * refusal there, and approve-dispatch's contract reads it in `error`.
+ */
+export async function cookieOriginGuard(c: AuthContext, next: Next) {
+  if (READ_ONLY_METHODS.has(c.req.method)) {
+    await next();
+    return;
+  }
+  if (c.get("authMethod") !== "token" && !isAllowedOrigin(c.req.header("Origin"))) {
+    // Typed with the contract's body, so a field renamed here or there breaks the build and not
+    // only a test (ADR 0105, decision 10).
+    const refusal: OriginNotAllowedBody = {
+      error: "origin_not_allowed",
+      code: "origin_not_allowed",
+      message: ORIGIN_NOT_ALLOWED_MESSAGE,
+    };
+    return c.json(refusal, 403);
+  }
   await next();
 }
 
