@@ -1190,9 +1190,10 @@ export const MUTANTS: Mutant[] = [
     id: "H08-publication-hook-wrong-dataset",
     layer: "hooks",
     file: `${SVC}/publication-orchestrator.ts`,
-    find: 'scheduleNeurobagelSync(env, waitUntil, datasetId, "hook:publication");\n\n  // The audit row was written with the closing write',
-    replace:
-      'scheduleNeurobagelSync(env, waitUntil, "nm000992", "hook:publication");\n\n  // The audit row was written with the closing write',
+    // The leading line break and exactly two spaces select the approval's own finalize: the
+    // all-steps-done branch calls the same hook indented four, which this must not match.
+    find: '\n  scheduleNeurobagelSync(env, waitUntil, datasetId, "hook:publication");',
+    replace: '\n  scheduleNeurobagelSync(env, waitUntil, "nm000992", "hook:publication");',
     note: "the approval's own finalize federates the wrong dataset",
     tests: [`${T}/neurobagel-hooks.test.ts`],
   },
