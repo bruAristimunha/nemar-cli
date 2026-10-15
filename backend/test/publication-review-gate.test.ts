@@ -2372,6 +2372,36 @@ describe("approve-dispatch runs the gate before it claims, and records after the
     expect(dispatchesSent()).toBe(0);
   });
 
+  test("13. a write of the override that faults refuses unverified, releases the claim and dispatches nothing", async () => {
+    // The override is recorded after the claim, and the write faults (a transient D1 error): the
+    // override is recorded nowhere, so nothing is approved, and the claim is released rather than
+    // held for the lease on a run that was never sent. The fault is raised ahead of the real
+    // statement; every other statement runs for real.
+    const { requestId, reviewId } = seedFailing();
+    let armed = true;
+    const faulty = hookedD1(realD1(db), {
+      statement: (sql) => {
+        if (armed && sql === RECORD_OVERRIDE_SQL) throw new Error("D1_ERROR: transient fault");
+      },
+    });
+    const body = {
+      override_publication_review: { review_id: reviewId, reasons: ["question_failed"] },
+    };
+
+    const res = await dispatchApproval(body, { bindings: env({ DB: faulty }) });
+
+    expect((await refusalOf(res)).refusal).toBe("unverified");
+    expect(requestRow(requestId).approval_requested_by).toBeNull();
+    expect(requestRow(requestId).approval_dispatched_at).toBeNull();
+    expect(reviewRow(reviewId).override_by).toBeNull();
+    expect(dispatchesSent()).toBe(0);
+
+    // The same click with the fault gone goes through at once.
+    armed = false;
+    expect((await dispatchApproval(body, { bindings: env({ DB: faulty }) })).status).toBe(202);
+    expect(dispatchesSent()).toBe(1);
+  });
+
   test("13. a stale screen refuses after the claim, releases it, and records no override", async () => {
     const { requestId, reviewId } = seedFailing();
     mainHead = OTHER_HEAD;

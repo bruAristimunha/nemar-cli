@@ -704,6 +704,65 @@ describe("a claim whose own checks throw", () => {
     expect(again.status).toBe(202);
     expect(dispatches).toHaveLength(1);
   });
+
+  test("a fault after the dispatch was attempted keeps the claim: the event may be queued, and a second click must not start a second run", async () => {
+    // GitHub answers 503, which is unknown (it may follow a queued event), so the claim is kept.
+    // The audit row that records the unknown also faults, and that bookkeeping failing must not
+    // turn into a release: the answer is still `dispatch_unconfirmed` and the claim still holds.
+    const id = seedRequest();
+    githubStatus = 503;
+    const faulty = wrapD1(realD1(db), (sql, binds) => {
+      if (/INSERT INTO audit_log/.test(sql) && binds.includes("approval_dispatch_unconfirmed")) {
+        throw new Error("D1_ERROR: transient fault on the audit write");
+      }
+    });
+
+    const res = await dispatchWith(ADMIN_KEY, DATASET, { ...env(), DB: faulty } as Bindings);
+
+    expect(res.status).toBe(502);
+    expect((await errorBody(res)).error).toBe("dispatch_unconfirmed");
+    expect(dispatches).toHaveLength(1);
+    expect(row(id)?.approval_requested_by).toBe(adminId);
+    expect(row(id)?.approval_dispatched_at).not.toBeNull();
+    // The lease holds a second click out.
+    githubStatus = 204;
+    const second = await dispatchWith(SECOND_ADMIN_KEY);
+    expect(second.status).toBe(409);
+    expect((await errorBody(second)).error).toBe("already_in_flight");
+    expect(dispatches).toHaveLength(1);
+  });
+
+  test("a release that finds the claim already replaced is a no-op: it clears only its own click's claim", async () => {
+    // While this click's acknowledgment write faults, the same administrator has clicked again and
+    // holds a newer claim (another instant, so another token). The release this click's fault
+    // triggers is bound to its own instant and clicker, so it changes nothing of the newer claim.
+    const id = seedRequest();
+    markScreen(db, id, DATASET, { status: "review" });
+    const faulty = wrapD1(realD1(db), (sql) => {
+      if (sql.includes("identifier_screen_ack_by = ?")) {
+        db.run(
+          `UPDATE publication_requests
+              SET approval_requested_by = ?, approval_dispatched_at = datetime('now', '-1 minutes')
+            WHERE id = ?`,
+          [adminId, id],
+        );
+        throw new Error("D1_ERROR: transient fault on the acknowledgment write");
+      }
+    });
+
+    const res = await dispatchBody(
+      ADMIN_KEY,
+      { acknowledge_identifier_screen: "Read every flagged file by hand, nothing to remove" },
+      DATASET,
+      { ...env(), DB: faulty } as Bindings,
+    );
+
+    expect(res.status).toBe(500);
+    // The newer claim is intact: this click's release did not clear it.
+    expect(row(id)?.approval_requested_by).toBe(adminId);
+    expect(row(id)?.approval_dispatched_at).not.toBeNull();
+    expect(dispatches).toHaveLength(0);
+  });
 });
 
 describe("a run that failed", () => {
