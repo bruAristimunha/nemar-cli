@@ -331,9 +331,28 @@ describe("DOI provider dispatch functions", () => {
   });
 
   test("sandbox with sandbox creds does not throw credential error", async () => {
-    // Should get past credential check and fail at network level (mintIdentifier)
-    await expect(
-      createConceptDoi(
+    // Gets past the credential check and sends the mint to EZID under the SANDBOX
+    // account. EZID is a local server answering as the registrar does for a refused
+    // login (the NEMAR_EZID_API_URL seam the DOI route suites use): this used to
+    // call the live ezid.cdlib.org with a made-up password from the pure-unit job,
+    // so a slow registrar timed the test out at 5 s (CI run 38677746843).
+    const seen: { method: string; path: string; authorization: string | null }[] = [];
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        seen.push({
+          method: req.method,
+          path: decodeURIComponent(new URL(req.url).pathname),
+          authorization: req.headers.get("authorization"),
+        });
+        return new Response("error: unauthorized", { status: 401 });
+      },
+    });
+    const holder = globalThis as { NEMAR_EZID_API_URL?: string };
+    const previous = holder.NEMAR_EZID_API_URL;
+    holder.NEMAR_EZID_API_URL = `http://localhost:${server.port}`;
+    try {
+      const failure = await createConceptDoi(
         {
           provider: "ezid",
           datasetId: "nm099999",
@@ -348,8 +367,24 @@ describe("DOI provider dispatch functions", () => {
           EZID_SANDBOX_PASSWORD: "testpass",
           ZENODO_API_KEY: "",
         },
-      ),
-    ).rejects.not.toThrow("EZID credentials not configured");
+      ).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).not.toContain("EZID credentials not configured");
+      expect((failure as Error).message).toContain("unauthorized");
+      expect(seen).toEqual([
+        {
+          method: "PUT",
+          path: "/id/doi:10.5072/FK2NM099999",
+          authorization: `Basic ${btoa("apitest:testpass")}`,
+        },
+      ]);
+    } finally {
+      holder.NEMAR_EZID_API_URL = previous;
+      server.stop(true);
+    }
   });
 
   test("sandbox without sandbox creds throws sandbox credential error", async () => {

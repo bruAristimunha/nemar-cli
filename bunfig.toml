@@ -6,3 +6,6 @@
 # pattern here also hides an explicit path, so the override is what makes the explicit run work.
 [test]
 pathIgnorePatterns = ["test/scrub/**"]
+# Every Bun.serve() in a suite listens on loopback unless it says otherwise: a wildcard bind
+# can be answered by another process's listener on the same port (the file says how).
+preload = ["./test/helpers/loopback-serve-preload.ts"]

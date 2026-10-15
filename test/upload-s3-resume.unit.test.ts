@@ -29,7 +29,7 @@
  * e2e/sandbox suite, test/e2e-upload.test.ts).
  */
 
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import {
   chmodSync,
   existsSync,
@@ -54,6 +54,14 @@ import {
 import { saveDatasetStep } from "../src/lib/upload/finalize";
 import { type UploadFileEntry, uploadDataToS3 } from "../src/lib/upload/transfer";
 import type { DatasetInfo } from "../src/lib/upload/types";
+
+// Every test here builds a real git-annex repository and drives the production upload
+// path against it: roughly 25 git and git-annex processes, 0.9 to 1.4 s per test on an idle
+// machine. Nothing in them sleeps or polls, so the time is process spawns and scales with
+// machine load, and bun's 5 s default deadline sat only 4x above the idle cost (it fired
+// under load, measured with `--timeout 1500`). The sibling git-annex suites declare the same
+// 60 s: a deadline for a test that is hung, not a pace the work has to keep.
+setDefaultTimeout(60_000);
 
 const TMP_DIR = join(import.meta.dir, ".test-upload-s3-resume");
 
@@ -164,7 +172,7 @@ beforeAll(async () => {
 
 afterAll(() => {
   // Guarded restore (#1175): never assign `undefined` directly.
-  if (previousTestApiUrl === undefined) delete process.env.TEST_API_URL;
+  if (previousTestApiUrl === undefined) Reflect.deleteProperty(process.env, "TEST_API_URL");
   else process.env.TEST_API_URL = previousTestApiUrl;
 
   if (existsSync(TMP_DIR)) {
