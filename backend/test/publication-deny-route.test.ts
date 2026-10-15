@@ -49,6 +49,7 @@ import { hashApiKey } from "../src/services/token";
 import type { Bindings, Variables } from "../src/types/bindings";
 import { freshDb, interceptingD1, realD1 } from "./helpers/d1";
 import { mainRefAnswer, markDatasetScreensClean } from "./helpers/identifier-screen";
+import { hookedD1 } from "./helpers/publication-review-harness";
 import { type CapturedEmail, sendsTo, withFakeResend } from "./helpers/resend";
 
 const ADMIN_KEY = "deny-admin-key-0123456789abcdef0123456789abcdef";
@@ -670,12 +671,19 @@ describe("the final publish write is guarded by the status it expects", () => {
   /** An environment whose database lands `effect` once, just before the run's final write. */
   function raceBeforeFinalWrite(effect: () => void | Promise<void>): Bindings {
     let fired = false;
+    // The final write is the first statement of a batch (with the publication's audit row, which
+    // is written with it), so the effect lands just before that batch begins.
     return env(
-      interceptingD1(realD1(db), async (sql) => {
-        if (!fired && /UPDATE publication_requests\s+SET status = 'published'/.test(sql)) {
-          fired = true;
-          await effect();
-        }
+      hookedD1(realD1(db), {
+        batch: async (sqls) => {
+          if (
+            !fired &&
+            sqls.some((sql) => /UPDATE publication_requests\s+SET status = 'published'/.test(sql))
+          ) {
+            fired = true;
+            await effect();
+          }
+        },
       }),
       "test",
     );
