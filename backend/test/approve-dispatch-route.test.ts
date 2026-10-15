@@ -688,12 +688,10 @@ describe("a claim whose own checks throw", () => {
     });
     const reason = "Read every flagged file by hand, nothing to remove";
 
-    const res = await dispatchBody(
-      ADMIN_KEY,
-      { acknowledge_identifier_screen: reason },
-      DATASET,
-      { ...env(), DB: faulty } as Bindings,
-    );
+    const res = await dispatchBody(ADMIN_KEY, { acknowledge_identifier_screen: reason }, DATASET, {
+      ...env(),
+      DB: faulty,
+    } as Bindings);
 
     expect(res.status).toBe(500);
     expect(dispatches).toHaveLength(0);
