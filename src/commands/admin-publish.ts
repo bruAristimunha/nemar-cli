@@ -107,7 +107,7 @@ Examples:
   $ nemar admin publish list -s denied             # Same as --denied
   $ nemar admin publish list --published --denied  # Both states
   $ nemar admin publish list --needs-me            # What is yours to act on
-  $ nemar admin publish list --search nm000104 --all   # Look up one dataset, any state`,
+  $ nemar admin publish list --search nm099999 --all   # Look up one dataset, any state`,
   )
   .action(
     async (options: ListFilterOptions & { search?: string; needsMe?: boolean; json?: boolean }) => {
@@ -314,10 +314,10 @@ Requirements:
   request in force.
 
 Examples:
-  $ nemar admin publish deny nm000104 --reason "BIDS validation failing"
-  $ nemar admin publish deny nm000104 -r "Dataset incomplete - missing subjects"
-  $ nemar admin publish deny nm000104    # Prompts for reason interactively
-  $ nemar admin publish deny nm000104 --request-id 42 -r "..."  # Only if request 42 is the one in force`,
+  $ nemar admin publish deny nm099999 --reason "BIDS validation failing"
+  $ nemar admin publish deny nm099999 -r "Dataset incomplete - missing subjects"
+  $ nemar admin publish deny nm099999    # Prompts for reason interactively
+  $ nemar admin publish deny nm099999 --request-id 42 -r "..."  # Only if request 42 is the one in force`,
   )
   .action(
     async (
@@ -442,7 +442,7 @@ Description:
   datasets, which are not screened.
 
 Examples:
-  $ nemar admin publish screen nm000104`,
+  $ nemar admin publish screen nm099999`,
   )
   .action(async (datasetArg: string) => {
     if (!requireSignedIn()) return;

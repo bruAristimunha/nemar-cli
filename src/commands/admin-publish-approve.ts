@@ -250,12 +250,12 @@ Resume Capability:
   steps are automatically skipped.
 
 Examples:
-  $ nemar admin publish approve nm000104                    # Run full orchestrator
-  $ nemar admin publish approve nm000104 --resume           # Resume from failed step
-  $ nemar admin publish approve nm000104 --skip-ci-check    # Skip the live CI check only
-  $ nemar admin publish approve nm000104 --force            # Approve over a review that is not a pass
-  $ nemar admin publish approve nm000104 --yes              # Skip confirmation (never a reason)
-  $ nemar admin publish approve nm000104 --request-id 42    # Only if request 42 is the one in force
+  $ nemar admin publish approve nm099999                    # Run full orchestrator
+  $ nemar admin publish approve nm099999 --resume           # Resume from failed step
+  $ nemar admin publish approve nm099999 --skip-ci-check    # Skip the live CI check only
+  $ nemar admin publish approve nm099999 --force            # Approve over a review that is not a pass
+  $ nemar admin publish approve nm099999 --yes              # Skip confirmation (never a reason)
+  $ nemar admin publish approve nm099999 --request-id 42    # Only if request 42 is the one in force
 
 After Approval:
   - User receives email with DOI and public dataset link

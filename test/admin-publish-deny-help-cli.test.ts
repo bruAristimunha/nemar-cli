@@ -48,3 +48,24 @@ test("--help-all says that a running approval, and one that has published a step
   // Nothing was asked of the API for a help screen.
   expect(h.requests).toEqual([]);
 });
+
+test("no help text of `admin publish` names a live dataset in an example (nm000103 to nm000107)", async () => {
+  // The examples of approve, deny, list and screen are the lines an administrator copies; a live
+  // dataset's id there is one paste from an approval or a denial of a published dataset. They name
+  // the end-to-end dataset instead, which exists to be approved and denied.
+  const commands = [
+    ["approve"],
+    ["deny"],
+    ["list"],
+    ["screen"],
+    ["show"],
+    ["start"],
+    ["next"],
+    [] as string[],
+  ];
+  for (const sub of commands) {
+    const r = await h.cli(["admin", "publish", ...sub, "--help-all"]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout, `admin publish ${sub.join(" ")}`).not.toMatch(/nm00010[3-7]/);
+  }
+});
