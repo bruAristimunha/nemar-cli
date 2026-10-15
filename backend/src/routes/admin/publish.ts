@@ -9,6 +9,10 @@ import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
 
 import { screenGate } from "../../../../shared/identifier-screen-report.js";
+import {
+  searchLimitProblem,
+  substringLikePattern,
+} from "../../../../shared/publish-list-search.js";
 import { auditLogStatement } from "../../db/audit-log";
 import { ACTIVE_REQUEST_TAIL_SQL, approvalInFlightSql } from "../../services/approval-dispatch";
 import { resolveEmailConfig, sendPublicationDeniedEmail } from "../../services/email";
@@ -54,6 +58,35 @@ const dispatchBodySchema = z
   .object({ acknowledge_identifier_screen: acknowledgeIdentifierScreenSchema.optional() })
   .strict();
 
+const REQUEST_STATUSES = ["requested", "approving", "blocked", "published", "denied"] as const;
+
+/**
+ * The list route's filters. `status` is one status or a comma-separated list
+ * (no value means every request); an unknown status is a 400 rather than an
+ * empty list, so a typo is never read as "nothing to do".
+ */
+function parseListFilters(
+  rawStatus: string | undefined,
+  rawSearch: string | undefined,
+): { statuses: string[]; search: string } | { error: string } {
+  const statuses = (rawStatus ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const unknown = statuses.filter((s) => !(REQUEST_STATUSES as readonly string[]).includes(s));
+  if (unknown.length > 0) {
+    return {
+      error: `Unknown status: ${unknown.join(", ")}. Use ${REQUEST_STATUSES.join(", ")}.`,
+    };
+  }
+  const search = (rawSearch ?? "").trim();
+  // D1 refuses a LIKE pattern over 50 bytes with a 500, which bun:sqlite does not
+  // reproduce, so the bound is enforced here (shared/publish-list-search.ts).
+  const tooLong = searchLimitProblem(search);
+  if (tooLong) return { error: tooLong };
+  return { statuses: [...new Set(statuses)], search };
+}
+
 export function registerPublishRoutes(admin: AdminRouter): void {
   // ============================================================================
   // Publication Workflow (Admin)
@@ -70,22 +103,44 @@ export function registerPublishRoutes(admin: AdminRouter): void {
    */
   admin.get("/publish/requests", async (c) => {
     const db = c.env.DB;
-    const status = c.req.query("status");
+    const parsed = parseListFilters(c.req.query("status"), c.req.query("search"));
+    if ("error" in parsed) return c.json({ error: parsed.error }, 400);
+    const { statuses, search } = parsed;
 
     let query = `
     SELECT pr.*, u.username as requested_by_username, u.email as requested_by_email,
+           d.name AS dataset_name,
            ${approvalInFlightSql("pr.")} AS approval_in_flight
     FROM publication_requests pr
     JOIN users u ON pr.requested_by = u.id
+    LEFT JOIN datasets d ON d.dataset_id = pr.dataset_id
   `;
+    const where: string[] = [];
     const params: string[] = [];
 
-    if (status) {
-      query += " WHERE pr.status = ?";
-      params.push(status);
+    if (statuses.length > 0) {
+      where.push(`pr.status IN (${statuses.map(() => "?").join(", ")})`);
+      params.push(...statuses);
     }
+    // Bound parameters, with the pattern characters escaped, so the text is a
+    // literal substring and never a pattern (#1775).
+    if (search) {
+      const like = substringLikePattern(search);
+      where.push(
+        "(pr.dataset_id LIKE ? ESCAPE '\\' OR u.username LIKE ? ESCAPE '\\' OR d.name LIKE ? ESCAPE '\\')",
+      );
+      params.push(like, like, like);
+    }
+    if (where.length > 0) query += ` WHERE ${where.join(" AND ")}`;
 
-    query += " ORDER BY pr.requested_at DESC";
+    // An exact dataset id comes first, so searching "nm000104" never buries it
+    // under a longer id that merely contains it.
+    if (search) {
+      query += " ORDER BY (LOWER(pr.dataset_id) = LOWER(?)) DESC, pr.requested_at DESC";
+      params.push(search);
+    } else {
+      query += " ORDER BY pr.requested_at DESC";
+    }
 
     const requests = await db
       .prepare(query)
@@ -97,6 +152,7 @@ export function registerPublishRoutes(admin: AdminRouter): void {
         requested_at: string;
         requested_by_username: string;
         requested_by_email: string;
+        dataset_name: string | null;
         steps_completed: string;
         current_step: string | null;
         last_error: string | null;

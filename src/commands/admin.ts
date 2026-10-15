@@ -55,6 +55,7 @@ import {
   PUBLICATION_STEP_LABELS,
   stepsForRelease,
 } from "../../shared/publication-steps.js";
+import { searchLimitProblem } from "../../shared/publish-list-search.js";
 import {
   CLEAR_FLAGS,
   EDIT_FLAG_FIELDS,
@@ -224,6 +225,12 @@ import {
 import { checkDownloadPrerequisites } from "../lib/git-annex/prereq.js";
 import { getVersionCommit, listDatasetVersions } from "../lib/git-annex/repo-state.js";
 import { identifierScreenLines } from "../lib/identifier-screen-display.js";
+import {
+  type ListFilterOptions,
+  choseListScope,
+  describeListScope,
+  resolveListStatuses,
+} from "../lib/publish-list-filter.js";
 import {
   type RecoverDatasetEntry,
   loadRecoverDatasets,
@@ -3168,42 +3175,80 @@ const publishCommand = new Command("publish").description("Publication workflow 
 
 publishCommand
   .command("list")
-  .description("List publication requests")
-  .option("-s, --status <status>", "Filter by status (requested, approving, published, denied)")
+  .description("List publication requests (active ones by default)")
+  .option("--all", "Show every request, whatever its state")
+  .option("--requested", "Show requests awaiting admin action")
+  .option("--approving", "Show requests being processed by the orchestrator")
+  .option("--blocked", "Show requests blocked on the depositor")
+  .option("--published", "Show published requests")
+  .option("--denied", "Show denied requests")
+  .option(
+    "-s, --status <status>",
+    "Show one exact status (requested, approving, blocked, published, denied)",
+  )
+  .option("--search <text>", "Match dataset ID, requester username or dataset name")
   .addHelpText(
     "after",
     `
 Description:
-  List all publication requests from users, with optional filtering by status.
+  List publication requests from users. By default only the active ones are
+  shown (requested, approving and blocked); the state flags, or -s/--status with
+  one status, narrow the list to those states, and --all shows every request.
   Shows dataset ID, status, requesting user, and current progress.
 
-Filter Options:
+States:
   requested  - Pending requests awaiting admin action
   approving  - Currently being processed by orchestrator
+  blocked    - Held until the depositor fixes something
   published  - Successfully published datasets
-  denied     - Denied requests with reasons
+  denied     - Denied requests, with reasons
+
+Search:
+  --search matches a substring (case-insensitive for ASCII letters) of the
+  dataset ID, the requester's username or the dataset name, within the states being shown.
+  An exact dataset ID is listed first.
 
 Examples:
-  $ nemar admin publish list                # All requests
-  $ nemar admin publish list --status requested   # Pending only
-  $ nemar admin publish list --status approving   # In progress
-  $ nemar admin publish list --status denied      # View denied`,
+  $ nemar admin publish list                       # Active requests
+  $ nemar admin publish list --all                 # Every request
+  $ nemar admin publish list --denied              # Denied only
+  $ nemar admin publish list -s denied             # Same as --denied
+  $ nemar admin publish list --published --denied  # Both states
+  $ nemar admin publish list --search nm000104 --all   # Look up one dataset, any state`,
   )
-  .action(async (options: { status?: string }) => {
+  .action(async (options: ListFilterOptions & { search?: string }) => {
     if (!requireAuth()) return;
+
+    // The server cannot run a longer pattern (D1's LIKE limit); say so here
+    // rather than after a round trip.
+    const search = options.search?.trim() || undefined;
+    const tooLong = search ? searchLimitProblem(search) : null;
+    if (tooLong) {
+      console.error(chalk.red(tooLong));
+      process.exit(1);
+    }
 
     const spinner = ora("Fetching publication requests...").start();
 
     try {
-      const result = await listPublishRequests(options.status);
+      const result = await listPublishRequests({
+        statuses: resolveListStatuses(options),
+        search,
+      });
       spinner.stop();
 
       if (result.requests.length === 0) {
-        console.log(chalk.dim("\n  No publication requests found.\n"));
+        const scope = describeListScope(options);
+        const widen = choseListScope(options) ? "" : " Use --all to include every state.";
+        console.log(
+          chalk.dim(`\n  No ${scope} found${search ? ` matching "${search}"` : ""}.${widen}\n`),
+        );
         return;
       }
 
-      console.log(`\n${chalk.cyan("Publication Requests")} (${result.count})\n`);
+      console.log(
+        `\n${chalk.cyan("Publication Requests")} (${result.count}, ${describeListScope(options)})\n`,
+      );
 
       for (const req of result.requests) {
         const statusColor =
@@ -3215,8 +3260,11 @@ Examples:
                 ? chalk.yellow
                 : chalk.white;
 
+        // The dataset name and the username are typed by the depositor: an
+        // escape sequence in either would run in this administrator's terminal.
+        const name = safeText(req.dataset_name ?? "");
         console.log(
-          `  ${chalk.bold(req.dataset_id)}  ${statusColor(req.status)}  by ${req.requested_by_username}  ${chalk.dim(req.requested_at)}`,
+          `  ${chalk.bold(req.dataset_id)}  ${statusColor(req.status)}  by ${safeText(req.requested_by_username)}  ${chalk.dim(req.requested_at)}${name ? `  ${chalk.dim(name)}` : ""}`,
         );
         // #1408: an anonymous release and a publication reach this list
         // looking identical, and approving the wrong one is not reversible in

@@ -62,6 +62,7 @@ export interface PublishRequestsResponse {
     requested_at: string;
     requested_by_username: string;
     requested_by_email: string;
+    dataset_name?: string | null;
     steps_completed: string[];
     current_step: string | null;
     last_error: string | null;
@@ -184,11 +185,34 @@ export async function resendPublishNotification(datasetId: string): Promise<{ me
   );
 }
 
+/** What `listPublishRequests` can narrow the list by. */
+export interface PublishListFilter {
+  /** Request statuses to include; none means every request. */
+  statuses?: string[];
+  /** Substring of the dataset id, requester username or dataset name. */
+  search?: string;
+}
+
 /**
- * List publication requests (admin)
+ * List publication requests (admin).
+ *
+ * Two call shapes are accepted. A string is one status, which is how this
+ * function began (`listPublishRequests("requested")`) and how other callers
+ * still use it; an empty string means no filter. The options object is the
+ * current shape and carries several statuses and a search. A string must NOT
+ * fall through to the object path: `"requested".search` is
+ * `String.prototype.search`, a function, and would be sent as the search text
+ * while the status was silently dropped and every request listed.
  */
-export async function listPublishRequests(status?: string): Promise<PublishRequestsResponse> {
-  const query = status ? `?status=${status}` : "";
+export async function listPublishRequests(
+  filter: string | PublishListFilter = {},
+): Promise<PublishRequestsResponse> {
+  const { statuses, search }: PublishListFilter =
+    typeof filter === "string" ? { statuses: filter ? [filter] : [] } : filter;
+  const params = new URLSearchParams();
+  if (statuses && statuses.length > 0) params.set("status", statuses.join(","));
+  if (search) params.set("search", search);
+  const query = params.size > 0 ? `?${params}` : "";
   return request<PublishRequestsResponse>(`/admin/publish/requests${query}`, {}, true);
 }
 
