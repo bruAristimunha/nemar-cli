@@ -100,6 +100,11 @@ import {
   deletionDate,
   warningStageForDaysLeft,
 } from "./services/staleness";
+import {
+  TEST_ACCOUNT_SWEEP_NOT_RUN,
+  type TestAccountSweepResult,
+  cleanUpLiveTestAccounts,
+} from "./services/test-account-sweep";
 import { publishZarrCatalog } from "./services/zarr-catalog";
 import { runZarrFidelitySweep } from "./services/zarr-fidelity-sweep";
 import type { Bindings, Variables } from "./types/bindings";
@@ -853,6 +858,18 @@ async function scheduledCleanup(env: Bindings): Promise<void> {
     blockedSweep = { ...blockedSweep, errors: 1 };
   }
 
+  // 6. Tombstone the accounts the live integration tests leave in the dev/staging database
+  //    (#1789): addresses of exactly the generated shapes, older than a week, owning
+  //    nothing, at most one bounded batch per run. NON-PRODUCTION ONLY, and
+  //    cleanUpLiveTestAccounts / sweepCiTestAccounts each refuse outside a recognized
+  //    non-production environment on their own too; the guard is repeated here so this call
+  //    site reads as what it is. The tally rides the audit row below, like the
+  //    blocked-publication sweep's. It never throws, so a failure is a tally with errors set.
+  let testAccountSweep: TestAccountSweepResult = { ...TEST_ACCOUNT_SWEEP_NOT_RUN };
+  if (isNonProductionEnv(env)) {
+    testAccountSweep = await cleanUpLiveTestAccounts(env);
+  }
+
   // Log summary to audit_log. `deleted`/`failed` cover only sandbox (xx)
   // datasets now; nm datasets are warned, not deleted, by this job.
   const deleted = results.filter((r) => r.success).length;
@@ -869,6 +886,7 @@ async function scheduledCleanup(env: Bindings): Promise<void> {
           staleness,
           importsSwept,
           blockedSweep,
+          testAccountSweep,
         }),
       )
       .run();
@@ -876,7 +894,7 @@ async function scheduledCleanup(env: Bindings): Promise<void> {
     console.error("Scheduled cleanup: failed to write audit log:", err);
   }
   console.log(
-    `Scheduled cleanup: ${deleted} deleted, ${failed} failed; staleness warned=${staleness.warned} adminNotified=${staleness.adminNotified} reset=${staleness.reset}; importsSwept=${importsSwept}; blockedSweep unblocked=${blockedSweep.unblocked} reblocked=${blockedSweep.reblocked} errors=${blockedSweep.errors} deferred=${blockedSweep.deferred} skipped=${blockedSweep.skipped}`,
+    `Scheduled cleanup: ${deleted} deleted, ${failed} failed; staleness warned=${staleness.warned} adminNotified=${staleness.adminNotified} reset=${staleness.reset}; importsSwept=${importsSwept}; blockedSweep unblocked=${blockedSweep.unblocked} reblocked=${blockedSweep.reblocked} errors=${blockedSweep.errors} deferred=${blockedSweep.deferred} skipped=${blockedSweep.skipped}; testAccountSweep ran=${testAccountSweep.ran} tombstoned=${testAccountSweep.tombstoned} skipped=${testAccountSweep.skipped} errors=${testAccountSweep.errors}`,
   );
 }
 
@@ -1067,8 +1085,18 @@ export default {
     // Safe outside prod: scheduledCleanup self-narrows to the dev sandbox band
     // and, outside production, runs ONLY its sandbox-delete, stuck-manifest
     // logging and audit-log sections, plus the blocked-publication sweep narrowed to the dev
-    // range and the fixtures dev owns. Its staleness-email and import-recovery sections are
-    // production-only (guards inside).
+    // range and the fixtures dev owns, plus the sweep of the live tests' accounts (#1789),
+    // which is the one section that runs ONLY outside production. Its staleness-email and
+    // import-recovery sections are production-only (guards inside).
+    //
+    // The live-test sweep (services/test-account-sweep.ts) is safe here for the reason this
+    // allowlist exists: it tombstones only addresses of exactly the generated shapes, at
+    // two domains the IANA reserves (an anchored, case-sensitive pattern, re-checked in code
+    // on every row and again by the conditional write), none of which can be a real person
+    // among the ~609 this database shares; it sends no mail, makes no network call (so
+    // nothing reaches the shared nemarDatasets org, a DOI or the prod bucket) and refuses an
+    // account with a dataset, a collaboration, a request or upload access. Bounded to one
+    // batch per run.
     ctx.waitUntil(scheduledCleanup(env));
     // #646 Phase 4: drain stale vectors (embedding_dirty=1) — the backstop for
     // changes that don't go through the inline enrich/reindex re-embed.

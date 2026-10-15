@@ -22,7 +22,7 @@ import { ownerMiddleware } from "../../middleware/auth";
 
 import { auditLogStatement } from "../../db/audit-log";
 import { flag } from "../../db/flag";
-import { tombstoneUserStatement } from "../../db/user-tombstone";
+import { tombstoneUserCascade } from "../../db/user-tombstone";
 import { SYSTEM_USER_ID } from "../../lib/constants";
 import {
   type RecipientGroup,
@@ -1661,56 +1661,15 @@ export function registerUsersRoutes(admin: AdminRouter): void {
       }
     }
 
-    // PII mask + tombstone + credential revocation in a single db.batch(): D1
-    // wraps a batch in one implicit transaction (all statements commit, or all
-    // roll back on any failure — see Cloudflare D1 docs, "Batched statements are
-    // SQL transactions"), so the email mask and the `deleted_at` stamp can never
-    // half-apply and leave an auth-resolvable row. `AND deleted_at IS NULL` on the
-    // mask makes it idempotent. The placeholder email embeds the PK (globally
-    // unique, never reused under AUTOINCREMENT) so the email UNIQUE constraint
-    // can't be hit, and .invalid (RFC 6761) can never be a real/deliverable
-    // address. web_sessions are revoked explicitly because a soft delete does NOT
-    // trigger their ON DELETE CASCADE; collaborator + S3-permission rows likewise.
-    // A batch failure rolls back atomically and is reported as a clear 500 so the
-    // caller knows the user was NOT deleted and can retry (idempotent).
-    let batch: D1Result[];
+    // PII mask + tombstone + credential revocation: one transaction, shared with the scheduled
+    // sweep of the live-test accounts through tombstoneUserCascade (db/user-tombstone.ts), which
+    // says why it is a single batch and what each statement ends. A failure rolls back
+    // atomically and is reported as a clear 500 so the caller knows the user was NOT deleted
+    // and can retry (idempotent).
+    let tokensRevoked: number;
+    let sessionsRevoked: number;
     try {
-      batch = await db.batch([
-        tombstoneUserStatement(db, id),
-        db
-          .prepare(
-            "UPDATE tokens SET revoked_at = datetime('now') WHERE user_id = ? AND revoked_at IS NULL",
-          )
-          .bind(id),
-        db
-          .prepare(
-            "UPDATE web_sessions SET revoked_at = datetime('now') WHERE user_id = ? AND revoked_at IS NULL",
-          )
-          .bind(id),
-        // The session revoke above covers every scope (no `scope` predicate, on
-        // purpose), but a docs GRANT is a separate row and a separate 60-second
-        // licence to mint a new session. `docs_grants.user_id` cascades on
-        // DELETE, and this is a tombstone rather than a delete, so nothing else
-        // reaches it.
-        db
-          .prepare(DOCS_GRANTS_PURGE_SQL)
-          .bind(id),
-        // Likewise the private site's grants, which live in their own table
-        // (ADR 0079); the session revoke above already covers that scope.
-        db
-          .prepare(PRIVATE_GRANTS_PURGE_SQL)
-          .bind(id),
-        db.prepare("DELETE FROM dataset_collaborators WHERE user_id = ?").bind(id),
-        db.prepare("DELETE FROM user_s3_permissions WHERE user_id = ?").bind(id),
-        // Expire any outstanding passwordless login codes for the original email so
-        // a code issued just before deletion can't be submitted (it would otherwise
-        // be consumed and then cleanly denied — this avoids even that round-trip).
-        db
-          .prepare(
-            "UPDATE auth_codes SET used_at = datetime('now') WHERE email = ? AND used_at IS NULL",
-          )
-          .bind(originalEmail),
-      ]);
+      ({ tokensRevoked, sessionsRevoked } = await tombstoneUserCascade(db, id, originalEmail));
     } catch (error) {
       console.error(`[delete-user] tombstone batch failed for id=${id}:`, error);
       return c.json(
@@ -1722,8 +1681,6 @@ export function registerUsersRoutes(admin: AdminRouter): void {
         500,
       );
     }
-    const tokensRevoked = batch[1]?.meta.changes ?? 0;
-    const sessionsRevoked = batch[2]?.meta.changes ?? 0;
 
     // Audit log (audit_log.user_id has no cascade, so the row survives). resource_id
     // is the non-PII integer id and details carries NO original username/email —
