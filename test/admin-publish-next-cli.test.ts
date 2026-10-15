@@ -1247,6 +1247,42 @@ describe.skipIf(process.platform === "win32")("on a terminal", () => {
     expect(r.stdout).toContain("Done: 1 skipped.");
   });
 
+  for (const [name, key, what] of [
+    ["the reason of a denial", "n", "reason"],
+    ["the message of a comment", "c", "message"],
+  ] as const) {
+    test(`${name} that arrives with further lines is cancelled, and nothing is sent`, async () => {
+      // A pasted paragraph is one line plus lines that would answer the next questions. On a
+      // terminal the first line is not the answer: the walk waits a moment for the rest of the
+      // paste (the second line comes a few milliseconds behind the first, as a real paste does),
+      // drops it, says so and sends nothing. With no wait the first line would be sent, and the
+      // second would sit in the queue for the next card.
+      const { requestId } = seed(A);
+      notStarted(requestId);
+
+      const r = await h.cli(NEXT, {
+        terminal: async (t) => {
+          const first = await t.waitFor(PROMPT);
+          t.type(`${key}\n`);
+          const asked = await t.waitFor("(empty cancels): ", { after: first });
+          t.type("The first line of a pasted paragraph\n");
+          await Bun.sleep(10);
+          t.type("and a second line that would answer the next question\n");
+          await t.waitFor("Nothing was sent.", { after: asked });
+          const again = await t.waitFor(PROMPT, { after: asked });
+          t.type("q\n");
+          await t.waitFor("Nothing was changed.", { after: again });
+        },
+      });
+
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout).toContain(`A ${what} is one line; 1 more line(s) arrived with it.`);
+      expect(h.posted).toEqual([]);
+      expect(h.mail).toEqual([]);
+      expect(requestRow(requestId)?.status).toBe("requested");
+    });
+  }
+
   test("an approval does not leave the terminal deaf: the next card still hears its answer", async () => {
     // The approval's spinner puts the terminal's input back in line mode and pauses it when it
     // stops; a walk that went on reading from there would hang at the next card.
