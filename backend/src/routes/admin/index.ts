@@ -39,7 +39,7 @@ import { registerZarrFidelitySweepRoutes } from "./zarr-fidelity-sweep";
 export const adminRoutes: AdminRouter = new Hono();
 
 // All admin routes require authentication and admin role, and a write made with a session cookie
-// has to come from a NEMAR page (#1603, #1584; ADR 0103, decision 10). The guard reads what
+// has to come from a NEMAR page (#1603, #1584; ADR 0105, decision 10). The guard reads what
 // authMiddleware set, and runs after the role check so a member is told "Admin access required"
 // and not asked about an Origin.
 adminRoutes.use("*", authMiddleware);

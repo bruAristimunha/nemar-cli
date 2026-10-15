@@ -1,6 +1,6 @@
 /**
  * The bounds of the publication approval path are declared once, in `shared/publication-limits.ts`
- * (ADR 0102; ADR 0103 decision 8 for the dispatch id rule), and the Worker enforces them from
+ * (ADR 0102; ADR 0105 decision 8 for the dispatch id rule), and the Worker enforces them from
  * there. These tests drive the real deny route, the real acknowledgment schema and the shared
  * words that quote a dataset id at the boundaries of the shared constants, so a bound that is
  * edited in one place and copied in another fails here.

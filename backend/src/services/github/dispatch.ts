@@ -564,7 +564,7 @@ export class DispatchRejectedError extends Error {
  * `--resume`) a terminal does, which is why the approval does not run inside
  * the Worker: that loop is long and its cost belongs on the runner. The payload
  * names the dataset, the request it was claimed for, whether to resume, the
- * environment, and the claim's dispatch token (#1604; ADR 0103, decision 3): the proof the
+ * environment, and the claim's dispatch token (#1604; ADR 0105, decision 3): the proof the
  * runner's `/approve` calls present so the click is recorded as the approver.
  * It carries no GitHub credential, no Worker secret and no URL; the token is a
  * MAC over the claim's own columns, authorizes nothing by itself, and is never

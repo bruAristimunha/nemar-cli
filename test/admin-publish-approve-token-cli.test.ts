@@ -1,5 +1,5 @@
 /**
- * `nemar admin publish approve` as the executor of a web approval (ADR 0103 decisions 3 to 5,
+ * `nemar admin publish approve` as the executor of a web approval (ADR 0105 decisions 3 to 5,
  * #1604).
  *
  * A click on the website claims the request and dispatches a runner, which is handed the claim's
@@ -25,7 +25,7 @@
  *    printable ASCII) is refused locally in one line that never shows it, with no request sent,
  *    and is not retried as if it were a network failure;
  *  - the token is a secret: it reaches neither the console nor the `--debug` log;
- *  - a stale variable in a person's shell is not a silent trap (ADR 0103, decision 3): a run
+ *  - a stale variable in a person's shell is not a silent trap (ADR 0105, decision 3): a run
  *    that presents a token says so on standard error before it sends anything, and a refusal of
  *    that token (`dispatch_superseded`, `dispatch_expired`) is followed by the hint to unset it.
  *
@@ -181,7 +181,7 @@ describe("the executor of a web approval", () => {
   });
 
   test("the same command with no token is the executor's own act: refused for the override it does not have, and the claim is intact", async () => {
-    // The flip of the earlier pin (ADR 0103 decision 4): the clicker's recorded override covers the
+    // The flip of the earlier pin (ADR 0105 decision 4): the clicker's recorded override covers the
     // clicker's run, not whoever happens to call inside the claim. Without the proof the call is
     // nobody else's.
     const { requestId } = await click();

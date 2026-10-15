@@ -60,7 +60,7 @@ import { plain } from "../lib/terminal-text.js";
 
 /**
  * The environment variable a web approval's executor is handed its dispatch token in (#1604, ADR
- * 0103 decision 3). Read by `approve` and by nothing else; never printed, never logged.
+ * 0105 decision 3). Read by `approve` and by nothing else; never printed, never logged.
  */
 const DISPATCH_TOKEN_ENV = "NEMAR_APPROVAL_DISPATCH_TOKEN";
 
@@ -82,7 +82,7 @@ const DISPATCH_TOKEN_UNSET_HINT = `If you are not running a dispatched approval,
 /**
  * What the dispatch token variable holds, read the way `approve` uses it. The two ends are trimmed,
  * as the Worker trims the header, so a token exported with the newline a file ends with is the
- * same token (ADR 0103, decision 3). What is left is none when it is empty (an unset variable, an
+ * same token (ADR 0105, decision 3). What is left is none when it is empty (an unset variable, an
  * empty one, or whitespace alone). Anything else must be what a header can carry: printable ASCII
  * with no whitespace inside, so a stray line break, a typographic quote pasted with the value or a
  * character from another script is refused here with a sentence, not handed to the HTTP client,
@@ -342,7 +342,7 @@ After Approval:
           if (decision !== null) {
             // The click recorded an override and an acknowledgment, and made no CI decision at all:
             // it has no option for one, so a run the website started never skips the CI check.
-            // Each flag gets the reason that is true of it (ADR 0103, decision 5).
+            // Each flag gets the reason that is true of it (ADR 0105, decision 5).
             const why =
               decision === "--skip-ci-check"
                 ? "a run the website started never skips the CI check (the click has no such option), and the API refuses a run that asks to"

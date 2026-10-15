@@ -4,7 +4,7 @@
  * Written against the CURRENT inline handler BEFORE the orchestrator
  * extraction and kept green through every extraction commit: they pin the
  * pre-loop (426 gate, request lookup, all-completed short-circuit (which ends like the loop,
- * ADR 0103 decision 12: published for an `approving` request, refused for any other),
+ * ADR 0105 decision 12: published for an `approving` request, refused for any other),
  * the 'approving' transition), resume filtering, the two no-op steps' recording
  * quirks, the finalize block (visibility self-heal, 'published' write, audit
  * row), and the exact response contract.

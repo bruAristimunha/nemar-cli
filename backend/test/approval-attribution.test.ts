@@ -1,5 +1,5 @@
 /**
- * Who a publication is recorded as approved by (ADR 0080, and ADR 0103 decisions 1 to 6, #1604).
+ * Who a publication is recorded as approved by (ADR 0080, and ADR 0105 decisions 1 to 6, #1604).
  *
  * Attribution forks on whether the call proves it belongs to a web click. A terminal approval
  * records the account that called `/approve`, as it always has. A web approval is executed by a
@@ -335,7 +335,7 @@ describe("a web-queued approval: the call that carries the click's token", () =>
   });
 
   test("end to end: the same run with no token is the executor's own act, and the claim is taken over", async () => {
-    // An executor that predates the token (the rollout window, ADR 0103): it is a
+    // An executor that predates the token (the rollout window, ADR 0105): it is a
     // terminal caller, recorded as itself, and the click's claim ends with its first mark.
     const id = seedRequest();
     const dispatch = await app.request(
@@ -693,7 +693,7 @@ describe("a token that is not the claim's is refused, and never downgraded to th
   });
 
   const article = (word: string) => (/^[aeiou]/.test(word) ? "an" : "a");
-  // The order of the checks (ADR 0103, decision 4): the request the run names and the request's own
+  // The order of the checks (ADR 0105, decision 4): the request the run names and the request's own
   // block are decided BEFORE the token, so a call that is wrong about the request is told so even
   // when its token is stale too, and neither word depends on the claim.
   for (const [name, setup] of [

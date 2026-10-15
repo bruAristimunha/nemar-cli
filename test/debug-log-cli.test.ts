@@ -223,7 +223,7 @@ describe("--debug log content is redacted (real request, real failure)", () => {
   });
 });
 
-describe("--debug never writes the approval dispatch token (ADR 0103 decision 2)", () => {
+describe("--debug never writes the approval dispatch token (ADR 0105 decision 2)", () => {
   // The executor of a web approval hands the CLI a per-claim token (env var, then a header on
   // every `/approve` call). The token is not the API key, so the log's header redaction did not
   // know it, and the debug log is the file users are told to drag onto a public issue. This runs

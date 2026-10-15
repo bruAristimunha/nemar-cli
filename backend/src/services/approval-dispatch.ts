@@ -126,13 +126,13 @@ export interface Approver {
  * The approver of a run: the admin who clicked Approve on the website when this call proves it
  * belongs to that click, otherwise the account calling `/approve`.
  *
- * Attribution forks on purpose (ADR 0080; ADR 0103, decision 4 for what it forks on). An executor
+ * Attribution forks on purpose (ADR 0080; ADR 0105, decision 4 for what it forks on). An executor
  * authenticates with its own service key, so without this the `approved_by` column and the
  * `dataset_published` audit row would name the bot for every web approval. A terminal approval
  * carries no token, so it falls through to the caller and behaves exactly as it always has; the
  * caller is the person.
  *
- * The proof is the dispatch token (#1604, ADR 0103 decisions 1 to 4): `proof` is the answer of
+ * The proof is the dispatch token (#1604, ADR 0105 decisions 1 to 4): `proof` is the answer of
  * {@link checkApprovalDispatchToken}, and only its `valid` variant, a call that presented the token
  * of THIS claim of THIS request while its lease is live, carries the clicker (`clickerId`, read from
  * the claim the token was verified against, so a valid proof with no clicker cannot be built). The
@@ -215,7 +215,7 @@ const EXPIRED: ApprovalDispatchTokenCheck = { kind: "refused", code: "dispatch_e
  * Does this `/approve` call carry the token of the claim on the request it is about to act on?
  *
  * The token is derived from the claim's own columns (`signApprovalDispatchToken`), so presenting
- * one that verifies means the call was dispatched by THIS click of THIS request (ADR 0103,
+ * one that verifies means the call was dispatched by THIS click of THIS request (ADR 0105,
  * decisions 1 and 4). The rules, in this order, each deciding before the next is read:
  *
  *   1. No header, or an empty or blank one: `absent`. The caller is a person at a terminal (or an

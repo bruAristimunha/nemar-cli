@@ -1,5 +1,5 @@
 /**
- * What `nemar admin publish deny --help-all` says about the denials the API refuses (ADR 0103,
+ * What `nemar admin publish deny --help-all` says about the denials the API refuses (ADR 0105,
  * decision 11, #1730).
  *
  * `deny` is refused for a request whose approval is running, and for one whose approval has already

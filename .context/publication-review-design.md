@@ -11,7 +11,7 @@
 > The Phase 1 sections below keep the plan as written; where the build departed from it, the ADR states what was built
 > (the workflow's step order, the participants file, the normalization before the pre-send rules, the cap accounting,
 > the mail at the deadline).
-> The Phase 3 block and the attribution risk were rewritten as built on 2026-10-13 (ADR 0103).
+> The Phase 3 block and the attribution risk were rewritten as built on 2026-10-13 (ADR 0105).
 > The Phase 4 block was rewritten as built on 2026-10-14 (ADR 0102 Phase 4 amendment).
 
 ## 1. What was read
@@ -447,7 +447,7 @@ Tests:
 Must not: let the Worker approve or deny anything; let `--yes` stand in for `--force` or for the screen's reason;
 change the orchestrator's steps; change ADR 0080's attribution (Phase 3's).
 
-### Phase 3 (#1730): approval robustness (as built; the verdict is ADR 0103)
+### Phase 3 (#1730): approval robustness (as built; the verdict is ADR 0105)
 
 Built: a per-claim dispatch token (#1604), a keyed hash of the dataset, the request, the clicker and the claim's own `approval_dispatched_at`,
 signed with the callback secret under its own domain tag, with no stored column and so no migration (the Worker stores none of it).
@@ -466,14 +466,14 @@ A resumed run whose steps are all done leaves the request `approving` when a tai
 and answers `status: "approving"` with the warnings joined in the singular `warning`, which the CLI prints,
 and when it closes the request it writes a `dataset_published` row that names who finished it (`finished_by_resume`);
 the step loop's closing path writes its row only when its own write changed the request, so a publication has one row.
-The step loop's own end keeps the same dead end after a warning, a known limit with a follow-up (ADR 0103, decision 12).
-Two more limits of that branch (a tail-job warning that approving again cannot clear, and no write that settles the claim) and the deny rule's reliance on a best-effort current-step write are stated, each with its trigger and effect, in ADR 0103, decisions 11 and 12.
+The step loop's own end keeps the same dead end after a warning, a known limit with a follow-up (ADR 0105, decision 12).
+Two more limits of that branch (a tail-job warning that approving again cannot clear, and no write that settles the claim) and the deny rule's reliance on a best-effort current-step write are stated, each with its trigger and effect, in ADR 0105, decisions 11 and 12.
 #1580 (persist the lock continuation token) is deferred: a restart at page 1 also locks objects added meanwhile, and the benefit is unmeasured.
 
 The executor's workflow is in the central workflow repository and is changed by the maintainer: mask the token first, export it for the approve step's process alone and never through `GITHUB_ENV`, install the CLI that matches the environment, release on failure.
 The rollout order, with the skew table, is in the ADR: the workflow edit before Phase 3 reaches `dev`, a staging check, then npm `latest` before the production Worker deploy.
 One question is left open: a valid token whose clicker is no longer an active administrator falls back to the caller.
-A clicker whose session or API key ends mid-run does not end the token, which is a deliberate exclusion (ADR 0103, "Left open").
+A clicker whose session or API key ends mid-run does not end the token, which is a deliberate exclusion (ADR 0105, "Left open").
 
 Must not (kept): weaken the lease; let a dispatch token approve anything by itself.
 
@@ -547,7 +547,7 @@ Must not: approve `nm099997` under a name; delete `PRESCREEN_CALLBACK_SECRET`.
 2. **Override fatigue.** A model that is often wrong teaches administrators to pass `--force`; the calibration measures it before the soak.
 3. **The mail is later.** Bounded by the screen's 50 minutes, the review's 30 and a tick.
 4. **Dev never ages a row.** Every surface must read a dispatched row past its deadline as not reported.
-5. **The interim attribution gap.** Closed in code by Phase 3 (a per-claim dispatch token, ADR 0103);
+5. **The interim attribution gap.** Closed in code by Phase 3 (a per-claim dispatch token, ADR 0105);
    what remains is the executor's workflow sending the token, and production stays dark until that is verified on staging.
 6. **The web page cannot pass the gate until Phase 4.** So the flag stays off in production until Phase 4 is promoted.
 7. **A script fix costs a release.** The workflow runs `main`'s script for every environment, so each fix to it found in the soak needs a `dev` to `main` release.

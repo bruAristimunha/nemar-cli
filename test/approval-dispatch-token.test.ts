@@ -1,5 +1,5 @@
 /**
- * The web approval's dispatch token (ADR 0103 decisions 1 and 4).
+ * The web approval's dispatch token (ADR 0105 decisions 1 and 4).
  *
  * A web click claims a request and dispatches an executor, which calls `/approve` under its own
  * key. The token is how that call proves it belongs to the claim: an HMAC over the claim's own

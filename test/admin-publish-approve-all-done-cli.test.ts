@@ -1,5 +1,5 @@
 /**
- * `nemar admin publish approve` of a request whose steps are all done (ADR 0103 decision 12,
+ * `nemar admin publish approve` of a request whose steps are all done (ADR 0105 decision 12,
  * #1730): what the operator is told when a tail job warned.
  *
  * A resumed run with every step already complete runs two tail jobs of a de-anonymization (the

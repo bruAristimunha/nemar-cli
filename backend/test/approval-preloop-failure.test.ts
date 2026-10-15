@@ -1,6 +1,6 @@
 /**
  * The four answers of `/approve` that return before its step loop say why on the row (#1582, ADR
- * 0103 decision 9).
+ * 0105 decision 9).
  *
  * `runPublicationApproval` marks the request `approving` and refreshes `updated_at`, then four
  * checks can still refuse it before any step records anything: the dataset is missing, it is a

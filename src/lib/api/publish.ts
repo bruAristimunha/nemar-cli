@@ -449,9 +449,9 @@ function retryDelayMs(): number {
  *
  * `requestId` is sent in the body of EVERY call of the run (the first, each batch of the lock, each
  * retry), so a request that is denied and filed again while the run is going is refused by the
- * Worker (409 `request_mismatch`) and not approved in the old one's place (#1579, ADR 0103
+ * Worker (409 `request_mismatch`) and not approved in the old one's place (#1579, ADR 0105
  * decision 7). A Worker that predates the field ignores it. `dispatchToken` is the per-claim token
- * of a run a web click started (#1604, ADR 0103 decision 3): it is sent as the
+ * of a run a web click started (#1604, ADR 0105 decision 3): it is sent as the
  * `X-Approval-Dispatch-Token` header on EVERY call of the run, batches and retries included,
  * because the Worker checks it at the top of each call and records the administrator who clicked
  * only for a call that carries it. It is a header and never part of the body, and it is a secret:

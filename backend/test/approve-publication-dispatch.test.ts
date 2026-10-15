@@ -1,5 +1,5 @@
 /**
- * `triggerApprovePublication` (ADR 0080; ADR 0103 decision 3 for the token): the dispatch that
+ * `triggerApprovePublication` (ADR 0080; ADR 0105 decision 3 for the token): the dispatch that
  * hands a web approval to the central workflow.
  *
  * Real engine: driven against a `Bun.serve()` stand-in for api.github.com, the

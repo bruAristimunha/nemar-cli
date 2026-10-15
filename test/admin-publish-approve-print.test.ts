@@ -307,7 +307,7 @@ describe("runApproval against a Worker that answers with hostile text", () => {
     setEnv("CI", "1");
     // The command reads the dispatch token variable of the runner's own environment when it runs
     // in this process: a malformed value stops it before it reads anything, and a good one would
-    // make every call an executor's (ADR 0103, decision 3). The spawned commands of the other
+    // make every call an executor's (ADR 0105, decision 3). The spawned commands of the other
     // suites are cleaned by their harness; this one is not spawned, so it is cleared here and put
     // back afterwards.
     previous[DISPATCH_TOKEN_VARIABLE] = process.env[DISPATCH_TOKEN_VARIABLE];

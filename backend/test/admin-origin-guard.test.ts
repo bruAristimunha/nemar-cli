@@ -1,5 +1,5 @@
 /**
- * One Origin rule for the whole admin router (#1603, #1584; ADR 0103 decision 10).
+ * One Origin rule for the whole admin router (#1603, #1584; ADR 0105 decision 10).
  *
  * A session cookie rides along with any cross-site request a browser can be made to send, so a
  * cookie-authenticated write has to come from a NEMAR page; a bearer key cannot be forged

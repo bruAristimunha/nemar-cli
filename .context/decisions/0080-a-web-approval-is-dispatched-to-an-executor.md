@@ -4,7 +4,7 @@
 **Date:** 2026-10-01
 **Owner:** Seyed Yahya Shirazi
 
-Partially superseded by [ADR 0103](0103-a-web-approval-is-attributed-by-a-per-claim-dispatch-token-and-a-terminal-approval-takes-the-claim-over.md),
+Partially superseded by [ADR 0105](0105-a-web-approval-is-attributed-by-a-per-claim-dispatch-token-and-a-terminal-approval-takes-the-claim-over.md),
 proposed with epic #1726 Phase 3 (#1730).
 It replaces the fork of decision 5, under which the approver was the clicker for any call that arrived inside the claim's lease, a person's terminal included,
 with a per-claim dispatch token that the executor presents on every `/approve` call.
@@ -67,12 +67,12 @@ The website does not run an approval. It asks the backend to dispatch one.
    lease are executor-agnostic, so a second executor changes the dispatch and nothing else.
    A cookie request needs a NEMAR `Origin` (`origin_not_allowed`), because the route launches an
    irreversible publication; a bearer key, which a terminal and the workflow use, is not asked for one.
-   Since ADR 0103 this is not the route's own check: one guard on the admin router applies the same
+   Since ADR 0105 this is not the route's own check: one guard on the admin router applies the same
    rule to every unsafe admin route.
 3. **The payload names an environment, never a URL, and carries no credential that authorizes anything.**
    `{ dataset_id, request_id, resume, environment, dispatch_token }`, where `environment` is `production`
    only for the production Worker and `dev` for everything else, including an unset value.
-   The `dispatch_token` is the claim's attribution token (decision 5, ADR 0103): it proves that a call
+   The `dispatch_token` is the claim's attribution token (decision 5, ADR 0105): it proves that a call
    belongs to this click and authorizes nothing alone.
    The central repository is shared by every environment, so the workflow maps the name to an API
    origin and a secret from a table of its own, and an admin key cannot be steered to a host the payload chose.
@@ -94,7 +94,7 @@ The website does not run an approval. It asks the backend to dispatch one.
    and a dispatch that is not sent puts the error back.
 5. **Attribution forks, and a click is honored only while its run is live.**
    The orchestrator reads `approval_requested_by` from the request it acts on.
-   For a call that presents the claim's dispatch token (decision 3, ADR 0103) while the lease is live
+   For a call that presents the claim's dispatch token (decision 3, ADR 0105) while the lease is live
    (the time-only lease, read at the top of `/approve`, before that call's own heartbeat bump), that admin is the approver:
    `approved_by`, the `dataset_published` audit row and the `notify_user_failed` audit row name them,
    and the executing account is kept as `executed_by` in the details.
@@ -114,7 +114,7 @@ The website does not run an approval. It asks the backend to dispatch one.
    and an executor whose key is not marked as a service account would then lose web attribution entirely, so the fork does not read it.
    A clicker who has since been demoted below admin, revoked or deleted is not recorded either:
    the caller stands in, because the run carries on after that person's access has ended
-   (whether such a click should publish at all is left open in ADR 0103).
+   (whether such a click should publish at all is left open in ADR 0105).
    The claim itself is cleared when the owner-name gate walks the request back to `blocked`,
    because that run is over and a claim left on the row would read as live again once the owner re-requests.
 6. **A dispatch whose answer is lost keeps the lease.**
@@ -123,7 +123,7 @@ The website does not run an approval. It asks the backend to dispatch one.
    The claim is released only for a failure that is definitely not sent:
    no credential (`dispatch_unconfigured`, and retrying will not help),
    a GitHub token that cannot be minted,
-   a dispatch token that cannot be signed (ADR 0103: a Worker with no secret to sign with refuses before it claims anything),
+   a dispatch token that cannot be signed (ADR 0105: a Worker with no secret to sign with refuses before it claims anything),
    or GitHub refusing the request with a 4xx (`dispatch_failed`).
    A dropped connection, the 10 second timeout or a 5xx answer is `dispatch_unconfirmed`, and the lease stands until it lapses.
    GitHub's edge can answer 502, 503 or 504 after the event was already queued, which is the same lost answer as a dropped connection.
@@ -144,13 +144,13 @@ Harder, and honest about it:
 - **A web run that sat quiet longer than the lease before its first `/approve` call is refused.**
   A runner queued for more than 15 minutes, or a dispatch that only starts after a long outage, does not
   run under a click made that long ago: its token's lease has lapsed, `/approve` answers 409
-  `dispatch_expired` and changes nothing, and a fresh click starts a new run (ADR 0103). The dispatch's
+  `dispatch_expired` and changes nothing, and a fresh click starts a new run (ADR 0105). The dispatch's
   own `approval_dispatched` audit row still names the clicker by id.
 - **A refusal before the step loop is recorded as a failure.**
   The gates after the request flips to `approving` behave differently, and only some leave a trace:
   an owner with no real name walks the row back to `blocked` with a `block_reason` and clears the web claim;
   the sandbox, no-repository, dataset-not-found and invalid-repository answers (400, 404, 500) return with the row left at `approving` and a fresh `updated_at`,
-  and the answer's own sentence is written to `last_error` (ADR 0103),
+  and the answer's own sentence is written to `last_error` (ADR 0105),
   as is a fixed sentence when the GitHub token for the dataset repositories cannot be minted, an exit that is then rethrown;
   so the row reads as failed and the page offers a retry once the 60 second grace has passed,
   where before it read "running" for the lease although nothing was running.
@@ -159,7 +159,7 @@ Harder, and honest about it:
   a call with no token cleared the claim at the mark.
   The reason is also in the workflow's log.
 - **A workflow failure the backend cannot see is reported by the workflow.** A missing secret or an install
-  failure means `/approve` is never called, so it writes nothing. Since ADR 0103 the workflow's failure step
+  failure means `/approve` is never called, so it writes nothing. Since ADR 0105 the workflow's failure step
   reports through `POST /webhooks/approval-release`, authenticated by the dispatch token alone, the way the
   pre-screen workflow reports through a callback token: the claim is cleared and a fixed sentence is
   recorded as `last_error`. A workflow that does not report (an older one, or a run killed before its
@@ -167,7 +167,7 @@ Harder, and honest about it:
 - **A dispatch that GitHub never confirmed holds the lease for up to 15 minutes**, so a retry is a 409 until
   it lapses, even when the event was in fact never created. A terminal approval is not gated by the lease,
   so an admin in a hurry uses that, and it takes the claim over: the executor of the web run it displaces
-  is refused at its next call (ADR 0103).
+  is refused at its next call (ADR 0105).
 - **The web path depends on GitHub being able to start a workflow.**
   A dispatch GitHub refuses with a 4xx releases the claim and answers 502, and the terminal path is the fallback.
 
@@ -195,7 +195,7 @@ Harder, and honest about it:
 
 ## Amendment 2026-10-13 (#1730): Phase 3, a web approval is attributed by a dispatch token
 
-[ADR 0103](0103-a-web-approval-is-attributed-by-a-per-claim-dispatch-token-and-a-terminal-approval-takes-the-claim-over.md) records the decision;
+[ADR 0105](0105-a-web-approval-is-attributed-by-a-per-claim-dispatch-token-and-a-terminal-approval-takes-the-claim-over.md) records the decision;
 this amendment says what it changed here.
 The text above was corrected in place where the built behavior made a sentence false
 (decision 2's Origin sentence, decision 3's payload, decision 5's fork and its accepted cost, decision 6's list of failures that are not sent,
@@ -227,7 +227,7 @@ where the two differ, this is the later text.
 6. **The route checks its dataset id for the environment before it claims,** and refuses a body that names a request other than the one in force.
 7. **Every unsafe admin route has the Origin rule,** by one guard on the admin router instead of a check in each route.
 8. **Open:** whether a valid token whose clicker is no longer an active administrator should publish at all.
-   This ADR's behavior (the caller stands in) is unchanged and is pinned by a test; ADR 0103 records the question and that it is not decided.
+   This ADR's behavior (the caller stands in) is unchanged and is pinned by a test; ADR 0105 records the question and that it is not decided.
 
 ### Replaced wording, kept so that the earlier verdict stays findable
 

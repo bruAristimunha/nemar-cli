@@ -1,5 +1,5 @@
 /**
- * `GET /admin/publish/requests` after a web click never carries the dispatch token (ADR 0103
+ * `GET /admin/publish/requests` after a web click never carries the dispatch token (ADR 0105
  * decision 2).
  *
  * The list selects `pr.*`, so every column of `publication_requests` reaches the wire unless a

@@ -16,7 +16,7 @@ export const PUBLICATION_DATASET_ID_RE = /^(nm|on|xx)\d{6}$/;
 
 /**
  * The id of a dataset a web approval may DISPATCH, by environment (`POST
- * /admin/publish/:id/approve-dispatch`, #1583; ADR 0103, decision 8). The executor workflow it
+ * /admin/publish/:id/approve-dispatch`, #1583; ADR 0105, decision 8). The executor workflow it
  * dispatches (`approve-publication.yml`, in the central workflow repository) accepts only `nm` or
  * `on` plus six digits, and on dev also `xx` plus six digits (the exemplar fleet); a dispatch for
  * any other id, or for an `xx` id on production, would claim the lease, dispatch, and fail in the
@@ -24,7 +24,7 @@ export const PUBLICATION_DATASET_ID_RE = /^(nm|on|xx)\d{6}$/;
  * it claims anything.
  *
  * The workflow cannot import this file, so the rule is written on both sides: its validate step
- * mirrors these shapes by hand, in `case` patterns of its own, and, once the edit of ADR 0103
+ * mirrors these shapes by hand, in `case` patterns of its own, and, once the edit of ADR 0105
  * (decision 8) is applied, carries a comment citing this constant. Keep the two in step by hand:
  * change one and the other in the same sitting. A test here pins every accepted and rejected shape
  * on this side. `dev` is also what the Worker uses

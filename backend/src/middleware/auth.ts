@@ -538,7 +538,7 @@ const READ_ONLY_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 /**
  * Middleware: a write made with a session cookie must come from a NEMAR page (#1603, #1584; ADR
- * 0103, decision 10).
+ * 0105, decision 10).
  *
  * A session cookie rides along with any cross-site request a browser can be tricked into making,
  * and a write on the admin router publishes datasets, mails real people and spends the platform's
@@ -561,7 +561,7 @@ export async function cookieOriginGuard(c: AuthContext, next: Next) {
   }
   if (c.get("authMethod") !== "token" && !isAllowedOrigin(c.req.header("Origin"))) {
     // Typed with the contract's body, so a field renamed here or there breaks the build and not
-    // only a test (ADR 0103, decision 10).
+    // only a test (ADR 0105, decision 10).
     const refusal: OriginNotAllowedBody = {
       error: "origin_not_allowed",
       code: "origin_not_allowed",

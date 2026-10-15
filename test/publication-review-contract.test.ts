@@ -3048,7 +3048,7 @@ describe("the wire vocabulary the approval refusals and the comment route share"
     // was replaced or lapsed, a decision sent by a run the web started, a denial of a request
     // that is running or has started publishing, and a dispatch for an id the executor's workflow
     // would not accept). The earlier stop-gap `override_inside_web_approval` is gone: its
-    // guarantee is now structural (ADR 0103 decision 5: a run the web started carries no decision
+    // guarantee is now structural (ADR 0105 decision 5: a run the web started carries no decision
     // of its own).
     expect([...APPROVAL_REFUSAL_ERROR_CODES]).not.toContain("override_inside_web_approval");
     expect([...APPROVAL_REFUSAL_ERROR_CODES]).toEqual([

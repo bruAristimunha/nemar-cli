@@ -1,6 +1,6 @@
 /**
  * `POST /admin/publish/:id/deny` is lease-gated and conditional, and the final publish write is
- * guarded by the status it expects (#1603, ADR 0103 decisions 11 and 12).
+ * guarded by the status it expects (#1603, ADR 0105 decisions 11 and 12).
  *
  * A denial used to be one unconditional UPDATE after a read, so it overwrote whatever the request
  * had become in between: a run still writing its steps, a request a run had just published, a
@@ -385,7 +385,7 @@ describe("a first mutation that did not finish is not a denial either", () => {
   // have landed without being acknowledged: a run cut off inside it, or one that failed it, has
   // only validation steps recorded and a `current_step` naming it, while the bucket policy may
   // already make the data public. `steps_completed` alone cannot say so, so the refusal reads the
-  // step the run set as well (ADR 0103 decision 11).
+  // step the run set as well (ADR 0105 decision 11).
   test("a stalled run cut off inside s3_public_read: only validation steps are recorded", async () => {
     const id = seedRequest({
       status: "approving",
@@ -771,7 +771,7 @@ describe("the final publish write is guarded by the status it expects", () => {
     expect(body.dataset_id).toBe(DATASET);
     expect(row(id).status).toBe("published");
     expect(auditRows("approval_finished_on_closed_request")).toHaveLength(0);
-    // One row per publication (ADR 0103 decision 12): the call that changes the request records
+    // One row per publication (ADR 0105 decision 12): the call that changes the request records
     // it. This finisher is a bare statement that records nothing, and the run that found the
     // request already published does not write a row of its own on top of it.
     expect(auditRows("dataset_published")).toHaveLength(0);

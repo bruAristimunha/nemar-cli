@@ -1,5 +1,5 @@
 /**
- * POST /admin/publish/:id/approve-dispatch (ADR 0080; ADR 0103 for the dispatch token, the id
+ * POST /admin/publish/:id/approve-dispatch (ADR 0080; ADR 0105 for the dispatch token, the id
  * rule and `request_id`).
  *
  * The website cannot drive an approval itself: after the irreversible DOI
@@ -461,7 +461,7 @@ describe("releasing a claim", () => {
   });
 });
 
-describe("the dispatch token (#1604, ADR 0103 decisions 1 to 3)", () => {
+describe("the dispatch token (#1604, ADR 0105 decisions 1 to 3)", () => {
   /** What the executor would be handed: the one token in the click's payload. */
   const tokenOf = (): string => dispatches[0].body.client_payload.dispatch_token as string;
 
@@ -1203,7 +1203,7 @@ describe("who may dispatch", () => {
 });
 
 // ---------------------------------------------------------------------------------------------
-// #1583 (ADR 0103 decision 8): the id is checked before anything is read or claimed
+// #1583 (ADR 0105 decision 8): the id is checked before anything is read or claimed
 // ---------------------------------------------------------------------------------------------
 
 describe("the dataset id is validated for the environment before the claim (#1583, decision 8)", () => {
@@ -1344,7 +1344,7 @@ describe("the dataset id is validated for the environment before the claim (#158
 });
 
 // ---------------------------------------------------------------------------------------------
-// #1579 (ADR 0103 decision 7): the optional request_id precondition
+// #1579 (ADR 0105 decision 7): the optional request_id precondition
 // ---------------------------------------------------------------------------------------------
 
 describe("a request_id names the request the click was for (#1579, decision 7)", () => {

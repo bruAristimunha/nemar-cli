@@ -76,7 +76,7 @@ const APPROVAL_IN_PROGRESS = {
 
 /**
  * The optional body of the approve-dispatch route. `request_id` is the request the click was for
- * (#1579, ADR 0103 decision 7): the page names the one it showed, and the route refuses a click
+ * (#1579, ADR 0105 decision 7): the page names the one it showed, and the route refuses a click
  * for a request that is no longer the one in force. Optional, so the bodyless click every existing
  * caller sends is unchanged.
  */
@@ -118,7 +118,7 @@ const DENIABLE_STATUSES: readonly string[] = ["requested", "approving", "blocked
  * interrupted inside `s3_public_read` (the first step that changes anything: its bucket-policy
  * write may have landed without being acknowledged) has only validation steps in `steps_completed`
  * and `s3_public_read` in `current_step`. A step outside the validation-only ones in either column
- * means the data may be public (ADR 0103, decision 11).
+ * means the data may be public (ADR 0105, decision 11).
  */
 function denyRefusal(row: {
   steps_completed: string | null;
@@ -276,7 +276,7 @@ export function registerPublishRoutes(admin: AdminRouter): void {
   });
 
   /**
-   * POST /admin/publish/:id/deny - Deny a publication request (#1603; ADR 0103, decision 11)
+   * POST /admin/publish/:id/deny - Deny a publication request (#1603; ADR 0105, decision 11)
    *
    * The newest active request is read, then refused by the shared words, in this order, before any
    * write (a denial that is refused changes nothing and mails nobody):
@@ -412,10 +412,10 @@ export function registerPublishRoutes(admin: AdminRouter): void {
    * reason, ADR 0086) and `override_publication_review` (the review shown and the reasons shown,
    * ADR 0102).
    *
-   * The body may name the request the run is for, `request_id` (#1579; ADR 0103, decision 7).
+   * The body may name the request the run is for, `request_id` (#1579; ADR 0105, decision 7).
    *
    * The header `X-Approval-Dispatch-Token` is the proof that a call belongs to a web click's claim
-   * (#1604; ADR 0103, decisions 3 to 6). A call that carries the token of the request's current
+   * (#1604; ADR 0105, decisions 3 to 6). A call that carries the token of the request's current
    * claim, while that claim's lease is live, is recorded as the administrator who clicked (the
    * caller is kept as `executed_by`); a call with no token (or a blank one) is its caller's own
    * act whatever the lease says, and once it passes every gate its mark takes the claim over, so
@@ -427,7 +427,7 @@ export function registerPublishRoutes(admin: AdminRouter): void {
    * Refusals, each with a stable code in `error` and a sentence in `message`:
    *   403 origin_not_allowed  an override sent with a session cookie: it is accepted only with
    *                         an API key, and the website records one through approve-dispatch
-   *                         (ADR 0102, section 8; ADR 0103, decision 10 keeps this stricter rule).
+   *                         (ADR 0102, section 8; ADR 0105, decision 10 keeps this stricter rule).
    *                         (A cookie request with no NEMAR origin never gets this far: the
    *                         router's `cookieOriginGuard` answers it with the same code.)
    *   409 request_mismatch  `request_id` is not the newest active request: it was denied or filed
@@ -461,7 +461,7 @@ export function registerPublishRoutes(admin: AdminRouter): void {
    *                         failed: the orchestrator's `CLAIM_READ_FAILED_MESSAGE`. Nothing was
    *                         marked and nothing started, so the caller tries again. Its body is
    *                         `{ error: <sentence> }`, like the other 500s of this route, with no
-   *                         code word (ADR 0103, decision 6).
+   *                         code word (ADR 0105, decision 6).
    */
   admin.post("/publish/:id/approve", zValidator("json", approveSchema), async (c) => {
     const body = c.req.valid("json");
@@ -508,7 +508,7 @@ export function registerPublishRoutes(admin: AdminRouter): void {
    * page cannot matter: the state lives in `publication_requests`.
    *
    * The executor calls `POST /publish/:id/approve` with its own service key and the claim's
-   * dispatch token (#1604; ADR 0103, decisions 1 to 3): the token, a MAC over this claim's
+   * dispatch token (#1604; ADR 0105, decisions 1 to 3): the token, a MAC over this claim's
    * dataset, request, clicker and instant (`approval_dispatched_at`, as stored), is minted here
    * and handed to the executor in the dispatch payload. The orchestrator records the admin who
    * clicked, rather than the bot, for a call that presents it while the lease is live. `/approve`
@@ -565,7 +565,7 @@ export function registerPublishRoutes(admin: AdminRouter): void {
     const environment = approvalDispatchEnvironment(c.env);
 
     // The id is checked first, for this environment, before the body is read, before any read of
-    // the request and before the claim (#1583, ADR 0103 decision 8). The workflow this dispatches
+    // the request and before the claim (#1583, ADR 0105 decision 8). The workflow this dispatches
     // accepts only the ids of `APPROVAL_DISPATCH_ID_RE` and fails in its own validation for any
     // other, which would leave the claim's lease held for fifteen minutes on a run that never
     // started.
@@ -791,7 +791,7 @@ export function registerPublishRoutes(admin: AdminRouter): void {
     };
 
     // The token the executor presents on every `/approve` call of this run: a MAC over this
-    // claim's dataset, request, clicker and instant (#1604, ADR 0103 decision 1). It is handed to
+    // claim's dataset, request, clicker and instant (#1604, ADR 0105 decision 1). It is handed to
     // the dispatch and to nothing else: never logged, audited, listed or answered. A claim that
     // cannot be signed (the signer refuses a field that holds a line break) was not sent, so it is
     // released.

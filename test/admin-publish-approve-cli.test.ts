@@ -1094,7 +1094,7 @@ describe("with the Worker's gate: what the Worker refuses is printed, and exits 
   });
 
   test("a --yes run with no dispatch token does not ride on the clicker's recorded override: refused, and the click's claim is intact", async () => {
-    // The flip of the earlier pin (#1604, ADR 0103 decisions 4 and 6). The clicker's override
+    // The flip of the earlier pin (#1604, ADR 0105 decisions 4 and 6). The clicker's override
     // covers the clicker's run, which is the one that carries the click's token
     // (admin-publish-approve-token-cli.test.ts); the same command without it is its caller's own
     // act, and the caller has no override.

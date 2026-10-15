@@ -581,7 +581,7 @@ PR_REVIEW_ENABLED = "1"
 # it must never be added there by a change that is not reviewed for it. What turning production
 # on takes is ADR 0102's "Before it is switched on": Phases 2, 3 and 4 shipped, the soak done, and
 # then adding PUBLICATION_REVIEW_ENABLED = "1" to [vars]. Phase 3 fixed the approval attribution
-# (#1604, ADR 0103) in code: a web run proves it belongs to its click with a dispatch token, and
+# (#1604, ADR 0105) in code: a web run proves it belongs to its click with a dispatch token, and
 # a terminal approval is recorded as its own caller. What production still must not be lit
 # without is item 7's verification: the executor's workflow sends that token, and the staging
 # audit query shows web approvals attributed to the administrators who clicked. The flag

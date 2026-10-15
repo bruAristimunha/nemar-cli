@@ -1,5 +1,5 @@
 /**
- * An approval whose steps are all complete (ADR 0103, decision 12; issue #1730).
+ * An approval whose steps are all complete (ADR 0105, decision 12; issue #1730).
  *
  * `runPublicationApproval` has a branch for a run that has nothing left to do: a web run that died
  * after its last step and is resumed, or the retry its own warnings ask for. The branch runs the two
@@ -165,7 +165,7 @@ describe("a tail job that warns leaves the request approving, so approving again
     expect(body.message).toBe("All steps already completed");
     // The answer says what the row says: a request the call did not close is `approving`, and the
     // warning is under the one key every other answer of this route and the CLI read, `warning`
-    // (ADR 0103 decision 12), never a plural one that nothing prints.
+    // (ADR 0105 decision 12), never a plural one that nothing prints.
     expect(body.status).toBe("approving");
     expect(body).not.toHaveProperty("warnings");
     expect(body.warning).toContain("Approve the request again to retry");
@@ -336,7 +336,7 @@ describe("the call that closes an all-steps-done request writes the dataset_publ
   // The row records the review gate's state for the dataset, read from the dataset's row. A run
   // that never read the row reads it here, and a row it cannot read (the read failed, or the
   // dataset is gone) is a warning and no audit row, never a row with a gate state made up for it
-  // (ADR 0103 decision 12).
+  // (ADR 0105 decision 12).
   describe("the dataset row the audit row is built from cannot be read", () => {
     const readFailing = () =>
       env({

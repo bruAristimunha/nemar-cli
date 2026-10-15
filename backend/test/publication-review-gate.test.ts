@@ -1057,7 +1057,7 @@ describe("an override is its approver's, and it is recorded once", () => {
   });
 
   test("23. a terminal approval by B inside A's live web claim is B's own act: it does not ride on A's override, and A's claim is intact", async () => {
-    // The flip of the earlier pin (#1604, ADR 0103 decisions 4 and 6). Inside a live claim, with no
+    // The flip of the earlier pin (#1604, ADR 0105 decisions 4 and 6). Inside a live claim, with no
     // dispatch token, B is not A's run: B is recorded as B, B needs B's own override, and a refusal
     // changes nothing, so the run the click dispatched can still be carried out by its executor.
     const { requestId, reviewId } = seedFailing();
@@ -1204,7 +1204,7 @@ describe("an override is its approver's, and it is recorded once", () => {
 
 /**
  * An override is recorded only under the credential that sent it, or at the clicker's own
- * dispatch (#1604, ADR 0103 decision 5). This is the guarantee the earlier refusal
+ * dispatch (#1604, ADR 0105 decision 5). This is the guarantee the earlier refusal
  * `override_inside_web_approval` stood in for; it is now structural, and held here as a property:
  * after every scenario, every override on a review row and in the audit trail names `sender`, and
  * when `sender` is null (the call was refused, or sent none) there is none.

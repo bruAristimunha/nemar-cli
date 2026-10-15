@@ -1,5 +1,5 @@
 /**
- * POST /webhooks/approval-release (#1582, ADR 0103 decision 9).
+ * POST /webhooks/approval-release (#1582, ADR 0105 decision 9).
  *
  * A web click claims the request and dispatches an executor. When that executor fails in a way the
  * Worker cannot see (a missing secret, a failed install, a cancelled run), the claim would hold
@@ -343,7 +343,7 @@ describe("a valid token releases the claim", () => {
 
   // The route reads the claim's own columns and never the lease: a run reports its own failure
   // late (a cancelled workflow is reported when GitHub says so), and a lapsed claim is exactly
-  // one that nothing else will clear (ADR 0103 decision 9).
+  // one that nothing else will clear (ADR 0105 decision 9).
   for (const status of ["requested", "approving"] as const) {
     test(`a claim 30 minutes old, past the lease, on a request that is ${status} is released all the same`, async () => {
       const s = await seedClaim({

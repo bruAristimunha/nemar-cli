@@ -9,12 +9,12 @@
  * The test reads the real file and parses it with Bun's TOML parser, so a misplaced line (under
  * another table, or commented out) fails here.
  *
- * Attribution is exact (#1604, ADR 0103 decision 4): a run the web started presents the click's
+ * Attribution is exact (#1604, ADR 0105 decision 4): a run the web started presents the click's
  * dispatch token and is recorded as the administrator who clicked, and every other caller, a
  * terminal inside a live web claim included, is recorded as itself. The code is fixed; what
  * remains before production is lit is the executor's workflow sending that token (the maintainer
  * changes it) and the staging audit query showing web approvals attributed to their clickers (ADR
- * 0102, "Before it is switched on", item 7; ADR 0103, Rollout).
+ * 0102, "Before it is switched on", item 7; ADR 0105, Rollout).
  */
 
 import { describe, expect, test } from "bun:test";

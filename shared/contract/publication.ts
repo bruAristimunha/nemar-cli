@@ -115,7 +115,7 @@ export const IDENTIFIER_SCREEN_ERROR_CODES: readonly string[] = [
 /**
  * The codes an approval refusal carries in `error` with the human sentence in `message`. ADR 0102
  * owns the review gate's 409, the blocked request's, and the request that changed while the
- * approval was being checked. ADR 0103 owns the rest: a run for a request that is no longer the
+ * approval was being checked. ADR 0105 owns the rest: a run for a request that is no longer the
  * one in force (decision 7), a dispatch token that was replaced or has lapsed (decision 4), a
  * decision sent by a run the web started (decision 5), a web approval for an id the executor's
  * workflow would not accept, a 400 before anything is claimed (decision 8), the two refusals of a
@@ -235,7 +235,7 @@ export const INVALID_DATASET_ID_MESSAGE =
   "This is not a dataset id an approval can be started for from the web: it is nm or on followed by six digits (a development environment also accepts xx). Nothing was claimed and nothing was sent.";
 
 /**
- * Why an approval executor releases the claim it was dispatched under (ADR 0103, decision 9): the
+ * Why an approval executor releases the claim it was dispatched under (ADR 0105, decision 9): the
  * closed vocabulary of the `reason` a failing executor reports. The Worker stores the sentence of
  * the word (never the word, and never a string the executor wrote) as the request's `last_error`,
  * so a failure the Worker cannot see for itself shows on the page and the claim does not hold its
@@ -269,7 +269,7 @@ export const APPROVAL_RELEASE_REASON_TEXT: Record<ApprovalReleaseReason, string>
 };
 
 /**
- * The request header an approval executor presents its dispatch token in (ADR 0103, decision 3).
+ * The request header an approval executor presents its dispatch token in (ADR 0105, decision 3).
  * The Worker reads it on `/approve` to decide whether the call belongs to the web claim it was
  * dispatched for (decision 4), and on the release route, where it is the only credential
  * (decision 9). The CLI sends it when the executor's workflow hands it the token. Declared once
