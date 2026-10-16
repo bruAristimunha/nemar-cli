@@ -32,7 +32,7 @@ import {
   notEditableHint,
 } from "../../../shared/contract/admin-user.js";
 import type { ProfileEditErrorCode } from "../../../shared/contract/user.js";
-import { emailFieldSchema } from "./identity";
+import { emailFieldSchema, normalizeOrcid } from "./identity";
 import { type ProfilePatch, normalizeProfilePatch } from "./profile";
 
 /**
@@ -40,9 +40,10 @@ import { type ProfilePatch, normalizeProfilePatch } from "./profile";
  *
  * `ProfilePatch` already says which fields may be cleared with `null` (the
  * affiliation and the GitHub handle, and nothing else), so this is that type
- * plus the email, which is never null: `users.email` is NOT NULL.
+ * plus the email, which is never null: `users.email` is NOT NULL, and the ORCID
+ * iD, which is canonicalised here and never cleared by this route.
  */
-export type AdminUserPatch = ProfilePatch & { email?: string };
+export type AdminUserPatch = ProfilePatch & { email?: string; orcid?: string };
 
 /** Compile-time proof that the patch can carry every editable field. */
 export const _patchCoversEditableFields: AdminUserEditableField extends keyof AdminUserPatch
@@ -130,9 +131,9 @@ export function parseAdminUserEdit(raw: unknown, actorIsOwner: boolean): AdminEd
   const body = shape.data;
   const patch: AdminUserPatch = {};
 
-  // Everything but the email goes through the self-service normaliser, which
-  // knows the length, charset and not-empty rules for each.
-  const { email, ...profileFields } = body;
+  // Everything but the email and the iD goes through the self-service
+  // normaliser, which knows the length, charset and not-empty rules for each.
+  const { email, orcid, ...profileFields } = body;
   if (Object.values(profileFields).some((value) => value !== undefined)) {
     const normalized = normalizeProfilePatch(profileFields);
     if (!normalized.ok) {
@@ -147,6 +148,16 @@ export function parseAdminUserEdit(raw: unknown, actorIsOwner: boolean): AdminEd
       return badRequest("invalid_edit", "email: not a valid email address");
     }
     patch.email = parsed.data;
+  }
+
+  if (orcid !== undefined) {
+    // The same canonical form the ORCID sign-in flow stores (ADR 0043): an `X`
+    // check digit in capitals, and a full orcid.org URL read as its bare iD.
+    const canonical = normalizeOrcid(orcid);
+    if (canonical === null) {
+      return badRequest("invalid_edit", "orcid: not an ORCID iD (expected 0000-0000-0000-000X)");
+    }
+    patch.orcid = canonical;
   }
 
   if (Object.keys(patch).length === 0) {

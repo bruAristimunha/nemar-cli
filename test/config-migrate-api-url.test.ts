@@ -28,6 +28,9 @@ function readConfig(): {
   return JSON.parse(readFileSync(configPath, "utf8"));
 }
 
+// `bun test` runs every file in one process: put the variable back as found, gone if it was unset.
+const previousConfigDir = process.env.NEMAR_CONFIG_DIR;
+
 beforeAll(() => {
   mkdirSync(testDir, { recursive: true });
   process.env.NEMAR_CONFIG_DIR = testDir;
@@ -70,8 +73,9 @@ beforeAll(() => {
 });
 
 afterAll(() => {
-  // biome-ignore lint/performance/noDelete: env var cleanup; assigning undefined leaves the key as the literal string "undefined" for child processes
-  delete process.env.NEMAR_CONFIG_DIR;
+  // Never `= undefined`: Bun would store the literal string "undefined".
+  if (previousConfigDir === undefined) Reflect.deleteProperty(process.env, "NEMAR_CONFIG_DIR");
+  else process.env.NEMAR_CONFIG_DIR = previousConfigDir;
   if (existsSync(testDir)) rmSync(testDir, { recursive: true, force: true });
 });
 

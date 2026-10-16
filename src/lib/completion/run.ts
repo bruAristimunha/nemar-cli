@@ -28,7 +28,7 @@ import { CompletionDirective, getCandidates } from "./candidates.js";
  * (#1173 review). The wire format every shell script here parses is one
  * candidate per line, terminated by a final `:<directive>` line -- a
  * candidate that itself contains "\n" splits into an extra line that every
- * consumer (bash's `mapfile`, zsh's `${(@f)...}`, fish's newline-split
+ * consumer (bash's `read` loop, zsh's `${(@f)...}`, fish's newline-split
  * `$lines`) reads as its own, unrelated candidate. Worse, a value shaped
  * like `"rest\n:4"` produces a line that is indistinguishable from the real
  * trailing directive.

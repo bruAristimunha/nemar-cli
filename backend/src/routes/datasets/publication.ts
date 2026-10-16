@@ -15,6 +15,11 @@ import {
   isCiPendingReason,
 } from "../../../../shared/contract/publication.js";
 import { publicationRequestNotice } from "../../../../shared/identifier-screen-report.js";
+import {
+  PRE_PUBLICATION_STEPS,
+  publishingHasStarted,
+} from "../../../../shared/publication-steps.js";
+import { applyEditWithAudit } from "../../db/audit-log";
 import { authMiddleware } from "../../middleware/auth";
 import {
   FIRST_PUBLICATION_STAMP_SQL,
@@ -22,6 +27,11 @@ import {
   hasEverBeenPublished,
   isAnonymous,
 } from "../../services/anonymity";
+import {
+  ACTIVE_REQUEST_TAIL_SQL,
+  APPROVAL_CLAIM_CLEAR_SQL,
+  approvalInFlightSql,
+} from "../../services/approval-dispatch";
 import { isValidDatasetId } from "../../services/datasetId";
 import { isExemplarPublishAllowed } from "../../services/exemplar";
 import {
@@ -38,10 +48,17 @@ import {
   RESET_SCREEN_COLUMNS_SQL,
   type ScreenView,
   mailPublicationRequest,
+  reviewHoldSql,
   screenEmailSection,
   screenView,
   startScreenAndNotify,
 } from "../../services/identifier-screen";
+import { ownedHere } from "../../services/pr-review-queue";
+import {
+  publicationReviewApplies,
+  publicationReviewEmailSection,
+  reviewEnabled,
+} from "../../services/publication-review-view";
 import { mirrorReconcileRemovals, resolveRepoCollaborators } from "../../services/repo-spec";
 import { markDatasetPrivate, markDatasetPublic } from "../../services/s3";
 import { checkSubmissionGate } from "../../services/submission-gate";
@@ -119,6 +136,32 @@ function blockMessage(reason: string | null | undefined): string {
   }
   return "Publication request blocked.";
 }
+
+/**
+ * {@link publishingHasStarted} as terms of a conditional UPDATE, so the write
+ * re-reads the row it is about to end. The step names are this repository's own
+ * constants, never request input. Malformed `steps_completed` reads as no steps,
+ * as it does in `hasStartedPublishing`.
+ *
+ * The two agree on every well-formed row (a JSON array of step names), and a test holds them
+ * together over every step name, `current_step` and the malformed shapes. They differ on one
+ * kind of row, and in the safe direction: a `steps_completed` that is valid JSON but not an array
+ * of strings (an object, a scalar string or number, a nested array or object as an element) counts
+ * as STARTED here, because `json_each` reads every value it holds, whereas `hasStartedPublishing`
+ * ignores it. JSON `null` and a `null` element are the exception: `json_each` yields NULL for
+ * them, and `NULL NOT IN (...)` is not true, so they are NOT started in either.
+ * This statement therefore only ever refuses where the function would have allowed, never the
+ * reverse, and it is not aligned the other way: `hasStartedPublishing` also decides which gates a
+ * resume may skip, where treating an unreadable row as started would widen an exemption.
+ */
+const PRE_PUBLICATION_STEPS_SQL = PRE_PUBLICATION_STEPS.map((step) => `'${step}'`).join(", ");
+export const NO_PUBLISHING_STARTED_SQL = `(
+  NOT EXISTS (
+    SELECT 1 FROM json_each(CASE WHEN json_valid(steps_completed) THEN steps_completed ELSE '[]' END)
+    WHERE value NOT IN (${PRE_PUBLICATION_STEPS_SQL})
+  )
+  AND (current_step IS NULL OR current_step = '' OR current_step IN (${PRE_PUBLICATION_STEPS_SQL}))
+)`;
 
 export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
   // ============================================================================
@@ -265,9 +308,7 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
 
     // Check for existing active request (allow re-checking blocked requests)
     const existing = await db
-      .prepare(
-        "SELECT id, status, block_reason FROM publication_requests WHERE dataset_id = ? AND status IN ('requested', 'approving', 'blocked') ORDER BY requested_at DESC LIMIT 1",
-      )
+      .prepare(`SELECT id, status, block_reason ${ACTIVE_REQUEST_TAIL_SQL}`)
       .bind(datasetId)
       .first<{ id: number; status: string; block_reason: string | null }>();
 
@@ -546,11 +587,25 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
     // the request is already 'requested', so a dispatch failure must not 500
     // the call -- we log it and leave the row as a normal pending request.
     // The verdict arrives later at /webhooks/prescreen-result.
+    //
+    // ADR 0102 retires this advisory check in favour of the publication review, and the two
+    // must not both read the README: with the review on (exactly the word `1`) the pre-screen
+    // is not dispatched for a request the review will run for, so the deploy that turns the
+    // review on is the one that stops it, with no gap and no overlap. "Will run for" is what
+    // the start of a review asks (`startPublicationReview`): the flag, a dataset the review
+    // applies to (not an OpenNeuro mirror or an exemplar) and one this Worker owns. A request
+    // outside that gets no review, so it keeps the pre-screen exactly as before. Only the
+    // dispatch is conditioned. The pre-screen's callback route, its columns and
+    // PRESCREEN_CALLBACK_SECRET (which also signs the identifier screen's, the sweep's and the
+    // pull-request review's tokens) all stay.
+    const reviewWillRun =
+      reviewEnabled(c.env) && publicationReviewApplies(dataset) && ownedHere(c.env, datasetId);
     if (
       prId !== null &&
       repoName &&
       pat &&
       c.env.PRESCREEN_ENABLED === "true" &&
+      !reviewWillRun &&
       c.env.PRESCREEN_CALLBACK_SECRET
     ) {
       try {
@@ -707,6 +762,7 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
         approved_at: string | null;
         denied_at: string | null;
         denied_reason: string | null;
+        withdrawn_at: string | null;
         block_reason: string | null;
         min_requirements_reasons: string | null;
         prescreen_status: string | null;
@@ -776,6 +832,10 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
       approved_at: request.approved_at,
       denied_at: request.denied_at,
       denied_reason: request.denied_reason,
+      // The requester ended this one themselves (migration 0097). `status`
+      // stays 'denied' so older clients still read a finished request.
+      withdrawn: request.status === "denied" && request.withdrawn_at !== null,
+      withdrawn_at: request.status === "denied" ? request.withdrawn_at : null,
       block_reason: request.block_reason,
       // The explanation is gated on the STATUS only. It used to also require
       // a repo, which is right for the CI-shaped reasons that link to a
@@ -808,6 +868,129 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
       current_step: request.current_step,
       last_error: request.last_error,
       updated_at: request.updated_at,
+    });
+  });
+
+  /**
+   * POST /datasets/:id/publish/withdraw - The requester takes the request back
+   *
+   * No administrator is involved. It is allowed only while nothing has started
+   * acting on the request, which is three questions asked of the row, not one:
+   *
+   *   1. its status is `requested` or `blocked` (not `approving`);
+   *   2. no approval is in flight (the lease, `approvalInFlightSql`);
+   *   3. publishing has not started: no step after the validation-only ones is
+   *      recorded in `steps_completed`, and none is the interrupted
+   *      `current_step`. A request keeps its steps when a run is walked back
+   *      (the owner's name cleared, a screen finding), so a `blocked` or
+   *      `requested` row can sit over data that is already public, and
+   *      withdrawing it would close the request over a public dataset.
+   *
+   * The claim is ONE conditional UPDATE carrying all three terms and an
+   * `updated_at` guard, so an approval that begins at the same moment either
+   * wins (this answers 409) or finds the request already ended (the
+   * orchestrator's own update is guarded the same way). The column terms are not
+   * redundant with `updated_at`: it has one-second resolution, so a step recorded
+   * in the same second as the read leaves it unchanged. The audit row rides in
+   * the same batch and is written only if the UPDATE changed a row.
+   *
+   * Only the dataset owner may withdraw, although an administrator may file a
+   * request on someone else's dataset (ADR 0104). An administrator ends a
+   * request with `deny`.
+   *
+   * Recorded as a finished request with `withdrawn_at` set. A later
+   * `publish request` inserts a NEW row (it matches only active statuses), and
+   * the other readers of `status = 'denied'` keep working (migration 0097).
+   */
+  datasetRoutes.post("/:id/publish/withdraw", authMiddleware, async (c) => {
+    const datasetId = c.req.param("id");
+    const currentUser = c.get("user");
+    const db = c.env.DB;
+
+    const dataset = await db
+      .prepare("SELECT id, owner_user_id FROM datasets WHERE dataset_id = ?")
+      .bind(datasetId)
+      .first<{ id: number; owner_user_id: number }>();
+
+    if (!dataset) {
+      return c.json({ error: "Dataset not found" }, 404);
+    }
+
+    if (dataset.owner_user_id !== currentUser.id) {
+      return c.json(
+        {
+          error:
+            "Only the dataset owner can withdraw a publication request. An administrator ends one with 'nemar admin publish deny'.",
+        },
+        403,
+      );
+    }
+
+    const request = await db
+      .prepare(
+        `SELECT id, status, steps_completed, current_step, updated_at,
+                ${approvalInFlightSql()} AS approval_in_flight
+         ${ACTIVE_REQUEST_TAIL_SQL}`,
+      )
+      .bind(datasetId)
+      .first<{
+        id: number;
+        status: string;
+        steps_completed: string | null;
+        current_step: string | null;
+        updated_at: string;
+        approval_in_flight: number;
+      }>();
+
+    if (!request) {
+      return c.json(
+        { error: "No active publication request found", code: "no_active_request" },
+        404,
+      );
+    }
+
+    // `error` carries the sentence, as the other routes do, so every client
+    // prints it without knowing the code; `code` is for a client that branches.
+    const tooLate = {
+      error:
+        "Publishing this dataset has already started, so the request can no longer be withdrawn. Ask an administrator if it should be stopped.",
+      code: "withdraw_too_late",
+    };
+    if (
+      request.status === "approving" ||
+      request.approval_in_flight === 1 ||
+      publishingHasStarted(request)
+    ) {
+      return c.json(tooLate, 409);
+    }
+
+    const applied = await applyEditWithAudit(
+      db,
+      db
+        .prepare(
+          `UPDATE publication_requests
+           SET status = 'denied', withdrawn_at = datetime('now'),
+               ${APPROVAL_CLAIM_CLEAR_SQL}, updated_at = datetime('now')
+           WHERE id = ? AND status IN ('requested', 'blocked') AND NOT ${approvalInFlightSql()}
+             AND ${NO_PUBLISHING_STARTED_SQL} AND updated_at = ?`,
+        )
+        .bind(request.id, request.updated_at),
+      {
+        userId: currentUser.id,
+        action: "publication_request_withdrawn",
+        resourceType: "dataset",
+        resourceId: datasetId,
+        details: JSON.stringify({ request_id: request.id }),
+      },
+    );
+
+    if (!applied) {
+      return c.json(tooLate, 409);
+    }
+
+    return c.json({
+      message: "Publication request withdrawn",
+      dataset_id: datasetId,
     });
   });
 
@@ -884,7 +1067,14 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
 
     // Resend notification to admins who have publication_request notifications
     // enabled, with the screen section as stored: a request that predates the
-    // screen says "NOT RUN for this request", never nothing.
+    // screen says "NOT RUN for this request", never nothing. The review's section
+    // is the one the screen callback and the watchdog build (ADR 0102), so the
+    // reminder never says less about the review than the mail it reminds of.
+    // ONE instant, in whole seconds, decides what that section says about a review
+    // in flight and whether the reminder counts as the mail below: a review that
+    // crossed its deadline between the two would otherwise be called running in
+    // the reminder and not in flight at the stamp, and its own mail skipped.
+    const reviewAtMs = Math.floor(Date.now() / 1000) * 1000;
     try {
       const outcome = await mailPublicationRequest(c.env, {
         datasetId,
@@ -895,13 +1085,19 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
           request.identifier_screen_status,
           request.identifier_screen_report,
         ),
+        review: await publicationReviewEmailSection(c.env, request.id, reviewAtMs),
       });
       if (outcome.delivered > 0 && request.identifier_screen_status !== null) {
         // A result whose first mail was lost has now reached an admin, so the
-        // watchdog must not send it a third time.
+        // watchdog must not send it a third time. Not while the mail is held for
+        // a review in flight: the reminder then said the review is running, the
+        // mail that carries its verdict has not gone, and stamping it here would
+        // stop that mail for good (the lease takes only an unstamped request).
         await db
           .prepare(
-            "UPDATE publication_requests SET identifier_screen_emailed_at = COALESCE(identifier_screen_emailed_at, datetime('now')) WHERE id = ?",
+            `UPDATE publication_requests
+                SET identifier_screen_emailed_at = COALESCE(identifier_screen_emailed_at, datetime('now'))
+              WHERE id = ?${reviewHoldSql(reviewEnabled(c.env), reviewAtMs)}`,
           )
           .bind(request.id)
           .run();

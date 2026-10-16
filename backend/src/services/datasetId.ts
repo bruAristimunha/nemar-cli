@@ -130,13 +130,19 @@ export const DEV_EPHEMERAL_BAND_END = formatDatasetId("xx", RESERVED_FIXTURE_FLO
 // Ownership is not a function of position either, which rules out splitting the
 // reserved band by owner: nm099999 and nm099998 are adjacent and differ.
 //
+// **nm099997 is declared before it exists.** It is the standing fixture the publication
+// review (ADR 0102) is exercised against on the dev worker: a native, named, private deposit.
+// An undeclared fixture is invisible to the dev worker and claimed by the production one, so the
+// release that ships the review must already carry this line, or production would dispatch
+// enrichment for a repository it has no row for from the day the fixture is created.
+//
 // **nm099999 is deliberately absent.** It exists in BOTH production and dev D1
 // (production holds it among its 203 nm rows), and it is maintained through
 // `POST /admin/datasets/nm099999/reset` rather than a delete-and-recreate
 // cycle. Adding it here would let a non-production worker cascade-delete a
 // GitHub repository production also uses.
 export const DEV_OWNED_FIXTURE_IDS: ReadonlySet<string> = Object.freeze(
-  new Set(["nm099998"]),
+  new Set(["nm099998", "nm099997"]),
 ) as ReadonlySet<string>;
 
 /**

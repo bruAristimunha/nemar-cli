@@ -23,6 +23,25 @@ export function freshDb(): Database {
   return db;
 }
 
+/**
+ * {@link freshDb} with foreign keys ENFORCED while the migrations run and afterwards, as D1 does.
+ * The difference is visible in the schema: SQLite rewrites the `REFERENCES` clauses of child
+ * tables when a parent is renamed only if foreign keys are on at that moment, so migration 0026's
+ * rename of `users_new` leaves every child pointing at a table that no longer exists in the
+ * default `freshDb()` (and any write to one then fails), and converges to `users(id)` here, as it
+ * does in D1 (probed on Miniflare). For a test of what a foreign key refuses.
+ */
+export function freshDbWithForeignKeys(): Database {
+  const db = new Database(":memory:");
+  db.exec("PRAGMA foreign_keys = ON");
+  for (const file of readdirSync(MIGRATIONS_DIR)
+    .filter((f) => f.endsWith(".sql"))
+    .sort()) {
+    db.exec(readFileSync(join(MIGRATIONS_DIR, file), "utf-8"));
+  }
+  return db;
+}
+
 export function realD1(db: Database): D1Database {
   return {
     prepare(sql: string) {
@@ -97,11 +116,15 @@ export function realD1(db: Database): D1Database {
 }
 
 /**
- * Wrap a D1 so `before(sql)` runs, and is awaited, ahead of every statement
- * executes. Statements built by the wrapper keep `__execForBatch`, so
- * `batch()` still works through it.
+ * Wrap a D1 so `before(sql, binds)` runs, and is awaited, ahead of every
+ * statement executes; `binds` are the values the statement was bound with, so
+ * a fault can be aimed at one row's statement and not at every row's. Statements
+ * built by the wrapper keep `__execForBatch`, so `batch()` still works through it.
  */
-export function wrapD1(d1: D1Database, before: (sql: string) => void | Promise<void>): D1Database {
+export function wrapD1(
+  d1: D1Database,
+  before: (sql: string, binds: readonly unknown[]) => void | Promise<void>,
+): D1Database {
   return {
     prepare(sql: string) {
       const inner = d1.prepare(sql) as unknown as {
@@ -111,21 +134,23 @@ export function wrapD1(d1: D1Database, before: (sql: string) => void | Promise<v
         all(): Promise<unknown>;
         __execForBatch(): unknown;
       };
+      let binds: readonly unknown[] = [];
       const api = {
         bind(...p: unknown[]) {
+          binds = p;
           inner.bind(...p);
           return api;
         },
         async run() {
-          await before(sql);
+          await before(sql, binds);
           return inner.run();
         },
         async first() {
-          await before(sql);
+          await before(sql, binds);
           return inner.first();
         },
         async all() {
-          await before(sql);
+          await before(sql, binds);
           return inner.all();
         },
         __execForBatch() {
@@ -160,7 +185,7 @@ export function yieldingD1(d1: D1Database): D1Database {
  */
 export function interceptingD1(
   d1: D1Database,
-  hook: (sql: string) => void | Promise<void>,
+  hook: (sql: string, binds: readonly unknown[]) => void | Promise<void>,
 ): D1Database {
   return wrapD1(d1, hook);
 }

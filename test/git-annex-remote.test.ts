@@ -1232,7 +1232,9 @@ exec "${realGit}" "$@"
       process.env.PATH = `${wrapperDir}:${originalPath ?? ""}`;
       result = await pushToGitHub(repo, "origin");
     } finally {
-      if (originalPath === undefined) process.env.PATH = undefined;
+      // Assigning `undefined` would store the STRING "undefined" as PATH for the rest of this
+      // shared `bun test` process, and no later spawn of git or git-annex would resolve.
+      if (originalPath === undefined) Reflect.deleteProperty(process.env, "PATH");
       else process.env.PATH = originalPath;
     }
 

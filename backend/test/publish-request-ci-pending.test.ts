@@ -508,12 +508,14 @@ describe("the request route checks the minimums while CI is pending", () => {
     descriptionBody = NO_ETHICS_FIELD;
     readmeMode = "missing";
     await requestPublication();
+    // The order of the one shared list (ADR 0102, shared/readme-candidates.ts),
+    // which the publication review reads too: `.rst` comes before `.txt`.
     expect(contentReads).toEqual([
       "dataset_description.json",
       "README.md",
       "README",
-      "README.txt",
       "README.rst",
+      "README.txt",
     ]);
   });
 

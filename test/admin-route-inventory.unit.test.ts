@@ -18,12 +18,12 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { adminMiddleware, authMiddleware } from "../backend/src/middleware/auth";
+import { adminMiddleware, authMiddleware, cookieOriginGuard } from "../backend/src/middleware/auth";
 import { adminRoutes } from "../backend/src/routes/admin";
 
 const EXPECTED_ENTRIES: Record<string, number> = {
-  // Router-level middleware (authMiddleware + adminMiddleware).
-  "ALL /*": 2,
+  // Router-level middleware (authMiddleware + adminMiddleware + cookieOriginGuard, #1603/#1584).
+  "ALL /*": 3,
 
   // Users / accounts
   "GET /users": 1,
@@ -31,6 +31,8 @@ const EXPECTED_ENTRIES: Record<string, number> = {
   "POST /users/:username/role": 3,
   // #1284, epic #1272 phase 4 (ADR 0048): account kinds.
   "POST /users/:username/kind": 3,
+  // Owner recovery for a stuck pending account: ownerMiddleware plus the handler.
+  "POST /users/by-id/:id/verify": 2,
   "GET /users/:username/keys": 2,
   "POST /users/:username/keys": 3,
   "DELETE /users/:username/keys/:id": 2,
@@ -89,6 +91,13 @@ const EXPECTED_ENTRIES: Record<string, number> = {
 
   // Publication workflow
   "GET /publish/requests": 1,
+  // ADR 0102: the review of the active request, with its history.
+  "GET /publish/:id/review": 1,
+  // ADR 0102: start (or start again) the review of the screened commit; one route, no `--all`.
+  "POST /publish/:id/review/start": 1,
+  // ADR 0102: mail the depositor an administrator's typed message and leave the request open; the
+  // body is parsed by hand, so there is one handler and no validator.
+  "POST /publish/:id/comment": 1,
   "POST /publish/:id/deny": 2,
   "POST /publish/:id/approve": 2,
   // ADR 0080: launch an approval from the web by dispatching it to an executor.
@@ -216,14 +225,20 @@ describe("admin route inventory", () => {
   });
 
   test("entry total is pinned", () => {
-    expect(adminRoutes.routes.length).toBe(142);
+    expect(adminRoutes.routes.length).toBe(148);
   });
 
-  // The count pin above can't see a SWAP of the two router-level middleware
-  // entries. Order is load-bearing: authMiddleware resolves the user that
-  // adminMiddleware's role check reads.
-  test("router-level middleware order is pinned (auth before admin)", () => {
+  // The count pin above can't see a SWAP of the router-level middleware
+  // entries. Order is load-bearing: authMiddleware resolves the user and the
+  // `authMethod` that adminMiddleware's role check and cookieOriginGuard read,
+  // and the guard answers after the role check so a member hears "Admin
+  // access required" and is not asked about an Origin.
+  test("router-level middleware order is pinned (auth, admin, then the cookie Origin guard)", () => {
     const star = adminRoutes.routes.filter((r) => r.method === "ALL" && r.path === "/*");
-    expect(star.map((r) => r.handler)).toEqual([authMiddleware, adminMiddleware]);
+    expect(star.map((r) => r.handler)).toEqual([
+      authMiddleware,
+      adminMiddleware,
+      cookieOriginGuard,
+    ]);
   });
 });

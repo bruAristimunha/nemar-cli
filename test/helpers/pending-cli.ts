@@ -139,6 +139,8 @@ export function statusBody(over: Record<string, unknown> = {}) {
     approved_at: null,
     denied_at: null,
     denied_reason: null,
+    withdrawn: false,
+    withdrawn_at: null,
     block_reason: "bids_validation_pending",
     message: PENDING_BODY.message,
     ci_url: CI_URL,

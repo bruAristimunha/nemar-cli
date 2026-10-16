@@ -47,16 +47,19 @@ export type { BidsTreeStats } from "./github/bids-tree";
 export {
   IDENTIFIER_SCREEN_TOKEN_DOMAIN,
   IDENTIFIER_SWEEP_TOKEN_DOMAIN,
+  signApprovalDispatchToken,
   signIdentifierScreenCallbackToken,
   signIdentifierSweepCallbackToken,
   signManifestCallbackToken,
   signPrescreenCallbackToken,
+  verifyApprovalDispatchToken,
   verifyIdentifierScreenCallbackToken,
   verifyIdentifierSweepCallbackToken,
   verifyManifestCallbackToken,
   verifyPrescreenCallbackToken,
 } from "./github/callback-tokens";
 export type {
+  ApprovalDispatchTokenPayload,
   IdentifierScreenCallbackPayload,
   IdentifierSweepCallbackPayload,
   ManifestCallbackPayload,

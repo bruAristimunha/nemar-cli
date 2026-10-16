@@ -1718,9 +1718,11 @@ addVerboseHelp(
   requestUploadAccessCmd,
   `
 Description:
-  Uploading datasets needs upload access: a one-time grant an admin makes
-  after reviewing who you are and where you are. Verifying your email is
-  not enough on its own, and nothing grants it automatically.
+  Uploading datasets, or being added as a collaborator on someone else's
+  dataset, needs upload access: a one-time grant an admin makes after
+  reviewing who you are and where you are. Your email must be verified
+  first, but verifying it is not enough on its own, and nothing grants
+  access automatically.
 
   Before asking, your account needs a username, your given and family name,
   a GitHub username that exists, and your city and country. Set them in

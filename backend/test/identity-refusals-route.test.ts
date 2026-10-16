@@ -240,7 +240,7 @@ describe("an address is found whatever case it was stored or typed in", () => {
 
   test("resend-verification finds a legacy row typed in another case", async () => {
     seedLegacy();
-    db.run("UPDATE users SET status = 'pending' WHERE email = ?", [MIXED]);
+    db.run("UPDATE users SET status = 'pending', email_verified = 0 WHERE email = ?", [MIXED]);
     await post("/auth/resend-verification");
     expect(storedToken()).not.toBe("seed-token");
     expect(storedToken()).toBeTruthy();
@@ -255,7 +255,7 @@ describe("an address is found whatever case it was stored or typed in", () => {
   test("an address matching NO account rotates nothing", async () => {
     // The guard against a rotation assertion that would pass on any input.
     seedLegacy();
-    db.run("UPDATE users SET status = 'pending' WHERE email = ?", [MIXED]);
+    db.run("UPDATE users SET status = 'pending', email_verified = 0 WHERE email = ?", [MIXED]);
     await post("/auth/resend-verification", "nobody@example.org");
     expect(storedToken()).toBe("seed-token");
   });

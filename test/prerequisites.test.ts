@@ -82,7 +82,8 @@ describe("checkPrerequisitesForCommand: a slow (not missing) tool (#1257 item 25
       expect(warnings.some((w) => w.includes("GitHub CLI") && w.includes("time"))).toBe(true);
     } finally {
       console.warn = originalWarn;
-      process.env.PATH = originalPath;
+      if (originalPath === undefined) Reflect.deleteProperty(process.env, "PATH");
+      else process.env.PATH = originalPath;
       // Assigning `undefined` here would coerce to the literal string
       // "undefined" (not delete the key), poisoning getProbeTimeoutMs()'s
       // Number() parse for every later test in this shared bun:test process

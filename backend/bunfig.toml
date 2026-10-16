@@ -1,0 +1,4 @@
+# `cd backend && bun test` (this package's test script) does not read the repository root's
+# bunfig.toml, so the loopback default for Bun.serve() is named here too. The root file says why.
+[test]
+preload = ["../test/helpers/loopback-serve-preload.ts"]

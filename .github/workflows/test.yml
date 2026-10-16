@@ -855,14 +855,15 @@ jobs:
       - name: Install backend dependencies
         run: cd backend && bun install
 
-      # The website's transcription of shared/contract/account-copy.ts, so
-      # test/account-copy-parity.test.ts can actually compare the two here
+      # The website's transcriptions of shared/contract/account-copy.ts and
+      # shared/contract/publication-review-copy.ts, so test/account-copy-parity.test.ts
+      # and test/publication-review-copy-parity.test.ts can actually compare them here
       # (#1268, ADR 0045). Without it that test found no checkout and returned
       # early: the parity claim was enforced on developer machines and nowhere
       # else, while reporting green as a required check.
       #
-      # nemarOrg/website is PUBLIC, so no token is needed. Sparse, non-cone, one
-      # file: a table of string constants, not that repo's module graph. It
+      # nemarOrg/website is PUBLIC, so no token is needed. Sparse, non-cone, two
+      # files: tables of string constants, not that repo's module graph. It
       # lands in website-copy/ at the repo root, which the unit-pure file glob
       # below cannot reach (it lists test/*.test.ts and backend/test/*.test.ts
       # only) and .gitignore covers.
@@ -894,19 +895,22 @@ jobs:
         with:
           repository: nemarOrg/website
           path: website-copy
-          sparse-checkout: src/lib/account-copy.ts
+          sparse-checkout: |
+            src/lib/account-copy.ts
+            src/lib/publication-review-copy.ts
           sparse-checkout-cone-mode: false
           ref: staging
 
-      # The deployed copies of onboard-openneuro.yml and run-pr-review.yml, for the
-      # same reason and with the same shape (#1309). Both are authored in this repo
-      # beside the code they invoke, then deployed by copying them whole into
-      # nemarDatasets/.github -- and the first pair had already drifted by one merged
+      # The deployed copies of onboard-openneuro.yml, run-pr-review.yml and
+      # run-publication-review.yml, for the same reason and with the same shape
+      # (#1309). All three are authored in this repo beside the code they invoke,
+      # then deployed by copying them whole into nemarDatasets/.github -- and the
+      # first pair (onboard-openneuro.yml and run-pr-review.yml) had already drifted by one merged
       # PR before anyone noticed, because nothing compared them. `main`, not a
       # pre-release branch: that repo has no release train, so what is on main is
       # what runs.
       #
-      # nemarDatasets/.github is PUBLIC, so no token is needed. Sparse, non-cone, two
+      # nemarDatasets/.github is PUBLIC, so no token is needed. Sparse, non-cone, three
       # files (non-cone mode takes file paths, one per line). They land in
       # dataset-workflows-live/ at the repo root, which the unit-pure file glob does
       # not reach, so they cannot be mistaken for test files. A workflow added to
@@ -919,6 +923,7 @@ jobs:
           sparse-checkout: |
             .github/workflows/onboard-openneuro.yml
             .github/workflows/run-pr-review.yml
+            .github/workflows/run-publication-review.yml
           sparse-checkout-cone-mode: false
           ref: main
 
@@ -974,8 +979,12 @@ jobs:
           # contract: a path that is not there FAILS rather than skipping, so a
           # broken checkout step cannot silently disable the check.
           NEMAR_WEBSITE_ACCOUNT_COPY: website-copy/src/lib/account-copy.ts
+          # Same checkout, same rule, for the page-owned words of the publication
+          # review (ADR 0102, #1780): a path that is not there FAILS.
+          NEMAR_WEBSITE_REVIEW_COPY: website-copy/src/lib/publication-review-copy.ts
           NEMAR_DATASET_WORKFLOW_LIVE: dataset-workflows-live/.github/workflows/onboard-openneuro.yml
           NEMAR_PR_REVIEW_WORKFLOW_LIVE: dataset-workflows-live/.github/workflows/run-pr-review.yml
+          NEMAR_PUBLICATION_REVIEW_WORKFLOW_LIVE: dataset-workflows-live/.github/workflows/run-publication-review.yml
           # Empty on a fork, where the checkout above is skipped, so the guard
           # skips VISIBLY instead of failing on a checkout that could never have
           # worked. On any run from this repository it is set, and a missing
@@ -1162,6 +1171,7 @@ jobs:
             if [[ "$VERSION" == *"$SHORT_SHA"* ]]; then
               echo "Found matching version: $VERSION"
               echo "tag=PR${PR_NUMBER}" >> $GITHUB_OUTPUT
+              echo "version=$VERSION" >> $GITHUB_OUTPUT
               exit 0
             fi
             echo "Attempt $i: version=$VERSION (waiting for $SHORT_SHA)..."
@@ -1172,9 +1182,24 @@ jobs:
           echo "::warning::PR-specific package PR${PR_NUMBER} with commit ${SHORT_SHA} not found after 5 minutes. Falling back to 'dev' tag. E2E tests may not be testing actual PR changes!"
           echo "tag=dev" >> $GITHUB_OUTPUT
 
+      # `npm view` above found the PR's version, but bun resolves a tag through its own request
+      # to the registry, which can still be served the package document from before the publish:
+      # `Package "nemar-cli" with tag "PR1793" not found, but package exists` failed this job on a
+      # pull request whose package had been found seconds earlier. So install the exact version the
+      # wait found (none when it fell back to `dev`, which installs the tag), without bun's cache,
+      # and retry for two minutes before failing.
       - name: Install CLI from npm
+        env:
+          TAG: ${{ steps.npm-tag.outputs.tag }}
+          VERSION: ${{ steps.npm-tag.outputs.version }}
         run: |
-          bun install -g nemar-cli@${{ steps.npm-tag.outputs.tag }}
+          SPEC="nemar-cli@${VERSION:-$TAG}"
+          for i in {1..12}; do
+            if bun install -g --no-cache "$SPEC"; then break; fi
+            if [[ "$i" -eq 12 ]]; then echo "::error::could not install $SPEC"; exit 1; fi
+            echo "Attempt $i: $SPEC is not installable yet, waiting for the registry..."
+            sleep 10
+          done
           echo "Installed version: $(nemar --version)"
 
       - name: Install test dependencies

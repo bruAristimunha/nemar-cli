@@ -64,6 +64,7 @@
  * `runAnonymitySweepCron` carries the fence.
  */
 
+import { README_CANDIDATES } from "../../../shared/readme-candidates.js";
 import { auditLogStatement } from "../db/audit-log.js";
 import type { Bindings } from "../types/bindings.js";
 import {
@@ -429,14 +430,13 @@ const MIN_OWNER_TOKEN_LENGTH = 4;
  * Root-level BIDS metadata plus the two free-text files, then any other
  * root-level `.json`/`.tsv`. Sub-directory sidecars are not scanned: they hold
  * acquisition parameters rather than prose, there are thousands of them, and
- * the budget is better spent on the files a person actually wrote.
+ * the budget is better spent on the files a person actually wrote. The README
+ * forms come from the one shared list (ADR 0102); all four are read, so only
+ * their order inside the budget follows it.
  */
-const PRIORITY_DEPOSIT_FILES = [
+const PRIORITY_DEPOSIT_FILES: readonly string[] = [
   "dataset_description.json",
-  "README",
-  "README.md",
-  "README.txt",
-  "README.rst",
+  ...README_CANDIDATES,
   "CHANGES",
   "CHANGES.md",
   "participants.tsv",

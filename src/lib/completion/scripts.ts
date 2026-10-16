@@ -15,6 +15,10 @@
  * a future second directive doesn't require touching every script's parsing
  * logic, only its branching.
  *
+ * The bash script avoids `mapfile` (bash 4+): macOS still ships bash 3.2 as
+ * /bin/bash, where `mapfile` is "command not found", `raw` was never split and
+ * TAB offered nothing, with the error hidden behind the user's prompt.
+ *
  * Built with array-of-lines + join("\n") rather than one big template
  * literal, so the shells' own `${...}`/`$(...)` syntax below never has to
  * be escaped against TypeScript's own template-literal interpolation.
@@ -25,13 +29,14 @@ const BASH_SCRIPT_LINES = [
   "# Install (current shell):  source <(nemar completion bash)",
   "# Install (persistent):     nemar completion bash > /usr/local/etc/bash_completion.d/nemar",
   "_nemar_complete() {",
-  "  local cur words_to_complete raw lines n",
+  "  local cur words_to_complete raw line lines n",
   '  cur="${COMP_WORDS[COMP_CWORD]}"',
   '  words_to_complete=("${COMP_WORDS[@]:1:COMP_CWORD}")',
   '  raw="$(nemar __complete -- "${words_to_complete[@]}" 2>/dev/null)"',
   "  COMPREPLY=()",
   '  if [[ -n "$raw" ]]; then',
-  '    mapfile -t lines <<< "$raw"',
+  "    lines=()",
+  '    while IFS= read -r line; do lines+=("$line"); done <<< "$raw"',
   "    n=${#lines[@]}",
   "    if (( n > 0 )); then",
   '      COMPREPLY=("${lines[@]:0:n-1}")',

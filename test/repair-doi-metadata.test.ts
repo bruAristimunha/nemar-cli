@@ -20,6 +20,17 @@ interface Recorded {
   body: Record<string, unknown> | null;
 }
 
+// What these held before this file touched them. `bun test` runs every file in one process, so
+// they are put back in afterAll: gone if they were unset (assigning `undefined` would store the
+// STRING "undefined"), their old value otherwise.
+const originalApiBase = process.env.NEMAR_API_BASE;
+const originalGhToken = process.env.GH_TOKEN;
+
+function restoreEnv(name: string, original: string | undefined): void {
+  if (original === undefined) Reflect.deleteProperty(process.env, name);
+  else process.env[name] = original;
+}
+
 let github: ReturnType<typeof Bun.serve>;
 let api: ReturnType<typeof Bun.serve>;
 const seen: Recorded[] = [];
@@ -98,8 +109,8 @@ beforeAll(async () => {
 
 afterAll(() => {
   (globalThis as { NEMAR_GITHUB_API_URL?: string }).NEMAR_GITHUB_API_URL = undefined;
-  process.env.NEMAR_API_BASE = undefined;
-  process.env.GH_TOKEN = undefined;
+  restoreEnv("NEMAR_API_BASE", originalApiBase);
+  restoreEnv("GH_TOKEN", originalGhToken);
   github.stop(true);
   api.stop(true);
 });

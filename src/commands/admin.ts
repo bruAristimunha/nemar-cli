@@ -13,7 +13,7 @@
  * - nemar admin repo public/private - Change repository visibility
  * - nemar admin ci check/add       - Manage CI workflows
  * - nemar admin doi create/info/update/enrich - DOI management
- * - nemar admin publish list/deny/approve - Publication workflow
+ * - nemar admin publish list/show/start/next/approve/deny/screen - Publication workflow and its automated review
  * - nemar admin revert             - Revert dataset to a previous version
  * - nemar admin withdraw/restore   - Withdraw/restore a published dataset (visibility + EZID DOIs)
  * - nemar admin recover [status]   - Re-copy epic #967 imports whose upstream is accessible
@@ -50,11 +50,7 @@ import {
   neurobagelVerificationState,
 } from "../../shared/contract/neurobagel-admin.js";
 import { weeklyAttention } from "../../shared/contract/weekly-attention.js";
-import {
-  PUBLICATION_STEPS,
-  PUBLICATION_STEP_LABELS,
-  stepsForRelease,
-} from "../../shared/publication-steps.js";
+import { failWith, handleCommandError } from "../lib/admin-command.js";
 import {
   CLEAR_FLAGS,
   EDIT_FLAG_FIELDS,
@@ -171,6 +167,7 @@ import {
   uploadTierOf,
   validateCi,
   verifyImport,
+  verifyUserById,
   withdrawDataset,
   zarrFidelitySweep,
 } from "../lib/api/admin.js";
@@ -184,7 +181,7 @@ import {
   listDatasets,
   submitEnrichment,
 } from "../lib/api/datasets.js";
-import { ApiError, errorDetail } from "../lib/api/errors.js";
+import { ApiError, errorDetail, isRouteNotFound } from "../lib/api/errors.js";
 import {
   NOTICE_LEVELS,
   type NoticeLevel,
@@ -192,15 +189,6 @@ import {
   deleteNotice,
   listAdminNotices,
 } from "../lib/api/notices.js";
-import {
-  type PublishProgressInfo,
-  type StepResult,
-  approvePublication,
-  denyPublication,
-  getPublishStatus,
-  listPublishRequests,
-  rerunIdentifierScreen,
-} from "../lib/api/publish.js";
 import { getConfig, isAuthenticated } from "../lib/config.js";
 import {
   type ConfirmOptions,
@@ -222,7 +210,6 @@ import {
 } from "../lib/git-annex/clone-push.js";
 import { checkDownloadPrerequisites } from "../lib/git-annex/prereq.js";
 import { getVersionCommit, listDatasetVersions } from "../lib/git-annex/repo-state.js";
-import { identifierScreenLines } from "../lib/identifier-screen-display.js";
 import {
   type RecoverDatasetEntry,
   loadRecoverDatasets,
@@ -237,39 +224,7 @@ import {
   stillWithdrawn,
 } from "../lib/withdrawn-datasets.js";
 import { prReviewsCommand } from "./admin-pr-reviews.js";
-
-/**
- * Hints keyed on a publication `block_reason`, which outrank the status-code
- * hint: a 422 from the publish paths is not always a CI problem, and telling
- * an admin to "fix the CI issues" when the real problem is a missing
- * researcher name sends them to the wrong place entirely (#1255).
- */
-const BLOCK_REASON_HINTS: Record<string, string> = {
-  owner_name_missing:
-    "Run `nemar admin backfill-names --apply` if the owner's ORCID record publishes their name; an ORCID-linked owner must otherwise make it public on ORCID and sign in again, and an owner with no linked ORCID can now type it into Settings on nemar.org (ADR 0042).",
-};
-
-/** Handle common error patterns in admin CLI commands */
-function handleCommandError(
-  error: unknown,
-  spinner: ReturnType<typeof ora>,
-  defaultMsg: string,
-  hints?: Record<number, string>,
-): void {
-  if (error instanceof ApiError) {
-    spinner.fail(error.message);
-    const reasonHint = error.blockReason ? BLOCK_REASON_HINTS[error.blockReason] : undefined;
-    const hint = reasonHint ?? hints?.[error.statusCode];
-    if (hint) {
-      console.log(chalk.dim(`  ${hint}`));
-    } else if (error.statusCode === 403) {
-      console.log(chalk.dim("  This command requires admin privileges"));
-    }
-  } else {
-    spinner.fail(defaultMsg);
-    console.log(chalk.dim(`  Error details: ${errorDetail(error)}`));
-  }
-}
+import { publishCommand } from "./admin-publish.js";
 
 /**
  * Fetch a file from a GitHub repo via the gh CLI, returning its decoded content.
@@ -938,6 +893,10 @@ adminUsersCommand
   .option("--github <handle>", "GitHub handle (owner only)")
   .option("--clear-github", "Remove the GitHub handle (owner only)")
   .option("--email <address>", "Email address (owner only; marks it unconfirmed)")
+  .option(
+    "--orcid <iD>",
+    "ORCID iD, attested by an owner and marked verified (owner only; ADR 0106)",
+  )
   .option(YES_OPTION, YES_DESCRIPTION)
   .option(NO_OPTION, NO_DESCRIPTION)
   .addHelpText(
@@ -955,11 +914,17 @@ Who can change what:
 What this does NOT change (each has its own command):
   role / status / upload access   nemar admin role | approve | revoke
   account kind                    nemar admin kind
-  ORCID iD                        proven by signing in with ORCID, never typed in
+  ORCID iD sign-in record         the person links it in Settings or with
+                                  'nemar auth profile orcid link'; --orcid records
+                                  an owner's attestation without that record, and
+                                  never replaces an iD the person proved (ADR 0106)
   names on an ORCID-verified account: ORCID owns them and rewrites them at the
   next sign-in, so the edit is refused (the person updates orcid.org)
 
 Safeguards:
+  - An attested iD is marked verified with no sign-in record behind it, and the
+    audit row says so (orcid_attested). Use it only when the iD is confirmed for
+    that person, for example against their own message.
   - The account is shown with the exact changes and you confirm (-y skips the
     prompt, but only when the text names the account exactly).
   - Every edit is written to the audit log with the old and new values.
@@ -1355,6 +1320,81 @@ Examples:
         404: "User not found",
         409: "User already has that role",
       });
+    }
+  });
+
+// ============================================================================
+// Force Verify (Owner Only)
+// ============================================================================
+
+adminCommand
+  .command("verify")
+  .description("Mark a pending account's email as verified (owner only)")
+  .argument("<id>", "Numeric user id (find it with 'nemar admin users --pending')")
+  .option(YES_OPTION, YES_DESCRIPTION)
+  .option(NO_OPTION, NO_DESCRIPTION)
+  .addHelpText(
+    "after",
+    `
+Moves a pending account to verified (the base tier) without the person
+redeeming an email code. It is the same transition the code flow makes, and the
+audit log records who did it.
+
+Find the numeric id with 'nemar admin users --pending'.
+No admin notification mail is sent: the owner is acting directly, unlike the
+self-verify flows where the person proved their own inbox.
+
+Rules:
+  - Only owners; it asserts an inbox the person did not prove
+  - Only pending accounts; use approve or revoke for the other tiers
+  - It grants no upload access: that is still 'nemar admin approve'
+
+Examples:
+  $ nemar admin verify 80
+  $ nemar admin verify 80 -y`,
+  )
+  .action(async (idArg: string, options: ConfirmOptions) => {
+    const id = Number.parseInt(idArg, 10);
+    if (!Number.isInteger(id) || id <= 0 || String(id) !== idArg.trim()) {
+      console.error(chalk.red(`Error: invalid user id: ${idArg}`));
+      process.exit(1);
+    }
+    if (!requireAuth()) return;
+
+    const confirmResult = await confirm(
+      `Mark user id ${id}'s email as verified without a code?`,
+      options,
+    );
+    if (confirmResult !== "confirmed") {
+      console.log(chalk.dim(confirmResult === "declined" ? "Skipped" : "Canceled"));
+      return;
+    }
+
+    const spinner = ora(`Verifying user id ${id}...`).start();
+    try {
+      const result = await verifyUserById(id);
+      spinner.succeed(result.message);
+    } catch (error) {
+      // A refused force verify must exit 1, or a script that checks the status code reads a
+      // refusal as a success; `failWith` does, and marks the exit as the Worker's answer so no
+      // "attach the log to a new issue" invitation follows it.
+      //
+      // A Worker that predates this command answers 404 for the ROUTE, and "User not found"
+      // under that would blame the id: the sentence the client already printed says the backend
+      // does not support the command yet, and that is all there is to say.
+      failWith(
+        error,
+        spinner,
+        "Failed to verify the account",
+        isRouteNotFound(error)
+          ? undefined
+          : {
+              400: "Invalid user id",
+              403: "Owner access required",
+              404: "User not found",
+              409: "Only a pending account can be force-verified",
+            },
+      );
     }
   });
 
@@ -3094,534 +3134,6 @@ doiCommand
   );
 
 adminCommand.addCommand(doiCommand);
-
-// ============================================================================
-// Publication Workflow (Admin)
-// ============================================================================
-
-const publishCommand = new Command("publish").description("Publication workflow management");
-
-publishCommand
-  .command("list")
-  .description("List publication requests")
-  .option("-s, --status <status>", "Filter by status (requested, approving, published, denied)")
-  .addHelpText(
-    "after",
-    `
-Description:
-  List all publication requests from users, with optional filtering by status.
-  Shows dataset ID, status, requesting user, and current progress.
-
-Filter Options:
-  requested  - Pending requests awaiting admin action
-  approving  - Currently being processed by orchestrator
-  published  - Successfully published datasets
-  denied     - Denied requests with reasons
-
-Examples:
-  $ nemar admin publish list                # All requests
-  $ nemar admin publish list --status requested   # Pending only
-  $ nemar admin publish list --status approving   # In progress
-  $ nemar admin publish list --status denied      # View denied`,
-  )
-  .action(async (options: { status?: string }) => {
-    if (!requireAuth()) return;
-
-    const spinner = ora("Fetching publication requests...").start();
-
-    try {
-      const result = await listPublishRequests(options.status);
-      spinner.stop();
-
-      if (result.requests.length === 0) {
-        console.log(chalk.dim("\n  No publication requests found.\n"));
-        return;
-      }
-
-      console.log(`\n${chalk.cyan("Publication Requests")} (${result.count})\n`);
-
-      for (const req of result.requests) {
-        const statusColor =
-          req.status === "published"
-            ? chalk.green
-            : req.status === "denied"
-              ? chalk.red
-              : req.status === "approving"
-                ? chalk.yellow
-                : chalk.white;
-
-        console.log(
-          `  ${chalk.bold(req.dataset_id)}  ${statusColor(req.status)}  by ${req.requested_by_username}  ${chalk.dim(req.requested_at)}`,
-        );
-        // #1408: an anonymous release and a publication reach this list
-        // looking identical, and approving the wrong one is not reversible in
-        // either direction -- publishing names a depositor who asked to be
-        // concealed; releasing anonymously withholds a DOI someone needs.
-        if (req.anonymous === 1) {
-          console.log(
-            `    ${chalk.yellow("! anonymous release:")} ${chalk.dim(
-              "repository stays private, DOI stays reserved, depositor is not named",
-            )}`,
-          );
-        }
-        // Epic #1610 phase 4: the identifier screen, in the backend's words.
-        for (const line of identifierScreenLines(req.identifier_screen, 4)) console.log(line);
-        if (req.current_step && req.status === "approving") {
-          console.log(
-            `    ${chalk.yellow(">")} ${req.current_step.replace(/_/g, " ")}${req.last_error ? chalk.red(` (${req.last_error})`) : ""}`,
-          );
-        }
-        // Non-blocking pre-screen advisory (#756): a concern for the admin to
-        // weigh before approving, NOT a block.
-        if (req.prescreen_status === "concern") {
-          let reasons: string[] = [];
-          try {
-            const parsed = JSON.parse(req.prescreen_reasons || "[]");
-            if (Array.isArray(parsed)) reasons = parsed.filter((x) => typeof x === "string");
-          } catch {
-            // malformed -> show the flag without inline reasons
-          }
-          const summary = reasons.length ? reasons.join("; ") : "see pre-screen";
-          console.log(`    ${chalk.yellow("! pre-screen advisory:")} ${chalk.dim(summary)}`);
-        }
-      }
-      console.log();
-    } catch (error) {
-      handleCommandError(error, spinner, "Failed to list publication requests");
-    }
-  });
-
-publishCommand
-  .command("deny")
-  .description("Deny a publication request")
-  .argument("<dataset-id>", "Dataset ID")
-  .option("-r, --reason <reason>", "Reason for denial")
-  .option(YES_OPTION, YES_DESCRIPTION)
-  .option(NO_OPTION, NO_DESCRIPTION)
-  .addHelpText(
-    "after",
-    `
-Description:
-  Deny a user's publication request with a specific reason.
-  The user will receive an email notification with your reason.
-
-  A clear, actionable reason helps users understand what to fix
-  before resubmitting their publication request.
-
-Requirements:
-  - Must provide a reason for denial
-  - Reason will be sent to the user via email
-  - User can fix issues and submit a new request
-
-Examples:
-  $ nemar admin publish deny nm000104 --reason "BIDS validation failing"
-  $ nemar admin publish deny nm000104 -r "Dataset incomplete - missing subjects"
-  $ nemar admin publish deny nm000104    # Prompts for reason interactively`,
-  )
-  .action(async (datasetId, options: ConfirmOptions & { reason?: string }) => {
-    if (!requireAuth()) return;
-
-    let reason = options.reason;
-    if (!reason) {
-      const { inputReason } = await inquirer.prompt([
-        { type: "input", name: "inputReason", message: "Reason for denial:" },
-      ]);
-      reason = inputReason;
-    }
-
-    if (!reason) {
-      console.log(chalk.red("Reason is required"));
-      return;
-    }
-
-    const confirmResult = await confirm(`Deny publication of ${datasetId}?`, options);
-    if (confirmResult !== "confirmed") {
-      console.log(chalk.dim(confirmResult === "declined" ? "Skipped" : "Cancelled"));
-      return;
-    }
-
-    const spinner = ora(`Denying publication for ${datasetId}...`).start();
-
-    try {
-      await denyPublication(datasetId, reason);
-      spinner.succeed(`Publication denied for ${datasetId}`);
-      console.log(chalk.dim("  User has been notified."));
-    } catch (error) {
-      handleCommandError(error, spinner, "Failed to deny publication");
-    }
-  });
-
-publishCommand
-  .command("screen")
-  .description("Re-run the identifier screen of a publication request")
-  .argument("<dataset-id>", "Dataset ID")
-  .addHelpText(
-    "after",
-    `
-Description:
-  Dispatch the identifier screen again for the dataset's active publication
-  request (requested or blocked). Use it when the screen did not run, did not
-  report, or read a commit that is no longer the repository's main. The admins
-  are mailed when it reports, as for a new request.
-
-  Refused while a screen is already running and recent, and for sandbox (xx)
-  datasets, which are not screened.
-
-Examples:
-  $ nemar admin publish screen nm000104`,
-  )
-  .action(async (datasetId: string) => {
-    if (!requireAuth()) return;
-    const spinner = ora(`Re-running the identifier screen for ${datasetId}...`).start();
-    try {
-      const result = await rerunIdentifierScreen(datasetId);
-      if (result.status === "pending") {
-        spinner.succeed(`Identifier screen dispatched for ${datasetId}`);
-        console.log(chalk.dim("  The admins are mailed when it reports."));
-      } else {
-        spinner.warn(`The identifier screen for ${datasetId} could not be started`);
-        for (const line of identifierScreenLines(result.identifier_screen)) console.log(line);
-        console.log(chalk.dim("  The admins have been mailed this result."));
-      }
-    } catch (error) {
-      handleCommandError(error, spinner, "Failed to re-run the identifier screen");
-      process.exitCode = 1;
-    }
-  });
-
-publishCommand
-  .command("approve")
-  .description("Approve and publish a dataset (runs orchestrator)")
-  .argument("<dataset-id>", "Dataset ID")
-  .option("--resume", "Resume from last failed step")
-  .option("--sandbox", "Use Zenodo sandbox for testing")
-  .option("--skip-ci-check", "Skip BIDS validation CI check (admin override)")
-  .option(
-    "--acknowledge-identifier-screen <reason>",
-    "Approve over an identifier screen that needs review, recording why (10 to 500 characters)",
-  )
-  .option(YES_OPTION, YES_DESCRIPTION)
-  .option(NO_OPTION, NO_DESCRIPTION)
-  .addHelpText(
-    "after",
-    `
-Description:
-  Approve a publication request and run the automated orchestrator
-  to make the dataset publicly accessible with a permanent DOI.
-
-  The request's IDENTIFIER SCREEN must allow it first. A clean screen passes.
-  A screen that needs review, or could not look at everything, passes only with
-  --acknowledge-identifier-screen "<reason>", which is recorded with your name.
-  Direct identifiers cannot be acknowledged: the depositor fixes the data and
-  requests again. A screen that did not run or did not report must be re-run
-  with 'nemar admin publish screen <dataset-id>', and so must one whose commit
-  is no longer the repository's main. 'nemar admin publish list' shows it.
-
-  An ANONYMOUS RELEASE runs a smaller step set: the GitHub repository stays
-  private, no identifier is published, and the depositor is not named. The
-  confirmation banner reads the pending request and lists what will actually
-  run, so approve one and read the banner rather than this list.
-
-  WARNING: This action is PERMANENT. Published datasets cannot be unpublished.
-  Once a DOI is assigned, it is permanent and cannot be deleted.
-
-Orchestrator Steps (execution order; shared/publication-steps.ts):
-   1. CI Check          - Verify BIDS validation passes, deploy workflows if missing
-   2. Enrichment Check  - Verify metadata pipeline has run (warn-only, non-blocking)
-   3. S3 Public Read    - Grant public read access to S3 data
-   4. Repo Public       - Publish the catalog row; for an ordinary publication
-                          this also makes the GitHub repository public, and for
-                          an anonymous release the repository stays private
-   5. Tag Protection    - Enable tag protection rules
-   6. Create DOI        - Create concept DOI via EZID (or Zenodo if configured)
-   7. Update Metadata   - Update dataset metadata from BIDS description
-   8. Update README     - Add DOI badge and citation info to README
-   9. Create Tag        - Create version tag (e.g., v1.0.0)
-  10. Create Release    - Create GitHub release from tag
-  11. Upload to Zenodo  - Legacy Zenodo upload (disabled; kept for step history)
-  12. Publish DOI       - Make DOI public and findable (permanent, irreversible)
-  13. Version DOI       - Mint the version DOI and dispatch the manifest job,
-                          which is what records the version. Runs for an
-                          anonymous release too, minting RESERVED (#1447)
-  14. S3 Lock           - Enable S3 Object Lock (prevents data deletion)
-  15. Sync NEMAR        - Legacy nemar.org sync (no-op, retired)
-  16. Notify User       - Send publication confirmation email
-
-  (Archive zip generation is not an orchestrator step; the version-DOI
-  workflow dispatches it separately.)
-
-  Steps 7, 8, 11 and 12 are skipped for an anonymous release: each one either
-  publishes an identifier or writes one into a file the data plane serves
-  publicly. See ANONYMOUS_RELEASE_SKIPPED_STEPS in shared/publication-steps.ts,
-  which states the reason for each.
-
-Resume Capability:
-  If a step fails, the orchestrator saves progress. Use --resume to retry
-  from the failed step without re-running successful steps.
-
-  The orchestrator is idempotent - safe to run multiple times. Completed
-  steps are automatically skipped.
-
-Examples:
-  $ nemar admin publish approve nm000104                    # Run full orchestrator
-  $ nemar admin publish approve nm000104 --resume           # Resume from failed step
-  $ nemar admin publish approve nm000104 --skip-ci-check    # Override BIDS validation
-  $ nemar admin publish approve nm000104 --yes              # Skip confirmation
-
-After Approval:
-  - User receives email with DOI and public dataset link
-  - Dataset is publicly visible on GitHub
-  - Tags are protected (prevents version manipulation)
-  - Data is protected by S3 Object Lock`,
-  )
-  .action(
-    async (
-      datasetId,
-      options: ConfirmOptions & {
-        resume?: boolean;
-        sandbox?: boolean;
-        skipCiCheck?: boolean;
-        acknowledgeIdentifierScreen?: string;
-      },
-    ) => {
-      if (!requireAuth()) return;
-
-      const ack = options.acknowledgeIdentifierScreen?.trim();
-      if (ack !== undefined && (ack.length < 10 || ack.length > 500)) {
-        console.log(
-          chalk.red("--acknowledge-identifier-screen needs a reason of 10 to 500 characters."),
-        );
-        process.exitCode = 1;
-        return;
-      }
-
-      const action = options.resume
-        ? `Resume publication of ${datasetId}`
-        : `Approve and publish ${datasetId}`;
-      console.log(chalk.cyan(`\n${action}\n`));
-
-      // Ask the server what this request IS before describing what approving
-      // it will do (#1447). An anonymous release runs a strictly smaller step
-      // set, and the banner used to be a hand-numbered literal of all sixteen:
-      // an admin approving one was told the repository would be made public
-      // and the DOI published irreversibly, and neither happens. A banner that
-      // describes the wrong operation is worse than no banner, because it is
-      // the screen the decision is made from.
-      let anonymousRelease = false;
-      let planUnknownReason: string | null = null;
-      try {
-        anonymousRelease = (await getPublishStatus(datasetId)).anonymous === true;
-      } catch (err) {
-        // Unreadable state is not a reason to refuse an approval the admin can
-        // still make, but it IS a reason to stop asserting what will happen --
-        // and to say WHY. A bare `catch {}` here printed "could not read the
-        // request's state" for an expired key, a 404 and a network failure
-        // alike, which is three different next actions rendered as one.
-        planUnknownReason = err instanceof Error ? err.message : String(err);
-      }
-
-      const steps = stepsForRelease(anonymousRelease);
-      if (planUnknownReason === null) {
-        console.log(
-          anonymousRelease
-            ? `This is an ANONYMOUS RELEASE and will run ${steps.length} of the ${PUBLICATION_STEPS.length} orchestrator steps:`
-            : `This will run the following ${steps.length}-step orchestrator:`,
-        );
-      } else {
-        console.log(
-          chalk.yellow(
-            `Could not read the request's state (${planUnknownReason}), so this lists all ${steps.length} steps; an anonymous release runs fewer.`,
-          ),
-        );
-      }
-      // Two columns, generated from the step list rather than typed out, so
-      // adding a step cannot leave the banner describing the old publication.
-      const half = Math.ceil(steps.length / 2);
-      for (let i = 0; i < half; i++) {
-        const left = steps[i];
-        const right = steps[i + half];
-        const label = (step: (typeof steps)[number], n: number): string => {
-          const text =
-            step === "doi_create" && options.sandbox
-              ? `${PUBLICATION_STEP_LABELS[step]} (SANDBOX)`
-              : PUBLICATION_STEP_LABELS[step];
-          return `${String(n).padStart(2, " ")}. ${text}`;
-        };
-        const leftCell = label(left, i + 1).padEnd(34, " ");
-        console.log(`   ${leftCell}${right ? label(right, i + half + 1) : ""}`.trimEnd());
-      }
-      if (anonymousRelease) {
-        console.log();
-        console.log(
-          chalk.yellow("  The GitHub repository stays PRIVATE and no identifier is published:"),
-        );
-        console.log(
-          chalk.yellow(
-            "  the concept and version DOIs stay reserved until the deposit is published for real.",
-          ),
-        );
-      }
-      console.log();
-
-      // Sandbox warning
-      if (options.sandbox) {
-        console.log(chalk.yellow("━".repeat(60)));
-        console.log(chalk.yellow.bold("                 SANDBOX MODE ENABLED"));
-        console.log(chalk.yellow("━".repeat(60)));
-        console.log(chalk.yellow("  • DOI will be created in sandbox mode (EZID test shoulder)"));
-        console.log(chalk.yellow("  • DOI will NOT be indexed by DataCite"));
-        console.log(chalk.yellow("  • DOI will NOT resolve in production"));
-        console.log(chalk.yellow("  • Use this for testing workflows only"));
-        console.log(chalk.yellow("━".repeat(60)));
-        console.log();
-      }
-
-      const confirmResult = await confirm(`${action}?`, options);
-      if (confirmResult !== "confirmed") {
-        console.log(chalk.dim(confirmResult === "declined" ? "Skipped" : "Cancelled"));
-        return;
-      }
-
-      const initialSpinnerText = "Running publication workflow (this may take a few minutes)...";
-      const spinner = ora(initialSpinnerText).start();
-
-      // Most recent step label rendered into the spinner; kept on the
-      // outer scope so onRetry can restore the same line after the
-      // retry notice instead of falling back to the generic text.
-      let currentSpinnerText = initialSpinnerText;
-
-      /**
-       * Render the spinner line for a progress event. Shows the step
-       * position and, for s3_lock, a running locked/total ratio so the
-       * admin can see thousands-of-objects datasets making progress
-       * instead of staring at a static spinner for minutes. See #284.
-       */
-      function renderProgress(info: PublishProgressInfo): string {
-        const stepLabel = info.step.replace(/_/g, " ");
-        const head = `Step ${info.stepIndex}/${info.stepTotal}: ${stepLabel}`;
-        if (
-          info.step === "s3_lock" &&
-          info.s3LockLocked !== undefined &&
-          info.s3LockTotal !== undefined &&
-          info.s3LockTotal > 0
-        ) {
-          const pct = ((info.s3LockLocked / info.s3LockTotal) * 100).toFixed(1);
-          const resumeSuffix = info.s3LockResumed ? " (resumed)" : "";
-          return `${head} | Locking S3 objects: ${info.s3LockLocked}/${info.s3LockTotal} (${pct}%)${resumeSuffix}`;
-        }
-        if (info.step === "s3_lock" && info.s3LockLocked !== undefined) {
-          // Total not yet known (rare; first response before server has
-          // counted). Show running count without the denominator so the
-          // line still advances.
-          const resumeSuffix = info.s3LockResumed ? " (resumed)" : "";
-          return `${head} | Locking S3 objects: ${info.s3LockLocked}${resumeSuffix}`;
-        }
-        return head;
-      }
-
-      try {
-        const result = await approvePublication(
-          datasetId,
-          !!options.resume,
-          !!options.sandbox,
-          !!options.skipCiCheck,
-          (info) => {
-            // Surface transient failures the CLI is about to retry. We pause
-            // the spinner so the message isn't overwritten, then resume it.
-            spinner.stop();
-            const stepLabel = info.step ? info.step.replace(/_/g, " ") : "step";
-            console.log(chalk.yellow(`  [!] ${stepLabel} failed: ${info.error}`));
-            console.log(
-              chalk.dim(
-                `  Retrying in ${Math.round(info.delayMs / 1000)}s (attempt ${info.attempt + 1}/${info.maxAttempts})...`,
-              ),
-            );
-            spinner.start(currentSpinnerText);
-          },
-          (info) => {
-            currentSpinnerText = renderProgress(info);
-            spinner.text = currentSpinnerText;
-          },
-          ack,
-        );
-        spinner.succeed(result.message);
-
-        // Display step-by-step results if available
-        if (result.step_results && result.step_results.length > 0) {
-          console.log();
-          const allSteps = result.step_results;
-          const totalSteps = allSteps.length;
-          allSteps.forEach((sr: StepResult, idx: number) => {
-            const stepNum = `[${String(idx + 1).padStart(2, " ")}/${totalSteps}]`;
-            const stepName = sr.step.replace(/_/g, " ");
-            if (sr.status === "completed") {
-              const durationSec = (sr.duration_ms / 1000).toFixed(1);
-              const retryNote = sr.attempts > 1 ? ` (attempt ${sr.attempts})` : "";
-              console.log(
-                `  ${chalk.green("[x]")} ${chalk.dim(stepNum)} ${stepName} ${chalk.dim(`(${durationSec}s${retryNote})`)}`,
-              );
-            } else if (sr.status === "failed") {
-              console.log(
-                `  ${chalk.red("[!]")} ${chalk.dim(stepNum)} ${stepName}${sr.error ? `: ${chalk.red(sr.error)}` : ""}`,
-              );
-            } else {
-              console.log(
-                `  ${chalk.dim("[-]")} ${chalk.dim(stepNum)} ${chalk.dim(stepName)} ${chalk.dim("(skipped)")}`,
-              );
-            }
-          });
-          console.log();
-        } else if (result.steps_completed) {
-          // Fallback for responses without step_results
-          console.log();
-          for (const step of result.steps_completed) {
-            console.log(`  ${chalk.green("[x]")} ${step.replace(/_/g, " ")}`);
-          }
-          console.log();
-        }
-
-        // Surface non-fatal orchestrator warnings (e.g. notify_user email
-        // failure) so operators know to follow up without re-running.
-        if (result.warning) {
-          console.log(chalk.yellow(`  Warning: ${result.warning}`));
-        }
-      } catch (error) {
-        handleCommandError(error, spinner, "Failed to approve publication", {
-          422: "Fix the CI issues and retry with --resume",
-        });
-
-        // After all retries fail, surface the per-attempt step timeline the
-        // retry loop attached to the error so the admin sees which step
-        // failed when, instead of just the final 500 message.
-        const stepResults = (error as { stepResults?: StepResult[] }).stepResults;
-        if (stepResults && stepResults.length > 0) {
-          console.log();
-          console.log(chalk.dim("Step timeline (last attempt):"));
-          const totalSteps = stepResults.length;
-          stepResults.forEach((sr, idx) => {
-            const stepNum = `[${String(idx + 1).padStart(2, " ")}/${totalSteps}]`;
-            const stepName = sr.step.replace(/_/g, " ");
-            const durationSec = (sr.duration_ms / 1000).toFixed(1);
-            const retryNote = sr.attempts > 1 ? ` (attempt ${sr.attempts})` : "";
-            if (sr.status === "completed") {
-              console.log(
-                `  ${chalk.green("[x]")} ${chalk.dim(stepNum)} ${stepName} ${chalk.dim(`(${durationSec}s${retryNote})`)}`,
-              );
-            } else if (sr.status === "failed") {
-              console.log(
-                `  ${chalk.red("[!]")} ${chalk.dim(stepNum)} ${stepName}${sr.error ? `: ${chalk.red(sr.error)}` : ""}`,
-              );
-            } else {
-              console.log(
-                `  ${chalk.dim("[-]")} ${chalk.dim(stepNum)} ${chalk.dim(stepName)} ${chalk.dim("(skipped)")}`,
-              );
-            }
-          });
-          console.log();
-        }
-      }
-    },
-  );
 
 adminCommand.addCommand(publishCommand);
 

@@ -356,6 +356,17 @@ export class EmailRejectedError extends Error {
 }
 
 /**
+ * Whether a failed {@link sendEmail} certainly delivered nothing: Resend ANSWERED with a 4xx
+ * ({@link EmailRejectedError}), or the dev fence refused the recipient before any request
+ * ({@link DevEmailFenceError}). Anything else (a timeout, a dropped connection, a 5xx) may have
+ * been accepted and only the answer lost, so a caller that reports to a person must not say
+ * "nothing was sent" for it. One classification for the sweep's report and the comment route.
+ */
+export function isCertainNonDelivery(error: unknown): boolean {
+  return error instanceof EmailRejectedError || error instanceof DevEmailFenceError;
+}
+
+/**
  * Send email via Resend API.
  *
  * `deliveryEnv` (issue #957) is the delivery-level fence: when set and not
@@ -1225,12 +1236,50 @@ export interface PublicationScreenSection {
   next?: string;
 }
 
+/**
+ * The publication review's part of the same email (ADR 0102). Built ONLY from the shared
+ * description (shared/publication-review.ts: `describePublicationReview`, or
+ * `describeUnreadableReview` when the review could not be read): the headline, each reason in the
+ * shared words, the next command and the standing line. It never carries the model's summary or
+ * any other text the model wrote: the summary is a field of the description of its own, and the
+ * section is built from `lines` alone.
+ */
+export interface PublicationReviewSection {
+  /** `describePublicationReview`'s headline, e.g. "Publication review: action required". */
+  headline: string;
+  tone: "ok" | "note" | "warn" | "stop";
+  /** The reasons in fixed words and closed words, the standing line last. */
+  lines: string[];
+  /** The command an administrator runs next, when it is theirs to run. */
+  next?: string;
+}
+
 const SCREEN_TONE_COLOR: Record<PublicationScreenSection["tone"], string> = {
   ok: "#16a34a",
   note: "#2563eb",
   warn: "#d97706",
   stop: "#dc2626",
 };
+
+/**
+ * One section of the publication-request email: a headline in its tone's colour, its lines, and
+ * the next step. The identifier screen's section and the review's are the same markup, so they
+ * read as one list.
+ */
+function sectionHtml(section: PublicationScreenSection | PublicationReviewSection): string {
+  return `
+  <div style="border-left: 4px solid ${SCREEN_TONE_COLOR[section.tone]}; background: #f9fafb; padding: 12px 16px; border-radius: 4px; margin: 16px 0;">
+    <strong style="color: ${SCREEN_TONE_COLOR[section.tone]};">${escapeHtml(section.headline)}</strong>
+    ${
+      section.lines.length > 0
+        ? `<ul style="margin: 8px 0 0 0; padding-left: 20px;">${section.lines
+            .map((line) => `<li>${escapeHtml(line)}</li>`)
+            .join("")}</ul>`
+        : ""
+    }
+    ${section.next ? `<p style="margin: 8px 0 0 0;"><strong>${escapeHtml(section.next)}</strong></p>` : ""}
+  </div>`;
+}
 
 /**
  * The verdict as it appears at the end of the subject line:
@@ -1260,7 +1309,11 @@ export async function sendPublicationRequestEmail(
   replyTo?: string,
   isDev?: boolean,
   deliveryEnv?: EmailDeliveryEnv,
-  opts?: { anonymous?: boolean; screen?: PublicationScreenSection },
+  opts?: {
+    anonymous?: boolean;
+    screen?: PublicationScreenSection;
+    review?: PublicationReviewSection;
+  },
 ): Promise<AdminNotificationOutcome> {
   // #1408: an anonymous release and a publication are different runs with
   // different outcomes -- one keeps the repository private and the DOI
@@ -1278,20 +1331,10 @@ export async function sendPublicationRequestEmail(
   </div>`
     : "";
   const screen = opts?.screen;
-  const screenSection = screen
-    ? `
-  <div style="border-left: 4px solid ${SCREEN_TONE_COLOR[screen.tone]}; background: #f9fafb; padding: 12px 16px; border-radius: 4px; margin: 16px 0;">
-    <strong style="color: ${SCREEN_TONE_COLOR[screen.tone]};">${escapeHtml(screen.headline)}</strong>
-    ${
-      screen.lines.length > 0
-        ? `<ul style="margin: 8px 0 0 0; padding-left: 20px;">${screen.lines
-            .map((line) => `<li>${escapeHtml(line)}</li>`)
-            .join("")}</ul>`
-        : ""
-    }
-    ${screen.next ? `<p style="margin: 8px 0 0 0;"><strong>${escapeHtml(screen.next)}</strong></p>` : ""}
-  </div>`
-    : "";
+  const screenSection = screen ? sectionHtml(screen) : "";
+  // Placed on the screen's own line below: with no review the mail is byte for byte what it was
+  // before the review existed.
+  const reviewSection = opts?.review ? sectionHtml(opts.review) : "";
   const html = `
 <!DOCTYPE html>
 <html>
@@ -1304,7 +1347,7 @@ export async function sendPublicationRequestEmail(
 
   <p>User <strong>${escapeHtml(username)}</strong> has requested ${anonymous ? "an anonymous release" : "publication"} of dataset <strong>${escapeHtml(datasetId)}</strong>.</p>
 ${anonymousNotice}
-${screenSection}
+${screenSection}${reviewSection}
 
   <h2 style="color: #333; font-size: 18px; margin-top: 30px;">Action Required</h2>
   <p>Review the dataset and approve or deny the request:</p>
@@ -1551,6 +1594,71 @@ export async function sendPublicationDeniedEmail(
   await sendEmail(
     to,
     `Publication request denied: ${datasetId}`,
+    html,
+    resendApiKey,
+    fromEmail,
+    replyTo,
+    isDev,
+    deliveryEnv,
+  );
+}
+
+/**
+ * Mail a depositor an administrator's typed message about their open publication request
+ * (ADR 0102, section 8). The body is a fixed frame around the message and nothing of the review:
+ * a greeting with the depositor's username, the dataset id, a fixed paragraph, the escaped
+ * message and a closing sentence. No headline, no reason and no sentence of the automated review
+ * reaches the depositor through this mail, whatever the review says (the review is shown to
+ * administrators only). The message is escaped and kept in a `pre-wrap` block so its line breaks
+ * survive. The request stays open, so the closing sentence says so, and it invites a reply only
+ * when there is a `replyTo` address to send one to: the mail is sent from a no-reply address.
+ *
+ * Like every sender here it goes through `sendEmail`'s delivery fence, and a send that does not
+ * go (a fence refusal, a Resend refusal, an unreachable host) throws: the route reports it, so an
+ * administrator is never told that a message went when it did not.
+ */
+export async function sendPublicationCommentEmail(
+  to: string,
+  username: string,
+  datasetId: string,
+  message: string,
+  resendApiKey: string,
+  fromEmail: string,
+  replyTo?: string,
+  isDev?: boolean,
+  deliveryEnv?: EmailDeliveryEnv,
+): Promise<void> {
+  const replyInvitation = replyTo ? "; reply to this email to answer" : "";
+  // The message starts right after its tag: `pre-wrap` would render any indentation before it.
+  const html = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
+  <h1 style="color: #2563eb;">About Your Publication Request</h1>
+
+  <p>Hello ${escapeHtml(username)},</p>
+
+  <p>An administrator has a message about your publication request for dataset <strong>${escapeHtml(datasetId)}</strong>:</p>
+
+  <div style="background-color: #eff6ff; padding: 16px; border-radius: 8px; margin: 16px 0; border-left: 4px solid #2563eb; white-space: pre-wrap;">${escapeHtml(message)}</div>
+
+  <p>This is a message from a NEMAR administrator. Your request stays open${replyInvitation}.</p>
+
+  <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0;">
+  <p style="color: #999; font-size: 12px;">
+    <a href="https://nemar.org" style="color: #999;">NEMAR</a> - Neuroelectromagnetic Data Archive and Tools Resource
+  </p>
+</body>
+</html>
+  `;
+
+  await sendEmail(
+    to,
+    `About your publication request: ${datasetId}`,
     html,
     resendApiKey,
     fromEmail,
@@ -2406,12 +2514,10 @@ export async function sendIdentifierSweepReportEmail(
       );
       delivered++;
     } catch (error) {
-      // Refused for certain: a 4xx from Resend, or the dev fence before any
-      // request. Anything else (a timeout, a dropped connection, a 5xx) may have
-      // been accepted, and the caller must not treat it as "reached nobody".
-      if (!(error instanceof EmailRejectedError || error instanceof DevEmailFenceError)) {
-        ambiguous++;
-      }
+      // Refused for certain (`isCertainNonDelivery`): a 4xx from Resend, or the dev
+      // fence before any request. Anything else (a timeout, a dropped connection,
+      // a 5xx) may have been accepted, and the caller must not treat it as "reached nobody".
+      if (!isCertainNonDelivery(error)) ambiguous++;
       // `sendEmail`'s message names the recipient; redact it in the message too.
       console.error(
         `Failed to send the identifier sweep report to ${redactRecipient(adminEmail)}:`,

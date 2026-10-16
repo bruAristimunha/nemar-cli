@@ -30,7 +30,7 @@ import { readdirSync } from "node:fs";
 import { join } from "node:path";
 
 const MODULE_EXPORTS: Record<string, string[]> = {
-  errors: ["ApiError", "MaintenanceError", "errorDetail"],
+  errors: ["ApiError", "MaintenanceError", "errorDetail", "isRouteNotFound"],
   client: ["IS_DEV_BUILD", "checkHealth", "getApiUrl", "request"],
   auth: [
     "checkGitHubUsername",
@@ -86,14 +86,19 @@ const MODULE_EXPORTS: Record<string, string[]> = {
   publish: [
     "PUBLICATION_STEPS",
     "approvePublication",
+    "commentOnPublication",
     "denyPublication",
+    "getPublicationReview",
     "getPublishStatus",
     "isRetryablePublishError",
     "listPublishRequests",
     "requestPublication",
     "rerunIdentifierScreen",
     "resendPublishNotification",
+    "reviewErrorCode",
+    "startPublicationReview",
     "stepIndexFor",
+    "withdrawPublishRequest",
   ],
   data: [
     "applyS3Lock",
@@ -182,6 +187,7 @@ const MODULE_EXPORTS: Record<string, string[]> = {
     "uploadTierOf",
     "validateCi",
     "verifyImport",
+    "verifyUserById",
     "withdrawDataset",
     "zarrFidelitySweep",
   ],
@@ -212,6 +218,7 @@ const POST_SPLIT_ADDITIONS = [
   "NOTICE_LEVELS", // #1025, notice level vocabulary
   "approveUserById", // #1012, id-keyed approve for web/ORCID accounts
   "revokeUserById", // #1274, ADR 0040: id-keyed revoke, the approve twin's eraser
+  "verifyUserById", // ADR 0103: owner force verify, POST /admin/users/by-id/:id/verify
   "backfillUserNames", // #1255, epic #1250: POST /admin/users/backfill-names
   "backfillUsernames", // #1253, epic #1250: POST /admin/users/backfill-usernames
   "checkOrcidName", // #1255, epic #1250: GET /auth/orcid-name pre-signup lookup
@@ -261,6 +268,11 @@ const POST_SPLIT_ADDITIONS = [
   "setPrReviewAuthor", // ADR 0093: PUT /admin/pr-review-authors/:login (allow or block)
   "clearPrReviewAuthor", // ADR 0093: DELETE /admin/pr-review-authors/:login
   "startPrReview", // ADR 0092: POST /admin/pr-reviews/:dataset/:pr/start (review an open pull request)
+  "getPublicationReview", // ADR 0102: GET /admin/publish/:id/review
+  "startPublicationReview", // ADR 0102: POST /admin/publish/:id/review/start
+  "commentOnPublication", // ADR 0102: POST /admin/publish/:id/comment (mails the depositor an administrator's words)
+  "reviewErrorCode", // ADR 0102: the closed word of a review route's refusal (rawBody.code, not ApiError.code)
+  "isRouteNotFound", // a backend that predates a route answers its not-found body: say so, do not call it a bug
 ];
 
 /** The api.ts monolith's runtime surface, captured at #908 commit 1. */
@@ -364,6 +376,7 @@ const MONOLITH_EXPORTS = [
   "validateDataset",
   "verifyImport",
   "withdrawDataset",
+  "withdrawPublishRequest",
 ];
 
 describe("lib/api export surface", () => {

@@ -1,0 +1,13 @@
+-- A depositor can withdraw their own publication request.
+--
+-- A withdrawal is a request that ended by the requester's own act. It is
+-- stored as `status = 'denied'` so that every check which asks "is this request
+-- finished?" (the re-request path, the staleness sweep, dataset deletion) keeps
+-- working without learning a sixth status, and `withdrawn_at` marks it as the
+-- requester's decision rather than an administrator's. `denied_by` and
+-- `denied_reason` stay NULL for it.
+--
+-- Rebuilding the table to widen its status CHECK would copy ~30 columns for no
+-- gain: nothing needs the database to tell the two endings apart, only the
+-- readers.
+ALTER TABLE publication_requests ADD COLUMN withdrawn_at TEXT;
