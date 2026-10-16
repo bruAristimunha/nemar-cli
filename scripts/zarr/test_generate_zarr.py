@@ -11396,15 +11396,18 @@ class TestConvertOneFifSidecarOvercount(unittest.TestCase):
         # other way the header count goes missing, a FIF MNE cannot parse:
         # with a sidecar over-declaring it, it must be refused before any
         # store exists, never reach the gate's "header unknown" path and publish.
+        # biosigIO 1.2.13 types a FIF cut short in its data `corrupt_or_truncated`
+        # through `Recording.from_file`; the other two cases keep the probe's codes.
+        header_codes = ("maxshield_probe_failed", "file_read_error")
         cases = {
-            "garbage header": lambda data: b"not a fif header at all",
-            "header cut short": lambda data: data[:600],
-            "data cut short": lambda data: data[: len(data) // 2],
+            "garbage header": (lambda data: b"not a fif header at all", header_codes),
+            "header cut short": (lambda data: data[:600], header_codes),
+            "data cut short": (lambda data: data[: len(data) // 2], ("corrupt_or_truncated",)),
         }
         path = os.path.join(self.repo, self.PRIMARY)
         with open(path, "rb") as fh:
             original = fh.read()
-        for name, corrupt in cases.items():
+        for name, (corrupt, codes) in cases.items():
             with self.subTest(name):
                 with open(path, "wb") as fh:
                     fh.write(corrupt(original))
@@ -11412,7 +11415,7 @@ class TestConvertOneFifSidecarOvercount(unittest.TestCase):
                 with contextlib.redirect_stdout(out):
                     result = self.convert(len(FIF_CHANNELS) + 9)
                 self.assertFalse(result["ok"])
-                self.assertIn(result["code"], ("maxshield_probe_failed", "file_read_error"))
+                self.assertIn(result["code"], codes)
                 self.assertNotIn("entry", result)
                 self.assertFalse(self.synced())
 
@@ -12573,10 +12576,15 @@ class TestMainRetryPendingRound(unittest.TestCase):
     index and the exit status all run for real.
 
     Recording B is committed the way git-annex commits it, as a symlink into
-    `.git/annex/objects`. Its content is absent on the first run, so B fails and
-    is listed as pending while A converts; the tests then decide whether the
-    content is there for the retry. HEAD never moves, which is exactly the
-    situation a retry round is in.
+    `.git/annex/objects`. Its object exists but this user cannot read it on the
+    first run (mode 0): the host's condition and not the file's, which no reader
+    types, so B fails uncoded and is listed as pending while A converts. The
+    tests then decide whether the content is readable for the retry. HEAD never
+    moves, which is exactly the situation a retry round is in.
+
+    An ABSENT object would not do. Since biosigIO 1.2.12 its streaming source
+    types a missing file `file_read_error`, as its in-memory path always did
+    (`TestAbsentAnnexObjectThroughConvertOne`).
     """
 
     A = "sub-01/eeg/sub-01_task-rest_eeg.edf"
@@ -12610,8 +12618,13 @@ class TestMainRetryPendingRound(unittest.TestCase):
             json.dump({"Name": "retry fixture", "BIDSVersion": "1.8.0"}, fh)
         build_real_edf(os.path.join(self.repo, "sub-01", "eeg"), "sub-01_task-rest_eeg", seconds=10)
         # B as git-annex leaves it before `get`: a committed symlink to an object
-        # that is not there.
+        # this user cannot read yet.
         self.b_object = os.path.join(self.repo, ".git", "annex", "objects", "B.edf")
+        os.makedirs(os.path.dirname(self.b_object))
+        build_real_edf(os.path.dirname(self.b_object), "B", seconds=10)
+        os.chmod(self.b_object, 0)
+        if os.access(self.b_object, os.R_OK):
+            self.skipTest("file modes do not bind this user (root), so B would convert")
         os.symlink(
             os.path.relpath(self.b_object, os.path.join(self.repo, "sub-02", "eeg")),
             os.path.join(self.repo, self.B),
@@ -12668,9 +12681,8 @@ class TestMainRetryPendingRound(unittest.TestCase):
         return f"http://127.0.0.1:{server.server_port}"
 
     def materialize_b(self):
-        """`git annex get` for B: the content appears, HEAD does not move."""
-        os.makedirs(os.path.dirname(self.b_object), exist_ok=True)
-        build_real_edf(os.path.dirname(self.b_object), "B", seconds=10)
+        """`git annex get` for B: the content becomes readable, HEAD does not move."""
+        os.chmod(self.b_object, 0o644)
 
     def run_main(self, *extra, clean: bool = True) -> tuple[int, str, dict]:
         argv = [
@@ -15023,10 +15035,11 @@ class TestMainAnnexMissingVerdict(unittest.TestCase):
         keys = {}
         for i, (rec, how) in enumerate(stored.items()):
             if how == "refused_bdf":
-                # A real BDF+ whose time-keeping onsets start at +40: pyedflib
-                # refuses it ("format errors", no errno), stored plain with a key
-                # that vouches for exactly these bytes.
-                content = build_onset_shifted_bdfplus(
+                # A real BDF+ cut to half its length: pyedflib refuses it
+                # ("Filesize"), and biosigIO's tolerant read cannot recover it
+                # (unlike a late first onset). Stored plain with a key that
+                # vouches for exactly these bytes.
+                content = build_truncated_bdfplus(
                     os.path.join(self.dir, os.path.basename(rec))
                 )
                 ext = ".bdf"
@@ -16101,19 +16114,34 @@ class TestFailureVerdict(unittest.TestCase):
             ValueError(MNE_SPLIT_REFUSAL.format(path=path)),
         )
 
-    # -- rule 4: the streaming EDF/BDF refusal ------------------------------
+    # -- a bare OSError is the host's, whatever its words --------------------
+    #
+    # The former bare-OSError text match typed pyedflib's streaming refusal and
+    # biosigIO's tolerant fallback's truncation errors by their words. biosigIO
+    # 1.2.12 types both itself (`CorruptFileError`), so nothing reads an
+    # `OSError`'s words now.
 
-    def test_a_bare_oserror_with_the_edf_refusal_is_corrupt_or_truncated(self):
-        for reason in ("(it contains format errors)", "(Filesize)", "(Recordingfield)"):
-            with self.subTest(reason):
-                exc = OSError(f"/scratch/work/x.bdf: {EDF_REFUSAL} {reason}")
-                self.assertEqual(self.verdict(exc), ("corrupt_or_truncated", None))
+    def test_a_bare_oserror_is_not_typed_by_its_text(self):
+        # The words biosigIO's streaming source used to leave in a bare,
+        # errno-less OSError: pyedflib's refusal, and the tolerant fallback's
+        # truncation errors with the scratch path in front.
+        for message in (
+            f"/scratch/work/x.bdf: {EDF_REFUSAL} (Filesize)",
+            "/scratch/work/x.edf: EDF/BDF header is truncated (<256 bytes)",
+            "/scratch/work/x.edf: invalid number of signals in header (-1)",
+            "/scratch/work/x.edf: signal header is truncated",
+            (
+                "/scratch/work/x.edf: file is truncated (expected at least 3080 bytes "
+                "for 4 data record(s), found 1850)"
+            ),
+        ):
+            with self.subTest(message):
+                self.assertEqual(self.verdict(OSError(message)), (None, None))
 
     def test_a_host_condition_is_not_a_refusal(self):
         # An OSError that carries an errno is the HOST saying no (a failing
-        # disk, a permission, a full volume), and it keeps its retry. Dropping
-        # the errno guard from the rule turns every one of these into a
-        # permanent data verdict.
+        # disk, a permission, a full volume), and it keeps its retry, also when
+        # its words are a reader's refusal.
         for exc in (
             OSError(errno.EIO, f"x.bdf: {EDF_REFUSAL} (Filesize)"),
             OSError(errno.ENOSPC, f"x.bdf: {EDF_REFUSAL} (Filesize)"),
@@ -16128,8 +16156,7 @@ class TestFailureVerdict(unittest.TestCase):
             RuntimeError(f"x.bdf: {EDF_REFUSAL} (Filesize)"),
             ValueError(f"x.bdf: {EDF_REFUSAL} (Filesize)"),
             Refusal(f"x.bdf: {EDF_REFUSAL} (Filesize)"),
-            # Subclasses of OSError built without an errno: the rule is for
-            # exactly pyedflib's bare OSError, not for the family.
+            # Subclasses of OSError built without an errno.
             PermissionError(f"x.bdf: {EDF_REFUSAL} (Filesize)"),
             FileNotFoundError(f"x.bdf: {EDF_REFUSAL} (Filesize)"),
         ):
@@ -16138,89 +16165,6 @@ class TestFailureVerdict(unittest.TestCase):
 
     def test_an_oserror_with_other_words_is_still_uncoded(self):
         self.assertEqual(self.verdict(OSError("download failed after 4 attempts")), (None, None))
-
-    # The four bare errors biosigIO's tolerant fallback raises for a file it can
-    # read no further (importers/_edf_tolerant.py, one per `raise`), as they read
-    # with the scratch path in front.
-    FALLBACK_TRUNCATIONS: ClassVar[tuple[str, ...]] = (
-        "/scratch/work/x.edf: EDF/BDF header is truncated (<256 bytes)",
-        "/scratch/work/x.edf: invalid number of signals in header (-1)",
-        "/scratch/work/x.edf: signal header is truncated",
-        (
-            "/scratch/work/x.edf: file is truncated (expected at least 3080 bytes "
-            "for 4 data record(s), found 1850)"
-        ),
-    )
-
-    def test_a_bare_oserror_with_a_fallback_truncation_is_corrupt_or_truncated(self):
-        # The in-memory path types the same file; streaming used to leave it
-        # uncoded, and an uncoded failure is retried until `retry_exhausted`.
-        for message in self.FALLBACK_TRUNCATIONS:
-            with self.subTest(message):
-                self.assertEqual(self.verdict(OSError(message)), ("corrupt_or_truncated", None))
-
-    def test_a_host_condition_is_not_a_fallback_truncation(self):
-        for message in self.FALLBACK_TRUNCATIONS:
-            for exc in (
-                OSError(errno.EIO, message),
-                OSError(errno.ENOSPC, message),
-                PermissionError(errno.EACCES, message),
-                FileNotFoundError(errno.ENOENT, message),
-                # Subclasses built without an errno, and other exception types:
-                # the rule is for exactly the fallback's own bare OSError.
-                PermissionError(message),
-                FileNotFoundError(message),
-                RuntimeError(message),
-                ValueError(message),
-                Refusal(message),
-            ):
-                with self.subTest(type(exc).__name__, errno=getattr(exc, "errno", None), message=message):
-                    self.assertEqual(self.verdict(exc), (None, None))
-
-    def test_only_the_exact_fallback_text_is_a_truncation(self):
-        # The same words in another sentence, a different number of bytes in the
-        # header, a non-number where a number goes, trailing text, or no path in
-        # front: none of them is what the fallback raises.
-        for message in (
-            "download is truncated",
-            "/scratch/work/x.edf: file is truncated",
-            (
-                "/scratch/work/x.edf: file is truncated (expected at least 3080 bytes "
-                "for 4 data record(s), found 1850) on retry 2"
-            ),
-            (
-                "/scratch/work/x.edf: file is truncated (expected at least many bytes "
-                "for 4 data record(s), found 1850)"
-            ),
-            "/scratch/work/x.edf: signal header is truncated by the proxy",
-            "signal header is truncated",
-            "/scratch/work/x.edf: EDF/BDF header is truncated (<512 bytes)",
-            "/scratch/work/x.edf: invalid number of signals in header (abc)",
-            "/scratch/work/x.edf: invalid number of signals in header (-1)\nretrying",
-            "",
-        ):
-            with self.subTest(message):
-                self.assertEqual(self.verdict(OSError(message)), (None, None))
-
-    def test_a_fallback_truncation_behind_another_exception_is_not_the_truncation(self):
-        # Top level only, like the pyedflib refusal beside it: biosigIO's
-        # fallback runs inside the `except` block that caught that refusal, so a
-        # host error it raises carries the refusal as its context, and a cause
-        # is a link behind the exception just as a context is.
-        for message in self.FALLBACK_TRUNCATIONS:
-            truncation = OSError(message)
-            with self.subTest(message):
-                host = self.raised_while_handling(
-                    truncation, lambda: OSError(errno.EIO, "Input/output error")
-                )
-                self.assertIs(host.__context__, truncation)
-                self.assertEqual(self.verdict(host), (None, None))
-                self.assertEqual(
-                    self.verdict(chained(OSError(errno.EIO, "Input/output error"), truncation)),
-                    (None, None),
-                )
-                for depth in range(1, 6):
-                    self.assertEqual(self.verdict(self.wrapper_chain(truncation, depth)), (None, None))
 
     @staticmethod
     def raised_while_handling(refusal: BaseException, make_next: Callable[[], BaseException]):
@@ -16242,9 +16186,9 @@ class TestFailureVerdict(unittest.TestCase):
         # biosigIO recovers three kinds of header pyedflib refuses by reading the
         # file again INSIDE the `except` block that caught the refusal. A host
         # error raised by that second read (a failing disk, a full volume, a
-        # permission) therefore carries the bare refusal as its `__context__`.
-        # It is the host saying no, and keeps its retry: the refusal behind it is
-        # not what this exception is.
+        # permission) therefore carries the refusal as its `__context__`. It is
+        # the host saying no, and keeps its retry: the refusal behind it is not
+        # what this exception is.
         for label, make in (
             ("EIO", lambda: OSError(errno.EIO, "Input/output error")),
             ("ENOSPC", lambda: OSError(errno.ENOSPC, "No space left on device")),
@@ -16261,8 +16205,8 @@ class TestFailureVerdict(unittest.TestCase):
                 self.assertEqual(self.verdict(exc), (None, None))
 
     def test_a_refusal_behind_another_exception_is_not_the_refusal(self):
-        # Only the exception itself is read. An explicit cause is a link behind
-        # it just as an implicit context is.
+        # A refusal text behind the exception is not a verdict: no rule reads an
+        # `OSError`'s words, at the top or down a chain.
         refusal = OSError(f"x.bdf: {EDF_REFUSAL} (Filesize)")
         host = OSError(errno.EIO, "Input/output error")
         host.__cause__ = refusal
@@ -16399,8 +16343,8 @@ class TestFailureVerdict(unittest.TestCase):
             self.verdict(self.wrapper_chain(leaf, 5), self.SET), ("corrupt_or_truncated", None)
         )
         self.assertEqual(self.verdict(self.wrapper_chain(leaf, 6), self.SET), (None, None))
-        # Rule 4 does not ride the walk: the same chain around the EDF refusal,
-        # at any depth, is not the refusal.
+        # The walk reads only what the rules above look for: the same chain
+        # around the EDF refusal, at any depth, is not a verdict.
         refusal = OSError(f"x.bdf: {EDF_REFUSAL} (Filesize)")
         for depth in range(1, 6):
             with self.subTest(refusal_at=depth):
@@ -16550,15 +16494,31 @@ def build_truncated_edfplus(path: str) -> str:
     return written
 
 
-def build_onset_shifted_bdfplus(path: str, first_onset: int = 40) -> str:
-    """A REAL BDF+ written by pyedflib whose time-keeping annotation onsets
-    start at +`first_onset` instead of +0: nm000284's shape, a session cut out of
-    the middle with its session-relative onsets kept. pyedflib refuses it with
-    "(it contains format errors)" and no errno. About 2 KB; only the onsets are
-    rewritten, in place, so every length in the header still holds."""
+def build_truncated_bdfplus(path: str) -> str:
+    """A REAL BDF+ written by pyedflib and cut to half its length: the same
+    "(Filesize)" refusal as `build_truncated_edfplus`, for a `.bdf`."""
     import pyedflib
 
-    build_edf_family(path, [("Fz", 64), ("Cz", 64)], pyedflib.FILETYPE_BDFPLUS, seconds=2)
+    build_edf_family(
+        path, [("Fz", 64), ("Cz", 64)], pyedflib.FILETYPE_BDFPLUS, annotations=True, seconds=10
+    )
+    with open(path, "rb") as fh:
+        data = fh.read()
+    with open(path, "wb") as fh:
+        fh.write(data[: len(data) // 2])
+    return path
+
+
+def build_onset_shifted_edf_family(path: str, file_type: int, first_onset: int = 40) -> str:
+    """A REAL EDF+ or BDF+ written by pyedflib whose time-keeping annotation
+    onsets start at +`first_onset` instead of +0: a session cut out of the middle
+    with its session-relative onsets kept. pyedflib refuses it with "(it contains
+    format errors)" and no errno. About 2 KB; only the onsets are rewritten, in
+    place, so every length in the header still holds."""
+    import pyedflib
+
+    build_edf_family(path, [("Fz", 64), ("Cz", 64)], file_type, seconds=2)
+    width = 3 if file_type in (pyedflib.FILETYPE_BDF, pyedflib.FILETYPE_BDFPLUS) else 2
     with open(path, "rb") as fh:
         raw = bytearray(fh.read())
     n_signals = int(raw[252:256].decode().strip())
@@ -16569,8 +16529,8 @@ def build_onset_shifted_bdfplus(path: str, first_onset: int = 40) -> str:
         for i in range(n_signals)
     ]
     header_bytes = 256 * (n_signals + 1)
-    record_bytes = 3 * sum(samples)
-    annotation_bytes = 3 * samples[-1]  # the annotation signal is last
+    record_bytes = width * sum(samples)
+    annotation_bytes = width * samples[-1]  # the annotation signal is last
     for record in range((len(raw) - header_bytes) // record_bytes):
         start = header_bytes + record * record_bytes + (record_bytes - annotation_bytes)
         new = f"+{first_onset + record}".encode() + b"\x14\x14\x00"
@@ -16578,6 +16538,51 @@ def build_onset_shifted_bdfplus(path: str, first_onset: int = 40) -> str:
     with open(path, "wb") as fh:
         fh.write(raw)
     return path
+
+
+def build_late_onset_pair(compliant: str, late: str, file_type: int, first_onset: int = 40) -> None:
+    """A REAL compliant EDF+C or BDF+C with events (`compliant`) and its late-onset
+    twin (`late`): the same bytes with every time-stamped annotation list (TAL)
+    moved by `first_onset` seconds, the time-keeping ones and the events alike.
+    That is a session cut out of the middle with its onsets kept, and it is what
+    pyedflib refuses ("it contains format errors"). Only TAL bytes differ between
+    the two, so the samples are identical by construction, and the compliant file
+    is the reference both are read against."""
+    from decimal import Decimal
+
+    import pyedflib
+
+    # Events at 1.0 s ("stimulus", no duration) and 4.5 s ("response", 0.5 s) in a
+    # six-second file of one-second data records.
+    build_edf_family(compliant, [("Fz", 64), ("Cz", 64)], file_type, annotations=True, seconds=6)
+    width = 3 if file_type in (pyedflib.FILETYPE_BDF, pyedflib.FILETYPE_BDFPLUS) else 2
+    with open(compliant, "rb") as fh:
+        raw = bytearray(fh.read())
+    n_signals = int(raw[252:256].decode().strip())
+    per_signal = 16 + 80 + 8 + 8 + 8 + 8 + 8 + 80  # label ... prefiltering, per signal
+    first_count = 256 + n_signals * per_signal
+    samples = [
+        int(raw[first_count + 8 * i : first_count + 8 * (i + 1)].decode().strip())
+        for i in range(n_signals)
+    ]
+    header_bytes = 256 * (n_signals + 1)
+    record_bytes = width * sum(samples)
+    block_bytes = width * samples[-1]  # the annotation signal is last
+    for record in range((len(raw) - header_bytes) // record_bytes):
+        start = header_bytes + record * record_bytes + (record_bytes - block_bytes)
+        shifted = bytearray()
+        for tal in re.findall(rb"[^\x00]+", bytes(raw[start : start + block_bytes])):
+            onset = re.match(rb"([+-])(\d+(?:\.\d+)?)(.*)", tal, re.DOTALL)
+            assert onset is not None, tal
+            fraction = onset.group(2).partition(b".")[2]
+            value = Decimal(onset.group(2).decode()) * (-1 if onset.group(1) == b"-" else 1)
+            value += first_onset
+            sign = "-" if value < 0 else "+"
+            shifted += f"{sign}{abs(value):.{len(fraction)}f}".encode() + onset.group(3) + b"\x00"
+        assert len(shifted) <= block_bytes, "the shifted TALs no longer fit the block"
+        raw[start : start + block_bytes] = bytes(shifted).ljust(block_bytes, b"\x00")
+    with open(late, "wb") as fh:
+        fh.write(raw)
 
 
 class StreamEdfThreshold:
@@ -16626,10 +16631,10 @@ class StreamEdfThreshold:
 class TestStreamedEdfRefusalThroughConvertOne(ConvertOneLocalCase):
     """A file pyedflib refuses is `corrupt_or_truncated` on BOTH exporters.
 
-    In memory, biosigIO types the refusal itself. Streaming, it re-raises
-    pyedflib's bare `OSError`, which `convert_one` took for infrastructure and
-    retried until `retry_exhausted` (361 published rows). Real files, the real
-    exporters, the real `convert_one`."""
+    biosigIO types the refusal itself on both (`CorruptFileError`, since 1.2.12).
+    Streaming used to re-raise pyedflib's bare `OSError`, which `convert_one`
+    took for infrastructure and retried until `retry_exhausted`. Real files, the
+    real exporters, the real `convert_one`."""
 
     REQUIRES = ("zarr", "pyedflib", "biosigio")
 
@@ -16637,8 +16642,8 @@ class TestStreamedEdfRefusalThroughConvertOne(ConvertOneLocalCase):
         "truncated EDF+ (Filesize)": (
             "sub-01/eeg/sub-01_task-rest_eeg.edf", build_truncated_edfplus,
         ),
-        "onset-shifted BDF+ (format errors)": (
-            "sub-01/eeg/sub-01_task-rest_eeg.bdf", build_onset_shifted_bdfplus,
+        "truncated BDF+ (Filesize)": (
+            "sub-01/eeg/sub-01_task-rest_eeg.bdf", build_truncated_bdfplus,
         ),
     }
 
@@ -16678,27 +16683,21 @@ class TestStreamedEdfRefusalThroughConvertOne(ConvertOneLocalCase):
         self.assertTrue(result["ok"], result.get("error"))
 
 
-class TestStreamingRefusalCanary(unittest.TestCase):
-    """TEMPORARY, with `failure_verdict` rule 4 (the bare-OSError rule).
+class TestPinnedStreamingRefusal(unittest.TestCase):
+    """The pinned biosigIO types a streamed EDF/BDF refusal itself.
 
-    Rule 4 exists only because biosigIO's streaming EDF/BDF source re-raises
-    pyedflib's refusal as a bare `OSError` (errno None) where its in-memory path
-    types it `corrupt_or_truncated`. biosigio#149 types the streaming refusal.
-    This canary asserts the defect is still there on the pinned biosigIO. The day
-    the cap in requirements.txt is raised past biosigio#149 it FAILS, and that
-    pull request deletes rule 4 and this class together: from then on biosigIO
-    says what the converter had to infer. Until then, removing either one leaves
-    361 published rows retried five times each.
+    `stream_to_zarr` used to re-raise pyedflib's refusal, and the tolerant
+    fallback's truncation errors, as a bare `OSError` (errno None), where the
+    in-memory path raised a typed `corrupt_or_truncated`. The converter read
+    those by their text. biosigio#149 (fixed by #150, released in 1.2.12) types
+    them at the source, so the converter has nothing to infer, and this class
+    is the canary for that contract on the converter's own call
+    (`write_store(stream_to_zarr, ...)`). The day a release raises a bare
+    `OSError` again, or a different type, it FAILS, and the cap in
+    requirements.txt is not raised until a person has read why.
 
-    The onset-shifted fixture converts once biosigio#145 lands (Phase 7 of the
-    epic); the truncated one stays a refusal for good.
-
-    `test_stream_to_zarr_still_raises_a_bare_oserror_for_a_cut_fallback_file` is
-    the same measurement for the tolerant fallback's own truncation errors
-    (`_BIOSIGIO_TRUNCATION_RES`). biosigio PR #150 (closes #149) wraps the
-    streaming fallback in `classify_read_error`, so it fails on biosigio 1.2.12;
-    the pinned 1.2.11 still raises them bare. At that release, delete the
-    fallback text match and this case."""
+    A bare `OSError` out of the streaming exporter is still read as the host's:
+    it carries no code, so it is retried (`TestFailureVerdict`)."""
 
     @classmethod
     def setUpClass(cls):
@@ -16709,59 +16708,58 @@ class TestStreamingRefusalCanary(unittest.TestCase):
         except Exception as exc:
             raise unittest.SkipTest(f"conversion deps unavailable: {exc}") from exc
 
-    def test_stream_to_zarr_still_raises_a_bare_oserror(self):
+    def streamed_error(self, build, name: str) -> BaseException:
+        """What the converter's streaming write raises for the file `build` makes."""
         from biosigio import stream_to_zarr
 
-        for label, build in (
-            ("truncated EDF+", lambda p: build_truncated_edfplus(p)),
-            ("onset-shifted BDF+", lambda p: build_onset_shifted_bdfplus(p)),
-        ):
-            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
-                ext = ".bdf" if "BDF" in label else ".edf"
-                src = build(os.path.join(tmp, f"sub-01_task-rest_eeg{ext}"))
-                try:
-                    stream_to_zarr(src, os.path.join(tmp, "out.zarr"), bids_channels="off")
-                except Exception as exc:  # noqa: BLE001 - the exception IS the measurement
-                    raised = exc
-                else:
-                    self.fail(
-                        "biosigIO now streams this file (biosigio#145 reads a late first "
-                        "onset): the converter has no refusal to type for it; update the "
-                        "fixtures that expect one, and see biosigio#149 for the rest"
-                    )
-                exc = raised
-                self.assertIs(
-                    type(exc), OSError,
-                    f"biosigIO now raises {type(exc).__name__} for a streamed refusal "
-                    "(biosigio#149): delete failure_verdict rule 4 and this canary",
+        with tempfile.TemporaryDirectory() as tmp:
+            src = build(os.path.join(tmp, name))
+            store = os.path.join(tmp, "out.zarr")
+            with self.assertRaises(Exception) as raised:  # the exception IS the measurement
+                generate_zarr.write_store(
+                    stream_to_zarr, src, store, expected_path=store, bids_channels="off"
                 )
-                self.assertIsNone(exc.errno)
-                self.assertIn("not EDF(+) or BDF(+) compliant", str(exc))
+        return raised.exception
 
-    def test_stream_to_zarr_still_raises_a_bare_oserror_for_a_cut_fallback_file(self):
-        # The fallback's own truncation errors, the other half of rule 4.
-        from biosigio import stream_to_zarr
+    def assert_typed(self, exc: BaseException, expected: type, code: str, text: str) -> None:
+        self.assertIs(
+            type(exc), expected,
+            f"biosigIO raised {type(exc).__name__} for a streamed refusal, not "
+            f"{expected.__name__}: {exc}",
+        )
+        self.assertNotIsInstance(exc, OSError)
+        self.assertEqual(exc.code, code)
+        self.assertIn(text, str(exc))
 
-        for label, build in (
-            ("cut", build_cut_degenerate_range_edf),
-            ("impossible signal count", build_negative_signal_count_edf),
+    def test_a_streamed_pyedflib_refusal_is_a_corrupt_file_error(self):
+        from biosigio.exceptions import CorruptFileError
+
+        for label, build, name in (
+            ("truncated EDF+", build_truncated_edfplus, "sub-01_task-rest_eeg.edf"),
+            ("truncated BDF+", build_truncated_bdfplus, "sub-01_task-rest_eeg.bdf"),
         ):
-            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
-                src = build(os.path.join(tmp, "sub-01_task-rest_eeg.edf"))
-                with self.assertRaises(Exception) as raised:  # the exception IS the measurement
-                    stream_to_zarr(src, os.path.join(tmp, "out.zarr"), bids_channels="off")
-                exc = raised.exception
-                self.assertIs(
-                    type(exc), OSError,
-                    f"biosigIO now raises {type(exc).__name__} for a streamed fallback "
-                    "truncation (biosigio 1.2.12 ships PR #150): delete "
-                    "_BIOSIGIO_TRUNCATION_RES from failure_verdict rule 4 and this case",
+            with self.subTest(label):
+                exc = self.streamed_error(build, name)
+                self.assert_typed(
+                    exc, CorruptFileError, "corrupt_or_truncated",
+                    "not EDF(+) or BDF(+) compliant",
                 )
-                self.assertIsNone(exc.errno)
-                self.assertTrue(
-                    any(p.search(str(exc)) for p in generate_zarr._BIOSIGIO_TRUNCATION_RES),
-                    f"biosigIO's fallback now words this differently: {exc}",
-                )
+
+    def test_a_streamed_fallback_truncation_is_a_corrupt_file_error(self):
+        from biosigio.exceptions import CorruptFileError
+
+        exc = self.streamed_error(build_cut_degenerate_range_edf, "sub-01_task-rest_eeg.edf")
+        self.assert_typed(exc, CorruptFileError, "corrupt_or_truncated", "file is truncated")
+
+    def test_a_streamed_impossible_signal_count_is_a_file_read_error(self):
+        # The fallback's header probe. biosigIO types it generically, not as
+        # `corrupt_or_truncated`; the converter publishes the code it is given.
+        from biosigio.exceptions import FileReadError
+
+        exc = self.streamed_error(build_negative_signal_count_edf, "sub-01_task-rest_eeg.edf")
+        self.assert_typed(
+            exc, FileReadError, "file_read_error", "invalid number of signals in header (-1)"
+        )
 
 
 def build_degenerate_range_edf(path: str) -> str:
@@ -16813,15 +16811,16 @@ class TestHostErrorWhileRecoveringARefusedEdf(ConvertOneLocalCase):
     """A host error is the host's, also when it is raised while biosigIO is
     recovering from pyedflib's refusal.
 
-    `failure_verdict` rule 4 types pyedflib's bare refusal a file failure. The
-    tolerant fallback reads the file a second time inside the `except` block
-    that caught that refusal, so an `OSError(EIO)` raised by the second read has
-    the refusal as its `__context__`. Reading the chain made it
-    `corrupt_or_truncated`, a terminal verdict for what a retry on a healthy
-    disk would convert. The EIO is injected at `mne.io.read_raw`, the
-    fallback's one read of the samples: no portable file permission reaches it,
-    since pyedflib's own open fails first on an unreadable file and raises the
-    host error before any fallback."""
+    The tolerant fallback reads the file a second time inside the `except`
+    block that caught pyedflib's refusal, so an `OSError(EIO)` raised by the
+    second read has the refusal as its `__context__`. biosigIO leaves that EIO
+    uncoded (it re-raises a host condition instead of typing it), and the
+    converter must not read the context behind it: the failure stays a
+    `pending` retry, never a terminal `corrupt_or_truncated` verdict for what a
+    retry on a healthy disk would convert. The EIO is injected at
+    `mne.io.read_raw`, the fallback's one read of the samples: no portable file
+    permission reaches it, since pyedflib's own open fails first on an
+    unreadable file and raises the host error before any fallback."""
 
     REQUIRES = ("zarr", "pyedflib", "biosigio", "mne")
     PRIMARY = "sub-01/eeg/sub-01_task-rest_eeg.edf"
@@ -16887,10 +16886,11 @@ class TestFallbackTruncationThroughConvertOne(ConvertOneLocalCase):
     on BOTH exporters.
 
     The fallback is for files pyedflib refuses and MNE can read, and it raises
-    its own bare, errno-less `OSError` when it finds the file shorter than its
-    header says. In memory biosigIO types that; streaming it reached
-    `failure_verdict` uncoded and was retried until `retry_exhausted`. Real
-    files, the real exporters, the real `convert_one`."""
+    an error when it finds the file shorter than its header says. biosigIO
+    types it on both exporters (`CorruptFileError`, since 1.2.12); streaming
+    used to raise it as a bare `OSError`, which reached `failure_verdict`
+    uncoded and was retried until `retry_exhausted`. Real files, the real
+    exporters, the real `convert_one`."""
 
     REQUIRES = ("zarr", "pyedflib", "biosigio", "mne")
     PRIMARY = "sub-01/eeg/sub-01_task-rest_eeg.edf"
@@ -16927,14 +16927,309 @@ class TestFallbackTruncationThroughConvertOne(ConvertOneLocalCase):
                 codes[path_name] = result["code"]
         self.assertEqual(codes.get("in-memory"), codes.get("streaming"))
 
-    def test_an_impossible_signal_count_is_corrupt_or_truncated_streamed(self):
-        # The fallback's header probe. Streamed only: biosigIO's in-memory path
-        # reports this file as a generic `file_read_error`, which is its call to
-        # make; the streaming path's bare `OSError` is what this rule reads.
+    def test_an_impossible_signal_count_is_a_generic_data_failure_on_both_exporters(self):
+        # The fallback's header probe. biosigIO calls this one a generic
+        # `file_read_error` on both exporters, which is its call to make, and the
+        # converter publishes the code it is given: a typed failure that is
+        # never retried, where the bare `OSError` used to be typed
+        # `corrupt_or_truncated` here by its text.
         self.build(build_negative_signal_count_edf)
-        result = self.convert_on("streaming", 1)
+        codes = {}
+        for path_name, threshold in (("in-memory", None), ("streaming", 1)):
+            with self.subTest(path_name):
+                result = self.convert_on(path_name, threshold)
+                self.assert_refused_as_data(result, "file_read_error")
+                self.assertIn("invalid number of signals in header (-1)", result["detail"])
+                codes[path_name] = result["code"]
+        self.assertEqual(codes.get("in-memory"), codes.get("streaming"))
+
+
+class TestAbsentAnnexObjectThroughConvertOne(ConvertOneLocalCase):
+    """A git-annex pointer whose content was never fetched, in LOCAL mode.
+
+    The working tree holds a symlink to an object that is not there, so the
+    converter cannot stat the file, forces streaming, and a reader is asked to
+    open a path that does not exist. biosigIO 1.2.12 types that
+    `file_read_error` on the streaming source, as its in-memory source always
+    did; before, the streaming source raised a bare `FileNotFoundError`, which
+    reached `failure_verdict` uncoded and was retried as `pending`. Remote
+    mode never gets here: it types a missing object `annex_object_missing`
+    before any reader runs.
+
+    This pins what the pin does, so the change is visible; it is not a
+    statement that a typed, never-retried failure is the right verdict for
+    content that is merely unfetched."""
+
+    REQUIRES = ("zarr", "pyedflib", "biosigio")
+    PRIMARY = "sub-01/eeg/sub-01_task-rest_eeg.edf"
+    PRIMARY_BDF = "sub-01/eeg/sub-01_task-rest_eeg.bdf"
+
+    def assert_unfetched_is_a_typed_read_failure(self, primary: str) -> None:
+        link = os.path.join(self.repo, primary)
+        os.makedirs(os.path.dirname(link))
+        extension = os.path.splitext(primary)[1]
+        absent = os.path.join(self.repo, ".git", "annex", "objects", f"absent{extension}")
+        os.symlink(os.path.relpath(absent, os.path.dirname(link)), link)
+        self.assertFalse(os.path.exists(link), "the control: the link dangles")
+
+        result = self.convert(primary, {primary})
+
+        self.assert_refused_as_data(result, "file_read_error")
+        self.assertIn("no such file or directory", result["detail"])
+
+    def test_an_unfetched_object_is_a_typed_read_failure(self):
+        self.assert_unfetched_is_a_typed_read_failure(self.PRIMARY)
+
+    def test_an_unfetched_bdf_object_is_a_typed_read_failure(self):
+        self.assert_unfetched_is_a_typed_read_failure(self.PRIMARY_BDF)
+
+
+class TestLateOnsetThroughConvertOne(ConvertOneLocalCase):
+    """An EDF+C or BDF+C recording whose first time-keeping onset is late
+    converts on BOTH exporters (biosigio#145, fixed by #152, in 1.2.12).
+
+    pyedflib refuses such a file ("it contains format errors"); biosigIO's
+    tolerant read recovers it and says so in the store's recording metadata
+    (`edf_tolerant_read`). The fixture is a small real file this test writes,
+    with its onsets rewritten in place."""
+
+    REQUIRES = ("zarr", "pyedflib", "biosigio")
+
+    def setUp(self):
+        super().setUp()
+        # `ConvertOneLocalCase`'s `aws` absorbs the upload; this one keeps the store.
+        self.synced_dir = os.path.join(self._tmp.name, "synced")
+        with open(os.path.join(self._tmp.name, "bin", "aws"), "w") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                'if [ "$1" = s3 ] && [ "$2" = sync ]; then\n'
+                f'  mkdir -p "{self.synced_dir}" && cp -R "$3" "{self.synced_dir}/"\n'
+                "fi\nexit 0\n"
+            )
+
+    def published_recording_metadata(self, entry: dict) -> dict:
+        with open(
+            os.path.join(self.synced_dir, os.path.basename(entry["zarr"]), "zarr.json"),
+            encoding="utf-8",
+        ) as fh:
+            return json.load(fh)["attributes"]["recording_metadata"]
+
+    def test_a_late_first_onset_converts_in_memory_and_streamed(self):
+        import pyedflib
+
+        for label, primary, file_type in (
+            ("EDF+C", "sub-01/eeg/sub-01_task-rest_eeg.edf", pyedflib.FILETYPE_EDFPLUS),
+            ("BDF+C", "sub-01/eeg/sub-01_task-rest_eeg.bdf", pyedflib.FILETYPE_BDFPLUS),
+        ):
+            path = os.path.join(self.repo, primary)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            build_onset_shifted_edf_family(path, file_type, first_onset=40)
+            with self.subTest(label, check="the fixture is the shape pyedflib refuses"):
+                with self.assertRaises(OSError) as refusal:
+                    pyedflib.EdfReader(path)
+                self.assertIn("not EDF(+) or BDF(+) compliant", str(refusal.exception))
+            for path_name, threshold in (("in-memory", None), ("streaming", 1)):
+                with self.subTest(label, path=path_name):
+                    shutil.rmtree(self.synced_dir, ignore_errors=True)
+                    StreamEdfThreshold.use(self, threshold)
+                    with StreamEdfThreshold.watching_writers() as writers:
+                        result = self.convert(primary, {primary})
+                    self.assertEqual(
+                        "stream_to_zarr" in writers, path_name == "streaming", writers
+                    )
+                    self.assertTrue(result["ok"], result.get("error"))
+                    (group,) = result["entry"]["groups"]
+                    self.assertEqual((group["n_channels"], group["n_samples"]), (2, 128))
+                    metadata = self.published_recording_metadata(result["entry"])
+                    self.assertIs(metadata.get("edf_tolerant_read"), True, metadata)
+                    self.assertEqual(
+                        metadata.get("edf_tolerant_read_reason"), "late_timekeeping_onset"
+                    )
+
+    def published_group(self, entry: dict):
+        import zarr
+
+        return zarr.open_group(
+            os.path.join(self.synced_dir, os.path.basename(entry["zarr"])), mode="r"
+        )
+
+    def published_samples(self, entry: dict) -> list[tuple[Any, float]]:
+        """Each channel's samples as the store serves them, decoded by the
+        channel's own `scale` and `offset`, with that scale: the serving copy is
+        int16, so the scale is one quantization step."""
+        import numpy as np
+
+        root = self.published_group(entry)
+        (name,) = root.attrs["channel_groups"]
+        group = root[name]
+        level0 = np.asarray(group["0"][:, :], dtype=np.float64)
+        return [
+            (level0[ch["row_index"]] * ch["scale"] + ch["offset"], ch["scale"])
+            for ch in group.attrs["channels"]
+        ]
+
+    def published_events(self, entry: dict) -> tuple[list[float], list[str]]:
+        """The store's events as (onsets in seconds, descriptions)."""
+        events = self.published_group(entry)["events"]
+        if events.attrs["n_events"] == 0:
+            return [], []
+        labels = events.attrs["label_map"]
+        return (
+            [float(v) for v in events["onset"][:]],
+            [labels[str(int(code))] for code in events["code"][:]],
+        )
+
+    EVENTS = ([1.0, 4.5], ["stimulus", "response"])
+    # The `events.tsv` rows of the test below. They differ from the file's own
+    # annotations on purpose: `apply_events_tsv` replaces events, and a store that
+    # still held the annotations (a no-op apply) would otherwise pass.
+    TSV_EVENTS = ([2.0, 3.25], ["go", "stop"])
+    # The store writer `convert_recording` hands to `write_store` on each path.
+    WRITER: ClassVar[dict[str, str]] = {"in-memory": "to_zarr", "streaming": "stream_to_zarr"}
+
+    def late_onset_formats(self):
+        import pyedflib
+
+        return (
+            ("EDF+C", "edf", pyedflib.FILETYPE_EDFPLUS),
+            ("BDF+C", "bdf", pyedflib.FILETYPE_BDFPLUS),
+        )
+
+    def test_a_late_first_onset_keeps_the_samples_and_the_in_file_events(self):
+        """The late recording's store holds the samples its compliant twin holds,
+        read by pyedflib (the reference reader), and the in-file events at the
+        times the compliant file states, not shifted by the late onset. The
+        streaming exporter carries no in-file annotations at all, on a compliant
+        recording as on this one, so there both stores must publish none."""
+        import numpy as np
+        import pyedflib
+
+        for label, ext, file_type in self.late_onset_formats():
+            late = f"sub-01/eeg/sub-01_task-rest_eeg.{ext}"
+            twin = f"sub-02/eeg/sub-02_task-rest_eeg.{ext}"
+            compliant = os.path.join(self._tmp.name, f"compliant.{ext}")
+            for rel in (late, twin):
+                os.makedirs(os.path.dirname(os.path.join(self.repo, rel)), exist_ok=True)
+            build_late_onset_pair(compliant, os.path.join(self.repo, late), file_type)
+            shutil.copy(compliant, os.path.join(self.repo, twin))
+
+            reader = pyedflib.EdfReader(compliant)
+            try:
+                reference = [reader.readSignal(i) for i in range(reader.signals_in_file)]
+                onsets, _durations, descriptions = reader.readAnnotations()
+            finally:
+                reader.close()
+            with self.subTest(label, check="the reference reads what the fixture wrote"):
+                self.assertEqual((list(onsets), list(descriptions)), self.EVENTS)
+                self.assertEqual(len(reference), 2)
+
+            for path_name, threshold in (("in-memory", None), ("streaming", 1)):
+                with self.subTest(label, path=path_name):
+                    StreamEdfThreshold.use(self, threshold)
+                    shutil.rmtree(self.synced_dir, ignore_errors=True)
+                    with StreamEdfThreshold.watching_writers() as writers:
+                        results = {rel: self.convert(rel, {rel}) for rel in (late, twin)}
+                    # The exporter that ran, for the late file and its twin alike.
+                    self.assertEqual(writers, [self.WRITER[path_name]] * 2)
+                    for rel, result in results.items():
+                        self.assertTrue(result["ok"], (rel, result.get("error")))
+                    # The controls: only the late file went through the tolerant read.
+                    self.assertIs(
+                        self.published_recording_metadata(results[late]["entry"]).get(
+                            "edf_tolerant_read"
+                        ),
+                        True,
+                    )
+                    self.assertNotIn(
+                        "edf_tolerant_read",
+                        self.published_recording_metadata(results[twin]["entry"]),
+                    )
+
+                    published = self.published_samples(results[late]["entry"])
+                    twin_published = self.published_samples(results[twin]["entry"])
+                    self.assertEqual(len(published), len(reference))
+                    for (decoded, step), (twin_decoded, _), source in zip(
+                        published, twin_published, reference, strict=True
+                    ):
+                        self.assertEqual(decoded.shape, source.shape)
+                        np.testing.assert_array_equal(decoded, twin_decoded)
+                        self.assertLessEqual(float(np.abs(decoded - source).max()), step)
+
+                    events = self.published_events(results[late]["entry"])
+                    self.assertEqual(events, self.published_events(results[twin]["entry"]))
+                    if path_name == "in-memory":
+                        self.assertEqual(events, self.EVENTS)
+                    else:
+                        # The streaming exporter writes only the events table it is
+                        # handed (from events.tsv), never a file's own annotations,
+                        # so the compliant file and the late one both publish none
+                        # here. The events.tsv test below covers streamed events.
+                        self.assertEqual(events, ([], []))
+
+    def test_events_tsv_events_reach_the_store_of_a_late_first_onset_recording(self):
+        """On the streaming path the events come from the BIDS `events.tsv`, so
+        that is where a late recording's events are checked against expected
+        values on both exporters. The rows differ from the file's own
+        annotations, so only the sidecar's values can satisfy the test."""
+        self.assertNotEqual(self.TSV_EVENTS, self.EVENTS)
+        tsv = "sub-01/eeg/sub-01_task-rest_events.tsv"
+        os.makedirs(os.path.join(self.repo, "sub-01/eeg"), exist_ok=True)
+        with open(os.path.join(self.repo, tsv), "w", encoding="utf-8") as fh:
+            fh.write("onset\tduration\ttrial_type\n2.0\t0.5\tgo\n3.25\t0\tstop\n")
+
+        for label, ext, file_type in self.late_onset_formats():
+            primary = f"sub-01/eeg/sub-01_task-rest_eeg.{ext}"
+            build_late_onset_pair(
+                os.path.join(self._tmp.name, f"compliant.{ext}"),
+                os.path.join(self.repo, primary),
+                file_type,
+            )
+            for path_name, threshold in (("in-memory", None), ("streaming", 1)):
+                with self.subTest(label, path=path_name):
+                    StreamEdfThreshold.use(self, threshold)
+                    shutil.rmtree(self.synced_dir, ignore_errors=True)
+                    with StreamEdfThreshold.watching_writers() as writers:
+                        result = self.convert(primary, {primary, tsv})
+                    self.assertEqual(writers, [self.WRITER[path_name]])
+                    self.assertTrue(result["ok"], result.get("error"))
+                    self.assertEqual(self.published_events(result["entry"]), self.TSV_EVENTS)
+                    self.assertEqual(result["entry"]["n_events"], 2)
+                    self.assertEqual(result["entry"]["trial_types"], {"go": 1, "stop": 1})
+
+
+class TestCutShortBrainVisionThroughConvertOne(ConvertOneLocalCase):
+    """A BrainVision data file cut short is a terminal `corrupt_or_truncated`.
+
+    Before biosigIO 1.2.13 the reader dropped the partial trailing frame, and any
+    marker in it, without a word, and the converter published a store for a
+    recording that was missing its end. The header here declares no `DataPoints`
+    count, so a size that is not a whole number of frames (channels times bytes
+    per sample) is the evidence. The files are a real BrainVision triplet written
+    by `write_brainvision`, converted through the real `convert_one`."""
+
+    REQUIRES = ("zarr", "mne", "biosigio")
+    PRIMARY = "sub-01/eeg/sub-01_task-rest_eeg.vhdr"
+
+    def test_a_data_file_cut_by_one_byte_is_terminal_corrupt_or_truncated(self):
+        os.makedirs(os.path.join(self.repo, "sub-01/eeg"))
+        paths = write_brainvision(os.path.join(self.repo, self.PRIMARY), ["Fp1", "Fp2", "Cz", "Pz"])
+        head_files = {os.path.relpath(path, self.repo) for path in paths}
+        data = paths[2]
+        self.assertEqual(os.path.splitext(data)[1], ".eeg")
+
+        # The control: the complete triplet converts, so the refusal below is the
+        # missing byte and not the fixture.
+        self.assertEqual(os.path.getsize(data) % (4 * 2), 0)
+        complete = self.convert(self.PRIMARY, head_files)
+        self.assertTrue(complete["ok"], complete.get("error"))
+
+        with open(data, "r+b") as fh:
+            fh.truncate(os.path.getsize(data) - 1)
+        result = self.convert(self.PRIMARY, head_files)
+
         self.assert_refused_as_data(result, "corrupt_or_truncated")
-        self.assertIn("invalid number of signals in header (-1)", result["detail"])
+        self.assertIn(os.path.basename(data), result["detail"])
+        self.assertNotIn("entry", result)
 
 
 class TestReaderRefusalsThroughConvertOne(ConvertOneLocalCase):
@@ -17146,7 +17441,7 @@ class TestSubjectInfoProblems(unittest.TestCase):
     writers that do or do not name the option. This tests the check itself:
     no conversion logic is replaced."""
 
-    def problems(self, installed="1.2.11", imported="1.2.11", strip=_strip_nothing, **writers):
+    def problems(self, installed="1.2.13", imported="1.2.13", strip=_strip_nothing, **writers):
         return generate_zarr.subject_info_problems(
             installed_version=installed, imported_version=imported,
             writers={**CAPABLE_WRITERS, **writers}, strip=strip,
@@ -17154,37 +17449,38 @@ class TestSubjectInfoProblems(unittest.TestCase):
 
     def test_a_capable_biosigio_passes(self):
         # "1.10.0" is the case a string comparison gets wrong: as strings it
-        # sorts below "1.2.11".
-        for version in ("1.2.11", "1.2.11.0", "1.2.11.post1", "1.2.11+local.1",
-                        "1.2.12", "1.3", "1.10.0", "2.0.0"):
+        # sorts below "1.2.13".
+        for version in ("1.2.13", "1.2.13.0", "1.2.13.post1", "1.2.13+local.1",
+                        "1.2.14", "1.3", "1.10.0", "2.0.0"):
             with self.subTest(version):
                 self.assertEqual(self.problems(version, version), [])
 
     def test_a_release_below_the_floor_is_refused(self):
-        for version in ("1.2.10", "1.2.10.post1", "1.2.9", "1.1.99", "0.9.9"):
+        for version in ("1.2.12", "1.2.12.post1", "1.2.11", "1.2.11.post1", "1.2.10",
+                        "1.2.10.post1", "1.2.9", "1.1.99", "0.9.9"):
             with self.subTest(version):
                 problems = self.problems(version, version)
                 self.assertEqual(problems, [
-                    f"the installed biosigIO is {version}, below 1.2.11",
-                    f"the imported biosigIO is {version}, below 1.2.11",
+                    f"the installed biosigIO is {version}, below 1.2.13",
+                    f"the imported biosigIO is {version}, below 1.2.13",
                 ])
 
     def test_a_pre_release_or_unreadable_version_is_refused(self):
-        # `1.2.11rc1` sorts BELOW 1.2.11; read by its leading digits it would pass.
-        for version in ("1.2.11rc1", "1.2.11.dev0", "1.2.11a1", "1.2.12.dev0",
-                        "1.2.11.post1.dev0", "not-a-version", "", None):
+        # `1.2.13rc1` sorts BELOW 1.2.13; read by its leading digits it would pass.
+        for version in ("1.2.13rc1", "1.2.13.dev0", "1.2.13a1", "1.2.14.dev0",
+                        "1.2.13.post1.dev0", "not-a-version", "", None):
             with self.subTest(version):
                 self.assertEqual(len(self.problems(version, version)), 2)
 
     def test_an_import_older_than_the_installed_release_is_refused(self):
         # An older copy shadowing the installed one, or imported before an
-        # upgrade: the distribution says 1.2.11, the code that runs is 1.2.10.
-        self.assertEqual(self.problems("1.2.11", "1.2.10"),
-                         ["the imported biosigIO is 1.2.10, below 1.2.11"])
+        # upgrade: the distribution says 1.2.13, the code that runs is 1.2.12.
+        self.assertEqual(self.problems("1.2.13", "1.2.12"),
+                         ["the imported biosigIO is 1.2.12, below 1.2.13"])
 
     def test_an_installed_release_older_than_the_import_is_refused(self):
-        self.assertEqual(self.problems("1.2.10", "1.2.11"),
-                         ["the installed biosigIO is 1.2.10, below 1.2.11"])
+        self.assertEqual(self.problems("1.2.12", "1.2.13"),
+                         ["the installed biosigIO is 1.2.12, below 1.2.13"])
 
     def test_every_writer_must_name_the_option(self):
         for name in generate_zarr.BIOSIGIO_STORE_WRITERS:
@@ -17210,8 +17506,8 @@ class TestSubjectInfoProblems(unittest.TestCase):
         self.assertFalse(generate_zarr.names_keyword(_writer_without_option, "exclude_subject_info"))
         self.assertFalse(generate_zarr.names_keyword(None, "exclude_subject_info"))
 
-    def test_the_floor_is_the_release_that_added_the_option(self):
-        self.assertEqual(generate_zarr.final_release(generate_zarr.SUBJECT_INFO_FLOOR), (1, 2, 11))
+    def test_the_floor_is_the_pinned_release(self):
+        self.assertEqual(generate_zarr.final_release(generate_zarr.SUBJECT_INFO_FLOOR), (1, 2, 13))
 
     def test_the_refusal_exit_is_ex_config(self):
         self.assertEqual(generate_zarr.EXIT_SUBJECT_INFO_UNAVAILABLE, 78)
@@ -18110,7 +18406,7 @@ class TestMainRefusesWithoutSubjectInfoExclusion(unittest.TestCase):
         git("add", "-A")
         git("commit", "-q", "-m", "init")
 
-    def standin(self, version: str = "1.2.11", dist_version: str | None = None,
+    def standin(self, version: str = "1.2.13", dist_version: str | None = None,
                 lacking: str | None = None, exporter_imports: bool = True,
                 mode: str = "read_nothing") -> str:
         """Write the stand-in package; `lacking` names the one writer that does
@@ -18210,21 +18506,21 @@ class TestMainRefusesWithoutSubjectInfoExclusion(unittest.TestCase):
 
     def test_a_release_below_the_floor_is_refused(self):
         self.commit(with_recording=True)
-        rc, log = self.run_main(self.standin(version="1.2.10"), "--wipe")
-        self.assert_refused(rc, log, "the installed biosigIO is 1.2.10, below 1.2.11")
+        rc, log = self.run_main(self.standin(version="1.2.12"), "--wipe")
+        self.assert_refused(rc, log, "the installed biosigIO is 1.2.12, below 1.2.13")
 
     def test_a_stale_import_is_refused_although_the_installed_release_is_current(self):
-        # The distribution record says 1.2.11; the module imported says 1.2.10.
+        # The distribution record says 1.2.13; the module imported says 1.2.12.
         self.commit(with_recording=True)
-        rc, log = self.run_main(self.standin(version="1.2.10", dist_version="1.2.11"), "--wipe")
-        self.assert_refused(rc, log, "the imported biosigIO is 1.2.10, below 1.2.11")
+        rc, log = self.run_main(self.standin(version="1.2.12", dist_version="1.2.13"), "--wipe")
+        self.assert_refused(rc, log, "the imported biosigIO is 1.2.12, below 1.2.13")
 
     def test_an_installed_release_older_than_the_import_is_refused(self):
-        # The other way round: the module says 1.2.11, but what the environment
-        # records as installed is 1.2.10.
+        # The other way round: the module says 1.2.13, but what the environment
+        # records as installed is 1.2.12.
         self.commit(with_recording=True)
-        rc, log = self.run_main(self.standin(version="1.2.11", dist_version="1.2.10"), "--wipe")
-        self.assert_refused(rc, log, "the installed biosigIO is 1.2.10, below 1.2.11")
+        rc, log = self.run_main(self.standin(version="1.2.13", dist_version="1.2.12"), "--wipe")
+        self.assert_refused(rc, log, "the installed biosigIO is 1.2.12, below 1.2.13")
 
     def test_a_biosigio_whose_exporter_cannot_be_imported_is_refused(self):
         # Fail closed: a check that cannot look must refuse, not wave through.

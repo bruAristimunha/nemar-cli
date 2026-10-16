@@ -115,7 +115,7 @@
     "failure_count": {
       "type": "integer",
       "minimum": 0,
-      "description": "Entries in failures[] -- recordings that will not convert without a change to the data or the converter."
+      "description": "Entries in failures[] -- recordings that will not convert without a change to the data or the converter, except content that is not yet fetched locally."
     },
     "pending_count": {
       "type": "integer",
@@ -458,7 +458,7 @@
     },
     "failure": {
       "type": "object",
-      "description": "A recording that has no store for a reason retrying will not change: a property of the data, or a converter gap someone has to close.",
+      "description": "A recording that has no store for a reason that retrying in the same state will not change: a property of the data, or a converter gap someone has to close.",
       "required": [
         "path",
         "code",

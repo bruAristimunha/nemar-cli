@@ -17,8 +17,9 @@ detection, annex-content materialization, S3 sync, and the index.
 A store holds the data, the events, channel names, types and units, and
 technical recording metadata, and never the subject (#1626). Every store is
 written through ``write_store``, which has biosigIO leave subject and operator
-information out (``exclude_subject_info``, biosigio>=1.2.11), and ``main``
-refuses to convert on a biosigIO that cannot. Subject information stays at
+information out (``exclude_subject_info``, added in biosigio 1.2.11), and ``main``
+refuses to convert on a biosigIO below ``SUBJECT_INFO_FLOOR`` (1.2.13) or one that
+cannot. Subject information stays at
 dataset scope, in ``participants.tsv``.
 
 Design notes
@@ -1991,8 +1992,8 @@ def reason_for_code(code: str | None) -> str:
 # --- Reading a reader's refusal (#1801) ---------------------------------------
 #
 # A reader says that a file failed, and often not why: a generic `file_read_error`,
-# MNE's refusal re-labeled `maxshield_probe_failed` by the probe, pyedflib's bare
-# `OSError` out of the streaming exporter (no code at all, so it was retried as if
+# MNE's refusal re-labeled `maxshield_probe_failed` by the probe, an `.fdt` that
+# is not the size its `.set` header says (no code at all, so it was retried as if
 # the node were at fault). `failure_verdict` is the ONE place those are read.
 #
 # Which codes it looks behind: the four a reader or the probe reports without
@@ -2010,32 +2011,6 @@ _VERDICT_CHAIN_LINKS = 5
 # MNE's refusal to read the head of a split series whose next file is not beside
 # it. It quotes the file by the path it looked at, which is a scratch path here.
 _MNE_SPLIT_RE = re.compile(r"Split raw file detected but next file (.+?) does not exist")
-# pyedflib's refusal, which biosigIO's streaming EDF/BDF source re-raises as a bare
-# `OSError`; matched anywhere in the text, the way it has always been.
-_PYEDFLIB_REFUSAL = "not EDF(+) or BDF(+) compliant"
-# biosigIO's tolerant fallback (`importers/_edf_tolerant.py`, 1.2.11) reads a file
-# pyedflib refuses and raises its OWN bare, errno-less `OSError` when the file is
-# cut short or its header is unusable. Each message is `<path>: <text>`, the path
-# being a scratch path here, so only the tail is matched, and all of it: a
-# sentence that merely contains these words is not the refusal. One per `raise`
-# in `probe_edf_header` (the first three) and `_check_not_truncated`.
-_BIOSIGIO_TRUNCATION_RES = (
-    re.compile(r"(?s)\A.+: EDF/BDF header is truncated \(<256 bytes\)\Z"),
-    re.compile(r"(?s)\A.+: invalid number of signals in header \(-?\d+\)\Z"),
-    re.compile(r"(?s)\A.+: signal header is truncated\Z"),
-    re.compile(
-        r"(?s)\A.+: file is truncated \(expected at least \d+ bytes "
-        r"for \d+ data record\(s\), found \d+\)\Z"
-    ),
-)
-
-
-def _is_streaming_edf_refusal(message: str) -> bool:
-    """True if `message` is pyedflib's refusal or one of biosigIO's tolerant
-    fallback's truncation errors: the texts rule 4 of `failure_verdict` types."""
-    return _PYEDFLIB_REFUSAL in message or any(
-        pattern.search(message) for pattern in _BIOSIGIO_TRUNCATION_RES
-    )
 
 
 def _exception_chain(exc: BaseException) -> list[BaseException]:
@@ -2066,11 +2041,10 @@ def failure_verdict(
     has a better one than the exception's (it names the file by its BIDS path,
     never a scratch path); None means `failure_detail(exc)`.
 
-    Reads `exc` and five `__cause__` links (rule 4 reads `exc` alone), and only
-    for the codes in `_REFINABLE_CODES`. Never `__context__`: an exception raised
-    while another was being handled is not caused by it, and a host error raised
-    during a read's recovery must keep its retry. The first rule that matches
-    wins:
+    Reads `exc` and five `__cause__` links, and only for the codes in
+    `_REFINABLE_CODES`. Never `__context__`: an exception raised while another
+    was being handled is not caused by it, and a host error raised during a
+    read's recovery must keep its retry. The first rule that matches wins:
 
     1. MNE's "Split raw file detected but next file X does not exist":
        `split_part_missing`, naming `dirname(primary)/basename(X)`, when the TREE
@@ -2082,29 +2056,13 @@ def failure_verdict(
     3. "float32 samples but the .set header implies": the `.fdt` is not the size
        its `.set` header says, `corrupt_or_truncated`. DEFENSE until biosigIO
        types the mismatch itself.
-    4. `exc` ITSELF is exactly `OSError`, with no errno, saying "not EDF(+) or
-       BDF(+) compliant" (pyedflib's refusal, re-raised bare by biosigIO's
-       streaming EDF/BDF source) or one of the four truncation errors biosigIO's
-       tolerant fallback raises bare (`_BIOSIGIO_TRUNCATION_RES`: a header or
-       signal header cut short, an impossible signal count, a file shorter than
-       its header implies): `corrupt_or_truncated`, as its in-memory path types
-       the same file. TEMPORARY, like its canary
-       (`TestStreamingRefusalCanary`), until biosigio 1.2.12 ships PR #150
-       (closes #149), which types the streaming refusal and wraps the streaming
-       fallback's errors in `classify_read_error`. The pinned 1.2.11 still
-       leaves both bare, so the fallback text match
-       (`_BIOSIGIO_TRUNCATION_RES`) is still needed; at that release it is
-       deleted with its canary case, and so is the rest of this rule. The guard
-       is exact on purpose: an `OSError` that carries an errno (EIO, ENOSPC,
-       EACCES) or is a subclass (`PermissionError`) is the HOST saying no, a
-       condition that must keep its retry. And it is `exc`, never a link behind
-       it: biosigIO recovers some refusals inside the `except` block that
-       caught them, so a host error raised during that recovery carries the
-       bare refusal as its
-       `__context__`, and reading the chain would type the host's error as the
-       file's. Rules 1 to 3 do read causes, but only explicit ones, for the
-       same reason.
-    5. Otherwise the exception's own code, which may be None.
+    4. Otherwise the exception's own code, which may be None.
+
+    No rule types a bare `OSError` by its text. biosigIO types a streamed
+    EDF/BDF refusal itself (`CorruptFileError`, since 1.2.12), and an `OSError`
+    that carries an errno (EIO, ENOSPC, EACCES) or is a subclass
+    (`PermissionError`) is the HOST saying no, a condition that must keep its
+    retry.
 
     A `.code` that is not a non-empty string is not a code: the exception is
     read as uncoded. Membership in a frozenset hashes the value, so a list
@@ -2127,8 +2085,6 @@ def failure_verdict(
     if lower_ext(primary) == ".set" and any("Must pass 2-d input" in m for m in messages):
         return EPOCHED_RECORDING, None
     if any("float32 samples but the .set header implies" in m for m in messages):
-        return "corrupt_or_truncated", None
-    if type(exc) is OSError and exc.errno is None and _is_streaming_edf_refusal(str(exc)):
         return "corrupt_or_truncated", None
     return code, None
 
@@ -5139,9 +5095,9 @@ def merge_index(
 
     `failures` is this run's typed data failures ({path, zarr, code, reason,
     detail}) -- recordings that will not convert without a change to the data or
-    the converter. They are merged like stores: prior failures carry over, a path
-    that converted (or whose store was removed) this run drops out, and this run's
-    failures overlay.
+    the converter, except content that is not yet fetched locally. They are merged
+    like stores: prior failures carry over, a path that converted (or whose store
+    was removed) this run drops out, and this run's failures overlay.
 
     `pending` is this run's INFRA failures ({path, zarr, reason, last_error,
     last_attempt_utc}) -- recordings that have no store yet but are still expected
@@ -8418,12 +8374,23 @@ def _recording_size_bytes(primary_local: str) -> int:
 #     writer is referenced anywhere else.
 #   * `sync_store`, the one upload, runs the same read-back on the bytes it is
 #     about to upload, after every later rewrite of the root.
-#   * hallu-zarr.sh's setup() refuses an installed biosigIO below 1.2.11.
+#   * hallu-zarr.sh's setup() refuses an installed biosigIO below 1.2.13.
 #
 # `fix_source_file_attr` still rewrites `source_file` afterwards: biosigIO now
 # leaves the scratch file's name there instead of its whole path, and the
 # converter replaces it with the BIDS path the index keys the store by.
-SUBJECT_INFO_FLOOR = "1.2.11"
+# The converter's biosigIO floor, equal to hallu-zarr.sh's BIOSIGIO_FLOOR
+# (test_hallu_zarr_config.py compares them). 1.2.11 added the option above, which
+# is where the name comes from. 1.2.12 types a streamed EDF/BDF refusal itself
+# (`CorruptFileError`), and `failure_verdict` no longer reads a bare `OSError`'s
+# text, so a 1.2.11 run would take every streamed refusal for the node's fault and
+# retry it until `retry_exhausted`. 1.2.13 is the pin's floor: it refuses a
+# BrainVision data file whose header shows it was cut short, where 1.2.12 read it
+# with the tail dropped, so the converter takes no older release
+# (TestCutShortBrainVisionThroughConvertOne). A cut exactly at a frame boundary of
+# a file with no positive `DataPoints` count is not detected: it reads as a
+# shorter recording.
+SUBJECT_INFO_FLOOR = "1.2.13"
 SUBJECT_INFO_OPTION = "exclude_subject_info"
 SUBJECT_INFO_EXCLUDED_ATTR = "subject_info_excluded"
 # The writers that put a store on disk, by the names `biosigio_subject_info_problems`
@@ -9284,9 +9251,9 @@ def convert_one(primary: str, peak_bytes: int | None = None) -> dict:
         #
         # The code is the exception's own, read through `failure_verdict`: a
         # reader that refuses a file without saying why (a generic read error,
-        # the MaxShield probe's relabel of MNE, pyedflib's bare OSError out of
-        # the streaming exporter) is typed here, by the refusal it reported, and
-        # `named` is the better detail it can publish (#1801).
+        # the MaxShield probe's relabel of MNE, an `.fdt` of the wrong size) is
+        # typed here, by the refusal it reported, and `named` is the better
+        # detail it can publish (#1801).
         code, named = failure_verdict(exc, primary, c.get("head_files") or frozenset())
         if code is None:
             import traceback

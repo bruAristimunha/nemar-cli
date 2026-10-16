@@ -179,13 +179,30 @@
 # published keep their subject members until they are reconverted or stripped
 # in place by a fleet tool that #1626 lists and this release does not build (the scrub's
 # `zarr` stage strips one dataset at a time), not by the stamp.
-# <1.2.12 is a CAP, not a floor, raised deliberately per release: a biosigIO
-# patch release has changed what a store contains three times in a row (1.2.9,
-# 1.2.10, 1.2.11), so the next one is read before the converter takes it. Raise
-# it in three places at once: here, `BIOSIGIO_SPEC`, `BIOSIGIO_FLOOR` and
-# `BIOSIGIO_CAP` in hallu-zarr.sh (setup() refuses an installed biosigIO outside
-# [floor, cap) after install, and any pre-release), and test_hallu_zarr_config.py.
-biosigio[zarr,meg,mef3,hdf5]>=1.2.11,<1.2.12
+# >=1.2.12: a streamed EDF/BDF refusal is a typed `CorruptFileError` (biosigio
+# #149, fixed by #150) instead of pyedflib's bare `OSError`, and the tolerant
+# read recovers an EDF+C or BDF+C recording whose first time-keeping onset is
+# late (#145, fixed by #152). 1.2.12 types the streamed refusals, which is why
+# the former bare-OSError text match in `failure_verdict` was removed.
+# ZARR_ENGINE_VERSION is NOT bumped here (ADR 0033): a bump is a separate,
+# owner-approved step.
+# >=1.2.13: a BrainVision data file whose header shows it was cut short is a typed
+# `CorruptFileError` (`corrupt_or_truncated`) on both the in-memory and the
+# streaming path, where it used to read with the tail dropped. Through
+# `Recording.from_file` a FIF file truncated in its data is typed
+# `corrupt_or_truncated` too, but the streaming export still raises a bare
+# `ValueError` for it (biosigio#161), which the converter reads as uncoded, so a
+# streamed truncated FIF is still retried until `retry_exhausted`. Which codes are
+# retried is `RETRYABLE_CODES` in generate_zarr.py. ZARR_ENGINE_VERSION is NOT
+# bumped here either (ADR 0033).
+# <1.2.14 is a CAP, not a floor, raised deliberately per release: a biosigIO
+# patch release has changed what a store contains or which recordings convert
+# five times in a row (1.2.9 through 1.2.13), so the next one is read before the
+# converter takes it. Raise it in three places at once: here,
+# `BIOSIGIO_SPEC`, `BIOSIGIO_FLOOR` and `BIOSIGIO_CAP` in hallu-zarr.sh
+# (setup() refuses an installed biosigIO outside [floor, cap) after install,
+# and any pre-release), and test_hallu_zarr_config.py.
+biosigio[zarr,meg,mef3,hdf5]>=1.2.13,<1.2.14
 
 # Draft 2020-12 validator for the converter's own pre-upload self-check: the index
 # it is about to publish is validated against `shared/zarr-index.schema.json` (and
