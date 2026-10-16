@@ -75,7 +75,11 @@ export const PR_REVIEW_ACTIONS: ReadonlySet<string> = new Set([
 /** The branch whose pull requests are reviewed. */
 export const PR_REVIEW_BASE_BRANCH = "main";
 
-/** How long a dispatched review may take before the watchdog gives up on it. The workflow's own limit is 20. */
+/**
+ * How long a dispatched review may take, counted from when its row was recorded, before the
+ * watchdog gives up on it. The review workflow's `timeout-minutes` is kept below this (a test in
+ * `test/pr-review-workflow.test.ts` checks the order).
+ */
 export const PR_REVIEW_DEADLINE_MINUTES = 30;
 
 /**
