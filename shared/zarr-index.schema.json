@@ -474,7 +474,7 @@
         },
         "code": {
           "type": "string",
-          "description": "Stable machine code (biosigIO's own, plus the NEMAR-side recording_too_large / channel_count_mismatch / maxshield_uncalibrated / maxshield_probe_failed / fdt_declaration_refused / annex_object_missing / retry_exhausted)."
+          "description": "Stable machine code (biosigIO's own, plus the NEMAR-side recording_too_large / channel_count_mismatch / maxshield_uncalibrated / maxshield_probe_failed / fdt_declaration_refused / annex_object_missing / companion_missing / split_part_missing / epoched_recording / retry_exhausted)."
         },
         "reason": {
           "type": "string",
