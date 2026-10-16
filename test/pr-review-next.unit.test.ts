@@ -36,7 +36,7 @@ describe("when y may approve and merge", () => {
   });
 
   test("a verdict that only asks first is allowed: the warning is on the screen", () => {
-    for (const verdict of ["uncertain", "could_not_decide", "not_reviewed"] as const) {
+    for (const verdict of ["uncertain", "could_not_decide", "not_reviewed", "exempt"] as const) {
       const gate = approvalGate({ verdict, staleVerdict: null });
       expect(approveAllowed({ gate, force: false, ...green })).toEqual({ ok: true });
     }

@@ -10,6 +10,7 @@
  */
 
 import type { Server } from "bun";
+import { permissionResponse } from "../../backend/test/helpers/github-permission";
 import { projectOnto } from "../../backend/test/helpers/graphql-select";
 
 export const WORKER_TOKEN = "ghp_worker_datasets_token";
@@ -179,6 +180,12 @@ export function startGitHubStandin(): GitHubStandin {
           ? Response.json(who)
           : Response.json({ message: "Bad credentials" }, { status: 401 });
       }
+
+      // The question the review's exemption asks once an account has matched (ADR 0107): an
+      // administrator on every dataset, whoever is asked. A test that needs another answer says
+      // so in the Worker's own suites (backend/test/pr-review-*.test.ts), where the table lives.
+      const permission = req.method === "GET" ? await permissionResponse(url, {}) : null;
+      if (permission) return permission;
 
       const user = url.pathname.match(/^\/users\/([^/]+)$/);
       if (req.method === "GET" && user) {

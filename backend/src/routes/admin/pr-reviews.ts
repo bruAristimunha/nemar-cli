@@ -13,11 +13,12 @@
  *
  * Admin-only through the router's `authMiddleware` and `adminMiddleware`. The reads need no switch:
  * `PR_REVIEW_ENABLED` gates the REVIEW, not the view of it, so with the review off the queue lists
- * the same pull requests and those with no stored review show as `not_reviewed`. Nothing here
- * approves or merges a pull request: no Worker code path approves, and the Worker holds nothing that
- * belongs to an individual administrator. An approval is the administrator's own act with their own
- * GitHub identity, taken by the CLI (ADR 0093). `start` is the one route that makes the Worker act:
- * it makes the dispatch, check and comment calls any review makes, and nothing more.
+ * the same pull requests and those with no stored review show as `not_reviewed` (or `exempt`, for
+ * a pull request an owner or administrator opened, ADR 0107). Nothing here approves or merges a
+ * pull request: no Worker code path approves, and the Worker holds nothing that belongs to an
+ * individual administrator. An approval is the administrator's own act with their own GitHub
+ * identity, taken by the CLI (ADR 0093). `start` is the one route that makes the Worker act: it
+ * makes the dispatch, check and comment calls any review makes, and nothing more.
  *
  * The contributor routes live under their own prefix (`pr-review-authors`) rather than under
  * `pr-reviews/authors/...`, because `pr-reviews/:dataset/:pr` has the same shape and a router that

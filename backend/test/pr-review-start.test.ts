@@ -27,6 +27,7 @@ import { handlePullRequestEvent } from "../src/services/pr-review";
 import { hashApiKey } from "../src/services/token";
 import type { Bindings, Variables } from "../src/types/bindings";
 import { freshDb, realD1, wrapD1 } from "./helpers/d1";
+import { type PermissionAnswer, permissionResponse } from "./helpers/github-permission";
 import { SHA_A, SHA_B, seedReview } from "./helpers/pr-queue-fixtures";
 
 const ADMIN_KEY = "start-admin-key-0123456789abcdef0123456789abcdef";
@@ -46,6 +47,10 @@ let calls: Recorded[] = [];
 /** What GitHub answers for `GET /repos/nemarDatasets/<ds>/pulls/<n>`: a pull request, or a status. */
 let pulls: Record<string, Record<string, unknown> | number> = {};
 let dispatchStatus = 204;
+/** What GitHub answers to a check-run write; a refusal carries a retry-after of zero. */
+let checkStatus = 200;
+/** What GitHub says each login holds on a repository (see helpers/github-permission.ts). */
+let permissions: Record<string, PermissionAnswer> = {};
 let nextId = 9000;
 
 beforeAll(() => {
@@ -64,11 +69,16 @@ beforeAll(() => {
         return new Response(dispatchStatus < 300 ? null : "{}", { status: dispatchStatus });
       }
       if (/\/check-runs(\/\d+)?$/.test(url.pathname)) {
+        if (checkStatus >= 300) {
+          return new Response("{}", { status: checkStatus, headers: { "Retry-After": "0" } });
+        }
         return Response.json({ id: ++nextId }, { status: req.method === "POST" ? 201 : 200 });
       }
       if (/\/issues\/(comments\/\d+|\d+\/comments)$/.test(url.pathname)) {
         return Response.json({ id: ++nextId }, { status: req.method === "POST" ? 201 : 200 });
       }
+      const permission = req.method === "GET" ? await permissionResponse(url, permissions) : null;
+      if (permission) return permission;
       const pull = url.pathname.match(/^\/repos\/nemarDatasets\/([^/]+)\/pulls\/(\d+)$/);
       if (req.method === "GET" && pull) {
         const hit = pulls[`${pull[1]}#${pull[2]}`];
@@ -156,6 +166,8 @@ afterEach(() => {
   calls = [];
   pulls = {};
   dispatchStatus = 204;
+  checkStatus = 200;
+  permissions = {};
   envOverrides = {};
   __resetRateLimitStateForTests();
 });
@@ -613,6 +625,129 @@ describe("what an administrator's start does not skip", () => {
       )
       .map((c) => `${c.method} ${c.path}`);
     expect(stray).toEqual([]);
+  });
+});
+
+describe("an owner's or administrator's pull request is not started (ADR 0107)", () => {
+  /** The check-run writes GitHub recorded. */
+  const checkWrites = () => calls.filter((c) => /\/check-runs(\/\d+)?$/.test(c.path));
+
+  test("it is answered exempt_author, gets the skipped check, and writes no row and no audit row", async () => {
+    // The seeded administrator's GitHub login, as seedUser stores it.
+    pulls[`${DATASET}#7`] = restPull({ number: 7, userId: 4001, login: "startadmin-gh" });
+
+    const r = await start(DATASET, 7);
+
+    expect(r.status).toBe(200);
+    expect(r.body).toMatchObject({
+      environment: "production",
+      dispatched: false,
+      reason: "exempt_author",
+      review_id: null,
+      author_login: "startadmin-gh",
+    });
+    expect(rows()).toHaveLength(0);
+    expect(dispatches()).toHaveLength(0);
+    expect(checkWrites()).toHaveLength(1);
+    expect(checkWrites()[0].body).toMatchObject({
+      name: "NEMAR PR Review",
+      head_sha: SHA_A,
+      status: "completed",
+      conclusion: "skipped",
+    });
+    // Only a start that was handed to GitHub is an audited fact.
+    expect(db.query("SELECT * FROM audit_log WHERE action = 'pr_review_started'").all()).toEqual(
+      [],
+    );
+  });
+
+  test("a commit a review has touched is handled like anyone's, whoever its author is: an administrator asked for a review of it", async () => {
+    // An earlier review of this commit errored. A start restarts such a commit, and the author
+    // being exempt now does not turn that undecided review into `skipped`, which a required check
+    // counts as passing: the review is started again.
+    seedReview(db, {
+      ds: DATASET,
+      n: 7,
+      sha: SHA_A,
+      authorId: 4001,
+      login: "startadmin-gh",
+      state: "errored",
+      detail: "workflow_failed",
+    });
+    db.run("UPDATE pr_reviews SET check_run_id = 4242 WHERE pr_number = 7");
+    pulls[`${DATASET}#7`] = restPull({ number: 7, userId: 4001, login: "startadmin-gh" });
+
+    const r = await start(DATASET, 7);
+
+    expect(r.body).toMatchObject({ dispatched: true, reason: "redispatched" });
+    expect(dispatches()).toHaveLength(1);
+    expect(rows()[0]).toMatchObject({ state: "dispatched", detail: null });
+    expect(checkWrites().length).toBeGreaterThan(0);
+    expect(JSON.stringify(checkWrites().map((c) => c.body))).not.toContain("skipped");
+  });
+
+  test("a commit with a decided review is left alone by a start of an exempt author's pull request", async () => {
+    seedReview(db, {
+      ds: DATASET,
+      n: 7,
+      sha: SHA_A,
+      authorId: 4001,
+      login: "startadmin-gh",
+      state: "reported",
+      verdict: "fail",
+    });
+    db.run("UPDATE pr_reviews SET check_run_id = 4242 WHERE pr_number = 7");
+    pulls[`${DATASET}#7`] = restPull({ number: 7, userId: 4001, login: "startadmin-gh" });
+
+    const r = await start(DATASET, 7);
+
+    expect(r.body).toMatchObject({ dispatched: false, reason: "duplicate" });
+    expect(dispatches()).toHaveLength(0);
+    // The failed review's check is not written over, by `skipped` or by anything.
+    expect(checkWrites()).toEqual([]);
+    expect(JSON.stringify(calls.map((c) => c.body))).not.toContain("skipped");
+    // The row still says what the review said (a start re-states a stored result on the pull
+    // request's comment, as a redelivery does, and that is all it does).
+    expect(rows()).toHaveLength(1);
+    expect(rows()[0]).toMatchObject({ state: "reported", verdict: "fail", check_run_id: 4242 });
+  });
+
+  test("a check GitHub will not take is a sentence to try again, and nothing is stored", async () => {
+    checkStatus = 500;
+    pulls[`${DATASET}#7`] = restPull({ number: 7, userId: 4001, login: "startadmin-gh" });
+
+    const r = await start(DATASET, 7);
+
+    expect(r.status).toBe(502);
+    expect(r.body).toMatchObject({ code: "github_unavailable" });
+    expect(String(r.body.error)).toContain("whose author is exempt from the review");
+    expect(String(r.body.error)).toContain("Try again");
+    expect(rows()).toHaveLength(0);
+    expect(dispatches()).toHaveLength(0);
+  });
+
+  test("an administrator that GitHub does not report as admin on the repository is started like anyone", async () => {
+    permissions = { "startadmin-gh": "write" };
+    pulls[`${DATASET}#7`] = restPull({ number: 7, userId: 4001, login: "startadmin-gh" });
+
+    const r = await start(DATASET, 7);
+
+    expect(r.body).toMatchObject({ dispatched: true, reason: "dispatched" });
+    expect(rows()).toHaveLength(1);
+    // The review's own check was posted (in progress), and none of the checks is `skipped`.
+    expect(checkWrites().length).toBeGreaterThan(0);
+    expect(JSON.stringify(checkWrites().map((c) => c.body))).not.toContain("skipped");
+  });
+
+  test("a pull request by an account that is not exempt is started as before", async () => {
+    // The control: the seeded member differs from the seeded administrator in the role alone.
+    pulls[`${DATASET}#7`] = restPull({ number: 7, userId: 4002, login: "startmember-gh" });
+
+    const r = await start(DATASET, 7);
+
+    expect(r.body).toMatchObject({ dispatched: true, reason: "dispatched" });
+    expect(rows()).toHaveLength(1);
+    expect(dispatches()).toHaveLength(1);
   });
 });
 

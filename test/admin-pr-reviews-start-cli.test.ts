@@ -222,6 +222,24 @@ describe("nemar admin pr-reviews start <dataset> <pr>", () => {
     expect(dispatches()).toHaveLength(0);
   });
 
+  test("an owner's or administrator's pull request is not started, and the sentence says why", async () => {
+    openPr({ ds: "nm000201", n: 12, author: "startadmin-gh", authorId: 4001 });
+
+    const r = await cli([...START, "nm000201", "12"]);
+
+    // An answer about a pull request, not a fault in the command.
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain(
+      "not started: its author is a NEMAR owner or administrator, so it is not reviewed",
+    );
+    expect(dispatches()).toHaveLength(0);
+    expect(rows()).toHaveLength(0);
+    // Its check was posted, as skipped, by the Worker.
+    const checks = gh.seen.filter((s) => s.method === "POST" && s.path.endsWith("/check-runs"));
+    expect(checks).toHaveLength(1);
+    expect(checks[0].body).toMatchObject({ status: "completed", conclusion: "skipped" });
+  });
+
   test("a pull request GitHub does not have is an error with a word", async () => {
     const r = await cli([...START, "nm000201", "99"]);
 

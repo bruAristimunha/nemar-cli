@@ -18,10 +18,10 @@ import type {
   AuthorTally,
   DeclineReason,
   OverrideMode,
-  ReviewOutcome,
   ReviewState,
   RunError,
   Standing,
+  StoredOutcome,
 } from "../pr-review.js";
 
 // The review's own vocabulary (ADR 0092) is declared once, in `shared/pr-review.ts`.
@@ -38,6 +38,11 @@ export type { OverrideMode, ReviewState };
  *  - `in_progress`: the review was handed to GitHub and has not reported.
  *  - `could_not_decide`: the review ran and ended without a verdict (an error, or it never
  *    reported). `detail` says why.
+ *  - `exempt`: the pull request's author is a NEMAR owner or administrator, who are not reviewed
+ *    (ADR 0107), so no review of the current commit is on record and none is wanted. Its review
+ *    check is posted as `skipped` when the commit arrives; this list does not verify that. A review
+ *    of the current commit still wins over this word, because a push by someone who is not exempt
+ *    IS reviewed, and a review of another commit is never carried over to this one.
  */
 export const QUEUE_VERDICTS = [
   "pass",
@@ -46,8 +51,16 @@ export const QUEUE_VERDICTS = [
   "not_reviewed",
   "in_progress",
   "could_not_decide",
+  "exempt",
 ] as const;
 export type QueueVerdict = (typeof QUEUE_VERDICTS)[number];
+
+/**
+ * A verdict a STORED review can have: every word but `exempt`, which is about a pull request with
+ * no review of its current commit and is never what a row says. The queue and the detail view may
+ * say `exempt`; a review record and a history item may not.
+ */
+export type StoredVerdict = Exclude<QueueVerdict, "exempt">;
 
 /** A verdict that means the review READ a commit and concluded something about it. */
 export type ReadVerdict = "pass" | "fail" | "uncertain";
@@ -152,9 +165,10 @@ export interface QueueResponse {
  * What starting the review of one open pull request came to. `reason` is one of the review's own
  * fixed words (ADR 0092): `dispatched`, `redispatched` (a commit started again) or `dispatch_claimed`
  * (GitHub's answer was lost but the workflow had already claimed it) when it was handed to GitHub,
- * otherwise why not (`duplicate`, `contributor_paused`, `daily_limit`, `draft`, `not_open`, `not_main`,
- * `bot_author`, `dataset_not_reviewable`, `pr_review_disabled`, ...). `review_id` is null when no
- * review row exists for it.
+ * otherwise why not (`duplicate`, `contributor_paused`, `daily_limit`, `exempt_author` (its author is
+ * an owner or administrator, so it is not reviewed and its check was posted as skipped), `draft`,
+ * `not_open`, `not_main`, `bot_author`, `dataset_not_reviewable`, `pr_review_disabled`, ...).
+ * `review_id` is null when no review row exists for it.
  */
 export interface StartReviewResponse {
   environment: QueueEnvironment;
@@ -169,7 +183,7 @@ export interface ReviewHistoryItem {
   id: number;
   head_sha: string;
   state: ReviewState;
-  verdict: QueueVerdict;
+  verdict: StoredVerdict;
   created_at: string;
   decided_at: string | null;
 }
@@ -178,7 +192,7 @@ export interface ReviewRecord {
   id: number;
   head_sha: string;
   /** What this review concluded of ITS OWN commit, re-derived from the stored report. */
-  verdict: QueueVerdict;
+  verdict: StoredVerdict;
   detail: VerdictDetail | null;
   author_login: string;
   author_id: number;
@@ -186,7 +200,7 @@ export interface ReviewRecord {
   created_at: string;
   decided_at: string | null;
   /** The stored outcome, re-validated on the way out; null while the review is in progress. */
-  outcome: ReviewOutcome | null;
+  outcome: StoredOutcome | null;
 }
 
 /** What GitHub says about the pull request right now. Best effort: null when GitHub could not be read. */

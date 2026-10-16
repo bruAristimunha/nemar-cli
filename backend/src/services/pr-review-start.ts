@@ -7,9 +7,12 @@
  * as the `pull_request` delivery it would have been, and hands it to the one gate every delivery
  * goes through (`handlePullRequestEvent`). So the flag, the "public, named, first-published"
  * test, the per-commit dedupe, the contributor pause and the platform's daily pool all apply
- * exactly as they would to a delivery. Two things differ, and both are the administrator's choice
- * made by name: the per-contributor allowances do not hold the review back, and a commit whose
- * review ended without a verdict (declined, errored, never reported) is started again.
+ * exactly as they would to a delivery, and so does the exemption: a pull request opened by an owner
+ * or administrator is answered `exempt_author` and gets the `skipped` check, and nothing is started
+ * for it (ADR 0107), unless a review has already touched its current commit, which is then handled
+ * like anyone's. Two things differ, and both are the administrator's choice made by name: the
+ * per-contributor allowances do not hold the review back, and a commit whose review ended without a
+ * verdict (declined, errored, never reported) is started again.
  *
  * Nothing here approves, merges or comments on a pull request itself; the review's own check and
  * comment are published by the same code that publishes them for a delivery.
@@ -23,7 +26,7 @@ import { getDatasetsTokenWithRefresher } from "./github-auth.js";
 import { GITHUB_API, ORG_NAME, ghHeaders } from "./github/shared.js";
 import { githubFetchWithRetry } from "./github/transport.js";
 import { QueueError, environmentName, ownedHere } from "./pr-review-queue.js";
-import { handlePullRequestEvent, reviewableDataset } from "./pr-review.js";
+import { ExemptCheckNotPublished, handlePullRequestEvent, reviewableDataset } from "./pr-review.js";
 
 /** A GitHub login's shape; anything else is not echoed back. */
 const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
@@ -166,13 +169,27 @@ export async function startPullRequestReview(
 
   const pull = await readPullRequest(env, datasetId, prNumber);
   const base = pull.base as { repo?: unknown } | null | undefined;
-  const result = await handlePullRequestEvent(
-    env,
-    // The shape a `pull_request` delivery has: GitHub's own record of the pull request, and the
-    // repository it targets. `synchronize` is only the delivery's name for "take it up".
-    { action: "synchronize", pull_request: pull, repository: base?.repo },
-    { adminStart: true },
-  );
+  let result: Awaited<ReturnType<typeof handlePullRequestEvent>>;
+  try {
+    result = await handlePullRequestEvent(
+      env,
+      // The shape a `pull_request` delivery has: GitHub's own record of the pull request, and the
+      // repository it targets. `synchronize` is only the delivery's name for "take it up".
+      { action: "synchronize", pull_request: pull, repository: base?.repo },
+      { adminStart: true },
+    );
+  } catch (err) {
+    // The author is exempt and GitHub would not take the `skipped` check: a sentence, not the
+    // generic failure, because retrying is exactly what the administrator should do.
+    if (err instanceof ExemptCheckNotPublished) {
+      throw new QueueError(
+        502,
+        "github_unavailable",
+        "GitHub would not take the check for this pull request, whose author is exempt from the review, so nothing was posted. Try again in a moment.",
+      );
+    }
+    throw err;
+  }
 
   const login = (pull.user as { login?: unknown } | null | undefined)?.login;
   const answer: StartReviewResponse = {

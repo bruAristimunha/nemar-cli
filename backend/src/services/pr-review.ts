@@ -18,6 +18,14 @@
  * can be sent by anyone holding a dataset repository's workflow credentials, so the caps bind
  * only reviews the Worker started; the claim step is what makes a forged dispatch buy nothing.
  *
+ * **Owners and administrators are not reviewed** (ADR 0107). A pull request opened by a NEMAR
+ * owner or administrator, when an owner or administrator also caused the delivery (the push, the
+ * reopening) and no review has yet touched that commit, is answered with a `skipped` check and
+ * nothing else: no row, no model call, no allowance spent. {@link isReviewExempt} decides from the
+ * accounts, never from anything the pull request says, and before any row is written. A commit that
+ * already has a row keeps what its review said, whoever acts on it next: `skipped` is never
+ * written over a review.
+ *
  * **Nothing here trusts the pull request.** The event is read by {@link readPullRequestEvent},
  * which accepts only the shapes it expects; the dispatch carries the review's coordinates and not
  * the pull request's text; the report that comes back goes through `parsePrReviewReport` before a
@@ -30,8 +38,10 @@
  * publishes it again, so a GitHub outage delays a check and never leaves it "in progress".
  *
  * Database failures inside {@link handlePullRequestEvent} throw: the webhook route answers 500 so
- * the delivery shows as failed in the App's delivery log, where it can be redelivered. Redelivery
- * is safe because (dataset, pull request, commit) is unique.
+ * the delivery shows as failed in the App's delivery log, where it can be redelivered. So does an
+ * exempt pull request's check that could not be published, which has no row for the watchdog to
+ * retry from. Redelivery of a reviewed commit is safe because (dataset, pull request, commit) is
+ * unique; redelivery of an exempt commit is safe because a second `skipped` check is harmless.
  */
 
 import {
@@ -43,6 +53,7 @@ import {
   PrReviewReportError,
   type ReviewOutcome,
   type ReviewState,
+  type StoredOutcome,
   conclusionOf,
   dailyAuthorCapFor,
   hourlyCapFor,
@@ -63,6 +74,7 @@ import { signPrReviewCallbackToken } from "./github/callback-tokens.js";
 import { approvalDispatchEnvironment, triggerPrReviewRun } from "./github/dispatch.js";
 import { upsertReviewCheckRun, upsertReviewComment } from "./github/pr-review-api.js";
 import { ORG_NAME } from "./github/shared.js";
+import { type AdminAnswers, isReviewExempt } from "./pr-review-exemption.js";
 
 /** `pull_request` actions that put new content in front of a reviewer. */
 export const PR_REVIEW_ACTIONS: ReadonlySet<string> = new Set([
@@ -133,6 +145,13 @@ export interface PrIntake {
   authorLogin: string;
   authorAssociation: string | null;
   fromFork: boolean;
+  /**
+   * Who caused the delivery (GitHub's `sender`): whoever pushed, reopened or marked the pull
+   * request ready. Null when the delivery names no one or a shape a login does not have, and for an
+   * administrator's start, which is built from GitHub's record of the pull request and has no
+   * sender. It is read only to decide the exemption, never shown or stored.
+   */
+  senderLogin: string | null;
 }
 
 /** Why a delivery was not taken up. Fixed words, safe to return and log. */
@@ -216,6 +235,10 @@ export function readPullRequestEvent(payload: unknown): IntakeResult {
     typeof headRepo?.full_name !== "string" ||
     headRepo.full_name.toLowerCase() !== repo.full_name.toLowerCase();
 
+  // The sender of a bot (`name[bot]`) is not a login, so it reads as no sender at all, and an
+  // exemption never rests on one.
+  const sender = rec(p.sender);
+
   return {
     ok: true,
     pr: {
@@ -226,6 +249,8 @@ export function readPullRequestEvent(payload: unknown): IntakeResult {
       authorLogin: user.login,
       authorAssociation: typeof pr.author_association === "string" ? pr.author_association : null,
       fromFork,
+      senderLogin:
+        typeof sender?.login === "string" && LOGIN.test(sender.login) ? sender.login : null,
     },
   };
 }
@@ -294,12 +319,22 @@ export async function readAuthorOverride(db: Db, authorId: number): Promise<Auth
 
 /** Which allowance, if any, the row just inserted is over. */
 async function capDecision(
-  db: Db,
+  env: Bindings,
   pr: PrIntake,
   rowId: number,
-  skipAuthorCaps = false,
+  options: PrReviewOptions,
   extraCalls = 0,
 ): Promise<Extract<DeclineReason, "rate_limited" | "daily_limit"> | null> {
+  // No allowance applies to a delivery an owner or administrator is behind (ADR 0107), whatever
+  // the tally says. The intake already answered for a delivery that is exempt, but it read the
+  // accounts before this row was written, and a role can be granted in between: asked again here,
+  // so an allowance never decides for a delivery that is exempt now. The WHOLE delivery is asked
+  // about, not the author alone: a review that exists because someone who is not exempt pushed to
+  // an exempt author's pull request spends the platform's money like any other, and the author's
+  // role does not waive that for them.
+  if (await isExemptDelivery(env, pr, options)) return null;
+  const db = env.DB;
+  const skipAuthorCaps = options.adminStart === true;
   // An administrator who asks for a review by name is not an outsider spending the platform's
   // money, so the per-contributor allowances do not hold it back; the platform's pool still does.
   if (!skipAuthorCaps) {
@@ -390,7 +425,7 @@ async function readRowByKey(
 }
 
 /** The outcome a stored row stands for, or null for a review still waiting for its report. */
-export function outcomeOfRow(row: ReviewRow): ReviewOutcome | null {
+export function outcomeOfRow(row: ReviewRow): StoredOutcome | null {
   if (row.state === "reported") {
     try {
       return { kind: "reported", report: parsePrReviewReport(JSON.parse(row.report ?? "null")) };
@@ -471,7 +506,7 @@ function errName(err: unknown): string {
 export async function publishOutcome(
   env: Bindings,
   row: ReviewRow,
-  outcome: ReviewOutcome | "running",
+  outcome: StoredOutcome | "running",
   opts: { commentOnly?: boolean } = {},
 ): Promise<boolean> {
   let checked = false;
@@ -610,9 +645,97 @@ export interface PrReviewOptions {
   /**
    * An administrator asked for this review by name (`startPullRequestReview`). The payload was built
    * from GitHub's own record of the pull request. It lifts the per-contributor allowances for this
-   * one review and lets a commit whose review ended without a verdict be started again.
+   * one review and lets a commit whose review ended without a verdict be started again. It names no
+   * sender, so whether the pull request is exempt is judged on its author alone.
    */
   adminStart?: boolean;
+  /**
+   * What GitHub said about each login on this repository, shared by every exemption question one
+   * delivery asks (the intake and the allowance check), so a slow or refusing GitHub is waited on
+   * once. Set by `handlePullRequestEvent` itself; callers do not pass it.
+   */
+  adminAnswers?: AdminAnswers;
+}
+
+/**
+ * Whether this delivery is one the review does not apply to (ADR 0107): the pull request's author
+ * is an owner or administrator AND so is whoever caused the delivery.
+ *
+ * The second half is what keeps the exemption from reaching a stranger's work. Anyone with write
+ * access can push to an owner's branch, reopen the pull request or mark it ready, and what they put
+ * in front of the review must not be skipped because the pull request carries another name. A
+ * sender who is the author (compared as GitHub does, without regard to case) needs no second look.
+ * Anyone else must be exempt in their own right. A delivery that names no usable sender cannot be
+ * attributed, and an unattributed delivery is reviewed.
+ *
+ * An administrator's start is the one delivery with no sender: its payload is GitHub's own record
+ * of the pull request, built by the Worker, and nobody pushed. It is judged on the author alone.
+ */
+async function isExemptDelivery(
+  env: Bindings,
+  pr: PrIntake,
+  options: PrReviewOptions,
+): Promise<boolean> {
+  const repo = pr.datasetId;
+  const answers = options.adminAnswers;
+  if (!(await isReviewExempt(env, { login: pr.authorLogin, repo }, answers))) return false;
+  if (options.adminStart === true) return true;
+  const sender = pr.senderLogin;
+  if (sender === null) return false;
+  if (sender.toLowerCase() === pr.authorLogin.toLowerCase()) return true;
+  return await isReviewExempt(env, { login: sender, repo }, answers);
+}
+
+/**
+ * The exempt pull request's check could not be published. Thrown, so the webhook answers 500 and
+ * the delivery shows as failed where it can be redelivered; an administrator's start turns it into
+ * a sentence.
+ */
+export class ExemptCheckNotPublished extends Error {
+  constructor() {
+    super("exempt check not published");
+    this.name = "ExemptCheckNotPublished";
+  }
+}
+
+/**
+ * Answer a pull request nobody reviews (ADR 0107) with the one check that says so, and nothing
+ * else: no row, no dispatch, no model call, no "in progress" check, no comment.
+ *
+ * It is only reached for a commit that has no row (see `handlePullRequestEvent`): a commit a review
+ * has touched keeps what the review said, so `skipped` is never written over a verdict, a decline
+ * or an error. For the same reason a NEW check run is created and an old one is never updated (a
+ * review that starts for the same commit between the row read and this publish therefore leaves
+ * the commit with two checks; the ADR says so). The pull request's review comment, when an earlier
+ * commit's review left one, is not touched: it names the commit it is about.
+ *
+ * It writes nothing, so there is nothing for the watchdog to publish again. A check that cannot
+ * be published is therefore thrown ({@link ExemptCheckNotPublished}) and the webhook answers 500:
+ * the delivery shows as failed in the App's delivery log, where it can be redelivered, instead of
+ * leaving a pull request with no check and no trace (see the module comment).
+ */
+async function publishExempt(env: Bindings, pr: PrIntake): Promise<PrReviewResponse> {
+  const where = `${pr.datasetId}#${pr.prNumber}`;
+  const outcome: ReviewOutcome = { kind: "exempt" };
+  try {
+    const { token, refresh } = await getDatasetsTokenWithRefresher(env);
+    await upsertReviewCheckRun({
+      token,
+      refresh,
+      quick: true,
+      repo: pr.datasetId,
+      headSha: pr.headSha,
+      checkRunId: null,
+      conclusion: conclusionOf(outcome),
+      ...renderCheck(outcome),
+    });
+  } catch (err) {
+    console.error(`[pr-review] ${where}: exempt check not published (${errName(err)})`);
+    throw new ExemptCheckNotPublished();
+  }
+  // The only record that a commit was exempted: it has no row and no comment. No login in it.
+  console.info(`[pr-review] ${where}: exempt, skipped check posted for ${pr.headSha.slice(0, 7)}`);
+  return no("exempt_author");
 }
 
 /**
@@ -646,8 +769,21 @@ export async function handlePullRequestEvent(
   if (reviewable === "unknown") return no("unknown_dataset");
   if (reviewable === "not_reviewable") return no("dataset_not_reviewable");
 
+  // What one delivery asks GitHub about an account is asked once (see `PrReviewOptions`).
+  const scoped: PrReviewOptions = { ...options, adminAnswers: new Map() };
+
+  // Owners and administrators are not reviewed (ADR 0107), decided before any row is written: an
+  // exempt pull request has no row, so no redelivery or restart can carry it into the review or
+  // its allowances. But only a commit no review has touched. A row means someone put this commit
+  // through review (a stranger's push to an owner's branch, or an author who was not exempt yet),
+  // and what the review said stands until the commit changes: an exempt author's reopening, or an
+  // administrator's start, must not turn another person's failed or undecided review into
+  // `skipped`, which a required check counts as passing. `handleRepeat` re-states the row instead.
   const existing = await readRowByKey(db, pr.datasetId, pr.prNumber, pr.headSha);
-  if (existing) return await handleRepeat(env, existing, secret, pr, options);
+  if (existing === null && (await isExemptDelivery(env, pr, scoped))) {
+    return await publishExempt(env, pr);
+  }
+  if (existing) return await handleRepeat(env, existing, secret, pr, scoped);
 
   const standing = standingOf(
     await readAuthorTally(db, pr.authorId),
@@ -679,11 +815,11 @@ export async function handlePullRequestEvent(
   if ((inserted.meta.changes ?? 0) !== 1) {
     // Another delivery of the same commit won the insert between the read and the write.
     const raced = await readRowByKey(db, pr.datasetId, pr.prNumber, pr.headSha);
-    return raced ? await handleRepeat(env, raced, secret, pr, options) : no("duplicate");
+    return raced ? await handleRepeat(env, raced, secret, pr, scoped) : no("duplicate");
   }
   const reviewId = Number(inserted.meta.last_row_id);
   try {
-    return await decideInserted(env, pr, reviewId, paused, nonce, secret, options);
+    return await decideInserted(env, pr, reviewId, paused, nonce, secret, scoped);
   } catch (err) {
     await markDispatchFailed(db, reviewId);
     throw err;
@@ -733,10 +869,10 @@ async function decideInserted(
   // A restarted row keeps its old id, which the allowance queries (`id <= ?`) would rank ahead of
   // everything inserted since: it is ranked as the newest instead.
   const over = await capDecision(
-    db,
+    env,
     pr,
     options.restarted ? Number.MAX_SAFE_INTEGER : reviewId,
-    options.adminStart === true,
+    options,
     options.extraCalls ?? 0,
   );
   if (over) {

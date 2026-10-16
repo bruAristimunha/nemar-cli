@@ -231,9 +231,33 @@ describe("what the review's verdict allows", () => {
     expect(approvalGate({ verdict: "pass", staleVerdict: null })).toEqual({ kind: "proceed" });
     expect(approvalGate({ verdict: "fail", staleVerdict: null }).kind).toBe("needs_force");
     expect(approvalGate({ verdict: "in_progress", staleVerdict: null }).kind).toBe("needs_force");
-    for (const v of ["uncertain", "could_not_decide", "not_reviewed"] as const) {
+    for (const v of ["uncertain", "could_not_decide", "not_reviewed", "exempt"] as const) {
       expect(approvalGate({ verdict: v, staleVerdict: null }).kind).toBe("confirm");
     }
+  });
+
+  test("an exempt pull request asks first and says why: it is neither a pass nor a block", () => {
+    const gate = approvalGate({ verdict: "exempt", staleVerdict: null });
+    expect(gate.kind).toBe("confirm");
+    if (gate.kind === "confirm") {
+      expect(gate.warning).toContain("did not run");
+      expect(gate.warning).toContain("owner or administrator");
+    }
+    // An unreadable answer still beats it: nothing is assumed about a review that cannot be read.
+    expect(approvalGate({ verdict: "exempt", staleVerdict: null, unread: "down" }).kind).toBe(
+      "needs_force",
+    );
+  });
+
+  test("an exempt pull request says what an earlier commit's review concluded, because that change is still in it", () => {
+    const gate = approvalGate({ verdict: "exempt", staleVerdict: "fail" });
+    expect(gate.kind).toBe("confirm");
+    if (gate.kind === "confirm") {
+      expect(gate.warning).toContain("did not run on this commit");
+      expect(gate.warning).toContain("An earlier commit of it was reviewed and read fail");
+    }
+    const none = approvalGate({ verdict: "exempt", staleVerdict: null });
+    if (none.kind === "confirm") expect(none.warning).not.toContain("earlier commit");
   });
 
   test("a review of a different commit says what it concluded, so its pass is not read as this one's", () => {

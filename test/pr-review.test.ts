@@ -13,6 +13,7 @@ import {
   CRITERIA,
   DAILY_AUTHOR_CAP,
   DAILY_REVIEW_CAP,
+  DECLINE_REASONS,
   FINDING_CODES,
   HOURLY_REVIEW_CAP,
   MAX_FINDINGS,
@@ -24,7 +25,10 @@ import {
   type PrReviewReport,
   PrReviewReportError,
   REJECTION_COUNT,
+  REVIEW_OUTCOME_KINDS,
   REVIEW_STATES,
+  RUN_ERRORS,
+  type ReviewOutcome,
   VERDICTS,
   conclusionOf,
   dailyAuthorCapFor,
@@ -103,6 +107,24 @@ function refusal(raw: unknown): string {
     throw e;
   }
   return "accepted";
+}
+
+/** Every outcome a review can come to, one of each shape, so a new conclusion is seen by all of them. */
+function everyOutcome(): ReviewOutcome[] {
+  const unknownCriteria = {
+    no_degradation: "unknown",
+    advances_revision: "pass",
+    material_improvement: "pass",
+  };
+  return [
+    { kind: "reported", report: parsed() },
+    { kind: "reported", report: parsed({ steering: true }) },
+    { kind: "reported", report: parsed({ criteria: unknownCriteria }) },
+    ...DECLINE_REASONS.map((reason) => ({ kind: "declined", reason }) as const),
+    ...RUN_ERRORS.map((error) => ({ kind: "error", error }) as const),
+    { kind: "unreported" },
+    { kind: "exempt" },
+  ];
 }
 
 describe("the report is a closed vocabulary", () => {
@@ -488,15 +510,36 @@ describe("conclusions: only a clear pass is green, nothing unknown ever satisfie
     expect(conclusionOf({ kind: "unreported" })).toBe("action_required");
   });
 
-  test("no outcome maps to neutral or skipped, which GitHub counts as passing", () => {
-    const outcomes = [
-      { kind: "reported", report: parsed() },
-      { kind: "declined", reason: "daily_limit" },
-      { kind: "error", error: "workflow_failed" },
-      { kind: "unreported" },
-    ] as const;
-    for (const o of outcomes) {
-      expect(["success", "failure", "action_required"]).toContain(conclusionOf(o));
+  test("everyOutcome has every kind of outcome there is, so the rules below see them all", () => {
+    expect(new Set(everyOutcome().map((o) => o.kind))).toEqual(new Set(REVIEW_OUTCOME_KINDS));
+  });
+
+  test("neutral is the conclusion of nothing: GitHub counts it as passing", () => {
+    for (const o of everyOutcome()) {
+      expect(["success", "failure", "action_required", "skipped"]).toContain(conclusionOf(o));
+      expect(conclusionOf(o)).not.toBe("neutral" as never);
+    }
+  });
+
+  test("skipped, which GitHub also counts as passing, is the conclusion of the exempt outcome and of no other", () => {
+    expect(conclusionOf({ kind: "exempt" })).toBe("skipped");
+    const skipped = everyOutcome().filter((o) => conclusionOf(o) === "skipped");
+    expect(skipped).toEqual([{ kind: "exempt" }]);
+    // And an exempt outcome is not a pass by another name: the only `success` is a reported pass.
+    const green = everyOutcome().filter((o) => conclusionOf(o) === "success");
+    expect(green).toHaveLength(1);
+    expect(green[0]).toMatchObject({ kind: "reported" });
+  });
+
+  test("a pull request opened by an owner or administrator says the review is not required, and that skipped is not a pass", () => {
+    const r = renderCheck({ kind: "exempt" });
+    expect(r.title).toBe("Not required: opened by a NEMAR owner or administrator");
+    expect(r.summary).toContain("did not run");
+    expect(r.summary).toContain("may merge without it");
+    expect(r.text).toContain("Skipped is not a pass");
+    // It must not borrow the words of a review that ran.
+    for (const words of ["Passes", "Needs changes", "Could not decide", "does not pass"]) {
+      expect(`${r.title} ${r.summary} ${r.text}`).not.toContain(words);
     }
   });
 
@@ -522,6 +565,16 @@ describe("conclusions: only a clear pass is green, nothing unknown ever satisfie
     );
     expect(renderCheck({ kind: "error", error: "model_refused" }).text).toContain("does not pass");
     expect(renderCheck({ kind: "unreported" }).title).toBe("Could not decide");
+  });
+
+  test("every outcome renders a title, a summary and a comment, and only a review that ran says it passed", () => {
+    for (const o of everyOutcome()) {
+      const r = renderCheck(o);
+      expect(r.title.length, JSON.stringify(o)).toBeGreaterThan(0);
+      expect(r.summary.length, JSON.stringify(o)).toBeGreaterThan(0);
+      const says = `${r.title} ${renderComment(o, "0123456789abcdef0123456789abcdef01234567")}`;
+      if (conclusionOf(o) !== "success") expect(says, JSON.stringify(o)).not.toContain("Passes");
+    }
   });
 
   test("every finding code has a label", () => {
@@ -565,6 +618,18 @@ describe("the pull-request comment", () => {
     expect(renderComment({ kind: "declined", reason: "contributor_paused" }, sha)).toContain(
       "NEEDS A PERSON",
     );
+  });
+
+  test("an exempt pull request says NOT REQUIRED, and is never mistaken for a pass or a failure", () => {
+    const body = renderComment({ kind: "exempt" }, sha);
+    expect(body.startsWith(PR_REVIEW_COMMENT_MARKER)).toBe(true);
+    expect(body).toContain("## NEMAR PR review: NOT REQUIRED");
+    expect(body).toContain("Not required: opened by a NEMAR owner or administrator");
+    expect(body).toContain("0123456");
+    for (const other of ["PASS", "NEEDS CHANGES", "NEEDS A PERSON"]) {
+      expect(body).not.toContain(other);
+    }
+    expect(body.split(PR_REVIEW_COMMENT_MARKER).length - 1).toBe(1);
   });
 
   test("a commit value that is not a hash is left out, not quoted", () => {
