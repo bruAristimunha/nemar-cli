@@ -96,22 +96,31 @@ export const TEST_ACCOUNT_SWEEP_SCAN_CAP = TEST_ACCOUNT_SWEEP_BATCH * 10;
 export const GENERATED_TEST_ACCOUNT_EMAIL =
   /^(?:(?:dcli|df|pl)-[a-z0-9]+(?:-[a-z0-9]+)*-[0-9]{13}-[a-z0-9]{1,6}@nemar\.test|pl-gate-[0-9]{13}-[a-z0-9]{1,6}@example\.com)$/;
 
-/** The same shapes as one GLOB each (case-sensitive, anchored): a prefilter only. */
-const GLOB_CLOCK = "[0-9]".repeat(13);
-const GLOB_PATTERNS = [
-  ...["dcli", "df", "pl"].map((p) => `${p}-*-${GLOB_CLOCK}-*@nemar.test`),
-  `pl-gate-${GLOB_CLOCK}-*@example.com`,
-];
-
 /**
  * Candidate accounts after `id > ?`, oldest first (ids are AUTOINCREMENT, so id order is
- * creation order). The GLOBs narrow the scan; they are NOT the decision, the regular
- * expression is, and it runs on every row returned.
+ * creation order). The two GLOB pairs narrow the scan to a generator prefix and a generator
+ * domain; they are NOT the decision, the regular expression is, and it runs on every row
+ * returned.
+ *
+ * EVERY LIKE AND GLOB PATTERN HERE IS A SHORT LITERAL, ON PURPOSE. D1 refuses a pattern over
+ * 50 bytes (`LIKE or GLOB pattern too complex`) and bun:sqlite does not. The first version
+ * spelled each whole shape as one GLOB (83 to 87 bytes, a character class per clock digit):
+ * every bun:sqlite test passed and on D1 the candidate read threw, so the sweep never
+ * tombstoned anything. The patterns are literals rather than bound values so that
+ * `test-account-sweep.test.ts` can read their lengths out of this text, and
+ * `test-account-sweep-d1.test.ts` runs the query on D1's own engine.
+ *
+ * The cost of the short patterns is a weaker prefilter: any `dcli-`, `df-` or `pl-` local part
+ * at either domain reaches the regex, not only the right clock shape. Those look-alikes
+ * (the fixed `pl-profile-patch@nemar.test` and the like) are skipped in code, counted in
+ * `skipped`, and occupy the scan window described in the BOUNDED paragraph above; there are
+ * a handful, against a window of {@link TEST_ACCOUNT_SWEEP_SCAN_CAP} rows.
  */
 export const TEST_ACCOUNT_SWEEP_CANDIDATES_SQL = `SELECT id, email FROM users
   WHERE id > ?
     AND deleted_at IS NULL
-    AND (${GLOB_PATTERNS.map(() => "email GLOB ?").join(" OR ")})
+    AND (email GLOB 'dcli-*' OR email GLOB 'df-*' OR email GLOB 'pl-*')
+    AND (email GLOB '*@nemar.test' OR email GLOB '*@example.com')
     AND signup_source = 'web'
     AND account_kind IN ('person', 'test')
     AND COALESCE(role, 'member') = 'member'
@@ -172,7 +181,7 @@ export async function sweepCiTestAccounts(
     while (spent() < TEST_ACCOUNT_SWEEP_BATCH && result.examined < TEST_ACCOUNT_SWEEP_SCAN_CAP) {
       const page = await db
         .prepare(TEST_ACCOUNT_SWEEP_CANDIDATES_SQL)
-        .bind(afterId, ...GLOB_PATTERNS, age, TEST_ACCOUNT_SWEEP_BATCH)
+        .bind(afterId, age, TEST_ACCOUNT_SWEEP_BATCH)
         .all<{ id: number; email: string }>();
       const rows = page.results ?? [];
       if (rows.length === 0) break;

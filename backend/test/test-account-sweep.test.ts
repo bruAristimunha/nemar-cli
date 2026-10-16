@@ -389,6 +389,31 @@ describe("what the sweep must never touch", () => {
   });
 });
 
+describe("D1's pattern limit", () => {
+  // D1 refuses a LIKE or GLOB pattern over 50 bytes ("LIKE or GLOB pattern too complex") and
+  // bun:sqlite does not, so no query test here can find one: the first version of this query
+  // carried patterns of 83 to 87 bytes, passed every test in this file, and never ran on D1.
+  // `test-account-sweep-d1.test.ts` runs the query on D1's own engine; this reads the patterns
+  // out of the exported SQL so the limit is also named where the query is edited.
+  const sql = TEST_ACCOUNT_SWEEP_CANDIDATES_SQL;
+  const literals = [...sql.matchAll(/\b(?:LIKE|GLOB)\s+'((?:[^']|'')*)'/gi)].map((m) => m[1]);
+
+  test("the query has pattern literals to check", () => {
+    expect(literals.length).toBeGreaterThanOrEqual(5);
+  });
+
+  test("every LIKE and GLOB in it is followed by a literal, never a bound value", () => {
+    // A bound pattern cannot be measured here, so it is not allowed.
+    expect((sql.match(/\b(?:LIKE|GLOB)\b/gi) ?? []).length).toBe(literals.length);
+  });
+
+  test("every pattern literal is at most 50 bytes", () => {
+    for (const literal of literals) {
+      expect(new TextEncoder().encode(literal).length).toBeLessThanOrEqual(50);
+    }
+  });
+});
+
 describe("the predicate itself", () => {
   test("accepts exactly the three generated shapes", () => {
     for (const p of ["dcli", "df", "pl"] as const) {
