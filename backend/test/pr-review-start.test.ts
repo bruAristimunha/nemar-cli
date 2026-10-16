@@ -6,7 +6,7 @@
  * GitHub ITSELF (nothing about it comes from the caller), builds the same intake a delivery would
  * have, and runs it through the same gate. The same start also restarts a commit whose review
  * ended without a verdict (declined, errored, never reported, or handed to GitHub and overdue),
- * which a new delivery never does, and counts the restart against the platform's daily pool.
+ * which a new delivery never does, and records the restart as a second model call on its row.
  *
  * Real engine only: bun:sqlite behind realD1 with every migration applied, the real admin router
  * with its real auth middleware and a real hashed token, and GitHub as a `Bun.serve()` stand-in
@@ -19,11 +19,11 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import type { Server } from "bun";
 import { Hono } from "hono";
 import type { StartReviewResponse } from "../../shared/contract/pr-review-admin";
-import { DAILY_REVIEW_CAP } from "../../shared/pr-review";
 import { adminRoutes } from "../src/routes/admin";
 import webhooks from "../src/routes/webhooks";
 import { __resetRateLimitStateForTests } from "../src/services/github/transport";
 import { handlePullRequestEvent } from "../src/services/pr-review";
+import { readVolume } from "../src/services/pr-review-queue";
 import { hashApiKey } from "../src/services/token";
 import type { Bindings, Variables } from "../src/types/bindings";
 import { freshDb, realD1, wrapD1 } from "./helpers/d1";
@@ -449,8 +449,9 @@ describe("starting the same commit again", () => {
     expect(dispatches()).toHaveLength(1);
   });
 
-  test("a commit whose review never started because of an allowance is started when asked", async () => {
-    // The stranger's three reviews this hour are used up.
+  test("a commit declined by a limit that no longer exists is started when asked", async () => {
+    // Rows written while the hourly allowance existed still say rate_limited. The stranger's three
+    // other reviews this hour do not matter any more, and neither does the word.
     for (let i = 0; i < 3; i++) {
       seedReview(db, {
         ds: DATASET,
@@ -474,7 +475,6 @@ describe("starting the same commit again", () => {
 
     const r = await start(DATASET, 7);
 
-    // The administrator chose this one, so the stranger's hourly allowance does not hold it back.
     expect(r.body).toMatchObject({ dispatched: true, reason: "redispatched" });
     const row = rows().find((x) => x.pr_number === 7);
     expect(row).toMatchObject({ state: "dispatched", detail: null });
@@ -565,7 +565,7 @@ describe("starting the same commit again", () => {
   });
 });
 
-describe("what an administrator's start does not skip", () => {
+describe("what an administrator's start is held to", () => {
   test("a paused contributor is declined, and an earlier decline stays one", async () => {
     db.run(
       "INSERT INTO pr_review_overrides (author_id, author_login, mode) VALUES (900, 'n', 'block')",
@@ -588,8 +588,48 @@ describe("what an administrator's start does not skip", () => {
     expect(dispatches()).toHaveLength(0);
   });
 
-  test("the platform's daily pool still applies", async () => {
-    for (let i = 0; i < DAILY_REVIEW_CAP; i++) {
+  test("a record of rejected pull requests holds nothing back: the start is dispatched", async () => {
+    for (let i = 0; i < 7; i++) {
+      seedReview(db, {
+        ds: DATASET,
+        n: 200 + i,
+        sha: `${i}`.repeat(40),
+        authorId: 900,
+        login: "n",
+        state: "reported",
+        verdict: "fail",
+      });
+    }
+    pulls[`${DATASET}#7`] = restPull({ userId: 900, login: "n" });
+
+    const r = await start(DATASET, 7);
+
+    expect(r.body).toMatchObject({ dispatched: true, reason: "dispatched" });
+    expect(dispatches()).toHaveLength(1);
+  });
+
+  test("no count holds a start back: 400 reviews today, thirty of them the author's", async () => {
+    for (let i = 0; i < 400; i++) {
+      seedReview(db, {
+        ds: DATASET,
+        n: 1000 + i,
+        sha: `${i}`.padStart(40, "b"),
+        authorId: i < 30 ? 700 : 20_000 + i,
+        state: "reported",
+        verdict: "pass",
+        createdAt: now(),
+      });
+    }
+    pulls[`${DATASET}#7`] = restPull({ userId: 700, login: "stranger", assoc: "NONE" });
+
+    const r = await start(DATASET, 7);
+
+    expect(r.body).toMatchObject({ dispatched: true, reason: "dispatched" });
+    expect(dispatches()).toHaveLength(1);
+  });
+
+  test("no count holds a restart back either: 400 reviews today and an errored review of this commit", async () => {
+    for (let i = 0; i < 400; i++) {
       seedReview(db, {
         ds: DATASET,
         n: 1000 + i,
@@ -600,12 +640,26 @@ describe("what an administrator's start does not skip", () => {
         createdAt: now(),
       });
     }
-    pulls[`${DATASET}#7`] = restPull({});
+    seedReview(db, {
+      ds: DATASET,
+      n: 7,
+      sha: SHA_A,
+      authorId: 700,
+      login: "stranger",
+      state: "errored",
+      detail: "model_refused",
+      createdAt: now(),
+    });
+    pulls[`${DATASET}#7`] = restPull({ userId: 700, login: "stranger", assoc: "NONE" });
 
     const r = await start(DATASET, 7);
 
-    expect(r.body).toMatchObject({ dispatched: false, reason: "daily_limit" });
-    expect(dispatches()).toHaveLength(0);
+    expect(r.body).toMatchObject({ dispatched: true, reason: "redispatched" });
+    expect(rows().find((x) => x.pr_number === 7)).toMatchObject({
+      state: "dispatched",
+      attempts: 2,
+    });
+    expect(dispatches()).toHaveLength(1);
   });
 
   test("an administrator's start is not an approval or a merge", async () => {
@@ -751,25 +805,8 @@ describe("an owner's or administrator's pull request is not started (ADR 0107)",
   });
 });
 
-describe("the platform's daily pool counts model calls, not rows", () => {
-  /** A full pool less one: a restart of a spent review is the 400th call, then the 401st. */
-  function seedPool(callsSpent: number) {
-    for (let i = 0; i < callsSpent; i++) {
-      seedReview(db, {
-        ds: DATASET,
-        n: 3000 + i,
-        sha: `${i}`.padStart(40, "d"),
-        authorId: 40_000 + i,
-        state: "reported",
-        verdict: "pass",
-        createdAt: now(),
-      });
-    }
-  }
-
+describe("a restart adds a model call to the row only when the earlier attempt spent one", () => {
   test("restarting a review that already spent a call costs a second one", async () => {
-    // 399 calls spent elsewhere, and this commit's own failed run is the 400th: the pool is full.
-    seedPool(DAILY_REVIEW_CAP - 1);
     seedReview(db, {
       ds: DATASET,
       n: 7,
@@ -780,20 +817,16 @@ describe("the platform's daily pool counts model calls, not rows", () => {
     });
     pulls[`${DATASET}#7`] = restPull({});
 
-    const first = await start(DATASET, 7);
+    const r = await start(DATASET, 7);
 
-    expect(first.body).toMatchObject({ dispatched: false, reason: "daily_limit" });
-    expect(dispatches()).toHaveLength(0);
-    // The attempt that never ran is not counted: the row is declined and still says one call.
+    expect(r.body).toMatchObject({ dispatched: true, reason: "redispatched" });
     expect(rows().find((x) => x.pr_number === 7)).toMatchObject({
-      state: "declined",
-      detail: "daily_limit",
-      attempts: 1,
+      state: "dispatched",
+      attempts: 2,
     });
   });
 
-  test("a restart is counted once it is handed to GitHub, so repeating it is bounded", async () => {
-    seedPool(10);
+  test("each restart that is handed to GitHub adds one, so a review that keeps failing says what it cost", async () => {
     seedReview(db, {
       ds: DATASET,
       n: 7,
@@ -813,30 +846,76 @@ describe("the platform's daily pool counts model calls, not rows", () => {
     );
     expect((await start(DATASET, 7)).body).toMatchObject({ reason: "redispatched" });
     expect(rows().find((x) => x.pr_number === 7)).toMatchObject({ attempts: 3 });
-    // 10 others + 3 calls of this one.
-    const pool = db
-      .query("SELECT SUM(attempts) AS n FROM pr_reviews WHERE state != 'declined'")
-      .get() as { n: number };
-    expect(pool.n).toBe(13);
   });
 
-  test("a restart of something that never reached the model costs nothing extra", async () => {
+  test("the administrator's volume counts the second call: one record, two model calls", async () => {
     seedReview(db, {
       ds: DATASET,
       n: 7,
       sha: SHA_A,
-      state: "declined",
-      detail: "rate_limited",
+      state: "errored",
+      detail: "model_refused",
+      createdAt: now(),
     });
     pulls[`${DATASET}#7`] = restPull({});
 
     await start(DATASET, 7);
 
-    expect(rows()[0]).toMatchObject({ state: "dispatched", attempts: 1 });
+    const volume = await readVolume(realD1(db));
+    expect(volume.last_24_hours).toMatchObject({ reviews: 1, model_calls: 2 });
+    expect(volume.last_24_hours.by_verdict.in_progress).toBe(1);
   });
+
+  test("a restart that the gate declines costs no call, and is not counted", async () => {
+    db.run(
+      "INSERT INTO pr_review_overrides (author_id, author_login, mode) VALUES (900, 'n', 'block')",
+    );
+    seedReview(db, {
+      ds: DATASET,
+      n: 7,
+      sha: SHA_A,
+      authorId: 900,
+      login: "n",
+      state: "errored",
+      detail: "model_refused",
+      createdAt: now(),
+    });
+    pulls[`${DATASET}#7`] = restPull({ userId: 900, login: "n" });
+
+    const r = await start(DATASET, 7);
+
+    expect(r.body).toMatchObject({ dispatched: false, reason: "contributor_paused" });
+    expect(rows().find((x) => x.pr_number === 7)).toMatchObject({
+      state: "declined",
+      detail: "contributor_paused",
+      attempts: 1,
+    });
+    // The administrator's volume agrees: a decline is a record and no model call.
+    const volume = await readVolume(realD1(db));
+    expect(volume.last_24_hours).toMatchObject({ reviews: 1, model_calls: 0 });
+    expect(volume.last_24_hours.declines.contributor_paused).toBe(1);
+  });
+
+  test.each([
+    ["declined", "contributor_paused"],
+    ["declined", "rate_limited"],
+    ["errored", "stale_head"],
+    ["errored", "dispatch_failed"],
+  ] as const)(
+    "a restart of a %s row (%s), which never reached the model, costs nothing extra",
+    async (state, detail) => {
+      seedReview(db, { ds: DATASET, n: 7, sha: SHA_A, state, detail });
+      pulls[`${DATASET}#7`] = restPull({});
+
+      const r = await start(DATASET, 7);
+
+      expect(r.body).toMatchObject({ dispatched: true });
+      expect(rows()[0]).toMatchObject({ state: "dispatched", attempts: 1 });
+    },
+  );
 });
 
-describe("a redelivery of a failed dispatch is held to the same gate", () => {
+describe("a redelivery of a failed dispatch is held to the block like a new delivery", () => {
   /** A signed delivery for the same pull request, as GitHub would redeliver it. */
   async function redeliver() {
     const payload = {
@@ -907,7 +986,7 @@ describe("a redelivery of a failed dispatch is held to the same gate", () => {
     expect(dispatches()).toHaveLength(0);
   });
 
-  test("a spent daily pool declines it too, whatever its old id", async () => {
+  test("a spent day does not hold a redelivery back: 400 reviews today change nothing", async () => {
     seedReview(db, {
       ds: DATASET,
       n: 7,
@@ -916,7 +995,7 @@ describe("a redelivery of a failed dispatch is held to the same gate", () => {
       state: "errored",
       detail: "dispatch_failed",
     });
-    for (let i = 0; i < DAILY_REVIEW_CAP; i++) {
+    for (let i = 0; i < 400; i++) {
       seedReview(db, {
         ds: DATASET,
         n: 2000 + i,
@@ -930,8 +1009,8 @@ describe("a redelivery of a failed dispatch is held to the same gate", () => {
 
     const r = await redeliver();
 
-    expect(r).toMatchObject({ dispatched: false, reason: "daily_limit" });
-    expect(dispatches()).toHaveLength(0);
+    expect(r).toMatchObject({ dispatched: true, reason: "redispatched" });
+    expect(dispatches()).toHaveLength(1);
   });
 
   test("an ordinary redelivery of a failed dispatch still runs it", async () => {
@@ -1006,7 +1085,8 @@ describe("when the start itself goes wrong", () => {
     seedReview(db, { ds: DATASET, n: 7, sha: SHA_A, state: "errored", detail: "workflow_failed" });
     pulls[`${DATASET}#7`] = restPull({});
     const broken = wrapD1(realD1(db), (sql) => {
-      if (sql.includes("SUM(attempts)")) throw new Error("D1 is unavailable");
+      // After the restart's reset, when the row's second call is recorded and before the hand-over.
+      if (sql.includes("SET attempts = attempts + 1")) throw new Error("D1 is unavailable");
     });
     const quiet = console.error;
     console.error = () => {};
@@ -1022,8 +1102,8 @@ describe("when the start itself goes wrong", () => {
     }
 
     expect(res.status).toBe(500);
-    // Not left 'dispatched' with a live nonce, counting against the allowances and waiting to be
-    // called late: a start or a redelivery can run it.
+    // Not left 'dispatched' with a live nonce and waiting to be called late: a start or a
+    // redelivery can run it.
     expect(rows()[0]).toMatchObject({ state: "errored", detail: "dispatch_failed", nonce: null });
     expect(dispatches()).toHaveLength(0);
   });
@@ -1126,42 +1206,10 @@ describe("the restart's bookkeeping and who can trigger it", () => {
     expect([a.reason, b.reason].sort()).toEqual(["duplicate", "redispatched"]);
   });
 
-  test("a contributor's per-day allowance is lifted for an administrator's start, as the hourly one is", async () => {
-    const threeHoursAgo = new Date(Date.now() - 3 * 3600_000)
-      .toISOString()
-      .slice(0, 19)
-      .replace("T", " ");
-    for (let i = 0; i < 6; i++) {
-      seedReview(db, {
-        ds: DATASET,
-        n: 100 + i,
-        sha: `${i}`.repeat(40),
-        authorId: 700,
-        login: "stranger",
-        state: "reported",
-        verdict: "pass",
-        createdAt: threeHoursAgo,
-      });
-    }
-    pulls[`${DATASET}#7`] = restPull({ userId: 700, login: "stranger", assoc: "NONE" });
-
-    const r = await start(DATASET, 7);
-
-    expect(r.body).toMatchObject({ dispatched: true, reason: "dispatched" });
-  });
-
-  test("a contributor paused by their record, not by a decision, is declined on a restart, and the decline is published", async () => {
-    for (let i = 0; i < 7; i++) {
-      seedReview(db, {
-        ds: DATASET,
-        n: 200 + i,
-        sha: `${i}`.repeat(40),
-        authorId: 900,
-        login: "n",
-        state: "reported",
-        verdict: "fail",
-      });
-    }
+  test("a contributor an administrator blocked is declined on a restart, and the decline is published", async () => {
+    db.run(
+      "INSERT INTO pr_review_overrides (author_id, author_login, mode) VALUES (900, 'n', 'block')",
+    );
     seedReview(db, {
       ds: DATASET,
       n: 7,

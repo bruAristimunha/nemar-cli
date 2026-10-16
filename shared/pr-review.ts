@@ -1,7 +1,7 @@
 /**
  * The dataset pull-request review's contract (ADR 0092): the report a review run posts, the
- * verdict derived from it, the check-run words shown to people, and the rule that stops
- * reviewing a contributor whose pull requests keep being rejected.
+ * verdict derived from it, the check-run words shown to people, and the one standing decision
+ * about a contributor, an administrator's block.
  *
  * One module, three readers. The workflow script builds a report with it, the Worker parses
  * what comes back with it before storing a byte, and the check-run is rendered from it, so
@@ -535,8 +535,30 @@ export function verdictOf(report: PrReviewReport): Verdict {
 // Outcome -> check-run
 // ---------------------------------------------------------------------------------------------
 
-/** Why a pull request was not sent to the model. */
-export const DECLINE_REASONS = ["contributor_paused", "rate_limited", "daily_limit"] as const;
+/**
+ * Why the Worker declines a pull request: an administrator has blocked its contributor. Nothing
+ * else is a reason, and in particular no count of reviews, per contributor or per day, and no
+ * count of rejections is one any more (ADR 0107).
+ */
+export const PRODUCED_DECLINE_REASONS = ["contributor_paused"] as const;
+export type ProducedDeclineReason = (typeof PRODUCED_DECLINE_REASONS)[number];
+
+/**
+ * Words rows written before the counts were removed still hold. They are never produced again and
+ * there is no migration: such a row keeps its word, and it parses and renders as "Not reviewed".
+ * (`contributor_paused` is not among them: a block still writes it, though rows from before the
+ * automatic pause was removed hold it too.)
+ */
+export const HISTORICAL_DECLINE_REASONS = ["rate_limited", "daily_limit"] as const;
+
+/**
+ * Every word a stored declined row can hold: the migration's CHECK list, kept equal to it by a test.
+ * Only {@link PRODUCED_DECLINE_REASONS} is written by new code.
+ */
+export const DECLINE_REASONS = [
+  ...PRODUCED_DECLINE_REASONS,
+  ...HISTORICAL_DECLINE_REASONS,
+] as const;
 export type DeclineReason = (typeof DECLINE_REASONS)[number];
 
 /** Why a review ended without a report. Some are the Worker's own words (see the callback). */
@@ -627,13 +649,21 @@ const RESULT_WORD: Record<CriterionResult, string> = {
   unknown: "Could not tell",
 };
 
+/**
+ * What a declined pull request is told. A stored row is shown again whenever its result is
+ * re-stated, long after the decision, so each sentence is about the moment the commit arrived and
+ * not about now. `contributor_paused` does not say who paused the contributor: rows written while
+ * a rejection record paused people automatically hold the same word as a block does. The two
+ * historical words are about a limit that no longer exists, so they say so and say what to do now,
+ * which is the same for both.
+ */
 const DECLINE_COPY: Record<DeclineReason, string> = {
   contributor_paused:
-    "Automated review is paused for this contributor. A maintainer needs to review this one by hand.",
+    "Automated review was paused for this contributor when this commit arrived. A maintainer needs to review this one by hand.",
   rate_limited:
-    "Automated review is rate limited for this contributor right now. Push again later, or ask a maintainer to review it by hand.",
+    "Automated review was rate limited for this contributor when this commit arrived. That limit has since been removed. Push a new commit, or ask a NEMAR administrator to start the review.",
   daily_limit:
-    "The daily limit of automated reviews was reached. A maintainer needs to review this one by hand.",
+    "The daily limit of automated reviews had been reached when this commit arrived. That limit has since been removed. Push a new commit, or ask a NEMAR administrator to start the review.",
 };
 
 /**
@@ -882,19 +912,15 @@ export function renderComment(outcome: ReviewOutcome, headSha: string): string {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Who gets reviewed: the contributor tally and the rate caps.
+// Who gets reviewed: an administrator's block, and the record shown beside it.
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Automated review is paused for a contributor once MORE THAN this many of their pull requests
- * were rejected AND those rejections are MORE THAN {@link REJECTION_PERCENT} percent of the pull
- * requests that got a decision. Both must hold, so the harder one to reach decides: a newcomer's
- * first failure never pauses anyone, and a prolific contributor with a few failures among hundreds
- * of accepted pull requests is not paused either.
+ * What a contributor's pull requests have come to, shown to the administrator who reads it. It is
+ * information and nothing else: no rejection record, however bad, pauses anyone's reviews any more
+ * (ADR 0107), because with the check required a contributor who could not be reviewed could never
+ * merge. Only an administrator's block does.
  */
-export const REJECTION_COUNT = 5;
-export const REJECTION_PERCENT = 10;
-
 export interface AuthorTally {
   /** Distinct pull requests whose latest decided review was a fail. */
   rejected: number;
@@ -902,57 +928,16 @@ export interface AuthorTally {
   decided: number;
 }
 
-/** A maintainer's standing decision about one contributor, or none. Wins over the tally in both directions. */
+/**
+ * An administrator's standing decision about one contributor, or none. `block` pauses their reviews;
+ * `allow` is only the word for lifting a block, since nothing else pauses anyone.
+ */
 export type AuthorOverride = OverrideMode | null;
 
-export type Standing = { paused: false } | { paused: true; because: "maintainer" | "tally" };
+export type Standing = { paused: false } | { paused: true; because: "maintainer" };
 
-export function standingOf(tally: AuthorTally, override: AuthorOverride): Standing {
-  if (override === "allow") return { paused: false };
-  if (override === "block") return { paused: true, because: "maintainer" };
-  // Integer arithmetic: rejected / decided > 10 / 100  <=>  rejected * 100 > decided * 10.
-  if (
-    tally.decided > 0 &&
-    tally.rejected > REJECTION_COUNT &&
-    tally.rejected * 100 > tally.decided * REJECTION_PERCENT
-  ) {
-    return { paused: true, because: "tally" };
-  }
-  return { paused: false };
-}
-
-/** GitHub's `author_association` values that mark someone with a standing relationship to the repository. */
-const TRUSTED_ASSOCIATIONS: ReadonlySet<string> = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
-
-/**
- * Reviews one contributor may start per hour. Anyone GitHub does not mark as the repository's
- * owner, a member or a collaborator (a fork's author, or a past contributor) gets the small
- * allowance: any GitHub user can open a pull request on a public dataset, and each review costs
- * money.
- */
-export const HOURLY_REVIEW_CAP = { trusted: 20, other: 3 } as const;
-
-/** Reviews one contributor may start per day, so a few accounts cannot drain the platform's pool. */
-export const DAILY_AUTHOR_CAP = { trusted: 100, other: 6 } as const;
-
-/**
- * Reviews the whole platform starts per day, a ceiling on spend whatever else is true of the
- * reviews that are started. A delivery an owner or administrator is behind is not held to it
- * (ADR 0107): it is answered without a review, or, for a commit a review has already touched,
- * handled as for anyone and not held back by this.
- */
-export const DAILY_REVIEW_CAP = 400;
-
-export function hourlyCapFor(authorAssociation: string | null | undefined): number {
-  return authorAssociation && TRUSTED_ASSOCIATIONS.has(authorAssociation)
-    ? HOURLY_REVIEW_CAP.trusted
-    : HOURLY_REVIEW_CAP.other;
-}
-
-export function dailyAuthorCapFor(authorAssociation: string | null | undefined): number {
-  return authorAssociation && TRUSTED_ASSOCIATIONS.has(authorAssociation)
-    ? DAILY_AUTHOR_CAP.trusted
-    : DAILY_AUTHOR_CAP.other;
+export function standingOf(override: AuthorOverride): Standing {
+  return override === "block" ? { paused: true, because: "maintainer" } : { paused: false };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -987,7 +972,7 @@ export function parseCallbackOutcome(
     }
   }
   // `dispatch_failed` is the Worker's own word for "GitHub never ran the workflow" and is retried
-  // on redelivery and refunded from the caps: a job must not be able to say it.
+  // on redelivery and not counted as a model call: a job must not be able to say it.
   return {
     kind: "error",
     error:

@@ -1,11 +1,12 @@
 /**
  * The wire shapes of the pull-request review queue's admin routes (ADR 0093, following ADR 0092):
  *
- *   GET    /admin/pr-reviews                      every open pull request to `main`, with its review
+ *   GET    /admin/pr-reviews                      every open pull request to `main`, with its review,
+ *                                                 and the volume of reviews over the last day and week
  *   GET    /admin/pr-reviews/:dataset/:pr         one pull request: the stored report, its history
- *   GET    /admin/pr-review-authors/:login        a contributor's tally, override and standing
- *   PUT    /admin/pr-review-authors/:login        allow or block a contributor
- *   DELETE /admin/pr-review-authors/:login        remove that decision, so the tally decides again
+ *   GET    /admin/pr-review-authors/:login        a contributor's record, override and standing
+ *   PUT    /admin/pr-review-authors/:login        block a contributor, or lift a block (allow)
+ *   DELETE /admin/pr-review-authors/:login        remove that decision
  *   POST   /admin/pr-reviews/:dataset/:pr/start   review a pull request that is already open
  *
  * Types, the closed vocabularies, and nothing else, so the Worker that answers and the CLI that
@@ -32,9 +33,10 @@ export type { OverrideMode, ReviewState };
  *
  *  - `pass`, `fail`, `uncertain`: the derived verdict of a review OF THE CURRENT COMMIT.
  *  - `not_reviewed`: no review of the current commit is on record. That is also the answer when the
- *    review is off, when the contributor was paused or rate limited (`detail` says which), and when
- *    the review on record is of another commit (`review_current` is false and `stale_verdict` says
- *    what that one concluded). A verdict is never carried over to a commit it did not read.
+ *    review is off, when the contributor was paused (`detail` says so; a row from before the
+ *    limits were removed may say rate limited or daily limit), and when the review on record is of
+ *    another commit (`review_current` is false and `stale_verdict` says what that one concluded). A
+ *    verdict is never carried over to a commit it did not read.
  *  - `in_progress`: the review was handed to GitHub and has not reported.
  *  - `could_not_decide`: the review ran and ended without a verdict (an error, or it never
  *    reported). `detail` says why.
@@ -61,6 +63,11 @@ export type QueueVerdict = (typeof QUEUE_VERDICTS)[number];
  * say `exempt`; a review record and a history item may not.
  */
 export type StoredVerdict = Exclude<QueueVerdict, "exempt">;
+
+/** Every {@link StoredVerdict}: the queue's own words but `exempt`, so a word added there is counted too. */
+export const STORED_VERDICTS: readonly StoredVerdict[] = QUEUE_VERDICTS.filter(
+  (v): v is StoredVerdict => v !== "exempt",
+);
 
 /** A verdict that means the review READ a commit and concluded something about it. */
 export type ReadVerdict = "pass" | "fail" | "uncertain";
@@ -147,6 +154,32 @@ export interface QueueFilters {
   needs_me: boolean;
 }
 
+/**
+ * What the review did over one window of time. Information for the administrator who reads the
+ * list, and never an input to a decision: no count here, or anywhere, decides whether a pull
+ * request is reviewed (ADR 0107).
+ */
+export interface VolumeWindow {
+  /** Review records created in the window. A commit started again counts as a new record. */
+  reviews: number;
+  /**
+   * Model calls those records cost, or may yet cost: the sum of their attempts, leaving out a
+   * decline and a run that never reached the model (a dispatch GitHub did not run, a commit a newer
+   * one superseded).
+   */
+  model_calls: number;
+  /** The records by what they came to, in the words the list uses. Every word is there, zero if unseen. */
+  by_verdict: Record<StoredVerdict, number>;
+  /** The declined records by their reason word. Every stored word is there, zero if unseen. */
+  declines: Record<DeclineReason, number>;
+}
+
+/** The volume of the last day and of the last week, counted from when each record was created. */
+export interface QueueVolume {
+  last_24_hours: VolumeWindow;
+  last_7_days: VolumeWindow;
+}
+
 export interface QueueResponse {
   environment: QueueEnvironment;
   /** The review itself is switched on in this environment (`PR_REVIEW_ENABLED`). */
@@ -159,14 +192,20 @@ export interface QueueResponse {
   truncated: boolean;
   skipped: QueueSkipped;
   filters: QueueFilters;
+  /**
+   * What the review has done lately across the whole platform, whatever the filters are. Null when
+   * it could not be read this time: informing never holds up the list, and an unread count is not
+   * a count of zero.
+   */
+  volume: QueueVolume | null;
 }
 
 /**
  * What starting the review of one open pull request came to. `reason` is one of the review's own
  * fixed words (ADR 0092): `dispatched`, `redispatched` (a commit started again) or `dispatch_claimed`
  * (GitHub's answer was lost but the workflow had already claimed it) when it was handed to GitHub,
- * otherwise why not (`duplicate`, `contributor_paused`, `daily_limit`, `exempt_author` (its author is
- * an owner or administrator, so it is not reviewed and its check was posted as skipped), `draft`,
+ * otherwise why not (`duplicate`, `contributor_paused`, `exempt_author` (its author is an owner or
+ * administrator, so it is not reviewed and its check was posted as skipped), `draft`,
  * `not_open`, `not_main`, `bot_author`, `dataset_not_reviewable`, `pr_review_disabled`, ...).
  * `review_id` is null when no review row exists for it.
  */
@@ -220,6 +259,7 @@ export interface LivePullRequest {
 export interface ContributorStanding {
   login: string;
   author_id: number;
+  /** The record of rejected pull requests: information, and never a reason to pause anyone. */
   tally: AuthorTally;
   override: null | {
     mode: OverrideMode;
@@ -227,12 +267,8 @@ export interface ContributorStanding {
     set_at: string;
     set_by: string | null;
   };
-  /** The standing the review gate applies today: the override if there is one, else the record. */
+  /** The standing the review gate applies today. Only a block pauses a contributor; the tally never does. */
   standing: Standing;
-  /** The standing the RECORD alone would give, ignoring any override. */
-  by_record: Standing;
-  /** The tally rule, so a reader can see how far from a pause a contributor is. */
-  thresholds: { rejected_more_than: number; percent_more_than: number };
   /** The latest decided review of each of the contributor's most recent pull requests. */
   recent: Array<{
     dataset_id: string;

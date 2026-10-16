@@ -13,18 +13,21 @@
  * **Why the Worker is the gate.** Every pull request reaches it, a fork's included, from a
  * delivery GitHub signs; no workflow in a dataset repository takes part, so no collaborator can
  * edit the review or reach the credentials it uses by editing a branch. It is also the only place
- * that can count: who opened which pull request, how many were rejected, how many reviews were
- * started this hour. Those counts decide whether a review is spent at all. A `repository_dispatch`
- * can be sent by anyone holding a dataset repository's workflow credentials, so the caps bind
- * only reviews the Worker started; the claim step is what makes a forged dispatch buy nothing.
+ * that knows who opened a pull request and whether an administrator has blocked them.
+ * {@link gateDecision} is that decision, made once per delivery: exempt, then blocked, then
+ * reviewed. **No count decides it** (ADR 0107): not how many reviews a contributor or the platform
+ * started this hour or day, and not how many of a contributor's pull requests were rejected. Only
+ * an administrator's block holds a contributor back. What bounds the cost is decided in that ADR
+ * (a content screen first, and the workspace's spend limit), and the claim step is what makes a
+ * forged `repository_dispatch` buy nothing, since anyone holding a dataset repository's workflow
+ * credentials can send one.
  *
  * **Owners and administrators are not reviewed** (ADR 0107). A pull request opened by a NEMAR
  * owner or administrator, when an owner or administrator also caused the delivery (the push, the
  * reopening) and no review has yet touched that commit, is answered with a `skipped` check and
- * nothing else: no row, no model call, no allowance spent. {@link isReviewExempt} decides from the
- * accounts, never from anything the pull request says, and before any row is written. A commit that
- * already has a row keeps what its review said, whoever acts on it next: `skipped` is never
- * written over a review.
+ * nothing else: no row, no model call. {@link isReviewExempt} decides from the accounts, never from
+ * anything the pull request says, and before any row is written. A commit that already has a row
+ * keeps what its review said, whoever acts on it next: `skipped` is never written over a review.
  *
  * **Nothing here trusts the pull request.** The event is read by {@link readPullRequestEvent},
  * which accepts only the shapes it expects; the dispatch carries the review's coordinates and not
@@ -48,15 +51,12 @@ import {
   type AuthorOverride,
   type AuthorTally,
   type CallbackOutcome,
-  DAILY_REVIEW_CAP,
-  type DeclineReason,
   PrReviewReportError,
+  type ProducedDeclineReason,
   type ReviewOutcome,
   type ReviewState,
   type StoredOutcome,
   conclusionOf,
-  dailyAuthorCapFor,
-  hourlyCapFor,
   isDeclineReason,
   isOverrideMode,
   isRunError,
@@ -74,7 +74,7 @@ import { signPrReviewCallbackToken } from "./github/callback-tokens.js";
 import { approvalDispatchEnvironment, triggerPrReviewRun } from "./github/dispatch.js";
 import { upsertReviewCheckRun, upsertReviewComment } from "./github/pr-review-api.js";
 import { ORG_NAME } from "./github/shared.js";
-import { type AdminAnswers, isReviewExempt } from "./pr-review-exemption.js";
+import { isReviewExempt } from "./pr-review-exemption.js";
 
 /** `pull_request` actions that put new content in front of a reviewer. */
 export const PR_REVIEW_ACTIONS: ReadonlySet<string> = new Set([
@@ -143,6 +143,11 @@ export interface PrIntake {
   headSha: string;
   authorId: number;
   authorLogin: string;
+  /**
+   * GitHub's relationship label for the author, stored with the review for people to read. Nothing
+   * in the gate reads it: it says CONTRIBUTOR for a private organization member, so it is no reason
+   * to exempt or to reject anyone (ADR 0107).
+   */
   authorAssociation: string | null;
   fromFork: boolean;
   /**
@@ -256,18 +261,12 @@ export function readPullRequestEvent(payload: unknown): IntakeResult {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The gate: who is reviewed, and how often
+// The gate: who is reviewed
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Rows that cost a model call, or may yet: everything except a decline (never sent) and a run
- * that errored before the model was reached (the dataset was ineligible, a newer delivery
- * superseded it, or the dispatch failed).
- */
-const COUNTS_TOWARD_CAPS = `state != 'declined' AND NOT (state = 'errored' AND detail IN ('stale_head', 'dispatch_failed'))`;
-
-/**
- * The tally for one contributor, counted from the reviews themselves.
+ * The tally for one contributor, counted from the reviews themselves. It is shown to
+ * administrators and decides nothing (see `AuthorTally`).
  *
  * `decided` is the number of distinct pull requests with at least one decided (pass or fail)
  * review; `rejected` is how many of those were most recently decided as a fail. Counting the
@@ -288,19 +287,6 @@ export const AUTHOR_TALLY_SQL = `
     FROM latest
    WHERE rn = 1`;
 
-/**
- * A row's place in its allowance: how many rows that count against it, up to and including this
- * one, were created inside the window. Counted AFTER the row is inserted, so two deliveries that
- * race each see the other and at most the cap survive; checking before inserting let a burst of
- * pull requests all pass the same check.
- */
-const AUTHOR_HOURLY_RANK_SQL = `SELECT COUNT(*) AS n FROM pr_reviews
-  WHERE author_id = ? AND ${COUNTS_TOWARD_CAPS} AND created_at >= datetime('now', '-1 hour') AND id <= ?`;
-const AUTHOR_DAILY_RANK_SQL = `SELECT COUNT(*) AS n FROM pr_reviews
-  WHERE author_id = ? AND ${COUNTS_TOWARD_CAPS} AND created_at >= datetime('now', '-1 day') AND id <= ?`;
-const PLATFORM_DAILY_RANK_SQL = `SELECT COALESCE(SUM(attempts), 0) AS n FROM pr_reviews
-  WHERE ${COUNTS_TOWARD_CAPS} AND created_at >= datetime('now', '-1 day') AND id <= ?`;
-
 export async function readAuthorTally(db: Db, authorId: number): Promise<AuthorTally> {
   const row = await db
     .prepare(AUTHOR_TALLY_SQL)
@@ -315,45 +301,6 @@ export async function readAuthorOverride(db: Db, authorId: number): Promise<Auth
     .bind(authorId)
     .first<{ mode: string }>();
   return isOverrideMode(row?.mode) ? row.mode : null;
-}
-
-/** Which allowance, if any, the row just inserted is over. */
-async function capDecision(
-  env: Bindings,
-  pr: PrIntake,
-  rowId: number,
-  options: PrReviewOptions,
-  extraCalls = 0,
-): Promise<Extract<DeclineReason, "rate_limited" | "daily_limit"> | null> {
-  // No allowance applies to a delivery an owner or administrator is behind (ADR 0107), whatever
-  // the tally says. The intake already answered for a delivery that is exempt, but it read the
-  // accounts before this row was written, and a role can be granted in between: asked again here,
-  // so an allowance never decides for a delivery that is exempt now. The WHOLE delivery is asked
-  // about, not the author alone: a review that exists because someone who is not exempt pushed to
-  // an exempt author's pull request spends the platform's money like any other, and the author's
-  // role does not waive that for them.
-  if (await isExemptDelivery(env, pr, options)) return null;
-  const db = env.DB;
-  const skipAuthorCaps = options.adminStart === true;
-  // An administrator who asks for a review by name is not an outsider spending the platform's
-  // money, so the per-contributor allowances do not hold it back; the platform's pool still does.
-  if (!skipAuthorCaps) {
-    const hourly = await db
-      .prepare(AUTHOR_HOURLY_RANK_SQL)
-      .bind(pr.authorId, rowId)
-      .first<{ n: number }>();
-    if ((hourly?.n ?? 0) > hourlyCapFor(pr.authorAssociation)) return "rate_limited";
-    const daily = await db
-      .prepare(AUTHOR_DAILY_RANK_SQL)
-      .bind(pr.authorId, rowId)
-      .first<{ n: number }>();
-    if ((daily?.n ?? 0) > dailyAuthorCapFor(pr.authorAssociation)) return "rate_limited";
-  }
-  const platform = await db.prepare(PLATFORM_DAILY_RANK_SQL).bind(rowId).first<{ n: number }>();
-  // The pool counts model calls, not rows: a restart of an attempt that already spent one is a
-  // second call that no row yet shows, so it is added here and recorded once it is handed over.
-  if ((platform?.n ?? 0) + extraCalls > DAILY_REVIEW_CAP) return "daily_limit";
-  return null;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -605,7 +552,11 @@ export async function publishOutcome(
  * message that never changes. A decline is published the first time; the same decline for the
  * same pull request within the hour is recorded without being published again.
  */
-async function publishDecline(env: Bindings, row: ReviewRow, reason: DeclineReason): Promise<void> {
+async function publishDecline(
+  env: Bindings,
+  row: ReviewRow,
+  reason: ProducedDeclineReason,
+): Promise<void> {
   const repeat = await env.DB.prepare(
     `SELECT 1 AS ok FROM pr_reviews
       WHERE dataset_id = ? AND pr_number = ? AND state = 'declined' AND detail = ?
@@ -644,17 +595,11 @@ const no = (reason: string, reviewId?: number): PrReviewResponse => ({
 export interface PrReviewOptions {
   /**
    * An administrator asked for this review by name (`startPullRequestReview`). The payload was built
-   * from GitHub's own record of the pull request. It lifts the per-contributor allowances for this
-   * one review and lets a commit whose review ended without a verdict be started again. It names no
-   * sender, so whether the pull request is exempt is judged on its author alone.
+   * from GitHub's own record of the pull request. It lets a commit whose review ended without a
+   * verdict be started again, which a new delivery of the commit does only for a dispatch GitHub did
+   * not run. It names no sender, so whether the pull request is exempt is judged on its author alone.
    */
   adminStart?: boolean;
-  /**
-   * What GitHub said about each login on this repository, shared by every exemption question one
-   * delivery asks (the intake and the allowance check), so a slow or refusing GitHub is waited on
-   * once. Set by `handlePullRequestEvent` itself; callers do not pass it.
-   */
-  adminAnswers?: AdminAnswers;
 }
 
 /**
@@ -677,13 +622,43 @@ async function isExemptDelivery(
   options: PrReviewOptions,
 ): Promise<boolean> {
   const repo = pr.datasetId;
-  const answers = options.adminAnswers;
-  if (!(await isReviewExempt(env, { login: pr.authorLogin, repo }, answers))) return false;
+  if (!(await isReviewExempt(env, { login: pr.authorLogin, repo }))) return false;
   if (options.adminStart === true) return true;
   const sender = pr.senderLogin;
   if (sender === null) return false;
   if (sender.toLowerCase() === pr.authorLogin.toLowerCase()) return true;
-  return await isReviewExempt(env, { login: sender, repo }, answers);
+  return await isReviewExempt(env, { login: sender, repo });
+}
+
+/** What the gate decides for a delivery. */
+type Gate = "exempt" | "blocked" | "review";
+
+/**
+ * Whether a review is spent on this delivery, the one decision (ADR 0107), in this order:
+ *
+ *  1. **exempt**: an owner or administrator is behind the delivery ({@link isExemptDelivery}, the
+ *     author AND whoever caused it, never the author alone). Asked only for a commit with no row
+ *     (`commit` is `"new"`): a commit a review has touched keeps what that review said, so there
+ *     `skipped` can never be the answer.
+ *  2. **blocked**: an administrator has blocked the author. It holds back a restart of a commit
+ *     already on record (`"on_record"`) as it does a new commit, and it never reaches an exempt
+ *     delivery, because exempt is asked first.
+ *  3. **review**: everything else. No count decides it: not how many reviews the author or the
+ *     platform started lately, and not how many of the author's pull requests were rejected.
+ *     That is what the earlier hourly, daily and platform caps and the automatic pause did, and
+ *     ADR 0107 removed them.
+ *
+ * A database error throws, like every read of the intake.
+ */
+async function gateDecision(
+  env: Bindings,
+  pr: PrIntake,
+  options: PrReviewOptions,
+  commit: "new" | "on_record",
+): Promise<Gate> {
+  if (commit === "new" && (await isExemptDelivery(env, pr, options))) return "exempt";
+  const standing = standingOf(await readAuthorOverride(env.DB, pr.authorId));
+  return standing.paused ? "blocked" : "review";
 }
 
 /**
@@ -769,27 +744,19 @@ export async function handlePullRequestEvent(
   if (reviewable === "unknown") return no("unknown_dataset");
   if (reviewable === "not_reviewable") return no("dataset_not_reviewable");
 
-  // What one delivery asks GitHub about an account is asked once (see `PrReviewOptions`).
-  const scoped: PrReviewOptions = { ...options, adminAnswers: new Map() };
-
-  // Owners and administrators are not reviewed (ADR 0107), decided before any row is written: an
-  // exempt pull request has no row, so no redelivery or restart can carry it into the review or
-  // its allowances. But only a commit no review has touched. A row means someone put this commit
-  // through review (a stranger's push to an owner's branch, or an author who was not exempt yet),
-  // and what the review said stands until the commit changes: an exempt author's reopening, or an
-  // administrator's start, must not turn another person's failed or undecided review into
-  // `skipped`, which a required check counts as passing. `handleRepeat` re-states the row instead.
+  // A commit a review has touched keeps what that review said, whoever acts on it next: a row means
+  // someone put this commit through review (a stranger's push to an owner's branch, or an author
+  // who was not exempt yet), and an exempt author's reopening, or an administrator's start, must not
+  // turn another person's failed or undecided review into `skipped`, which a required check counts
+  // as passing. `handleRepeat` re-states the row instead.
   const existing = await readRowByKey(db, pr.datasetId, pr.prNumber, pr.headSha);
-  if (existing === null && (await isExemptDelivery(env, pr, scoped))) {
-    return await publishExempt(env, pr);
-  }
-  if (existing) return await handleRepeat(env, existing, secret, pr, scoped);
+  if (existing) return await handleRepeat(env, existing, secret, pr, options);
 
-  const standing = standingOf(
-    await readAuthorTally(db, pr.authorId),
-    await readAuthorOverride(db, pr.authorId),
-  );
-  const paused = standing.paused;
+  // Every other delivery meets the gate once, before any row is written: an exempt pull request
+  // stores no row, so no redelivery or restart can carry it into the review.
+  const gate = await gateDecision(env, pr, options, "new");
+  if (gate === "exempt") return await publishExempt(env, pr);
+  const paused = gate === "blocked";
   const nonce = crypto.randomUUID();
   const inserted = await db
     .prepare(
@@ -815,11 +782,11 @@ export async function handlePullRequestEvent(
   if ((inserted.meta.changes ?? 0) !== 1) {
     // Another delivery of the same commit won the insert between the read and the write.
     const raced = await readRowByKey(db, pr.datasetId, pr.prNumber, pr.headSha);
-    return raced ? await handleRepeat(env, raced, secret, pr, scoped) : no("duplicate");
+    return raced ? await handleRepeat(env, raced, secret, pr, options) : no("duplicate");
   }
   const reviewId = Number(inserted.meta.last_row_id);
   try {
-    return await decideInserted(env, pr, reviewId, paused, nonce, secret, scoped);
+    return await decideInserted(env, reviewId, paused, nonce, secret);
   } catch (err) {
     await markDispatchFailed(db, reviewId);
     throw err;
@@ -828,9 +795,9 @@ export async function handlePullRequestEvent(
 
 /**
  * The row exists but nothing has run for it (a database error between the insert and the
- * dispatch). Left as 'dispatched' it would count against the caps and wait for the watchdog to call
- * it late, and a redelivery would find it and answer "duplicate". Mark it as a dispatch that did not
- * happen, which a redelivery retries; the caller lets the route answer 500.
+ * dispatch). Left as 'dispatched' it would wait for the watchdog to call it late, and a redelivery
+ * would find it and answer "duplicate". Mark it as a dispatch that did not happen, which a
+ * redelivery retries; the caller lets the route answer 500.
  */
 async function markDispatchFailed(db: Db, reviewId: number): Promise<void> {
   try {
@@ -847,15 +814,22 @@ async function markDispatchFailed(db: Db, reviewId: number): Promise<void> {
   }
 }
 
-/** Everything after the insert: publish a decline, or check the allowances and start the review. */
+/**
+ * Everything after the insert: publish a decline for a blocked contributor, or start the review.
+ * `secondCall` is set when this attempt restarts a row whose earlier attempt already cost a model
+ * call, and adds one to the row's `attempts`, which the administrator's volume sums. That is the
+ * best record there is and not an exact one: the count is made before the hand-over, so a
+ * hand-over GitHub refuses leaves the row one call over until a later run, and a restart a block
+ * declined has overwritten the state this rule reads, so the call after it can read one short.
+ * Nothing decides on it.
+ */
 async function decideInserted(
   env: Bindings,
-  pr: PrIntake,
   reviewId: number,
   paused: boolean,
   nonce: string,
   secret: string,
-  options: PrReviewOptions & { restarted?: boolean; extraCalls?: number } = {},
+  options: { secondCall?: boolean } = {},
 ): Promise<PrReviewResponse> {
   const db = env.DB;
   const row = await readRow(db, reviewId);
@@ -866,33 +840,11 @@ async function decideInserted(
     return no("contributor_paused", reviewId);
   }
 
-  // A restarted row keeps its old id, which the allowance queries (`id <= ?`) would rank ahead of
-  // everything inserted since: it is ranked as the newest instead.
-  const over = await capDecision(
-    env,
-    pr,
-    options.restarted ? Number.MAX_SAFE_INTEGER : reviewId,
-    options,
-    options.extraCalls ?? 0,
-  );
-  if (over) {
-    await db
-      .prepare(
-        `UPDATE pr_reviews SET state = 'declined', detail = ?, nonce = NULL, decided_at = datetime('now')
-          WHERE id = ? AND state = 'dispatched'`,
-      )
-      .bind(over, reviewId)
-      .run();
-    const declined = await readRow(db, reviewId);
-    await publishDecline(env, declined ?? row, over);
-    return no(over, reviewId);
-  }
-
   // The attempt is going ahead, so a call the row had already spent is now a second one.
-  if ((options.extraCalls ?? 0) > 0) {
+  if (options.secondCall) {
     await db
-      .prepare("UPDATE pr_reviews SET attempts = attempts + ? WHERE id = ?")
-      .bind(options.extraCalls, reviewId)
+      .prepare("UPDATE pr_reviews SET attempts = attempts + 1 WHERE id = ?")
+      .bind(reviewId)
       .run();
   }
   return await startReview(env, row, nonce, secret);
@@ -958,8 +910,12 @@ async function isRestartable(db: Db, row: ReviewRow, options: PrReviewOptions): 
   return overdue !== null;
 }
 
-/** Whether a row's attempt may have cost a model call: the complement of a decline or an attempt GitHub never ran. */
-function spentACall(row: ReviewRow): boolean {
+/**
+ * Whether a row's attempt may have cost a model call: the complement of a decline or an attempt
+ * GitHub never ran. A restart of a row that did adds a second call to its `attempts`, and the
+ * administrator's volume count sums `attempts` over the rows that did.
+ */
+export function spentACall(row: { state: string; detail: string | null }): boolean {
   if (row.state === "declined") return false;
   return !(
     row.state === "errored" &&
@@ -968,10 +924,9 @@ function spentACall(row: ReviewRow): boolean {
 }
 
 /**
- * Give a commit a fresh attempt, held to the same gate as a new one: a contributor who is paused is
- * declined, and the allowances that apply to it are asked again (an administrator's start only the
- * platform's pool), with the row ranked as the newest (see `decideInserted`). Null when another
- * delivery moved the row first.
+ * Give a commit a fresh attempt, held to the same gate as a new one except for the exemption (see
+ * {@link gateDecision}; the commit has a row, so `skipped` is never an answer): a contributor an
+ * administrator has blocked is declined. Null when another delivery moved the row first.
  */
 async function restartReview(
   env: Bindings,
@@ -981,11 +936,7 @@ async function restartReview(
   options: PrReviewOptions,
 ): Promise<PrReviewResponse | null> {
   const db = env.DB;
-  const standing = standingOf(
-    await readAuthorTally(db, pr.authorId),
-    await readAuthorOverride(db, pr.authorId),
-  );
-  const paused = standing.paused;
+  const paused = (await gateDecision(env, pr, options, "on_record")) === "blocked";
   const nonce = crypto.randomUUID();
   const reset = await db
     .prepare(
@@ -1006,11 +957,9 @@ async function restartReview(
     .run();
   if ((reset.meta.changes ?? 0) !== 1) return null;
   try {
-    const res = await decideInserted(env, pr, existing.id, paused, nonce, secret, {
-      ...options,
-      restarted: true,
+    const res = await decideInserted(env, existing.id, paused, nonce, secret, {
       // The earlier attempt cost a model call unless it never got that far.
-      extraCalls: spentACall(existing) ? 1 : 0,
+      secondCall: spentACall(existing),
     });
     return res.dispatched && res.reason === "dispatched" ? { ...res, reason: "redispatched" } : res;
   } catch (err) {

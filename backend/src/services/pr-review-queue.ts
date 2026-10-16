@@ -42,17 +42,19 @@ import {
   type QueueResponse,
   type QueueSkipped,
   type QueueVerdict,
+  type QueueVolume,
   type ReadVerdict,
   type ReviewHistoryItem,
   type ReviewRecord,
+  STORED_VERDICTS,
   type SetOverrideResponse,
   type StoredVerdict,
   type VerdictDetail,
+  type VolumeWindow,
 } from "../../../shared/contract/pr-review-admin.js";
 import {
   type AuthorOverride,
-  REJECTION_COUNT,
-  REJECTION_PERCENT,
+  DECLINE_REASONS,
   REVIEW_STATES,
   type ReviewState,
   type StoredOutcome,
@@ -76,6 +78,7 @@ import {
   outcomeOfRow,
   readAuthorOverride,
   readAuthorTally,
+  spentACall,
 } from "./pr-review.js";
 
 /** The GitHub search that defines the queue: open pull requests to `main` across the datasets org. */
@@ -105,7 +108,8 @@ const GRAPHQL_TOTAL_MS = 90_000;
  * this is deadline plus one tick, after which the queue says it never reported rather than showing a
  * review that will not finish as one still running.
  */
-const OVERDUE_AFTER_MS = (PR_REVIEW_DEADLINE_MINUTES + 30) * 60_000;
+const OVERDUE_GRACE_MINUTES = 30;
+const OVERDUE_AFTER_MS = (PR_REVIEW_DEADLINE_MINUTES + OVERDUE_GRACE_MINUTES) * 60_000;
 /** How many reviews of one pull request `show` lists. */
 const HISTORY_LIMIT = 20;
 /** D1 allows 100 bound parameters per query; stay under it. */
@@ -926,6 +930,92 @@ function exemptionLookup(env: Bindings) {
   return { ask, warm, known };
 }
 
+// ---------------------------------------------------------------------------------------------
+// The volume line
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The records of the last week, grouped by everything a count needs, with their model calls. One
+ * group is a state, a verdict, a reason, whether a running review is overdue and whether it is
+ * inside the last day. The one bound value is how many minutes after it was handed over a review
+ * that never reported stops reading as running, which is the list's own rule (`OVERDUE_AFTER_MS`).
+ */
+const VOLUME_SQL = `
+  SELECT state, verdict, detail,
+         CASE WHEN state = 'dispatched'
+               AND created_at < datetime('now', '-' || ? || ' minutes') THEN 1 ELSE 0 END AS overdue,
+         CASE WHEN created_at >= datetime('now', '-1 day') THEN 1 ELSE 0 END AS in_day,
+         COUNT(*) AS reviews,
+         COALESCE(SUM(attempts), 0) AS attempts
+    FROM pr_reviews
+   WHERE created_at >= datetime('now', '-7 days')
+   GROUP BY state, verdict, detail, overdue, in_day`;
+
+interface VolumeGroup {
+  state: string;
+  verdict: string | null;
+  detail: string | null;
+  overdue: number;
+  in_day: number;
+  reviews: number;
+  attempts: number;
+}
+
+function emptyWindow(): VolumeWindow {
+  return {
+    reviews: 0,
+    model_calls: 0,
+    by_verdict: Object.fromEntries(
+      STORED_VERDICTS.map((v) => [v, 0]),
+    ) as VolumeWindow["by_verdict"],
+    declines: Object.fromEntries(DECLINE_REASONS.map((w) => [w, 0])) as VolumeWindow["declines"],
+  };
+}
+
+/**
+ * What the review has done over the last 24 hours and the last 7 days, for the administrator who
+ * reads the list: the records created, the model calls they cost, what they came to and why the
+ * declined ones were. Counted from the records and used for nothing else: it informs and never
+ * blocks (ADR 0107), so nothing here, or anywhere, reads it to decide whether a pull request is
+ * reviewed. A record is counted when it was created, and a commit started again is created anew.
+ */
+export async function readVolume(db: D1Database): Promise<QueueVolume> {
+  const { results } = await db
+    .prepare(VOLUME_SQL)
+    .bind(PR_REVIEW_DEADLINE_MINUTES + OVERDUE_GRACE_MINUTES)
+    .all<VolumeGroup>();
+  const day = emptyWindow();
+  const week = emptyWindow();
+  for (const g of results) {
+    // The list's own reading of a row, so the two never disagree about what a record came to.
+    const meant =
+      g.state === "dispatched" && g.overdue === 1
+        ? { verdict: "could_not_decide" as const }
+        : meaningOf(g);
+    for (const w of g.in_day === 1 ? [week, day] : [week]) {
+      w.reviews += g.reviews;
+      if (spentACall(g)) w.model_calls += g.attempts;
+      w.by_verdict[meant.verdict] += g.reviews;
+      if (g.state === "declined" && isDeclineReason(g.detail)) w.declines[g.detail] += g.reviews;
+    }
+  }
+  return { last_24_hours: day, last_7_days: week };
+}
+
+/**
+ * {@link readVolume}, except that a failure to read it is a null and a log line and not a failed
+ * list: the volume only informs, and a count that could not be read is told apart from a count of
+ * zero by the null.
+ */
+async function readVolumeIfPossible(db: D1Database): Promise<QueueVolume | null> {
+  try {
+    return await readVolume(db);
+  } catch (err) {
+    console.error(`[pr-queue] the volume could not be read (${errMessage(err)})`);
+    return null;
+  }
+}
+
 export async function buildQueue(env: Bindings, filters: QueueFilters): Promise<QueueResponse> {
   const open = await fetchOpenPullRequests(env);
   const skipped: QueueSkipped = {
@@ -994,6 +1084,7 @@ export async function buildQueue(env: Bindings, filters: QueueFilters): Promise<
     truncated: open.truncated,
     skipped,
     filters,
+    volume: await readVolumeIfPossible(env.DB),
   };
 }
 
@@ -1266,7 +1357,10 @@ const RECENT_SQL = `
   SELECT dataset_id, pr_number, head_sha, verdict, decided_at
     FROM latest WHERE rn = 1 ORDER BY seen_at DESC, id DESC LIMIT 10`;
 
-/** The tally, override and standing of one contributor, as the review gate would see them now. */
+/**
+ * The tally, override and standing of one contributor, as the review gate would see them now. The
+ * tally is the record beside the decision, not an input to it: only a block pauses anyone.
+ */
 export async function standingFor(
   db: D1Database,
   login: string,
@@ -1304,9 +1398,7 @@ export async function standingFor(
             set_by: row.set_by ? plainRef(row.set_by, 60) : null,
           }
         : null,
-    standing: standingOf(tally, mode),
-    by_record: standingOf(tally, null),
-    thresholds: { rejected_more_than: REJECTION_COUNT, percent_more_than: REJECTION_PERCENT },
+    standing: standingOf(mode),
     recent: recent.results,
     resolved_from: resolvedFrom,
   };
@@ -1362,7 +1454,7 @@ async function resolveAtGitHub(
       throw new QueueError(
         422,
         "not_a_user",
-        `${u.login} is a GitHub ${sanitizeNote(u.type, 20) || "account"}, not a person. Reviews are counted per person.`,
+        `${u.login} is a GitHub ${sanitizeNote(u.type, 20) || "account"}, not a person. A block or an allow applies to a person's account.`,
       );
     }
     return { id: u.id, login: u.login, from: "github" };

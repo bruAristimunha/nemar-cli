@@ -11,30 +11,26 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import {
   CRITERIA,
-  DAILY_AUTHOR_CAP,
-  DAILY_REVIEW_CAP,
   DECLINE_REASONS,
   FINDING_CODES,
-  HOURLY_REVIEW_CAP,
+  HISTORICAL_DECLINE_REASONS,
   MAX_FINDINGS,
   MAX_LISTED,
   MAX_MODEL_FILES,
   NOTE_MAX,
   OVERRIDE_MODES,
+  PRODUCED_DECLINE_REASONS,
   PR_REVIEW_COMMENT_MARKER,
   type PrReviewReport,
   PrReviewReportError,
-  REJECTION_COUNT,
   REVIEW_OUTCOME_KINDS,
   REVIEW_STATES,
   RUN_ERRORS,
   type ReviewOutcome,
   VERDICTS,
   conclusionOf,
-  dailyAuthorCapFor,
   effectiveCriteria,
   factsOf,
-  hourlyCapFor,
   isRunError,
   parseCallbackOutcome,
   parsePrReviewReport,
@@ -577,6 +573,36 @@ describe("conclusions: only a clear pass is green, nothing unknown ever satisfie
     }
   });
 
+  test.each([...HISTORICAL_DECLINE_REASONS])(
+    "a stored row with the old word %s still renders as not reviewed, and says the limit is gone",
+    (reason) => {
+      const outcome: ReviewOutcome = { kind: "declined", reason };
+      const r = renderCheck(outcome);
+      expect(r.title).toBe("Not reviewed");
+      expect(conclusionOf(outcome)).toBe("action_required");
+      // A person can act on it: the limit no longer exists, so a new commit or a start works.
+      expect(r.summary).toContain("has since been removed");
+      expect(r.summary).toContain(
+        "Push a new commit, or ask a NEMAR administrator to start the review",
+      );
+      expect(renderComment(outcome, "0123456789abcdef0123456789abcdef01234567")).toContain(
+        "NEEDS A PERSON",
+      );
+      // Plain words: no word of the vocabulary, JSON or escape reaches the text.
+      expect(`${r.title} ${r.summary} ${r.text}`).not.toMatch(/_|[{}\\]/);
+    },
+  );
+
+  test.each([...DECLINE_REASONS])(
+    "the sentence for %s is about the moment the commit arrived, because it is shown again long after",
+    (reason) => {
+      const { summary } = renderCheck({ kind: "declined", reason });
+      expect(summary).toContain("when this commit arrived");
+      // Never the present tense about a state that may have ended.
+      expect(summary).not.toMatch(/\b(is paused|is rate limited|is reached)\b/);
+    },
+  );
+
   test("every finding code has a label", () => {
     for (const code of FINDING_CODES) {
       const r = parsed({
@@ -644,57 +670,17 @@ describe("the pull-request comment", () => {
   });
 });
 
-describe("the contributor tally: more than 5 rejections AND more than 10 percent, the later of the two", () => {
-  test("a newcomer's first failure never pauses anyone", () => {
-    expect(standingOf({ rejected: 1, decided: 1 }, null).paused).toBe(false);
+describe("a contributor's standing: only an administrator's block pauses anyone (ADR 0107)", () => {
+  test("with no decision a contributor is not paused", () => {
+    expect(standingOf(null)).toEqual({ paused: false });
   });
 
-  test("exactly the threshold count is not enough; one more is, when the rate also holds", () => {
-    expect(standingOf({ rejected: REJECTION_COUNT, decided: 10 }, null).paused).toBe(false);
-    expect(standingOf({ rejected: REJECTION_COUNT + 1, decided: 10 }, null)).toEqual({
-      paused: true,
-      because: "tally",
-    });
+  test("a block pauses, and says an administrator did it", () => {
+    expect(standingOf("block")).toEqual({ paused: true, because: "maintainer" });
   });
 
-  test("a prolific contributor with a few failures among many accepted is not paused", () => {
-    // 6 rejected of 100 is 6 percent: past the count, short of the rate.
-    expect(standingOf({ rejected: 6, decided: 100 }, null).paused).toBe(false);
-    // 11 of 100 is 11 percent and past the count: paused.
-    expect(standingOf({ rejected: 11, decided: 100 }, null).paused).toBe(true);
-  });
-
-  test("exactly ten percent is not more than ten percent", () => {
-    expect(standingOf({ rejected: 10, decided: 100 }, null).paused).toBe(false);
-    expect(standingOf({ rejected: 11, decided: 110 }, null).paused).toBe(false);
-    expect(standingOf({ rejected: 12, decided: 110 }, null).paused).toBe(true);
-  });
-
-  test("no decided pull requests is never a pause", () => {
-    expect(standingOf({ rejected: 0, decided: 0 }, null).paused).toBe(false);
-  });
-
-  test("a maintainer's decision wins in both directions", () => {
-    expect(standingOf({ rejected: 50, decided: 50 }, "allow").paused).toBe(false);
-    expect(standingOf({ rejected: 0, decided: 0 }, "block")).toEqual({
-      paused: true,
-      because: "maintainer",
-    });
-  });
-});
-
-describe("rate caps", () => {
-  test("a stranger gets a small hourly allowance, a collaborator a large one", () => {
-    expect(hourlyCapFor("COLLABORATOR")).toBe(HOURLY_REVIEW_CAP.trusted);
-    expect(hourlyCapFor("OWNER")).toBe(HOURLY_REVIEW_CAP.trusted);
-    expect(hourlyCapFor("NONE")).toBe(HOURLY_REVIEW_CAP.other);
-    expect(hourlyCapFor("FIRST_TIME_CONTRIBUTOR")).toBe(HOURLY_REVIEW_CAP.other);
-    expect(hourlyCapFor(null)).toBe(HOURLY_REVIEW_CAP.other);
-  });
-
-  test("the daily ceiling is finite", () => {
-    expect(Number.isSafeInteger(DAILY_REVIEW_CAP)).toBe(true);
-    expect(DAILY_REVIEW_CAP).toBeGreaterThan(0);
+  test("an allow only lifts a block: it is the standing of someone with no decision", () => {
+    expect(standingOf("allow")).toEqual(standingOf(null));
   });
 });
 
@@ -1055,10 +1041,19 @@ describe("closed lists the SQL and the code share", () => {
     expect([...OVERRIDE_MODES]).toEqual(["allow", "block"]);
   });
 
-  test("a contributor has a daily allowance as well as an hourly one", () => {
-    expect(dailyAuthorCapFor("COLLABORATOR")).toBe(DAILY_AUTHOR_CAP.trusted);
-    expect(dailyAuthorCapFor("NONE")).toBe(DAILY_AUTHOR_CAP.other);
-    expect(DAILY_AUTHOR_CAP.other).toBeLessThan(DAILY_AUTHOR_CAP.trusted);
+  test("the decline words are two lists, the one produced today and the historical one, and together every stored word", () => {
+    expect([...PRODUCED_DECLINE_REASONS]).toEqual(["contributor_paused"]);
+    expect([...HISTORICAL_DECLINE_REASONS]).toEqual(["rate_limited", "daily_limit"]);
+    expect([...DECLINE_REASONS]).toEqual([
+      ...PRODUCED_DECLINE_REASONS,
+      ...HISTORICAL_DECLINE_REASONS,
+    ]);
+    // No word is on both lists, so a word that is no longer produced cannot be mistaken for one that is.
+    expect(
+      PRODUCED_DECLINE_REASONS.filter((w) =>
+        (HISTORICAL_DECLINE_REASONS as readonly string[]).includes(w),
+      ),
+    ).toEqual([]);
   });
 });
 
@@ -1230,26 +1225,5 @@ describe("the check shows what the facts left of an answer, not what the model s
     expect(r.criteria.advances_revision).toBe("pass");
     expect(text).toMatch(/The revision advances[^\n]*\bNo\b/);
     expect(text).not.toMatch(/The revision advances[^\n]*\bYes\b/);
-  });
-});
-
-describe("who counts as trusted, as numbers", () => {
-  test.each([
-    ["OWNER", 20, 100],
-    ["MEMBER", 20, 100],
-    ["COLLABORATOR", 20, 100],
-    ["CONTRIBUTOR", 3, 6],
-    ["FIRST_TIME_CONTRIBUTOR", 3, 6],
-    ["NONE", 3, 6],
-    ["", 3, 6],
-    [null, 3, 6],
-    [undefined, 3, 6],
-  ])("%j gets %d an hour and %d a day", (assoc, hourly, daily) => {
-    expect(hourlyCapFor(assoc as string | null | undefined)).toBe(hourly);
-    expect(dailyAuthorCapFor(assoc as string | null | undefined)).toBe(daily);
-  });
-
-  test("the platform's daily ceiling is 400", () => {
-    expect(DAILY_REVIEW_CAP).toBe(400);
   });
 });

@@ -7,7 +7,11 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import type { ContributorStanding, QueueEntry } from "../shared/contract/pr-review-admin";
+import type {
+  ContributorStanding,
+  QueueEntry,
+  VolumeWindow,
+} from "../shared/contract/pr-review-admin";
 import {
   ageOf,
   plain,
@@ -16,6 +20,7 @@ import {
   standingLines,
   terminalize,
   verdictText,
+  volumeLines,
 } from "../src/commands/admin-pr-reviews";
 
 const ESC = String.fromCharCode(27);
@@ -59,8 +64,6 @@ function standing(over: Partial<ContributorStanding> = {}): ContributorStanding 
     tally: { rejected: 0, decided: 0 },
     override: null,
     standing: { paused: false },
-    by_record: { paused: false },
-    thresholds: { rejected_more_than: 5, percent_more_than: 10 },
     recent: [],
     resolved_from: "github",
     ...over,
@@ -223,7 +226,6 @@ describe("standingLines", () => {
           set_by: HOSTILE,
         },
         standing: { paused: true, because: "maintainer" },
-        by_record: { paused: true, because: "tally" },
         recent: [
           {
             dataset_id: HOSTILE,
@@ -236,21 +238,53 @@ describe("standingLines", () => {
       }),
     ).map((l) => l.replace(ANSI, ""));
     for (const l of lines) expect(DANGEROUS.test(l)).toBe(false);
-    // 6 of 59 is 10.17%: "10%" would sit beside "more than 10%" and read as not exceeding it.
+    // 6 of 59 is 10.17%: shown as "10%" it would read as a round number it is not.
     expect(lines.join("\n")).toContain("6 of 59 decided pull requests rejected (10.2%)");
   });
 
-  test("says what the record alone would do beside an allow, from the server's own answer", () => {
-    const text = standingLines(
+  test("a record of rejections is information, and a block is the only thing that pauses", () => {
+    const record = standingLines(standing({ tally: { rejected: 9, decided: 10 } }))
+      .map((l) => l.replace(ANSI, ""))
+      .join("\n");
+    expect(record).toContain("9 of 10 decided pull requests rejected (90.0%)");
+    expect(record).toContain("does not pause anyone's reviews, only a block does");
+    expect(record).toContain("not paused: reviewed automatically");
+    expect(record).toContain("Decision:  none");
+    // The rule that used to pause on this record is not described, and the limits are not mentioned.
+    expect(record).not.toContain("MORE than");
+    expect(record).not.toContain("rate limit");
+
+    const blocked = standingLines(
       standing({
-        override: { mode: "allow", reason: null, set_at: "2026-10-01", set_by: "queueadmin" },
-        by_record: { paused: true, because: "tally" },
+        override: { mode: "block", reason: null, set_at: "2026-10-01", set_by: "queueadmin" },
+        standing: { paused: true, because: "maintainer" },
       }),
     )
       .map((l) => l.replace(ANSI, ""))
       .join("\n");
-    expect(text).toContain("the record alone would pause them; the decision wins");
-    expect(text).toContain("not paused: reviewed automatically, within the rate limits");
+    expect(blocked).toContain("blocked by queueadmin on 2026-10-01");
+    expect(blocked).toContain(
+      "paused by an administrator's block: their pull requests need a person",
+    );
+
+    const allowed = standingLines(
+      standing({
+        override: { mode: "allow", reason: null, set_at: "2026-10-01", set_by: "queueadmin" },
+      }),
+    )
+      .map((l) => l.replace(ANSI, ""))
+      .join("\n");
+    expect(allowed).toContain("allowed by queueadmin on 2026-10-01");
+    expect(allowed).toContain("not paused: reviewed automatically");
+  });
+
+  test("a pause this CLI does not know the cause of is a plain pause, never called a block", () => {
+    // An older Worker still pauses by the contributor's record, and says so as `tally`.
+    const text = standingLines(standing({ standing: { paused: true, because: "tally" } as never }))
+      .map((l) => l.replace(ANSI, ""))
+      .join("\n");
+    expect(text).toContain("paused: their pull requests need a person");
+    expect(text).not.toContain("administrator's block");
   });
 
   test("says an owner or administrator is exempt whatever is decided, so a block or an allow is not misread", () => {
@@ -273,6 +307,141 @@ describe("standingLines", () => {
   test("says where an identity came from when GitHub was not asked", () => {
     const text = standingLines(standing({ resolved_from: "history" })).join("\n");
     expect(text).toContain("from the Worker's records");
+  });
+});
+
+describe("volumeLines", () => {
+  const window = (over: Partial<VolumeWindow> = {}): VolumeWindow => ({
+    reviews: 14,
+    model_calls: 9,
+    by_verdict: {
+      pass: 5,
+      fail: 4,
+      uncertain: 0,
+      could_not_decide: 1,
+      in_progress: 0,
+      not_reviewed: 4,
+    },
+    declines: { contributor_paused: 1, rate_limited: 1, daily_limit: 2 },
+    ...over,
+  });
+  const text = (lines: string[]) => lines.map((l) => l.replace(ANSI, ""));
+
+  test("says in a sentence for each window what was recorded, what it cost and what it came to", () => {
+    const lines = text(
+      volumeLines({
+        last_24_hours: window({
+          reviews: 1,
+          model_calls: 1,
+          by_verdict: {
+            ...window().by_verdict,
+            pass: 1,
+            fail: 0,
+            could_not_decide: 0,
+            not_reviewed: 0,
+          },
+          declines: { contributor_paused: 0, rate_limited: 0, daily_limit: 0 },
+        }),
+        last_7_days: window(),
+      }),
+    );
+    expect(lines).toEqual([
+      "Review volume, for information only (no count limits reviews):",
+      "  Last 24 hours: 1 review recorded, 1 model call; 1 pass.",
+      "  Last 7 days:   14 reviews recorded, 9 model calls; 5 pass, 4 fail, 1 could not decide, 4 not reviewed (1 contributor paused, 1 rate limited, 2 daily limit).",
+    ]);
+  });
+
+  test("a window with nothing in it says so, and a count of zero is not left out of a real one", () => {
+    const quiet = window({
+      reviews: 0,
+      model_calls: 0,
+      by_verdict: {
+        pass: 0,
+        fail: 0,
+        uncertain: 0,
+        could_not_decide: 0,
+        in_progress: 0,
+        not_reviewed: 0,
+      },
+      declines: { contributor_paused: 0, rate_limited: 0, daily_limit: 0 },
+    });
+    const lines = text(volumeLines({ last_24_hours: quiet, last_7_days: window() }));
+    expect(lines[1]).toBe("  Last 24 hours: no reviews recorded.");
+    expect(lines[2]).toContain("14 reviews recorded");
+  });
+
+  test("a volume that could not be read is said, and an older server that sent none is not made to look empty", () => {
+    expect(text(volumeLines(null))).toEqual(["The review volume could not be read this time."]);
+    expect(volumeLines(undefined)).toEqual([]);
+  });
+
+  test("a count that is not a whole number is a question mark and never a zero", () => {
+    const broken = window({
+      by_verdict: { ...window().by_verdict, pass: Number.NaN, fail: -3 },
+    });
+    const lines = text(
+      volumeLines({ last_24_hours: broken, last_7_days: window({ reviews: 1.5 }) }),
+    );
+    expect(lines[1]).toContain("? pass, ? fail");
+    // A window whose own totals cannot be read is not guessed at.
+    expect(lines[2]).toBe("  Last 7 days:   could not be read.");
+  });
+
+  test("a breakdown the server did not send is said to be missing, and is never read as nothing", () => {
+    const noBreakdown = text(
+      volumeLines({
+        last_24_hours: window({ by_verdict: null as never }),
+        last_7_days: window({ by_verdict: undefined as never }),
+      }),
+    );
+    expect(noBreakdown[1]).toBe(
+      "  Last 24 hours: 14 reviews recorded, 9 model calls; what they came to could not be read.",
+    );
+    expect(noBreakdown[2]).toContain("what they came to could not be read");
+
+    // A word every server sends and this one did not: a question mark, not a zero and not nothing.
+    const { in_progress: _missing, ...rest } = window().by_verdict;
+    const lines = text(
+      volumeLines({
+        last_24_hours: window({ by_verdict: rest as never }),
+        last_7_days: window(),
+      }),
+    );
+    expect(lines[1]).toContain("? in progress");
+    expect(lines[2]).not.toContain("in progress");
+
+    // Not reviewed with no reasons sent: the reasons are said to be missing, not left out.
+    const noReasons = text(
+      volumeLines({
+        last_24_hours: window({ declines: undefined as never }),
+        last_7_days: window({ declines: null as never }),
+      }),
+    );
+    expect(noReasons[1]).toContain("4 not reviewed (reasons could not be read)");
+    expect(noReasons[2]).toContain("4 not reviewed (reasons could not be read)");
+  });
+
+  test("a word a newer server adds is shown as itself, cleaned, after the ones this version knows", () => {
+    const lines = text(
+      volumeLines({
+        last_24_hours: window({
+          by_verdict: { ...window().by_verdict, [`brilliant${HOSTILE}`]: 2 } as never,
+          declines: { ...window().declines, [`odd_reason${HOSTILE}`]: 1 } as never,
+        }),
+        last_7_days: window(),
+      }),
+    );
+    for (const l of lines) expect(DANGEROUS.test(l)).toBe(false);
+    expect(lines[1]).toContain("4 not reviewed (");
+    expect(lines[1]).toMatch(/, 2 brilliant\[2J\]0;titlexyzw$|, 2 brilliant\[2J\]0;titlexyzw\.$/);
+  });
+
+  test("no line is JSON, a hash or an escaped string: only counts, the list's own words and punctuation", () => {
+    const lines = text(volumeLines({ last_24_hours: window(), last_7_days: window() }));
+    for (const l of lines) {
+      expect(l).not.toMatch(/[{}"\\]|\b[0-9a-f]{12,}\b|\\u|_/);
+    }
   });
 });
 

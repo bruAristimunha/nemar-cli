@@ -460,6 +460,7 @@ describe("nemar admin pr-reviews (list)", () => {
       truncated: true,
       skipped: { not_a_dataset: 0, not_owned_here: 0, unreadable: 2 },
       filters: { verdicts: [], dataset: null, author: null, needs_me: false },
+      volume: null,
     };
     apiOverride = (req) =>
       new URL(req.url).pathname === "/admin/pr-reviews" ? Response.json(queue) : null;
@@ -475,6 +476,77 @@ describe("nemar admin pr-reviews (list)", () => {
     expect(r.exitCode).toBe(1);
     expect(r.stdout).toBe("");
     expect(r.stderr).toContain("Not authenticated");
+  });
+
+  describe("the review volume", () => {
+    const hoursAgo = (h: number) =>
+      new Date(Date.now() - h * 3_600_000).toISOString().slice(0, 19).replace("T", " ");
+
+    /** Four records in the last day (one a decline) and one three days ago. */
+    function seedVolume() {
+      nodes({ ds: "nm000203", n: 4, author: "carol", authorId: 44 });
+      const at = (n: number, hours: number, r: Omit<Parameters<typeof seed>[0], "ds" | "n">) =>
+        seed({ ds: "nm000301", n, authorId: 42, login: "alice", createdAt: hoursAgo(hours), ...r });
+      at(1, 1, { state: "reported", verdict: "pass" });
+      at(2, 1, { state: "reported", verdict: "pass" });
+      at(3, 1, { state: "reported", verdict: "fail" });
+      at(4, 1, { state: "declined", detail: "contributor_paused" });
+      at(5, 72, { state: "reported", verdict: "pass" });
+    }
+
+    test("is printed after the list, in sentences, and says it is only information", async () => {
+      seedVolume();
+      const r = await cli(PR);
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout).toContain(
+        [
+          "Review volume, for information only (no count limits reviews):",
+          "  Last 24 hours: 4 reviews recorded, 3 model calls; 2 pass, 1 fail, 1 not reviewed (1 contributor paused).",
+          "  Last 7 days:   5 reviews recorded, 4 model calls; 3 pass, 1 fail, 1 not reviewed (1 contributor paused).",
+        ].join("\n"),
+      );
+      // Sentences, not a dump: no JSON, no quoted keys, no underscored words.
+      const block = r.stdout.slice(r.stdout.indexOf("Review volume"));
+      expect(block).not.toMatch(/[{}"]|_/);
+    });
+
+    test("is in the --json answer as counts, and the list still prints without it being asked", async () => {
+      seedVolume();
+      const q = JSON.parse((await cli([...PR, "--json"])).stdout) as QueueResponse;
+      expect(q.volume?.last_24_hours).toMatchObject({
+        reviews: 4,
+        model_calls: 3,
+        by_verdict: { pass: 2, fail: 1, not_reviewed: 1 },
+        declines: { contributor_paused: 1, rate_limited: 0, daily_limit: 0 },
+      });
+      expect(q.volume?.last_7_days.reviews).toBe(5);
+    });
+
+    test("says when the Worker could not read it, and prints nothing for a server that sends none", async () => {
+      const base: QueueResponse = {
+        environment: "production",
+        review_enabled: true,
+        entries: [],
+        total_open: 0,
+        truncated: false,
+        skipped: { not_a_dataset: 0, not_owned_here: 0, unreadable: 0 },
+        filters: { verdicts: [], dataset: null, author: null, needs_me: false },
+        volume: null,
+      };
+      apiOverride = (req) =>
+        new URL(req.url).pathname === "/admin/pr-reviews" ? Response.json(base) : null;
+      const unread = await cli(PR);
+      expect(unread.exitCode).toBe(0);
+      expect(unread.stdout).toContain("The review volume could not be read this time.");
+
+      const { volume: _unsent, ...older } = base;
+      apiOverride = (req) =>
+        new URL(req.url).pathname === "/admin/pr-reviews" ? Response.json(older) : null;
+      const none = await cli(PR);
+      expect(none.exitCode).toBe(0);
+      expect(none.stdout).not.toContain("Review volume");
+      expect(none.stdout).not.toContain("could not be read this time");
+    });
   });
 
   test("a hostile title, branch or login cannot put a control sequence on the terminal", async () => {
@@ -647,7 +719,9 @@ describe("nemar admin pr-reviews show", () => {
     });
     const r = await cli([...PR, "show", "nm000201", "7"]);
     expect(r.stdout).toContain("Not reviewed");
-    expect(r.stdout).toContain("Automated review is paused for this contributor");
+    expect(r.stdout).toContain(
+      "Automated review was paused for this contributor when this commit arrived",
+    );
   });
 
   test("--json is the raw detail", async () => {
@@ -708,25 +782,28 @@ describe("who is reviewed", () => {
     }
   }
 
-  test("standing shows the record, the rule, and what it means", async () => {
+  test("standing shows the record as information, and says nothing pauses on it", async () => {
     gh.users.alice = { id: 77, login: "alice", type: "User" };
     seedRecord(6, 4);
     const r = await cli([...PR, "standing", "alice"]);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("6 of 10 decided pull requests rejected (60.0%)");
-    expect(r.stdout).toContain("MORE than 5 are rejected AND more than 10%");
-    expect(r.stdout).toContain("paused by the record");
-    expect(r.stdout).toContain("Decision:  none, the record decides");
+    expect(r.stdout).toContain("does not pause anyone's reviews, only a block does");
+    expect(r.stdout).toContain("not paused: reviewed automatically");
+    expect(r.stdout).toContain("Decision:  none");
+    // The rule that used to pause on this record is not described any more.
+    expect(r.stdout).not.toContain("MORE than");
+    expect(r.stdout).not.toContain("paused by the record");
   });
 
-  test("allow lifts a pause, says that the record alone would pause them, and clear hands it back", async () => {
+  test("allow lifts a block and says so, and clear removes the decision", async () => {
     gh.users.alice = { id: 77, login: "alice", type: "User" };
     seedRecord(6, 4);
+    expect((await cli([...PR, "block", "alice"])).exitCode).toBe(0);
     const allow = await cli([...PR, "allow", "alice", "--reason", "Vetted by hand"]);
     expect(allow.exitCode).toBe(0);
     expect(allow.stdout).toContain("Allowed alice");
     expect(allow.stdout).toContain("reviewed automatically");
-    expect(allow.stdout).toContain("the record alone would pause them; the decision wins");
     expect(allow.stdout).toContain("by queueadmin");
     expect(allow.stdout).toContain("Vetted by hand");
     expect(allow.stdout).toContain("not re-reviewed until their next push");
@@ -736,19 +813,19 @@ describe("who is reviewed", () => {
 
     const clear = await cli([...PR, "clear", "alice"]);
     expect(clear.stdout).toContain("Removed the allow for alice");
-    expect(clear.stdout).toContain("paused by the record");
+    expect(clear.stdout).toContain("reviewed automatically");
     expect(db.query("SELECT COUNT(*) AS n FROM pr_review_overrides").get()).toEqual({ n: 0 });
 
     const again = await cli([...PR, "clear", "alice"]);
     expect(again.stdout).toContain("had no allow or block");
   });
 
-  test("block pauses a contributor the record would not", async () => {
+  test("block pauses a contributor, and says an administrator did", async () => {
     gh.users.dave = { id: 88, login: "dave", type: "User" };
     const r = await cli([...PR, "block", "@dave", "--reason", "Spam"]);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("Blocked dave");
-    expect(r.stdout).toContain("paused by a maintainer");
+    expect(r.stdout).toContain("paused by an administrator's block");
     // "Not re-reviewed" means nothing for a contributor who is not reviewed at all.
     expect(r.stdout).not.toContain("re-reviewed");
     expect(db.query("SELECT mode, author_id FROM pr_review_overrides").get()).toEqual({
@@ -1203,7 +1280,7 @@ describe("nemar admin pr-reviews approve", () => {
     const r = await approve();
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("not reviewed (contributor paused)");
-    expect(r.stdout).toContain("not reviewed automatically (paused by a maintainer)");
+    expect(r.stdout).toContain("not reviewed automatically (paused by an administrator's block)");
   });
 
   describe("merging", () => {
@@ -1942,6 +2019,7 @@ describe("nemar admin pr-reviews next", () => {
       truncated: true,
       skipped: { not_a_dataset: 0, not_owned_here: 0, unreadable: 0 },
       filters: { verdicts: [], dataset: null, author: null, needs_me: true },
+      volume: null,
     };
     apiOverride = (req) =>
       new URL(req.url).pathname === "/admin/pr-reviews" ? Response.json(queue) : null;
@@ -2288,6 +2366,7 @@ describe("nemar admin pr-reviews next", () => {
       truncated: true,
       skipped: { not_a_dataset: 0, not_owned_here: 0, unreadable: 0 },
       filters: { verdicts: [], dataset: null, author: null, needs_me: true },
+      volume: null,
     };
     apiOverride = (req) =>
       new URL(req.url).pathname === "/admin/pr-reviews" ? Response.json(queue) : null;

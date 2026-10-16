@@ -6,13 +6,12 @@
  * request comes from the caller: the Worker reads it from GitHub with the datasets token, shapes it
  * as the `pull_request` delivery it would have been, and hands it to the one gate every delivery
  * goes through (`handlePullRequestEvent`). So the flag, the "public, named, first-published"
- * test, the per-commit dedupe, the contributor pause and the platform's daily pool all apply
- * exactly as they would to a delivery, and so does the exemption: a pull request opened by an owner
- * or administrator is answered `exempt_author` and gets the `skipped` check, and nothing is started
- * for it (ADR 0107), unless a review has already touched its current commit, which is then handled
- * like anyone's. Two things differ, and both are the administrator's choice made by name: the
- * per-contributor allowances do not hold the review back, and a commit whose review ended without a
- * verdict (declined, errored, never reported) is started again.
+ * test, the per-commit dedupe and the contributor pause all apply exactly as they would to a
+ * delivery, and so does the exemption: a pull request opened by an owner or administrator is
+ * answered `exempt_author` and gets the `skipped` check, and nothing is started for it (ADR 0107),
+ * unless a review has already touched its current commit, which is then handled like anyone's. One
+ * thing differs, and it is the administrator's choice made by name: a commit whose review ended
+ * without a verdict (declined, errored, never reported) is started again.
  *
  * Nothing here approves, merges or comments on a pull request itself; the review's own check and
  * comment are published by the same code that publishes them for a delivery.

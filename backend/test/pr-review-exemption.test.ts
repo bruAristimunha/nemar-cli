@@ -4,8 +4,8 @@
  * `isReviewExempt` is asked about a GitHub login. The accounts answer first, so the tests seed real
  * accounts into the real schema (bun:sqlite behind realD1, every migration applied) and ask; GitHub
  * answers second, as a `Bun.serve()` stand-in for api.github.com. The callers that act on the
- * answer (the webhook, the allowance check, the admin queue) are exercised through their own entry
- * points in `pr-review-flow.test.ts` and `pr-review-queue.test.ts`.
+ * answer (the review gate, the admin queue) are exercised through their own entry points in
+ * `pr-review-flow.test.ts` and `pr-review-queue.test.ts`.
  */
 
 import type { Database } from "bun:sqlite";
@@ -15,7 +15,6 @@ import { join } from "node:path";
 import type { Server } from "bun";
 import { ACCOUNT_KIND_VALUES } from "../../shared/contract/user";
 import {
-  type AdminAnswers,
   REVIEW_EXEMPT_KINDS,
   REVIEW_EXEMPT_ROLES,
   REVIEW_EXEMPT_SQL,
@@ -303,30 +302,16 @@ describe("GitHub has to agree", () => {
     }
   });
 
-  test("one delivery asks GitHub once per login and repository, however many questions it asks", async () => {
+  test("nothing is remembered between calls: GitHub is asked each time, and a demotion is seen at once", async () => {
     admin();
-    const answers: AdminAnswers = new Map();
     const who = { login: "Admin-GH", repo: REPO };
-    expect(await isReviewExempt(env(), who, answers)).toBe(true);
-    expect(await isReviewExempt(env(), who, answers)).toBe(true);
-    // Case does not make it a second question, and another repository is one.
-    expect(await isReviewExempt(env(), { ...who, login: "admin-gh" }, answers)).toBe(true);
-    expect(asked).toHaveLength(1);
-    expect(await isReviewExempt(env(), { ...who, repo: "nm000461" }, answers)).toBe(true);
-    expect(asked).toHaveLength(2);
-    // Without the memory every question is asked.
     expect(await isReviewExempt(env(), who)).toBe(true);
-    expect(asked).toHaveLength(3);
-  });
-
-  test("only GitHub's half is remembered: the accounts are read again, so a demotion is seen", async () => {
-    admin();
-    const answers: AdminAnswers = new Map();
-    const who = { login: "Admin-GH", repo: REPO };
-    expect(await isReviewExempt(env(), who, answers)).toBe(true);
+    expect(await isReviewExempt(env(), who)).toBe(true);
+    expect(asked).toHaveLength(2);
     db.run("UPDATE users SET role = 'member' WHERE github_username = 'Admin-GH'");
-    expect(await isReviewExempt(env(), who, answers)).toBe(false);
-    expect(asked).toHaveLength(1);
+    expect(await isReviewExempt(env(), who)).toBe(false);
+    // The accounts said no, so GitHub was not asked a third time.
+    expect(asked).toHaveLength(2);
   });
 
   test("a GitHub that does not answer in time is not exempt", async () => {

@@ -11,8 +11,9 @@ The Worker as the gate, the per-commit row, the one-shot claim, the derived verd
 Follows ADR 0048 (account kinds), ADR 0053 and ADR 0086 (unknown is never clear), ADR 0020 (a workflow edit reaches ~785 repositories at once).
 
 This ADR records the decisions of epic #1813.
-The first phase (#1814) builds the exemption, the `exempt` queue verdict and their CLI wording, which is the only part of this ADR the code does so far.
-The rest is decided here and built by the later phases; until they ship, the caps, the tally pause and the three-question review of ADR 0092 are what runs.
+Two phases are built so far: the exemption with the `exempt` queue verdict and its CLI wording (#1814), and the removal of the counts, which is the caps, the platform's pool and the automatic tally pause, with a volume line in the admin list (#1815).
+The rest is decided here and built by the later phases; until they ship, the three-question review of ADR 0092 is what runs.
+The removal of the counts is released only together with the stage-1 screen, so that spend is never left without a bound.
 
 ## Context
 
@@ -57,12 +58,12 @@ And the review only ever sees a pull request's text and metadata, so a count of 
   The owner confirmed this check for a push, and on 2026-10-16 confirmed applying it to every action.
 - **An exempt pull request gets one completed `skipped` check and no review.**
   The title says the review is not required for an owner or administrator, and the text says skipped is not a pass.
-  No row is stored, no model is called, no allowance is spent, nothing is dispatched, and no comment is made.
+  No row is stored, no model is called, nothing is dispatched, and no comment is made.
 - **That applies only to a commit no review has touched.**
   A commit that has a row keeps what its review said, whoever acts on it next: the author reopening the pull request, a force-push back to it, or an administrator's start.
   A row means someone put the commit through review (a stranger's push to an owner's branch, or an author who was not exempt yet), `skipped` counts as passing for a required check, and writing it over a failed or undecided review would erase a verdict nobody exempt gave.
   An exempt author who wants such a commit through pushes a new commit, which is exempt in its own right.
-  An administrator's start of such a commit, and an exempt author's own redelivery of one whose dispatch failed, are handled like anyone's: a review is started again if the earlier one ended without a verdict, a block on the author holds it back, and no allowance or platform pool does, because none is held against an exempt actor.
+  An administrator's start of such a commit, and an exempt author's own redelivery of one whose dispatch failed, are handled like anyone's: a review is started again if the earlier one ended without a verdict, and a block on the author holds it back.
 - **`skipped` does not break "unknown is never green" (ADR 0092, ADR 0053, ADR 0086).**
   GitHub counts `skipped` as passing for a required check, which is why ADR 0092 kept it out of `conclusionOf`.
   It is now the conclusion of exactly one outcome, `exempt`, and of no other, and a test pins that.
@@ -74,12 +75,20 @@ And the review only ever sees a pull request's text and metadata, so a count of 
 - **The per-author hourly and daily allowances and the platform's daily pool are removed as reasons to decline a pull request.**
   A stage-1 screen (below) bounds the cost of spam instead, and an Anthropic workspace spend limit is the hard backstop.
   The historical words `rate_limited` and `daily_limit` stay readable in stored rows and are never produced again; no migration.
+  A stored row with one of them renders as "Not reviewed" with a sentence that says the limit no longer exists and what to do now: push a new commit, or ask an administrator to start the review.
+  `start --all` no longer stops when a daily pool is spent, and its JSON no longer carries `not_tried`.
 - **An administrator's explicit `block` still declines, and `allow` only clears a block.**
-  The tally stays as information in `standing` and in the queue.
+  The tally stays as information in `standing`.
   A delivery is judged in this order: exempt, then a block, then the review.
   A block on an owner's or administrator's account therefore changes nothing for a commit no review has touched, and a restart of a review already on record is held to the block like anyone's.
 - **The automatic tally pause (more than 5 rejected and more than 10 percent) is removed.**
-  The owner confirmed this; the code keeps the pause until phase P2 removes it.
+  The owner confirmed this, and phase P2 removed it.
+  `contributor_paused` is still the word a block writes.
+  Rows written while the pause was automatic hold the same word, so its copy does not say who paused the contributor.
+  The standing answer no longer carries `by_record` or `thresholds`, which described the rule that is gone.
+- **The admin list carries a volume line.**
+  For the last 24 hours and the last 7 days it gives the review records created, the model calls they cost (the sum of their attempts, leaving out a decline and a run that never reached the model), what they came to, and the declined ones by reason word.
+  It informs and never blocks: nothing reads it to decide whether a pull request is reviewed, and a volume that could not be read is said so and is never shown as zero.
 
 ### 3. Two model calls, at the highest effort Haiku 5.5 offers
 
@@ -132,7 +141,7 @@ And the review only ever sees a pull request's text and metadata, so a count of 
 - **ADR 0092, "The check is not required by any ruleset yet", and the Consequences that lean on it** ("acceptable only because the check is not required", "This is why the check is not required", "only matter once the check is required"): the check is required on reviewable datasets, and the risk that a model's false green lets a maintainer merge is accepted, bounded by facts, calibration and re-review on edit.
 - **ADR 0092, the accepted risks "Many new accounts" and "Padding the tally":** replaced by the stage-1 cost bound and the workspace spend limit.
 - **ADR 0092, the amendment of 2026-10-10:** the allowances and the pool (and so `start --all` stopping when the daily pool is spent), and "A new delivery of the same commit still restarts nothing but a dispatch GitHub did not run", which now has one more exception, an edit.
-- **ADR 0093:** `allow` lifting the tally's pause (it will only clear a block); the queue verdicts gain `exempt` (built in phase P1); the two required checks it reads are joined by the review where its ruleset exists; and the `blocked` refusal, whose rule is unchanged, names the review.
+- **ADR 0093:** `allow` lifting the tally's pause (it now only clears a block); the queue verdicts gain `exempt` (built in phase P1); the two required checks it reads are joined by the review where its ruleset exists; and the `blocked` refusal, whose rule is unchanged, names the review.
 
 ## Consequences
 
@@ -159,6 +168,13 @@ And the review only ever sees a pull request's text and metadata, so a count of 
   It reads `CONTRIBUTOR` for a private organization member, so neither the exemption nor the screen uses it.
 - **The cross-check costs one GitHub call per role-matched account on a delivery** (two when someone other than the author caused it; one delivery asks about each account once), each bounded to a few seconds.
   An admin queue request asks once per exempt author and dataset, a few at a time and within 20 seconds, and a pull request whose lookup did not run in time is listed as not exempt.
+- **An installed CLI older than this change cannot read the standing answer.**
+  It reads `thresholds`, which is gone, so `standing` and `show` fail, and `allow`, `block` and `clear` report a failure after the Worker has stored the change.
+  A newer CLI against an older Worker shows a pause by the record as a plain pause and not as a block.
+  The package publish and the Worker deploy are separate workflows, within minutes of each other, in either order (CHANGELOG, Deploy coupling), so either skew can happen for a few minutes.
+  Both are administrators' tools, the Worker itself is unaffected, and the remedy is to upgrade the CLI; the two fields are not kept, because they would describe a rule that no longer exists.
+- **Until the screen ships, nothing bounds spend but the workspace limit.**
+  Phase P2 removes the counts and phase P3 adds the screen, so the epic's branch must not be released with the first and without the second.
 - **Without caps, cost is bounded by the screen and the spend limit.**
   One account pushing every minute to a pull request that passes stage 1 could cost up to about $70 a day at $0.10 and $0.50 per million input and output tokens (the planning pass's estimate, which assumes prompts under 100,000 tokens: above that the price is five times higher, and the review's input caps keep it below).
   Spam that fails stage 1 costs under one cent a pull request.
@@ -181,7 +197,9 @@ And the review only ever sees a pull request's text and metadata, so a count of 
 
 ## Receipts
 
-- Epic #1813 and its first phase #1814.
+- Epic #1813 and its first two phases, #1814 and #1815.
 - Exemption: `backend/src/services/pr-review-exemption.ts`, `backend/src/services/pr-review.ts` (`isExemptDelivery`, `publishExempt`), `shared/pr-review.ts` (`exempt`, `skipped`).
+- The gate and the removal of the counts (#1815): `backend/src/services/pr-review.ts` (`gateDecision`: exempt, then blocked, then reviewed), `shared/pr-review.ts` (`PRODUCED_DECLINE_REASONS`, `HISTORICAL_DECLINE_REASONS`, `standingOf`).
+- The volume line: `backend/src/services/pr-review-queue.ts` (`readVolume`), `shared/contract/pr-review-admin.ts` (`QueueVolume`), `src/commands/admin-pr-reviews.ts` (`volumeLines`).
 - Queue and labels: `backend/src/services/pr-review-queue.ts`, `shared/contract/pr-review-admin.ts`, `src/commands/admin-pr-reviews.ts`.
 - Tests: `backend/test/pr-review-exemption.test.ts`, `backend/test/pr-review-flow.test.ts`, `backend/test/pr-review-queue.test.ts`, `backend/test/pr-review-start.test.ts`, `test/pr-review.test.ts`, `test/admin-pr-reviews-cli.test.ts`.

@@ -321,7 +321,26 @@ describe("reading the review the API sent", () => {
       SHA_A,
     );
     expect(r).toMatchObject({ ok: true, detail: "contributor_paused" });
-    if (r.ok) expect(r.contributorNote).toContain("paused by a maintainer");
+    if (r.ok) expect(r.contributorNote).toContain("paused by an administrator's block");
+  });
+
+  test("a pause whose cause this CLI does not know is a plain pause, not a block", () => {
+    const r = reviewForApproval(
+      {
+        ...good,
+        verdict: "not_reviewed",
+        detail: "contributor_paused",
+        review_current: null,
+        author: { standing: { paused: true, because: "tally" } },
+      },
+      SHA_A,
+    );
+    expect(r).toMatchObject({ ok: true });
+    if (r.ok) {
+      expect(r.contributorNote).toBe(
+        "The contributor's pull requests are not reviewed automatically (paused).",
+      );
+    }
   });
 
   test("anything that cannot be read as an answer about THIS commit is unread, which needs --force", () => {
