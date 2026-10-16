@@ -190,11 +190,11 @@
 # `CorruptFileError` (`corrupt_or_truncated`) on both the in-memory and the
 # streaming path, where it used to read with the tail dropped. Through
 # `Recording.from_file` a FIF file truncated in its data is typed
-# `corrupt_or_truncated` too, but the streaming export still raises a bare
-# `ValueError` for it (biosigio#161), which the converter reads as uncoded, so a
-# streamed truncated FIF is still retried until `retry_exhausted`. Which codes are
-# retried is `RETRYABLE_CODES` in generate_zarr.py. ZARR_ENGINE_VERSION is NOT
-# bumped here either (ADR 0033).
+# `corrupt_or_truncated` too. The streaming export still raises a bare
+# `ValueError` for a truncated FIF (biosigio#161) and for a truncated KIT `.sqd`
+# or 4D/BTi `config` or `hs_file` (biosigio#168); the converter reads it as
+# uncoded and retries the recording until `retry_exhausted`.
+# ZARR_ENGINE_VERSION is NOT bumped here either (ADR 0033).
 # <1.2.14 is a CAP, not a floor, raised deliberately per release: a biosigIO
 # patch release has changed what a store contains or which recordings convert
 # five times in a row (1.2.9 through 1.2.13), so the next one is read before the
