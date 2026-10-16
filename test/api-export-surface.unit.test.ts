@@ -30,7 +30,7 @@ import { readdirSync } from "node:fs";
 import { join } from "node:path";
 
 const MODULE_EXPORTS: Record<string, string[]> = {
-  errors: ["ApiError", "MaintenanceError", "errorDetail"],
+  errors: ["ApiError", "MaintenanceError", "errorDetail", "isRouteNotFound"],
   client: ["IS_DEV_BUILD", "checkHealth", "getApiUrl", "request"],
   auth: [
     "checkGitHubUsername",
@@ -272,6 +272,7 @@ const POST_SPLIT_ADDITIONS = [
   "startPublicationReview", // ADR 0102: POST /admin/publish/:id/review/start
   "commentOnPublication", // ADR 0102: POST /admin/publish/:id/comment (mails the depositor an administrator's words)
   "reviewErrorCode", // ADR 0102: the closed word of a review route's refusal (rawBody.code, not ApiError.code)
+  "isRouteNotFound", // a backend that predates a route answers its not-found body: say so, do not call it a bug
 ];
 
 /** The api.ts monolith's runtime surface, captured at #908 commit 1. */

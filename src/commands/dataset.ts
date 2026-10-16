@@ -39,6 +39,7 @@ import { LICENSE_TIERS } from "../../shared/license-tiers.js";
 import { MODALITY_FILTER_CLI_HELP } from "../../shared/modality-filter.js";
 import { stepsForRelease } from "../../shared/publication-steps.js";
 import { RangeParseError } from "../../shared/range.js";
+import { isAnswered } from "../lib/admin-command.js";
 import { addCi } from "../lib/api/admin.js";
 import { getCurrentUser } from "../lib/api/auth.js";
 import { requestDownloadCredentials, requestUploadCredentials } from "../lib/api/data.js";
@@ -106,6 +107,7 @@ import {
   updateLastUpload,
   writeLocalConfig,
 } from "../lib/dataset-config.js";
+import { markReportedExit } from "../lib/debug-log.js";
 import {
   FacetEnumCliError,
   RANGE_FORMS_HELP,
@@ -4533,6 +4535,9 @@ Examples:
         // Keyed on the backend's own code, never on its wording: a missing
         // dataset, or a backend without the route, carries no such code.
         const code = withdrawErrorCode(error);
+        // The Worker's refusal, or its 404 for a backend that does not have this route yet, is
+        // the command's answer: exit 1 without the invitation to attach the log to a new issue.
+        if (isAnswered(error)) markReportedExit();
         if (code === "no_active_request") {
           console.log(chalk.dim("  There is no active publication request for this dataset."));
         } else if (code === "withdraw_too_late") {

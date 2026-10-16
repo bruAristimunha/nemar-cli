@@ -335,7 +335,15 @@ describe("how a withdrawal reads", () => {
     try {
       const r = await runCli(["admin", "publish", "list"], server.url);
       expect(r.exitCode).toBe(0);
-      expect(server.queries).toEqual(["?status=requested%2Capproving%2Cblocked"]);
+      // The union first; its empty answer is then confirmed once per active status (a Worker
+      // that cannot take a comma list answers the union with nothing). A withdrawn request is
+      // stored as `denied`, which no question here names.
+      expect(server.queries).toEqual([
+        "?status=requested%2Capproving%2Cblocked",
+        "?status=requested",
+        "?status=approving",
+        "?status=blocked",
+      ]);
       expect(r.stdout).toContain("Use --all to include every state");
     } finally {
       server.stop();

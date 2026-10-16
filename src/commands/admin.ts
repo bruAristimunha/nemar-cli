@@ -50,7 +50,7 @@ import {
   neurobagelVerificationState,
 } from "../../shared/contract/neurobagel-admin.js";
 import { weeklyAttention } from "../../shared/contract/weekly-attention.js";
-import { handleCommandError } from "../lib/admin-command.js";
+import { failWith, handleCommandError } from "../lib/admin-command.js";
 import {
   CLEAR_FLAGS,
   EDIT_FLAG_FIELDS,
@@ -181,7 +181,7 @@ import {
   listDatasets,
   submitEnrichment,
 } from "../lib/api/datasets.js";
-import { ApiError, errorDetail } from "../lib/api/errors.js";
+import { ApiError, errorDetail, isRouteNotFound } from "../lib/api/errors.js";
 import {
   NOTICE_LEVELS,
   type NoticeLevel,
@@ -1375,15 +1375,26 @@ Examples:
       const result = await verifyUserById(id);
       spinner.succeed(result.message);
     } catch (error) {
-      handleCommandError(error, spinner, "Failed to verify the account", {
-        400: "Invalid user id",
-        403: "Owner access required",
-        404: "User not found",
-        409: "Only a pending account can be force-verified",
-      });
-      // handleCommandError only reports. A refused force verify must not exit 0,
-      // or a script that checks the status code reads a refusal as a success.
-      process.exitCode = 1;
+      // A refused force verify must exit 1, or a script that checks the status code reads a
+      // refusal as a success; `failWith` does, and marks the exit as the Worker's answer so no
+      // "attach the log to a new issue" invitation follows it.
+      //
+      // A Worker that predates this command answers 404 for the ROUTE, and "User not found"
+      // under that would blame the id: the sentence the client already printed says the backend
+      // does not support the command yet, and that is all there is to say.
+      failWith(
+        error,
+        spinner,
+        "Failed to verify the account",
+        isRouteNotFound(error)
+          ? undefined
+          : {
+              400: "Invalid user id",
+              403: "Owner access required",
+              404: "User not found",
+              409: "Only a pending account can be force-verified",
+            },
+      );
     }
   });
 

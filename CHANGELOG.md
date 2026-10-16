@@ -150,6 +150,10 @@ The Worker's approval gate reads nothing and passes (`off`), and any review a re
 
 ### Changed
 
+- **`nemar admin publish list --json` now returns only the active requests by default (#1777).**
+  A script that read every request from it, published and denied ones included, now gets `requested`, `approving` and `blocked` ones only, and `--all` restores every request.
+  The shape of the output is the same, and `-s, --status` and the state flags select states as before.
+  The route is unchanged: `GET /admin/publish/requests` without a `status` still returns every request.
 - **Account copy says collaborating needs upload access and a verified email (#1769).**
   The sentences about upload access, and the help of `nemar auth request-upload-access`, now say that being added as a collaborator on someone else's dataset needs the same grant and that the email must be verified first.
   The website transcribes the account copy, and a drift test on each side compares them.
@@ -209,10 +213,21 @@ All three apply on deploy, before the new Worker, and are additive or repairing;
 - **The executor workflow is already on `main`.**
   The change that carries the token through the run (`approve-publication.yml`, the central workflow repository's #136) merged on 2026-10-15, and it does nothing against a Worker that sends no token.
   The review workflow `run-publication-review.yml` (that repository's #137) is on its `main` too, and CI now compares the deployed copy with the authored one byte for byte (#1790).
-- **Publish to npm before the production Worker deploy, or accept a short window.**
-  The executor installs the CLI from npm, and a runner without this release's CLI ignores `NEMAR_APPROVAL_DISPATCH_TOKEN`.
-  The pipeline does not enforce the order.
-  In the window a web approval is recorded under the executor's account and an approval that needed the clicker's recorded acknowledgment or override is refused; nothing is published wrongly, and the audit rows of `approval_dispatched` joined to the request's approver list the cases to read.
+- **The package publish and the Worker deploy are separate workflows, within minutes of each other, in either order.**
+  Nothing enforces which comes first, so for a few minutes a new CLI can meet the old Worker.
+  The new CLI behaves sensibly against either Worker for `list`, `show`, `approve`, `start`, `withdraw` and `verify`, and what the 0.10.18 Worker cannot do is this:
+  - `list` shows the active requests, which that Worker cannot filter by a comma-separated status: when the union comes back empty the CLI asks once per status and merges the rows, newest first.
+    That Worker never read `--search`, so the CLI drops the rows that do not match and lists an exact dataset id first.
+    That Worker sent no dataset name and no review, so a search that matches only a dataset's name finds nothing on it, and no row shows a review line.
+  - `show`, `start`, `withdraw` and `verify` cannot do anything on it, because it has none of their routes.
+    Each says that the backend does not support the command yet and exits 1, `start --all` says the Worker is older than the review, and none invites a bug report.
+  - `approve` works as it did: it finds no review, says so, and sends no override and no `request_id`, so that Worker has neither the stale-request check nor the review's gate.
+  A new Worker answers the CLI's comma-separated list and its search itself, and the CLI changes nothing in its answer.
+- **The attribution window of ADR 0105 is the other order: the new Worker with an old CLI on the executor.**
+  The executor installs the CLI from npm, and a CLI without this release ignores `NEMAR_APPROVAL_DISPATCH_TOKEN`.
+  Until it can install this release, a web approval is recorded under the executor's account and not the clicker's, and an approval that needed the clicker's recorded screen acknowledgment (or their override, when the review is on) is refused.
+  Nothing is published wrongly, and the audit rows of `approval_dispatched` joined to the request's approver list the cases to read.
+  Holding the Worker deploy until npm shows this version closes the window, and the pipeline does not enforce that.
 - **The review script reaches the workflow only when this release is on `main`.**
   The workflow checks the script out of this repository's `main`, and its design forbids a ref chosen by the payload.
   Until then a review started by the dev Worker cannot complete, which is why the flag is dev-only and why the soak (#1732) runs after this release.
@@ -241,7 +256,7 @@ It happens after this release, in a reviewed change, and ADR 0102's "Before it i
 4. Make the separate docs change that corrects the policy pages for current practice, then add the review's statement to them, so that they say a model reads the submission text.
 5. Verify the attribution: the executor's workflow sends the token, and the staging audit query shows each web approval attributed to the administrator who clicked.
    Record the maintainer's decision on a click whose clicker is no longer an active administrator, which ADR 0105 leaves open (see Known limitations).
-6. Add `PUBLICATION_REVIEW_ENABLED = "1"` to the production variables, delete the production secret `PRESCREEN_ENABLED`, disable `run-prescreen.yml` in the central workflow repository, and run `nemar admin publish start --all` once for the requests already open.
+6. Add `PUBLICATION_REVIEW_ENABLED = "1"` to the production variables, delete the production pre-screen switch (find it by listing the production secret names, read only), disable `run-prescreen.yml` in the central workflow repository, and run `nemar admin publish start --all` once for the requests already open.
    The configuration file does not record production's pre-screen switch, which is a Worker secret, so deleting the secret is what turns the pre-screen off and editing the file would not.
 
 ### Known limitations

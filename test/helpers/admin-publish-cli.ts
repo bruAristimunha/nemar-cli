@@ -135,6 +135,12 @@ export interface CliOptions {
   /** How the Resend stand-in answers for this run (a refusal, a lost answer). */
   resend?: FakeResendOptions;
   /**
+   * Point the command at another API address than the real backend's (`PublishCli.apiUrl`): how a
+   * test runs it against a Worker of another version that sits in front of the real one
+   * (`startOldWorker` in `old-worker.ts`).
+   */
+  apiUrl?: string;
+  /**
    * Extra environment variables for the command, e.g. `NEMAR_APPROVE_RETRY_DELAY_MS` so a test of
    * the retry does not sleep. The harness's own variables (the configuration directory, the API and
    * GitHub addresses, the colour switches) always win over these.
@@ -145,6 +151,8 @@ export interface CliOptions {
 export interface PublishCli {
   /** The backend's database: every migration applied, rebuilt by `reset()`. */
   readonly db: Database;
+  /** Where the real backend answers, for a stand-in that forwards to it. */
+  readonly apiUrl: string;
   /** The bindings the next request is answered with. */
   env(): Bindings;
   /** Merge `over` into the bindings until the next `reset()`, e.g. `{ PUBLICATION_REVIEW_ENABLED: "1" }`. */
@@ -488,7 +496,7 @@ export function startPublishCli(): PublishCli {
       ...ambient,
       ...opts.env,
       NEMAR_CONFIG_DIR: configDir,
-      TEST_API_URL: `http://127.0.0.1:${apiServer.port}`,
+      TEST_API_URL: opts.apiUrl ?? `http://127.0.0.1:${apiServer.port}`,
       NEMAR_GITHUB_API_URL: `http://127.0.0.1:${githubServer.port}`,
       NEMAR_NO_UPDATE_CHECK: "1",
       NO_COLOR: "1",
@@ -520,6 +528,7 @@ export function startPublishCli(): PublishCli {
       return db;
     },
     configDir,
+    apiUrl: `http://127.0.0.1:${apiServer.port}`,
     env,
     setEnv(over) {
       envOver = { ...envOver, ...over };

@@ -21,6 +21,7 @@ import {
 import { APPROVAL_DISPATCH_TOKEN_HEADER } from "../../../shared/contract/publication.js";
 import { APPROVE_RETRY_DELAY_MS } from "../../../shared/publication-retry.js";
 import { PUBLICATION_STEPS } from "../../../shared/publication-steps.js";
+import { isExactIdMatch, matchesListSearch } from "../../../shared/publish-list-search.js";
 import type { IdentifierScreenView } from "../identifier-screen-display.js";
 import { request } from "./client.js";
 import { ApiError } from "./errors.js";
@@ -263,11 +264,59 @@ export async function listPublishRequests(
 ): Promise<PublishRequestsResponse> {
   const { statuses, search }: PublishListFilter =
     typeof filter === "string" ? { statuses: filter ? [filter] : [] } : filter;
+  const first = await fetchPublishRequests(statuses, search);
+
+  let answer = first;
+  if (statuses !== undefined && statuses.length > 1 && first.requests.length === 0) {
+    // A Worker that predates the multi-status filter (0.10.18) ran `WHERE pr.status = ?` with the
+    // whole comma string, so it matches nothing and the empty answer is false. This cannot be told
+    // from a true empty one, so ask once per status, which that Worker takes, and merge the rows
+    // the way it orders them. On a current Worker the answer was true and these are empty too:
+    // a few small reads, only when the list is empty, and the result is the same.
+    // One after the other: three small reads, in the order the caller named the statuses.
+    const each: PublishRequestsResponse[] = [];
+    for (const status of new Set(statuses)) each.push(await fetchPublishRequests([status], search));
+    const requests = each.flatMap((one) => one.requests).sort(newestFirst);
+    answer = { ...first, requests, count: requests.length };
+  }
+
+  return search ? keepSearchMatches(answer, search) : answer;
+}
+
+/** The route's `ORDER BY pr.requested_at DESC`. `sort` is stable, so a tie keeps its order. */
+function newestFirst(a: { requested_at: string }, b: { requested_at: string }): number {
+  return a.requested_at < b.requested_at ? 1 : a.requested_at > b.requested_at ? -1 : 0;
+}
+
+async function fetchPublishRequests(
+  statuses: string[] | undefined,
+  search: string | undefined,
+): Promise<PublishRequestsResponse> {
   const params = new URLSearchParams();
   if (statuses && statuses.length > 0) params.set("status", statuses.join(","));
   if (search) params.set("search", search);
   const query = params.size > 0 ? `?${params}` : "";
   return request<PublishRequestsResponse>(`/admin/publish/requests${query}`, {}, true);
+}
+
+/**
+ * Keep the rows that match the search, in the order the route lists them (an exact dataset id
+ * first, then newest first). A Worker that read `search` has already done both, so on its answer
+ * this changes nothing; a Worker that ignored it (0.10.18) answered with rows that do not match,
+ * which a person must not be shown as if they did. The route matches the dataset's name too, which
+ * an old row does not carry, so such a row cannot be confirmed and is left out.
+ */
+function keepSearchMatches(
+  answer: PublishRequestsResponse,
+  search: string,
+): PublishRequestsResponse {
+  const kept = answer.requests.filter((row) =>
+    matchesListSearch(search, [row.dataset_id, row.requested_by_username, row.dataset_name]),
+  );
+  const rank = (row: { dataset_id: string }) => (isExactIdMatch(row.dataset_id, search) ? 0 : 1);
+  // `sort` is stable, so rows the route would tie keep the order they came in.
+  const requests = [...kept].sort((a, b) => rank(a) - rank(b) || newestFirst(a, b));
+  return { ...answer, requests, count: requests.length };
 }
 
 /**

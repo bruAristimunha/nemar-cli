@@ -46,7 +46,7 @@ const PLACEHOLDER_AUTHOR =
 
 /**
  * Ethics statement detection in a README: any of the conventional phrasings.
- * Deliberately generous — the requirement is that SOME ethics statement
+ * Deliberately generous: the requirement is that SOME ethics statement
  * exists, not that it follows a template; false negatives here send a human
  * to docs, false positives are caught by admin review.
  */
