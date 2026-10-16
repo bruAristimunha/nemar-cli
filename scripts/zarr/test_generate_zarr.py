@@ -17232,6 +17232,59 @@ class TestCutShortBrainVisionThroughConvertOne(ConvertOneLocalCase):
         self.assertNotIn("entry", result)
 
 
+class TestStreamedTruncatedFifThroughConvertOne(ConvertOneLocalCase):
+    """A FIF cut short in its data, converted down the STREAMING path.
+
+    Through `Recording.from_file` biosigIO 1.2.13 types such a file
+    `corrupt_or_truncated`, and the in-memory path ends there (see
+    `TestConvertOneFifSidecarOvercount`). The streaming export still raises MNE's
+    bare `ValueError` ("buffer size must be a multiple of element size",
+    biosigio#161), which reaches `failure_verdict` uncoded, so the converter
+    retries the recording until `retry_exhausted`. One defect, two verdicts.
+
+    The streaming branch is selected by lowering `STREAM_MIN_BYTES`, which is path
+    selection and not a substitute for any logic: the file, the reader and the
+    converter are real. A KIT `.sqd` and a 4D/BTi `config` or `hs_file` have the
+    same gap on the streaming path (biosigio#168), but this repository carries no
+    such fixture, so they are not covered here.
+
+    The first test pins today's verdict, so a biosigIO that fixes #161 breaks it
+    and says why; the second is the verdict we want, an expected failure that
+    turns into a failing run the day it passes. Remove both xfail and companion
+    together when #161 is fixed."""
+
+    REQUIRES = ("zarr", "mne", "biosigio")
+    PRIMARY = "sub-01/meg/sub-01_task-rest_meg.fif"
+
+    def convert_streamed(self) -> tuple[dict, list[str]]:
+        os.makedirs(os.path.join(self.repo, "sub-01/meg"))
+        path = build_real_fif(os.path.join(self.repo, self.PRIMARY))
+        with open(path, "rb") as fh:
+            data = fh.read()
+        with open(path, "wb") as fh:
+            fh.write(data[: len(data) // 2])
+        saved = generate_zarr.STREAM_MIN_BYTES
+        self.addCleanup(setattr, generate_zarr, "STREAM_MIN_BYTES", saved)
+        generate_zarr.STREAM_MIN_BYTES = 1
+        with StreamEdfThreshold.watching_writers() as writers:
+            result = self.convert(self.PRIMARY, {self.PRIMARY})
+        return result, writers
+
+    def test_a_streamed_truncated_fif_is_uncoded_until_biosigio_161_is_fixed(self):
+        result, writers = self.convert_streamed()
+        self.assertEqual(writers, ["stream_to_zarr"], "the streaming branch ran")
+        self.assertFalse(result["ok"])
+        self.assertIsNone(result["code"], "uncoded, so retried as infrastructure")
+        self.assertIn("buffer size must be a multiple of element size", result["error"])
+
+    @unittest.expectedFailure
+    def test_a_streamed_truncated_fif_is_corrupt_or_truncated(self):
+        """xfail (strict): biosigio#161."""
+        result, writers = self.convert_streamed()
+        self.assertEqual(writers, ["stream_to_zarr"], "the streaming branch ran")
+        self.assert_refused_as_data(result, "corrupt_or_truncated")
+
+
 class TestReaderRefusalsThroughConvertOne(ConvertOneLocalCase):
     """The readers' refusals that `failure_verdict` types, each reached by giving
     the real reader a real broken file, and the controls that keep the rules
