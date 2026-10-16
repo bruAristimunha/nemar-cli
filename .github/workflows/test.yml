@@ -1171,6 +1171,7 @@ jobs:
             if [[ "$VERSION" == *"$SHORT_SHA"* ]]; then
               echo "Found matching version: $VERSION"
               echo "tag=PR${PR_NUMBER}" >> $GITHUB_OUTPUT
+              echo "version=$VERSION" >> $GITHUB_OUTPUT
               exit 0
             fi
             echo "Attempt $i: version=$VERSION (waiting for $SHORT_SHA)..."
@@ -1181,9 +1182,24 @@ jobs:
           echo "::warning::PR-specific package PR${PR_NUMBER} with commit ${SHORT_SHA} not found after 5 minutes. Falling back to 'dev' tag. E2E tests may not be testing actual PR changes!"
           echo "tag=dev" >> $GITHUB_OUTPUT
 
+      # `npm view` above found the PR's version, but bun resolves a tag through its own request
+      # to the registry, which can still be served the package document from before the publish:
+      # `Package "nemar-cli" with tag "PR1793" not found, but package exists` failed this job on a
+      # pull request whose package had been found seconds earlier. So install the exact version the
+      # wait found (none when it fell back to `dev`, which installs the tag), without bun's cache,
+      # and retry for two minutes before failing.
       - name: Install CLI from npm
+        env:
+          TAG: ${{ steps.npm-tag.outputs.tag }}
+          VERSION: ${{ steps.npm-tag.outputs.version }}
         run: |
-          bun install -g nemar-cli@${{ steps.npm-tag.outputs.tag }}
+          SPEC="nemar-cli@${VERSION:-$TAG}"
+          for i in {1..12}; do
+            if bun install -g --no-cache "$SPEC"; then break; fi
+            if [[ "$i" -eq 12 ]]; then echo "::error::could not install $SPEC"; exit 1; fi
+            echo "Attempt $i: $SPEC is not installable yet, waiting for the registry..."
+            sleep 10
+          done
           echo "Installed version: $(nemar --version)"
 
       - name: Install test dependencies
