@@ -13,7 +13,7 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
-## 0.10.19 - 2026-10-15
+## 0.10.19 - 2026-10-16
 
 A publication request now gets one derived verdict that is built by the Worker from the mechanical gates and a no-tools model review of the submission, and approving over anything that is not a clear pass is the administrator's recorded act (epic #1726, #1782; Architecture Decision Record (ADR) 0102 and ADR 0105).
 **The review ships switched off in production.**
