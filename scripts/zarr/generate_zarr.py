@@ -10334,8 +10334,8 @@ def main() -> int:
             for problem in problems:
                 print(f"::error::{problem}", flush=True)
             reason = (
-                f"refusing to convert: this biosigIO cannot leave subject information "
-                f"out of a store (needs a final release >= {SUBJECT_INFO_FLOOR} whose "
+                f"refusing to convert: this biosigIO does not meet the converter's floor "
+                f"(a final release >= {SUBJECT_INFO_FLOOR} whose "
                 f"{', '.join(BIOSIGIO_STORE_WRITERS)} take {SUBJECT_INFO_OPTION}): "
                 + "; ".join(problems)
             )

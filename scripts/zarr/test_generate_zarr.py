@@ -18524,7 +18524,7 @@ class TestMainRefusesWithoutSubjectInfoExclusion(unittest.TestCase):
         self.assertEqual(body["status"], "failed")
         self.assertEqual(body["converted"], [])
         self.assertFalse(body["deterministic"], "the node, not the dataset, is at fault")
-        self.assertIn("cannot leave subject information out", body["error"])
+        self.assertIn("does not meet the converter's floor", body["error"])
         self.assertEqual(body["discovered_count"], 1)
         self.assertEqual(body["pending_count"], 0, "nothing was attempted")
         # The prior index was read first, and nothing in the bucket was synced,
@@ -18587,7 +18587,7 @@ class TestMainRefusesWithoutSubjectInfoExclusion(unittest.TestCase):
         self.commit(with_recording=True)
         rc, log = self.run_main(self.standin())
         self.assertEqual(rc, 1, log)
-        self.assertNotIn("cannot leave subject information out", log)
+        self.assertNotIn("does not meet the converter's floor", log)
         self.assertIn(f"conversion failed for {self.PRIMARY}", log)
         body = self.callback_body()
         self.assertNotIn("error", body)
@@ -18630,7 +18630,7 @@ class TestMainRefusesWithoutSubjectInfoExclusion(unittest.TestCase):
         self.commit(with_recording=False)
         rc, log = self.run_main(self.standin(lacking="stream_to_zarr"))
         self.assertEqual(rc, 0, log)
-        self.assertNotIn("cannot leave subject information out", log)
+        self.assertNotIn("does not meet the converter's floor", log)
 
 
 class TestFailedCallbackBody(unittest.TestCase):

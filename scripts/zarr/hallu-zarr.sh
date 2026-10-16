@@ -395,8 +395,9 @@ sys.exit(code)
 # `retry_exhausted`. The engine stamp did not move for any of them, and this pin
 # does not move it (see requirements.txt).
 # The `<1.2.14` half is a CAP, not a floor, raised deliberately per release; raise
-# it in all three places at once (requirements.txt, this default and
-# BIOSIGIO_FLOOR/BIOSIGIO_CAP, test_hallu_zarr_config.py).
+# it everywhere at once (requirements.txt, this default and
+# BIOSIGIO_FLOOR/BIOSIGIO_CAP, SUBJECT_INFO_FLOOR in generate_zarr.py when the
+# floor moves, test_hallu_zarr_config.py).
 # Extras are not optional here: [mef3] carries pymef and [hdf5] carries h5py, and
 # without either the matching recordings raise ImportError at convert time even
 # though discovery finds them.
@@ -1022,8 +1023,10 @@ on_stop_signal() {
   fi
 }
 
-# The driver's exit when this node's biosigIO cannot leave subject information
-# out of a store (generate_zarr.py EXIT_SUBJECT_INFO_UNAVAILABLE, sysexits.h
+# The driver's exit when this node's biosigIO does not meet the converter's floor,
+# SUBJECT_INFO_FLOOR, which is where it can leave subject information out of a
+# store and the converter takes nothing older (generate_zarr.py
+# EXIT_SUBJECT_INFO_UNAVAILABLE, sysexits.h
 # EX_CONFIG; #1626; test_hallu_zarr_config.py holds the two together). It is a
 # property of the NODE, not of the dataset: every dataset would be refused the
 # same way, so the drain stops on it instead of spending a retry attempt of every
@@ -1042,7 +1045,7 @@ on_stop_signal() {
 DRIVER_EXIT_SUBJECT_INFO_UNAVAILABLE=78
 report_subject_info_refusal() {
   local id="$1"
-  err "FATAL: the driver stopped on ${id}: this node's biosigIO cannot leave subject information out of a store (exit ${DRIVER_EXIT_SUBJECT_INFO_UNAVAILABLE}, #1626). No store it refused was uploaded."
+  err "FATAL: the driver stopped on ${id}: this node's biosigIO does not meet the converter's floor (SUBJECT_INFO_FLOOR in generate_zarr.py; exit ${DRIVER_EXIT_SUBJECT_INFO_UNAVAILABLE}, #1626). No store it refused was uploaded."
   err "No queue row was marked failed and no retry attempt was spent. The driver's callback for ${id} was posted as on any outcome, so its zarr_status in D1 reads failed (ready if part of it converted) until its next conversion; the failure detail of its previous conversion was already cleared when this attempt started."
   err "Fix biosigIO in ${VENV_DIR} (the driver's ::error:: lines are in ${LOG_FILE}), then rerun."
 }

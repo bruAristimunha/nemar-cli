@@ -1282,7 +1282,7 @@ def test_a_subject_info_refusal_stops_the_drain_and_fails_nothing(ack_run) -> No
 
     assert proc.returncode == 78, proc.stdout + proc.stderr
     assert "FATAL" in proc.stderr
-    assert "cannot leave subject information out of a store" in proc.stderr
+    assert "does not meet the converter's floor" in proc.stderr
     assert len(_calls_for(qpy_calls, "next")) == 1, qpy_calls()
     assert [c for c in qpy_calls() if c.startswith("DRIVER ")] != []
     assert _calls_for(qpy_calls, "fail") == [], "no retry attempt may be spent"
@@ -1321,7 +1321,7 @@ def test_an_ordinary_driver_failure_still_fails_the_row_and_drains_on(ack_run) -
     proc = run(extra_env={"QPY_NEXT": TWO_QUEUED, "FAKE_DRIVER_RC": "1"})
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "cannot leave subject information" not in proc.stderr
+    assert "does not meet the converter's floor" not in proc.stderr
     assert len(_calls_for(qpy_calls, "next")) == 3, qpy_calls()  # two rows, then empty
     assert len(_calls_for(qpy_calls, "fail")) == 2, qpy_calls()
 
@@ -1338,7 +1338,7 @@ def test_a_one_off_run_reports_the_refusal_and_keeps_its_exit(ack_run) -> None:
 
     assert proc.returncode == 78, proc.stdout + proc.stderr
     assert "FATAL" in proc.stderr
-    assert "cannot leave subject information out of a store" in proc.stderr
+    assert "does not meet the converter's floor" in proc.stderr
     assert _calls_for(qpy_calls, "fail") == []
 
 
