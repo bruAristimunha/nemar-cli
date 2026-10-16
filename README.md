@@ -296,7 +296,7 @@ nemar dataset drop [files]     # Free local copies of data
 nemar dataset list             # List all datasets (--mine for own)
 nemar dataset status <id>      # Check dataset status
 nemar dataset release <id>     # Create version bump PR
-nemar dataset update [path]    # Push local changes via PR
+nemar dataset update [path]    # Push local changes via PR (needs -m title and --description)
 nemar dataset save             # Stage and commit changes
 nemar dataset push             # Push commits and data
 nemar dataset ci [id]          # Check BIDS validation CI status
