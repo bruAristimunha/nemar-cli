@@ -4788,8 +4788,9 @@ class StoreEntry(TypedDict, total=False):
 
 class FailureEntry(TypedDict):
     """One published `failures[]` entry: a recording that will not convert
-    without a change to the data or the converter. `reason` is the sanitized
-    sentence a viewer shows; `detail` is the operator-facing cause."""
+    without a change to the data or the converter, except content that is not yet
+    fetched locally. `reason` is the sanitized sentence a viewer shows; `detail`
+    is the operator-facing cause."""
 
     path: str
     zarr: str
