@@ -30,6 +30,7 @@ export type TextKind = "title" | "description";
 /** Every way text is refused, as a closed word. */
 export const TEXT_PROBLEMS = [
   "empty",
+  "author_year",
   "machine_output",
   "placeholder",
   "template_field",
@@ -104,6 +105,42 @@ const TEMPLATE_FIELDS: readonly RegExp[] = [
   /\b(?:FirstAuthorSurname|paperDOI)\b/,
 ];
 
+/**
+ * A word of letters with an apostrophe (straight or curly) or a hyphen allowed inside it, then one
+ * optional hyphen or underscore, then a year from 1900 to 2099 that is not the start of a longer
+ * number. Each repeated part is set off by a character the part before it cannot match, so a long
+ * first word is judged in linear time. That shape is the whole argument, so a test checks it on the
+ * pattern itself, which is why the pattern is exported; nothing in the suite is timed.
+ */
+export const AUTHOR_YEAR_PREFIX =
+  /^[\p{L}\p{M}]+(?:[-'\u{2019}][\p{L}\p{M}]+)*[-_]?(?:19|20)\d{2}(?!\d)/u;
+
+/**
+ * What `text` opens with when that is a name and a year, as it was typed (`Lee-2019` for
+ * `Lee-2019-EEG`, `MOVING2024` for `MOVING2024 release`), or null. That is how a dataset is named
+ * (the atlas naming rule is FirstAuthorSurname-year-keyword-paperDOI), and a pull request title says
+ * what the change does, not what the dataset is called: `Lee2019 EEG dataset`, `Lee-2019-EEG`,
+ * `O'Brien_2020` and `MOVING2024 release` are refused. The function is pure and exported so that
+ * the pull request review, and any check on a dataset name, ask the same question.
+ *
+ * The name is the first word: letters of any case, with an apostrophe or a hyphen allowed inside it
+ * (`O'Brien`, `Smith-Jones`). The year is four digits from 1900 to 2099 that are not the start of a
+ * longer number, and it follows the name directly or after one hyphen or underscore; whatever comes
+ * after the year does not matter. A space ends the word, so `Release 2019` and `Add 2019
+ * recordings` are ordinary sentences, and a title that begins with the year (`2019 release notes`)
+ * has no name before it. Only the start of the text is looked at: `Rename the dataset to
+ * Lee-2019-EEG` is a sentence.
+ *
+ * Nothing here can tell a surname from any other letters, so an acronym such as `BNCI2014_001`, a
+ * funding code such as `H2020` and a BIDS label such as `ses-2019` are refused too.
+ *
+ * Blanks before the text are skipped, so the answer is the same before and after
+ * {@link normalizeTitle}.
+ */
+export function findAuthorYearPrefix(text: string): string | null {
+  return text.trimStart().match(AUTHOR_YEAR_PREFIX)?.[0] ?? null;
+}
+
 /** Seven to 64 hex digits holding at least one digit and one letter: a git or checksum digest. */
 const DIGEST =
   /^(?:(?:sha\d*|md5|git|commit)[:\s-]*)?(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,64}$/i;
@@ -141,6 +178,16 @@ function quoted(text: string): string {
 export function findTextProblem(kind: TextKind, raw: string | undefined): TextProblem | null {
   const text = cleanPrText(kind, raw);
   if (text === "") return { code: "empty", reason: "is empty; say in plain words what changed" };
+  // A title only: a description may cite a paper the way the paper is cited. Before the digest
+  // check, because a name of the letters a to f and a year (`Decade2019`) is also seven or more hex
+  // digits, and it is a name that was typed.
+  const authorYear = kind === "title" ? findAuthorYearPrefix(text) : null;
+  if (authorYear !== null) {
+    return {
+      code: "author_year",
+      reason: `starts with a name and a year (${quoted(authorYear)}); describe the change in plain words, such as "Add three EEG recordings"`,
+    };
+  }
   if (DIGEST.test(text) || isJsonDocument(text)) {
     return {
       code: "machine_output",

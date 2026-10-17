@@ -3461,7 +3461,8 @@ Title and description (both required):
   and why. The title is also the new version's entry in CHANGES (created if
   the dataset has none), and reads there as you wrote it.
   An empty value, placeholder text such as "Save changes", an unfilled
-  template field, text with no words in it, and a pasted hash or JSON are
+  template field, text with no words in it, a pasted hash or JSON, and a
+  title that starts with a name and a year (Lee2019 EEG dataset) are
   refused. At a terminal the command asks for what you leave out; with
   --yes, or without a terminal, it refuses instead.
 
@@ -5256,9 +5257,10 @@ Description:
   With --pr, creates a pull request after pushing the current branch.
   The title (-t) and the body (-b) are required: a reviewer reads them, and
   so does NEMAR's automated review, so say in plain words what changed and
-  why. Placeholder text, an empty value and a pasted hash or JSON are
-  refused. At a terminal the command asks for what you leave out; without
-  one it refuses, before anything is pushed.
+  why. Placeholder text, an empty value, a pasted hash or JSON, and a title
+  that starts with a name and a year (Lee2019 EEG dataset) are refused. At
+  a terminal the command asks for what you leave out; without one it
+  refuses, before anything is pushed.
 
   S3 push uses temporary credentials from the NEMAR API. Falls back to
   environment AWS credentials if not logged in.
