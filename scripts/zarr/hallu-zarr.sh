@@ -289,8 +289,9 @@ VENV_DIR="${ZARR_VENV_DIR:-${STATE_DIR}/.zarr-venv}"
 # check is TWO-SIDED: the installed biosigIO must be a final release in
 # [BIOSIGIO_FLOOR, BIOSIGIO_CAP). Below the floor is a failed upgrade; at or above
 # the cap is a release nobody has read yet (the cap exists because a biosigIO
-# patch release changed what a store contains three times in a row), which an install
-# that went wrong can also leave behind; a pre-release or dev build satisfies
+# patch release changed what a store contains or which recordings convert five
+# times in a row, 1.2.9 through 1.2.13), which an install that went wrong can also
+# leave behind; a pre-release or dev build satisfies
 # neither pin. None of them may convert.
 #
 # The probe prints the installed version and exits 0 when it is in range, 3 when
@@ -303,8 +304,8 @@ VENV_DIR="${ZARR_VENV_DIR:-${STATE_DIR}/.zarr-venv}"
 # `1.2.10rc1` and `1.2.10.dev0` as pre-releases, which a bare tuple of leading
 # digits would read as 1.2.10 and accept. Anything the fallback cannot parse fails
 # closed.
-BIOSIGIO_FLOOR="1.2.11"
-BIOSIGIO_CAP="1.2.12"
+BIOSIGIO_FLOOR="1.2.13"
+BIOSIGIO_CAP="1.2.14"
 BIOSIGIO_FLOOR_PROBE='
 import re
 import sys
@@ -382,15 +383,25 @@ sys.exit(code)
 # (`units_report.matched_case_only`), and the join texts in the schema, zod and
 # MCP mirrors were reworded with this bump, and 1.2.11 lets a store be written
 # without subject information (`exclude_subject_info`, #1626), which the
-# converter passes on every write and refuses to convert without. The engine
-# stamp did not move for any of them (see requirements.txt).
-# The `<1.2.12` half is a CAP, not a floor, raised deliberately per release; raise
-# it in all three places at once (requirements.txt, this default and
-# BIOSIGIO_FLOOR/BIOSIGIO_CAP, test_hallu_zarr_config.py).
+# converter passes on every write and refuses to convert without, and 1.2.12
+# types a streamed EDF/BDF refusal (`CorruptFileError`, biosigio#149) and reads
+# an EDF+C or BDF+C recording whose first time-keeping onset is late
+# (biosigio#145), and 1.2.13 refuses a BrainVision data file whose header shows it
+# was cut short, with a typed `CorruptFileError`, where it used to read with the
+# tail dropped. It types a truncated FIF the same way only through
+# `Recording.from_file`. The streaming export still raises a bare `ValueError` for
+# a truncated FIF (biosigio#161) and for a truncated KIT `.sqd` or 4D/BTi `config`
+# or `hs_file` (biosigio#168), and an uncoded failure is retried until
+# `retry_exhausted`. The engine stamp did not move for any of them, and this pin
+# does not move it (see requirements.txt).
+# The `<1.2.14` half is a CAP, not a floor, raised deliberately per release; raise
+# it everywhere at once (requirements.txt, this default and
+# BIOSIGIO_FLOOR/BIOSIGIO_CAP, SUBJECT_INFO_FLOOR in generate_zarr.py when the
+# floor moves, test_hallu_zarr_config.py).
 # Extras are not optional here: [mef3] carries pymef and [hdf5] carries h5py, and
 # without either the matching recordings raise ImportError at convert time even
 # though discovery finds them.
-BIOSIGIO_SPEC="${BIOSIGIO_SPEC:-biosigio[zarr,meg,mef3,hdf5]>=1.2.11,<1.2.12}"
+BIOSIGIO_SPEC="${BIOSIGIO_SPEC:-biosigio[zarr,meg,mef3,hdf5]>=1.2.13,<1.2.14}"
 API_BASE="${API_BASE:-https://api.nemar.org}"
 # The STABLE base published in each index as `contract_base` and in each store's
 # `nemar.contract_url` (#1059/#1064). Distinct from S3_BUCKET/AWS_REGION, which
@@ -870,6 +881,10 @@ setup() {
   # store serves the importer's unit where the sidecar declares another. On 1.2.10
   # no writer can leave subject information out of a store; generate_zarr.py
   # would refuse every dataset with exit 78, so stop here once instead (#1626).
+  # On 1.2.11 a streamed EDF/BDF refusal is a bare OSError, which the converter
+  # no longer reads by its text (the former bare-OSError text match is gone), so
+  # it becomes an uncoded retry as if the node were at fault, until
+  # `retry_exhausted`.
   # And it must be BELOW the cap, and a final release: see BIOSIGIO_FLOOR_PROBE.
   local installed probe_rc=0
   installed="$(VIRTUAL_ENV="$VENV_DIR" "$VENV_DIR/bin/python" -c "$BIOSIGIO_FLOOR_PROBE" "$BIOSIGIO_FLOOR" "$BIOSIGIO_CAP" 2>&1)" || probe_rc=$?
@@ -1008,8 +1023,10 @@ on_stop_signal() {
   fi
 }
 
-# The driver's exit when this node's biosigIO cannot leave subject information
-# out of a store (generate_zarr.py EXIT_SUBJECT_INFO_UNAVAILABLE, sysexits.h
+# The driver's exit when this node's biosigIO does not meet the converter's floor,
+# SUBJECT_INFO_FLOOR, which is where it can leave subject information out of a
+# store and the converter takes nothing older (generate_zarr.py
+# EXIT_SUBJECT_INFO_UNAVAILABLE, sysexits.h
 # EX_CONFIG; #1626; test_hallu_zarr_config.py holds the two together). It is a
 # property of the NODE, not of the dataset: every dataset would be refused the
 # same way, so the drain stops on it instead of spending a retry attempt of every
@@ -1028,7 +1045,7 @@ on_stop_signal() {
 DRIVER_EXIT_SUBJECT_INFO_UNAVAILABLE=78
 report_subject_info_refusal() {
   local id="$1"
-  err "FATAL: the driver stopped on ${id}: this node's biosigIO cannot leave subject information out of a store (exit ${DRIVER_EXIT_SUBJECT_INFO_UNAVAILABLE}, #1626). No store it refused was uploaded."
+  err "FATAL: the driver stopped on ${id}: this node's biosigIO does not meet the converter's floor (SUBJECT_INFO_FLOOR in generate_zarr.py; exit ${DRIVER_EXIT_SUBJECT_INFO_UNAVAILABLE}, #1626). No store it refused was uploaded."
   err "No queue row was marked failed and no retry attempt was spent. The driver's callback for ${id} was posted as on any outcome, so its zarr_status in D1 reads failed (ready if part of it converted) until its next conversion; the failure detail of its previous conversion was already cleared when this attempt started."
   err "Fix biosigIO in ${VENV_DIR} (the driver's ::error:: lines are in ${LOG_FILE}), then rerun."
 }
