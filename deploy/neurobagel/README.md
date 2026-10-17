@@ -467,19 +467,24 @@ If that happens, the only fix is a hard reset: `bin/nb down`, `docker volume rm 
 - Of the stack itself: restore the previous `pins.env` and run the upgrade steps in reverse.
   The previous images stay in Docker's cache until pruned (do not run `docker system prune` on a shared host).
 
-## Cloudflare Tunnel (for the lead; nothing here is enabled)
+## Cloudflare Tunnel (for the lead)
 
-The node has no public path today.
-The `tunnel` profile adds a `cloudflared` connector on a network of its own that holds only the API, so it exposes exactly one thing, the node API, as `http://api:8000`; GraphDB is on a different network and is never one route away.
-The connector token and the hostname are the lead's decision, and nothing below has been done.
+The node's public path is the `tunnel` profile, and the hostname is `neurobagel.nemar.org`.
+The profile adds a `cloudflared` connector on a network of its own that holds only the API, so it exposes exactly one thing, the node API, as `http://api:8000`; GraphDB is on a different network and is never one route away.
+The connector token and the hostname are the lead's decision.
+Where the token is stored and how the host supplies it are host specifics, kept in the gated operations documentation.
 
 1. In the Cloudflare Zero Trust dashboard, Networks, Tunnels, create a tunnel of type Cloudflared named `nemar-neurobagel` and copy its connector token.
-2. Add a public hostname to the tunnel, for example `neurobagel.nemar.org`, with service type HTTP and URL `api:8000`.
+2. Add a public hostname to the tunnel, `neurobagel.nemar.org`, with service type HTTP and URL `api:8000`.
    No path, no Access policy (Neurobagel's federation API must reach it unauthenticated), and leave `NB_NAPI_BASE_PATH` empty.
-3. On the host, in `.env` only, set `NB_TUNNEL_TOKEN=<token>` and `COMPOSE_PROFILES=portal,tunnel`.
+3. On the host, make `NB_TUNNEL_TOKEN` available and set `COMPOSE_PROFILES=portal,tunnel`.
+   The token does not have to live in `.env`: `bin/nb compose` passes `.env` as an env file, and a variable already in the shell environment wins over it, so a host can supply the token from its own environment, for example from a wrapper that exports it for the one command in step 4, and leave `NB_TUNNEL_TOKEN` empty in `.env`.
+   `bin/nb up` refuses to start the profile while the token is in neither place.
 4. Start the connector without touching the running node: `bin/nb compose --profile tunnel up -d --no-deps cloudflared`.
 5. Check: `curl -s https://<hostname>/` returns the node API welcome page, `curl -s -X POST -H 'Content-Type: application/json' -d '{}' https://<hostname>/datasets` returns the datasets, and `bin/nb status` shows `cloudflared` healthy.
+   Measured on 2026-10-16 with 903 datasets loaded: the second request returned all 903 records, every one protected and without an access email, and an unrestricted `POST /subjects` was refused by GraphDB with an insufficient-heap error.
 6. Recommended: a Cloudflare rate-limiting rule on the hostname (the node serves one query at a time), and a rule that blocks `POST /subjects` from outside if nobody needs it: that endpoint is the heaviest and the node returns only `protected` there anyway.
+   The measurement in step 5 is the reason to have it.
 
 Registration in Neurobagel's federation (the `neurobagel/menu` pull request) is Phase 7, and happens only after the gate in the epic.
 Do not register this node before then.
