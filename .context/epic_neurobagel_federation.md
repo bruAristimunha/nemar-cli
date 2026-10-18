@@ -2,6 +2,7 @@
 
 > **STATUS: CURRENT design input.** Written 2026-10-02. Decisions will land as ADRs with the phases; where this document and an ADR disagree, the ADR wins.
 > The architect's plan below was produced before the owner's hosting decision. Where it disagrees with the overrides in this section, the overrides win.
+> Update 2026-10-16: the node is public at `https://neurobagel.nemar.org` (tunnel enabled) and serves 903 datasets from the production store; it is not registered yet, and the 14-day soak counts from this date.
 
 ## Owner overrides (2026-10-01 and 2026-10-02), binding
 
@@ -10,6 +11,7 @@
 3. **Scope.** OpenNeuro mirrors (`on` datasets) are INCLUDED; the plan excluded them. This was agreed with Neurobagel's PI because NEMAR adds value (Zarr serving, the viewer, richer metadata, soon data quality, HED and processed data). Anonymous, private, unpublished, sandbox and fixture datasets remain excluded.
 4. **Delivery.** nemaring pulls artifacts from a private store. No ssh push and no inbound access to nemaring.
 5. **Viewer.** Link out only; the first link on each record is the NEMAR dataset page.
+   Update 2026-10-16: an embeddable viewer now exists (`docs.nemar.org/web/viewer-links/#embedding-the-viewer`), so anyone who wants an iframe appends `/embed` to that first link; the records themselves still carry no embed link, and the "defer the embed" verdict later in this file is superseded.
 6. **nemaring is shared.** It also runs other long-lived services, including the secrets store. Existing services must never be stopped, restarted or reconfigured, and the node runs under hard memory and CPU limits. Host specifics (resources, ports, paths, schedules) are recorded in the gated operations documentation, not in this repository.
 
 ## Mapping from the plan's phases to the epic's
