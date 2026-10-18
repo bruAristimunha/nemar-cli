@@ -18,6 +18,7 @@ import {
   unknownRecordingMembers,
   zarrIdentifierCount,
 } from "../../../scripts/scrub/s3/zarr-json";
+import { canonical } from "../../../shared/identifier-scan";
 
 const cut = (text: string) => removeIdentifierKeys(text);
 
@@ -449,5 +450,24 @@ describe("unknownRecordingMembers: what recording metadata may hold (I10)", () =
         "streamed",
       ].sort(),
     );
+  });
+
+  test("each converter technical flag is named until the operator accepts it", () => {
+    // biosigIO's four technical flags, and the fifth that the converter's partial-frame opt-in
+    // writes (ADR 0085, amendment of 2026-10-18). None is in KNOWN_BENIGN, so a store that carries
+    // one refuses until --allow-member names it; the operator's set holds canonical names.
+    const flags = [
+      "channel_labels_deduplicated",
+      "brainvision_header_recovered",
+      "eeglab_fdt_recovered",
+      "edf_tolerant_read",
+      "brainvision_dropped_bytes",
+    ];
+    for (const flag of flags) {
+      const meta = doc({ startdate: "01.01.90", [flag]: 1 });
+      expect(KNOWN_BENIGN.has(canonical(flag))).toBe(false);
+      expect(unknownRecordingMembers(meta, new Set())).toEqual([flag]);
+      expect(unknownRecordingMembers(meta, new Set([canonical(flag)]))).toEqual([]);
+    }
   });
 });
