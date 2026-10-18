@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import unittest
 import urllib.error
 import urllib.request
@@ -15319,7 +15320,15 @@ class TestRequireCompanionsVhdr(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.local = os.path.join(self._tmp.name, "sub-01_task-rest_eeg.vhdr")
 
-    def check(self, tracked, data_file="sub-01_task-rest_eeg.eeg", *, header=True):
+    def check(
+        self,
+        tracked,
+        data_file="sub-01_task-rest_eeg.eeg",
+        *,
+        header=True,
+        primary=None,
+    ):
+        primary = primary or self.PRIMARY
         if header:
             with open(self.local, "w", encoding="utf-8") as fh:
                 fh.write(
@@ -15327,7 +15336,7 @@ class TestRequireCompanionsVhdr(unittest.TestCase):
                     f"[Common Infos]\nDataFile={data_file}\nMarkerFile=x.vmrk\n"
                 )
         generate_zarr.require_companions(
-            self.PRIMARY, self.local, {self.PRIMARY, *tracked}, self.HEAD, False
+            primary, self.local, {primary, *tracked}, self.HEAD, False
         )
 
     def test_a_header_whose_data_file_is_tracked_passes(self):
@@ -15355,6 +15364,29 @@ class TestRequireCompanionsVhdr(unittest.TestCase):
             with self.subTest(ext):
                 self.check({f"sub-01/eeg/sub-01_task-rest_eeg{ext}"}, data_file="old_name.eeg")
 
+    def test_a_same_stem_match_is_unicode_normalized(self):
+        # A name can reach the tree composed (one code point for the accented
+        # letter) or decomposed (the letter, then a combining accent), and the
+        # sibling search takes the two for one stem. The header's DataFile names
+        # neither, so only the sibling clause can satisfy the rule.
+        composed = "sub-01_task-caf\u00e9_eeg"
+        decomposed = "sub-01_task-cafe\u0301_eeg"
+        self.assertNotEqual(composed, decomposed)
+        self.assertEqual(unicodedata.normalize("NFC", decomposed), composed)
+        for label, header_stem, data_stem in (
+            ("decomposed header, composed data file", decomposed, composed),
+            ("composed header, decomposed data file", composed, decomposed),
+        ):
+            with self.subTest(label):
+                primary = f"sub-01/eeg/{header_stem}.vhdr"
+                data = f"sub-01/eeg/{data_stem}.eeg"
+                self.check({data}, data_file="old_name.eeg", primary=primary)
+                # The controls: no sibling at all, and a sibling whose stem
+                # differs by more than the spelling of its accent.
+                for tracked in (set(), {"sub-01/eeg/sub-01_task-cafe_eeg.eeg"}):
+                    with self.assertRaises(generate_zarr.CompanionMissing):
+                        self.check(tracked, data_file="old_name.eeg", primary=primary)
+
     def test_a_stale_header_with_no_sibling_is_refused(self):
         with self.assertRaises(generate_zarr.CompanionMissing) as cm:
             self.check({"sub-01/eeg/sub-01_task-rest_eeg.vmrk"}, data_file="old_name.eeg")
@@ -15379,6 +15411,23 @@ class TestRequireCompanionsVhdr(unittest.TestCase):
         with self.assertRaises(generate_zarr.CompanionMissing) as cm:
             self.check({"sub-01/eeg/run1.eeg"}, data_file="data/run1.eeg")
         self.assertIn("sub-01/eeg/data/run1.eeg", str(cm.exception))
+
+    def test_a_data_file_path_is_normalized_before_the_tree_lookup(self):
+        # The tree lists normalized paths, and a header may spell its DataFile with
+        # `.` and `..` components. The tracked file shares no stem with the header,
+        # so only the normalized path can satisfy the rule.
+        wanted = "sub-01/eeg/shared.eeg"
+        # Paths that a spelling would reach if its `..` were dropped rather than
+        # resolved. The rule must not find them.
+        decoys = {"sub-01/eeg/data/shared.eeg", "sub-01/eeg/eeg/shared.eeg"}
+        for written in ("./shared.eeg", "data/../shared.eeg", "../eeg/shared.eeg"):
+            with self.subTest(written):
+                self.check({wanted}, data_file=written)
+                # The control: with that file untracked the same header is refused,
+                # and the refusal names the path the spelling means.
+                with self.assertRaises(generate_zarr.CompanionMissing) as cm:
+                    self.check(decoys, data_file=written)
+                self.assertIn(wanted, str(cm.exception))
 
     def test_nothing_is_refused_that_the_rule_cannot_read(self):
         # No such header, a header naming no data file: the reader decides.
@@ -15455,16 +15504,38 @@ class TestRequireCompanionsSet(unittest.TestCase):
             self.PRIMARY, self.local, {self.PRIMARY, *tracked}, self.HEAD, declared
         )
 
-    def test_a_tracked_sibling_passes_without_reading_the_header(self):
-        # No file at all: the tree already answers, so the header is not opened.
-        self.check({self.SIBLING})
+    def test_a_tracked_same_stem_fdt_satisfies_a_set_in_any_matlab_format(self):
+        # The BIDS-rename shape: the .fdt was renamed with the .set, and the name
+        # stored inside the .set is the stale pre-rename one. The header is
+        # readable and names a file the tree lacks, so only the tracked
+        # <stem>.fdt can satisfy the rule, in every format a .set is saved in.
+        for label, v73, wrapped in (
+            ("classic", False, True),
+            ("v7.3 wrapped", True, True),
+            ("v7.3 flat", True, False),
+        ):
+            with self.subTest(label):
+                original = os.path.join(self._tmp.name, "pre_rename.set")
+                try:
+                    build_eeglab_set(original, 4, fdt=True, v73=v73, wrapped=wrapped)
+                except ImportError as exc:
+                    self.skipTest(
+                        f"{exc.name} not installed (the fast tier); the full tier runs this"
+                    )
+                os.replace(original, self.local)
+                self.check({self.SIBLING})
+                # The control: without that sibling the same header is refused, so
+                # the pass above is the sibling clause and not a header the rule
+                # could not read.
+                with self.assertRaises(generate_zarr.CompanionMissing):
+                    self.check(set())
 
     def test_a_tracked_same_stem_fdt_passes_though_the_header_names_another(self):
         # The common BIDS-rename shape: the .fdt was renamed with the .set, and
-        # the name inside the .set is the stale pre-rename one. The case above
-        # cannot see the same-stem clause (no file, so the header is unreadable
-        # and the rule returns anyway); this header IS readable, names a file
-        # the tree lacks, and only the tracked <stem>.fdt satisfies the rule.
+        # the name inside the .set is the stale pre-rename one. The header IS
+        # readable, names a file the tree lacks, and only the tracked <stem>.fdt
+        # satisfies the rule. Written without scipy or h5py, so the fast tier
+        # runs it too.
         write_fdt_backed_set(self.local, embedded="pre_rename.fdt")
         self.check({self.SIBLING})
         # The control: without that sibling the same header is refused.
@@ -16183,12 +16254,16 @@ class TestFailureVerdict(unittest.TestCase):
         raise AssertionError("make_next() was not raised")
 
     def test_a_host_error_raised_while_recovering_from_a_refusal_keeps_its_retry(self):
-        # biosigIO recovers three kinds of header pyedflib refuses by reading the
-        # file again INSIDE the `except` block that caught the refusal. A host
+        # A reader's recovery can read the file again INSIDE the `except` block
+        # that caught its refusal (biosigIO's tolerant EDF read does). A host
         # error raised by that second read (a failing disk, a full volume, a
         # permission) therefore carries the refusal as its `__context__`. It is
         # the host saying no, and keeps its retry: the refusal behind it is not
-        # what this exception is.
+        # what this exception is. The refusal here is one a rule reads (MNE's
+        # split refusal), so (None, None) can only mean the walk declined the
+        # context; behind a refusal no rule reads it would hold whatever the
+        # walk did.
+        text = MNE_SPLIT_REFUSAL.format(path="/w/sub-01_task-rest_split-02_meg.fif")
         for label, make in (
             ("EIO", lambda: OSError(errno.EIO, "Input/output error")),
             ("ENOSPC", lambda: OSError(errno.ENOSPC, "No space left on device")),
@@ -16196,38 +16271,65 @@ class TestFailureVerdict(unittest.TestCase):
             ("no errno, other words", lambda: OSError("fallback read failed")),
         ):
             with self.subTest(label):
-                exc = self.raised_while_handling(
-                    OSError(f"x.bdf: {EDF_REFUSAL} (Filesize)"), make
-                )
+                refusal = ValueError(text)
+                exc = self.raised_while_handling(refusal, make)
                 # The control: the refusal really is the context, so a verdict
                 # of (None, None) is the rule declining to read it.
-                self.assertIn(EDF_REFUSAL, str(exc.__context__))
-                self.assertEqual(self.verdict(exc), (None, None))
+                self.assertIn(text, str(exc.__context__))
+                self.assertEqual(self.verdict(exc, self.SPLIT_HEAD), (None, None))
+                # And the walk does read this refusal as a cause: the same host
+                # error raised `from` it names the part the tree lacks.
+                self.assertEqual(
+                    self.verdict(chained(make(), refusal), self.SPLIT_HEAD)[0],
+                    "split_part_missing",
+                )
 
-    def test_a_refusal_behind_another_exception_is_not_the_refusal(self):
-        # A refusal text behind the exception is not a verdict: no rule reads an
-        # `OSError`'s words, at the top or down a chain.
-        refusal = OSError(f"x.bdf: {EDF_REFUSAL} (Filesize)")
-        host = OSError(errno.EIO, "Input/output error")
-        host.__cause__ = refusal
-        self.assertEqual(self.verdict(host), (None, None))
+    def test_a_split_refusal_is_read_through_five_causes_and_never_by_context(self):
+        # The walk reads the exception and five explicit `__cause__` links: a host
+        # error on top does not hide a refusal that close, and nothing further
+        # down is read. A context is not a link at any depth.
+        text = MNE_SPLIT_REFUSAL.format(path="/w/sub-01_task-rest_split-02_meg.fif")
+
+        def host_over(leaf, depth):
+            """A host error whose explicit causes reach `leaf` after `depth` links."""
+            host = OSError(errno.EIO, "Input/output error")
+            host.__cause__ = self.wrapper_chain(leaf, depth - 1)
+            return host
+
         for depth in range(1, 6):
-            with self.subTest(depth=depth):
-                self.assertEqual(self.verdict(self.wrapper_chain(refusal, depth)), (None, None))
+            with self.subTest(cause_at=depth):
+                code, detail = self.verdict(
+                    host_over(ValueError(text), depth), self.SPLIT_HEAD
+                )
+                self.assertEqual(code, "split_part_missing")
+                self.assertIn(self.SPLIT_NEXT, detail or "")
+        # One link further is out of reach.
+        exc = host_over(ValueError(text), 6)
+        self.assertEqual(self.verdict(exc, self.SPLIT_HEAD), (None, None))
+        # The same distances with the last hop an implicit context instead of a
+        # cause: the host error nearest the refusal was raised while handling it.
+        for depth in range(1, 6):
+            with self.subTest(context_at=depth):
+                tail = self.raised_while_handling(
+                    ValueError(text), lambda: OSError(errno.EIO, "Input/output error")
+                )
+                self.assertIsNone(tail.__cause__)
+                self.assertIn(text, str(tail.__context__))
+                exc = host_over(tail, depth - 1) if depth > 1 else tail
+                self.assertEqual(self.verdict(exc, self.SPLIT_HEAD), (None, None))
 
     # -- a code that is not generic passes through -------------------------
 
     def test_a_specific_code_is_never_refined(self):
-        edf = OSError(f"x.bdf: {EDF_REFUSAL} (Filesize)")
         split = ValueError(MNE_SPLIT_REFUSAL.format(path="/w/sub-01_task-rest_split-02_meg.fif"))
         for exc, code in (
-            (chained(RecordingMemoryExceeded("out of memory"), edf), "recording_memory_exceeded"),
+            (chained(RecordingMemoryExceeded("out of memory"), split), "recording_memory_exceeded"),
             (chained(generate_zarr.AnnexObjectMissing("KEY", "chunk C2 is absent"), split),
              "annex_object_missing"),
             (chained(MaxShieldUncalibrated("no pair"), split), "maxshield_uncalibrated"),
             (chained(generate_zarr.CompanionMissing("no fdt"), split), "companion_missing"),
-            (chained(Refusal("x", "channel_count_mismatch"), edf), "channel_count_mismatch"),
-            (chained(Refusal("x", "not_continuous"), edf), "not_continuous"),
+            (chained(Refusal("x", "channel_count_mismatch"), split), "channel_count_mismatch"),
+            (chained(Refusal("x", "not_continuous"), split), "not_continuous"),
         ):
             with self.subTest(code):
                 self.assertEqual(
@@ -16380,15 +16482,6 @@ class TestFailureVerdict(unittest.TestCase):
                 raise RuntimeError("wrapped on purpose") from inner
         except RuntimeError as exc:
             self.assertEqual(self.verdict(exc, self.SET), ("corrupt_or_truncated", None))
-        # And what it must NOT carry to a data verdict is a host error: raised
-        # while handling pyedflib's refusal, it holds the refusal as its context
-        # and is still the host's.
-        host = self.raised_while_handling(
-            OSError(f"x.bdf: {EDF_REFUSAL} (Filesize)"),
-            lambda: OSError(errno.EIO, "Input/output error"),
-        )
-        self.assertIsNotNone(host.__context__)
-        self.assertEqual(self.verdict(host), (None, None))
 
     # -- rules 1 to 3 read causes, never contexts ----------------------------
     #
