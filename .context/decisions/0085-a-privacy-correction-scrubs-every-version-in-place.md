@@ -414,3 +414,9 @@ The fleet-wide strip of stores converted before it, admin triage and the purge l
 Two corrections to the text above.
 The publication gate is not a publication step named `identifier_screen` before `s3_public_read`: it is `screenStateGate` at approval and on resume until `s3_public_read`, as ADR 0086 records.
 And issue #1616 became the acquisition-date warning (ADR 0090), not admin triage, which ADR 0090 leaves to be done outside the repository.
+
+## Amendment 2026-10-18 (#1837): a fifth technical flag
+
+The converter's partial-frame opt-in writes a fifth technical flag when it reads a BrainVision file that ends in a partial frame and declares no positive `DataPoints` count: `brainvision_dropped_bytes`, the number of bytes dropped. The count in the Allowed bullet above is five, not four: `channel_labels_deduplicated`, `brainvision_header_recovered`, `eeglab_fdt_recovered`, `edf_tolerant_read` and `brainvision_dropped_bytes`.
+
+The verdict stands. None of the five is in `KNOWN_BENIGN`, so a store that carries one refuses until `--allow-member` names it. Whether to add them to the list is still the maintainer's decision; adding them would change the verdict and would need a superseding ADR.
