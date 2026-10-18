@@ -194,6 +194,11 @@
 # `ValueError` for a truncated FIF (biosigio#161) and for a truncated KIT `.sqd`
 # or 4D/BTi `config` or `hs_file` (biosigio#168); the converter reads it as
 # uncoded and retries the recording until `retry_exhausted`.
+# The converter opts in to `allow_partial_frame` for one case, a MULTIPLEXED file
+# that ends in a partial frame and declares no positive `DataPoints` count: it
+# reads the whole frames, as 1.2.12 did, and the dropped byte count is recorded in
+# the store (`brainvision_dropped_bytes`). Vectorized data with a partial frame is
+# still refused.
 # ZARR_ENGINE_VERSION is NOT bumped here either (ADR 0033).
 # <1.2.14 is a CAP, not a floor, raised deliberately per release: a biosigIO
 # patch release has changed what a store contains or which recordings convert

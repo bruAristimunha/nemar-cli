@@ -16005,6 +16005,30 @@ class ConvertOneLocalCase(unittest.TestCase):
         self.assertTrue(generate_zarr.dataset_failure_is_deterministic([result["primary"]], [entry]))
 
 
+class ConvertOneKeepingStoreCase(ConvertOneLocalCase):
+    """`ConvertOneLocalCase` whose `aws` keeps the store it is asked to upload, in
+    `synced_dir`, so a test can read what would have been published."""
+
+    def setUp(self):
+        super().setUp()
+        # `ConvertOneLocalCase`'s `aws` absorbs the upload; this one keeps the store.
+        self.synced_dir = os.path.join(self._tmp.name, "synced")
+        with open(os.path.join(self._tmp.name, "bin", "aws"), "w") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                'if [ "$1" = s3 ] && [ "$2" = sync ]; then\n'
+                f'  mkdir -p "{self.synced_dir}" && cp -R "$3" "{self.synced_dir}/"\n'
+                "fi\nexit 0\n"
+            )
+
+    def published_recording_metadata(self, entry: dict) -> dict:
+        with open(
+            os.path.join(self.synced_dir, os.path.basename(entry["zarr"]), "zarr.json"),
+            encoding="utf-8",
+        ) as fh:
+            return json.load(fh)["attributes"]["recording_metadata"]
+
+
 class TestCompanionMissingThroughConvertOne(ConvertOneLocalCase):
     """A recording whose companion data the tree does not hold, through the real
     `convert_one` and the real readers (MNE for BrainVision, scipy and biosigIO
@@ -17077,7 +17101,7 @@ class TestAbsentAnnexObjectThroughConvertOne(ConvertOneLocalCase):
         self.assert_unfetched_is_a_typed_read_failure(self.PRIMARY_BDF)
 
 
-class TestLateOnsetThroughConvertOne(ConvertOneLocalCase):
+class TestLateOnsetThroughConvertOne(ConvertOneKeepingStoreCase):
     """An EDF+C or BDF+C recording whose first time-keeping onset is late
     converts on BOTH exporters (biosigio#145, fixed by #152, in 1.2.12).
 
@@ -17087,25 +17111,6 @@ class TestLateOnsetThroughConvertOne(ConvertOneLocalCase):
     with its onsets rewritten in place."""
 
     REQUIRES = ("zarr", "pyedflib", "biosigio")
-
-    def setUp(self):
-        super().setUp()
-        # `ConvertOneLocalCase`'s `aws` absorbs the upload; this one keeps the store.
-        self.synced_dir = os.path.join(self._tmp.name, "synced")
-        with open(os.path.join(self._tmp.name, "bin", "aws"), "w") as fh:
-            fh.write(
-                "#!/bin/sh\n"
-                'if [ "$1" = s3 ] && [ "$2" = sync ]; then\n'
-                f'  mkdir -p "{self.synced_dir}" && cp -R "$3" "{self.synced_dir}/"\n'
-                "fi\nexit 0\n"
-            )
-
-    def published_recording_metadata(self, entry: dict) -> dict:
-        with open(
-            os.path.join(self.synced_dir, os.path.basename(entry["zarr"]), "zarr.json"),
-            encoding="utf-8",
-        ) as fh:
-            return json.load(fh)["attributes"]["recording_metadata"]
 
     def test_a_late_first_onset_converts_in_memory_and_streamed(self):
         import pyedflib
@@ -17290,39 +17295,180 @@ class TestLateOnsetThroughConvertOne(ConvertOneLocalCase):
                     self.assertEqual(result["entry"]["trial_types"], {"go": 1, "stop": 1})
 
 
-class TestCutShortBrainVisionThroughConvertOne(ConvertOneLocalCase):
-    """A BrainVision data file cut short is a terminal `corrupt_or_truncated`.
+class TestCutShortBrainVisionThroughConvertOne(ConvertOneKeepingStoreCase):
+    """A BrainVision data file that ends in a partial frame, through `convert_one`.
 
     Before biosigIO 1.2.13 the reader dropped the partial trailing frame, and any
-    marker in it, without a word, and the converter published a store for a
-    recording that was missing its end. The header here declares no `DataPoints`
-    count, so a size that is not a whole number of frames (channels times bytes
-    per sample) is the evidence. The files are a real BrainVision triplet written
-    by `write_brainvision`, converted through the real `convert_one`."""
+    marker in it, without a word. 1.2.13 refuses it, and the converter opts back
+    in (`allow_partial_frame`) for ONE case: a multiplexed file that ends in a
+    partial frame and whose header declares no positive `DataPoints` count.
+    Without a count, a partial frame cannot be told from a complete recording
+    that ends in stray bytes, so the whole frames convert and the dropped byte
+    count is recorded in the store's `recording_metadata` as
+    `brainvision_dropped_bytes`, where it used to vanish. Every other refusal
+    stays a terminal `corrupt_or_truncated`: a file that holds fewer frames than
+    the positive `DataPoints` count its header declares, vectorized data with a
+    partial frame (a cut there moves every channel after the first), and a file
+    that holds no whole frame.
+
+    A frame is one sample of every channel: channels times bytes per sample, read
+    from the header. The files are a real BrainVision triplet written by
+    `write_brainvision`, converted through the real `convert_one` on both
+    exporters. The streaming exporter is selected by lowering `STREAM_MIN_BYTES`,
+    which is path selection and not a substitute for any logic."""
 
     REQUIRES = ("zarr", "mne", "biosigio")
     PRIMARY = "sub-01/eeg/sub-01_task-rest_eeg.vhdr"
+    LABELS = ("Fp1", "Fp2", "Cz", "Pz")
+    PATHS: ClassVar[tuple[str, ...]] = ("in-memory", "streaming")
+    DROPPED = "brainvision_dropped_bytes"
+    # Bytes per sample of the binary formats MNE reads.
+    SAMPLE_BYTES: ClassVar[dict[str, int]] = {"INT_16": 2, "INT_32": 4, "IEEE_FLOAT_32": 4}
 
-    def test_a_data_file_cut_by_one_byte_is_terminal_corrupt_or_truncated(self):
+    def write_recording(self) -> tuple[set[str], str, str]:
+        """A complete triplet in the repository: the files the tree tracks, the
+        header and the data file."""
         os.makedirs(os.path.join(self.repo, "sub-01/eeg"))
-        paths = write_brainvision(os.path.join(self.repo, self.PRIMARY), ["Fp1", "Fp2", "Cz", "Pz"])
-        head_files = {os.path.relpath(path, self.repo) for path in paths}
-        data = paths[2]
-        self.assertEqual(os.path.splitext(data)[1], ".eeg")
+        paths = write_brainvision(os.path.join(self.repo, self.PRIMARY), list(self.LABELS))
+        self.assertEqual(os.path.splitext(paths[2])[1], ".eeg")
+        return {os.path.relpath(path, self.repo) for path in paths}, paths[0], paths[2]
 
-        # The control: the complete triplet converts, so the refusal below is the
-        # missing byte and not the fixture.
-        self.assertEqual(os.path.getsize(data) % (4 * 2), 0)
-        complete = self.convert(self.PRIMARY, head_files)
-        self.assertTrue(complete["ok"], complete.get("error"))
+    def frame_bytes(self, vhdr: str) -> int:
+        """One frame of the data file a header describes: a sample of every
+        channel, so its channel count times its bytes per sample."""
+        with open(vhdr, encoding="utf-8") as fh:
+            declared = dict(re.findall(r"^(\w+)=(.*)$", fh.read(), re.MULTILINE))
+        return int(declared["NumberOfChannels"]) * self.SAMPLE_BYTES[declared["BinaryFormat"]]
+
+    def convert_on(self, path_name: str, head_files: set[str]) -> dict:
+        """Convert the recording down one exporter, and check it was that one."""
+        import warnings
+
+        self.addCleanup(setattr, generate_zarr, "STREAM_MIN_BYTES", generate_zarr.STREAM_MIN_BYTES)
+        generate_zarr.STREAM_MIN_BYTES = 1 if path_name == "streaming" else STREAM_MIN_BYTES
+        shutil.rmtree(self.synced_dir, ignore_errors=True)
+        with StreamEdfThreshold.watching_writers() as writers, warnings.catch_warnings():
+            # biosigIO also warns about the bytes it drops; the store records them.
+            warnings.filterwarnings(
+                "ignore", message="BrainVision data file .* ends in a partial frame"
+            )
+            result = self.convert(self.PRIMARY, head_files)
+        # Which exporter ran, from what it was handed to write with.
+        self.assertEqual("stream_to_zarr" in writers, path_name == "streaming", writers)
+        return result
+
+    def n_samples(self, result: dict) -> int:
+        """The samples per channel the converted store holds."""
+        (group,) = result["entry"]["groups"]
+        return group["n_samples"]
+
+    def edit_header(self, vhdr: str, old: str, new: str) -> None:
+        """Rewrite part of the header the fixture wrote. The part must be there
+        exactly once: an edit that matched nothing would leave the unedited file
+        under test."""
+        with open(vhdr, encoding="utf-8") as fh:
+            header = fh.read()
+        self.assertEqual(header.count(old), 1, old)
+        with open(vhdr, "w", encoding="utf-8") as fh:
+            fh.write(header.replace(old, new))
+
+    def assert_converts(self, head_files: set[str], samples: int) -> None:
+        """The control of a test: the recording converts on both exporters, with
+        every frame and nothing dropped, so what the test does to it next is what
+        is being judged and not the fixture."""
+        for path_name in self.PATHS:
+            with self.subTest("complete", path=path_name):
+                result = self.convert_on(path_name, head_files)
+                self.assertTrue(result["ok"], result.get("error"))
+                self.assertEqual(self.n_samples(result), samples)
+                self.assertNotIn(self.DROPPED, self.published_recording_metadata(result["entry"]))
+
+    def assert_refused(self, head_files: set[str], data: str, reason: str) -> None:
+        """Both exporters refuse the recording, typed and never retried, naming its
+        data file, and publish no store for it. `reason` is the part of biosigIO's
+        message that says why, so a refusal for another cause does not pass. It is
+        read from `error`: `detail` is capped at 300 characters, and the longest
+        refusal runs past that."""
+        for path_name in self.PATHS:
+            with self.subTest("refused", path=path_name):
+                result = self.convert_on(path_name, head_files)
+                self.assert_refused_as_data(result, "corrupt_or_truncated")
+                self.assertIn(os.path.basename(data), result["detail"])
+                self.assertIn(reason, result["error"])
+                self.assertNotIn("entry", result)
+
+    def test_a_data_file_cut_inside_its_last_frame_converts_the_whole_frames(self):
+        head_files, vhdr, data = self.write_recording()
+        frame = self.frame_bytes(vhdr)
+        size = os.path.getsize(data)
+        self.assertEqual(size % frame, 0)
+
+        self.assert_converts(head_files, size // frame)
 
         with open(data, "r+b") as fh:
-            fh.truncate(os.path.getsize(data) - 1)
-        result = self.convert(self.PRIMARY, head_files)
+            fh.truncate(size - 1)
+        # The cut lands inside the last frame: every frame before it is whole, and
+        # what is left of the last one is a partial frame.
+        frames, dropped = divmod(size - 1, frame)
+        self.assertEqual((frames, dropped), (size // frame - 1, frame - 1))
 
-        self.assert_refused_as_data(result, "corrupt_or_truncated")
-        self.assertIn(os.path.basename(data), result["detail"])
-        self.assertNotIn("entry", result)
+        # The same expected values on both exporters.
+        for path_name in self.PATHS:
+            with self.subTest("cut by one byte", path=path_name):
+                result = self.convert_on(path_name, head_files)
+                self.assertTrue(result["ok"], result.get("error"))
+                self.assertEqual(self.n_samples(result), frames)
+                self.assertEqual(
+                    self.published_recording_metadata(result["entry"]).get(self.DROPPED), dropped
+                )
+
+    def test_a_data_file_cut_below_its_declared_data_points_is_terminal_corrupt_or_truncated(self):
+        head_files, vhdr, data = self.write_recording()
+        frame = self.frame_bytes(vhdr)
+        size = os.path.getsize(data)
+        # The header now declares the complete recording's frame count. The same
+        # one-byte cut as above then leaves fewer frames than the file promises, and
+        # the opt-in, which covers a file that declares no count, does not touch it.
+        self.edit_header(
+            vhdr,
+            "DataOrientation=MULTIPLEXED\n",
+            f"DataOrientation=MULTIPLEXED\nDataPoints={size // frame}\n",
+        )
+        self.assert_converts(head_files, size // frame)
+
+        with open(data, "r+b") as fh:
+            fh.truncate(size - 1)
+        # biosigIO's refusal for a file smaller than the frames its header declares.
+        declared = size // frame * frame
+        self.assert_refused(
+            head_files, data, f"is smaller than the {declared} bytes its header declares"
+        )
+
+    def test_a_vectorized_data_file_with_a_partial_frame_is_terminal_corrupt_or_truncated(self):
+        head_files, vhdr, data = self.write_recording()
+        frame = self.frame_bytes(vhdr)
+        size = os.path.getsize(data)
+        # The same bytes, declared as channel after channel instead of sample after
+        # sample. A cut there moves every channel boundary after the first, so the
+        # whole frames are not a shorter recording and the opt-in does not apply.
+        self.edit_header(vhdr, "DataOrientation=MULTIPLEXED", "DataOrientation=VECTORIZED")
+        self.assert_converts(head_files, size // frame)
+
+        with open(data, "r+b") as fh:
+            fh.truncate(size - 1)
+        # biosigIO says the flag does not apply only when the flag was passed, so
+        # this also fails if the converter stops passing it.
+        self.assert_refused(head_files, data, "does not apply to vectorized data")
+
+    def test_a_data_file_smaller_than_one_frame_is_terminal_corrupt_or_truncated(self):
+        head_files, vhdr, data = self.write_recording()
+        frame = self.frame_bytes(vhdr)
+        self.assert_converts(head_files, os.path.getsize(data) // frame)
+
+        # One byte short of a single frame: no whole frame is left to read.
+        with open(data, "r+b") as fh:
+            fh.truncate(frame - 1)
+        self.assert_refused(head_files, data, "so the file holds no whole frame")
 
 
 class TestStreamedTruncatedFifThroughConvertOne(ConvertOneLocalCase):
