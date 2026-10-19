@@ -1013,6 +1013,14 @@ export const DECLINE_REASONS = [
 ] as const;
 export type DeclineReason = (typeof DECLINE_REASONS)[number];
 
+/**
+ * How many times an edit of a pull request's title, description or base, a reopening or a marking as
+ * ready may restart the review of one head commit; the next is refused (ADR 0107, decision 4). The
+ * owner set it on 2026-10-19. An administrator's start resets the count, and a push is a new commit
+ * and so a new count. The Worker keeps the count in `pr_reviews.edit_restarts`.
+ */
+export const PR_REVIEW_EDIT_CAP = 5;
+
 /** Why a review ended without a report. Some are the Worker's own words (see the callback). */
 export const RUN_ERRORS = [
   "evidence_unavailable",
@@ -1026,12 +1034,22 @@ export const RUN_ERRORS = [
   "report_invalid",
   "dispatch_failed",
   "workflow_failed",
+  "edit_limit",
 ] as const;
 export type RunError = (typeof RUN_ERRORS)[number];
 
 export function isRunError(x: unknown): x is RunError {
   return isOneOf(RUN_ERRORS, x);
 }
+
+/**
+ * The run errors only the Worker may say: a job's callback that names one is `workflow_failed`
+ * ({@link parseCallbackOutcome}). `dispatch_failed` is the Worker's word for "GitHub never ran the
+ * workflow", which a redelivery retries and does not count as a model call, and `edit_limit` is its
+ * word for a restart it refused at the cap (decision 4 of ADR 0107). Neither is something a job can
+ * have seen, so neither may be forged by one.
+ */
+export const WORKER_ONLY_RUN_ERRORS: readonly RunError[] = ["dispatch_failed", "edit_limit"];
 
 export function isDeclineReason(x: unknown): x is DeclineReason {
   return isOneOf(DECLINE_REASONS, x);
@@ -1194,12 +1212,13 @@ const WAIVED_COPY = {
 /**
  * What a pull request whose review ended at the facts is told, by the naming fact that ended it
  * ({@link factsStop}, not the verdict): it says the rule decided and no model was asked, and what
- * the author does, which is to fix the title or the dataset's name and push again. Nothing is
- * reviewed until the rule is satisfied, so the next push is what runs the review.
+ * the author does: a new title is an edit, which starts the review again (until the commit has had
+ * {@link PR_REVIEW_EDIT_CAP} restarts by edits, after which a push or an administrator's start does),
+ * and a new dataset name is a change to the files, which needs a push. Nothing is reviewed until the
+ * rule is satisfied, so the next edit or push is what runs the review.
  */
 const FACTS_COPY = {
-  refused:
-    "The naming rule found a problem with this pull request, so the review stage did not run and no model was asked. Edit the title, or the Name in dataset_description.json, as described below, and push again: the review runs on the new commit.",
+  refused: `The naming rule found a problem with this pull request, so the review stage did not run and no model was asked. Edit the title, or the Name in dataset_description.json, as described below. A new title runs the review again as soon as it is saved, until edits have already started the review of this commit ${PR_REVIEW_EDIT_CAP} times, the most one commit gets, and after that a push or a NEMAR administrator's start is what runs it; a new Name is a change to the files, so push again: the review runs on the new commit.`,
   unchecked:
     "The naming rule could not check this pull request's new dataset name, so the review stage did not run and no model was asked. Fixing dataset_description.json as described below and pushing again runs the review.",
 } as const;
@@ -1258,6 +1277,7 @@ const ERROR_COPY: Record<RunError, string> = {
   report_invalid: "The review could not be read back.",
   dispatch_failed: "The review could not be started. Push again to re-run it.",
   workflow_failed: "The review job failed before it finished.",
+  edit_limit: `Edits to the title, description or base of this pull request, and reopenings and markings as ready for review, had already started the review of this commit ${PR_REVIEW_EDIT_CAP} times, the most one commit gets. This latest change did not start the review again, and the earlier result no longer stands, because the text it judged may no longer be the pull request's. Push a new commit to run the review, or ask a NEMAR administrator to start the review of this commit again.`,
 };
 
 const CODE_LABEL: Record<FindingCode, string> = {
@@ -1524,7 +1544,10 @@ export function renderCheck(outcome: ReviewOutcome): RenderedCheck {
   }
   if (outcome.kind === "error") {
     return {
-      title: "Could not decide",
+      // The refusal at the edit cap says why in its title: the person who reads the check list
+      // learns that nothing is wrong with the review, and that the edits are what held it.
+      title:
+        outcome.error === "edit_limit" ? "Could not decide: too many edits" : "Could not decide",
       summary: ERROR_COPY[outcome.error],
       text: `${FOOTER}\n\n${NO_VERDICT}`,
     };
@@ -1733,11 +1756,12 @@ export function parseCallbackOutcome(
       return { kind: "error", error: "report_invalid" };
     }
   }
-  // `dispatch_failed` is the Worker's own word for "GitHub never ran the workflow" and is retried
-  // on redelivery and not counted as a model call: a job must not be able to say it.
+  // The Worker's own words (see {@link WORKER_ONLY_RUN_ERRORS}) are not ones a job may say.
   return {
     kind: "error",
     error:
-      isRunError(body.error) && body.error !== "dispatch_failed" ? body.error : "workflow_failed",
+      isRunError(body.error) && !WORKER_ONLY_RUN_ERRORS.includes(body.error)
+        ? body.error
+        : "workflow_failed",
   };
 }

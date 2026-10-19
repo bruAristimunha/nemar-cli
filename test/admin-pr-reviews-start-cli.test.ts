@@ -612,6 +612,96 @@ describe("nemar admin pr-reviews start --all", () => {
   });
 });
 
+describe("a commit capped by too many edits is started by name, never by --all", () => {
+  /** One pull request whose review was refused at the cap, and an ordinary one waiting to be started. */
+  function cappedAndOrdinary() {
+    openPr({ ds: "nm000201", n: 1, author: "alice", authorId: 42 });
+    seedReview(db, {
+      ds: "nm000201",
+      n: 1,
+      sha: SHA_A,
+      authorId: 42,
+      state: "errored",
+      detail: "edit_limit",
+    });
+    db.run("UPDATE pr_reviews SET edit_restarts = 5");
+    openPr({ ds: "nm000202", n: 2, author: "bob", authorId: 43 });
+  }
+
+  test("--all leaves the capped commit out, says how to start it, and does not touch its row", async () => {
+    cappedAndOrdinary();
+    const before = rows().find((x) => x.pr_number === 1);
+
+    const r = await cli([...START, "--all", "--yes"]);
+
+    expect(r.exitCode).toBe(0);
+    // Only the ordinary one was started, and the capped row is exactly as it was: still capped,
+    // with its count, so a bulk start did not lift the cap.
+    expect(dispatches()).toHaveLength(1);
+    expect(rows().find((x) => x.pr_number === 1)).toEqual(before);
+    expect(rows().find((x) => x.pr_number === 1)).toMatchObject({
+      state: "errored",
+      detail: "edit_limit",
+      edit_restarts: 5,
+    });
+    expect(r.stdout).toMatch(/1 started/);
+    // The list says which one is capped, why it is not started, and how to start it.
+    expect(r.stdout).toContain("1 left out, capped by too many edits");
+    expect(r.stdout).toContain("nm000201 #1");
+    expect(r.stdout).toContain(
+      "nm000201 #1  alice  capped: nemar admin pr-reviews start nm000201 1",
+    );
+    expect(r.stdout).toContain("lifts the cap");
+  });
+
+  test("--all with only a capped commit has nothing to start, and --json names it", async () => {
+    openPr({ ds: "nm000201", n: 1, author: "alice", authorId: 42 });
+    seedReview(db, {
+      ds: "nm000201",
+      n: 1,
+      sha: SHA_A,
+      authorId: 42,
+      state: "errored",
+      detail: "edit_limit",
+    });
+
+    const text = await cli([...START, "--all", "--yes"]);
+    expect(text.exitCode).toBe(0);
+    expect(text.stdout).toContain("Nothing to start");
+    expect(text.stdout).toContain("capped: nemar admin pr-reviews start nm000201 1");
+    expect(dispatches()).toHaveLength(0);
+
+    const json = await cli([...START, "--all", "--dry-run", "--json"]);
+    expect(json.exitCode).toBe(0);
+    const out = JSON.parse(json.stdout);
+    // Nothing is waiting, so the document is the empty result, and it still names what was left out.
+    expect(out.results).toEqual([]);
+    expect(out.capped).toEqual([{ dataset_id: "nm000201", pr_number: 1, author_login: "alice" }]);
+  });
+
+  test("started by name, it starts the review again and begins the count again", async () => {
+    cappedAndOrdinary();
+
+    const r = await cli([...START, "nm000201", "1"]);
+
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("started again");
+    expect(rows().find((x) => x.pr_number === 1)).toMatchObject({
+      state: "dispatched",
+      detail: null,
+      edit_restarts: 0,
+    });
+    expect(dispatches()).toHaveLength(1);
+  });
+
+  test("the help says so", async () => {
+    const r = await cli([...START, "--help-all"]);
+    expect(r.stdout).toContain("left out of --all");
+    expect(r.stdout).toContain("start it");
+    expect(r.stdout).toContain("by name, which starts its review and lifts the cap");
+  });
+});
+
 describe("nemar admin pr-reviews start --all --json", () => {
   test("a dry run lists what it would start, in the JSON too", async () => {
     openPr({ ds: "nm000201", n: 1, author: "alice", authorId: 42 });

@@ -1198,7 +1198,11 @@ describe("who is reviewed", () => {
     expect(allow.stdout).toContain("reviewed automatically");
     expect(allow.stdout).toContain("by queueadmin");
     expect(allow.stdout).toContain("Vetted by hand");
-    expect(allow.stdout).toContain("not re-reviewed until their next push");
+    // What happens to a pull request that is already open, now that an edit, a reopening and a
+    // marking as ready review it as a push does, and an administrator's start does too.
+    expect(allow.stdout).toContain("pushed to, edited, reopened or marked ready for review");
+    expect(allow.stdout).toContain("an administrator starts its review");
+    expect(allow.stdout).not.toContain("until their next push");
     expect(db.query("SELECT mode, set_by FROM pr_review_overrides").get()).toMatchObject({
       mode: "allow",
     });

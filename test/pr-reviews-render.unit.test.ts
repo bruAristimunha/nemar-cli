@@ -30,6 +30,7 @@ import {
   reportLines,
   standingLines,
   startAllQuestion,
+  startedWord,
   terminalize,
   tokenText,
   verdictText,
@@ -229,6 +230,12 @@ describe("verdictText", () => {
     expect(
       verdictText({ verdict: "not_reviewed", detail: "contributor_paused", review_current: null }),
     ).toBe("not reviewed (contributor paused)");
+  });
+
+  test("a review refused at the edit cap says so in plain words", () => {
+    expect(
+      verdictText({ verdict: "could_not_decide", detail: "edit_limit", review_current: true }),
+    ).toBe("could not decide (too many edits)");
   });
 
   test("an owner's or administrator's pull request reads exempt (owner or admin), whatever else is on record", () => {
@@ -949,6 +956,24 @@ describe("waiverLines", () => {
       expect(surfaces[where], where).toContain("GitHub may not have answered");
       expect(surfaces[where], where).toContain("has no readable Name");
       expect(surfaces[where], where).toMatch(/\bonce\b/);
+    }
+  });
+
+  test("every restart reads as started again, whatever started it, and a first start as started", () => {
+    const answerFor = (reason: string): StartReviewResponse => ({
+      environment: "production",
+      dispatched: true,
+      reason,
+      review_id: 1,
+      author_login: null,
+    });
+    // `redispatched_after_edit` is the word an edit of the title, the body or the base says; a word
+    // that only starts like it is read the same way, and so is the plain one.
+    for (const reason of ["redispatched", "redispatched_after_edit"]) {
+      expect(startedWord(answerFor(reason)), reason).toBe("started again");
+    }
+    for (const reason of ["dispatched", "dispatch_claimed"]) {
+      expect(startedWord(answerFor(reason)), reason).toBe("started");
     }
   });
 

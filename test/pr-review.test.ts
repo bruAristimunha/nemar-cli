@@ -22,6 +22,7 @@ import {
   OVERRIDE_MODES,
   PRODUCED_DECLINE_REASONS,
   PR_REVIEW_COMMENT_MARKER,
+  PR_REVIEW_EDIT_CAP,
   type PrReviewReport,
   PrReviewReportError,
   REVIEW_OUTCOME_KINDS,
@@ -29,6 +30,7 @@ import {
   RUN_ERRORS,
   type ReviewOutcome,
   VERDICTS,
+  WORKER_ONLY_RUN_ERRORS,
   conclusionOf,
   effectiveCriteria,
   estimateCostUsd,
@@ -1178,6 +1180,26 @@ describe("the callback body becomes an outcome, and never a verdict by itself", 
     ).toEqual({ kind: "error", error: "workflow_failed" });
   });
 
+  test("a job cannot report the Worker's own edit_limit either, and the two are the whole list", () => {
+    // The Worker refuses a restart past the cap; no job sees that, so none may say it, or a job could
+    // show a pull request as held by edits that never happened.
+    expect([...WORKER_ONLY_RUN_ERRORS]).toEqual(["dispatch_failed", "edit_limit"]);
+    for (const word of WORKER_ONLY_RUN_ERRORS) {
+      expect(isRunError(word), word).toBe(true);
+      expect(
+        parseCallbackOutcome({ outcome: "error", report: undefined, error: word }),
+        word,
+      ).toEqual({ kind: "error", error: "workflow_failed" });
+    }
+    // Every other word in the vocabulary is still the job's to say.
+    for (const word of RUN_ERRORS.filter((w) => !WORKER_ONLY_RUN_ERRORS.includes(w))) {
+      expect(
+        parseCallbackOutcome({ outcome: "error", report: undefined, error: word }),
+        word,
+      ).toEqual({ kind: "error", error: word });
+    }
+  });
+
   test("a refused report tells the caller the parser's fixed word, and nothing else changes", () => {
     const told: string[] = [];
     const o = parseCallbackOutcome(
@@ -1193,6 +1215,64 @@ describe("the callback body becomes an outcome, and never a verdict by itself", 
     expect(isRunError("model_refused")).toBe(true);
     expect(isRunError("other")).toBe(false);
     expect(isRunError(undefined)).toBe(false);
+  });
+});
+
+describe("the refusal at the edit cap (ADR 0107, decision 4)", () => {
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+  const refusal = { kind: "error", error: "edit_limit" } as const;
+
+  test("it is the number the owner set", () => {
+    expect(PR_REVIEW_EDIT_CAP).toBe(5);
+  });
+
+  test("the check needs a person, has its own title and says what happened and what to do", () => {
+    expect(conclusionOf(refusal)).toBe("action_required");
+    const r = renderCheck(refusal);
+    expect(r.title).toBe("Could not decide: too many edits");
+    expect(r.summary).toBe(
+      "Edits to the title, description or base of this pull request, and reopenings and markings as ready for review, had already started the review of this commit 5 times, the most one commit gets. This latest change did not start the review again, and the earlier result no longer stands, because the text it judged may no longer be the pull request's. Push a new commit to run the review, or ask a NEMAR administrator to start the review of this commit again.",
+    );
+    // The usual footer and the no-verdict line, as every error has, and no model's words.
+    const other = renderCheck({ kind: "error", error: "workflow_failed" });
+    expect(r.text).toBe(other.text);
+    expect(r.text).not.toContain("edit_limit");
+  });
+
+  test("the comment says a person is needed, for the commit it names", () => {
+    const body = renderComment(refusal, sha);
+    expect(body).toContain("NEEDS A PERSON");
+    expect(body).toContain(sha.slice(0, 7));
+    expect(body).not.toContain("PASS");
+  });
+
+  test("no other error has that title, and its summary is its own", () => {
+    for (const error of RUN_ERRORS.filter((w) => w !== "edit_limit")) {
+      const r = renderCheck({ kind: "error", error });
+      expect(r.title, error).toBe("Could not decide");
+      expect(r.summary, error).not.toContain("the most one commit gets");
+    }
+  });
+
+  test("the copy of a review that stopped at the facts does not promise an unlimited edit", () => {
+    const check = renderCheck({
+      kind: "reported",
+      report: parsePrReviewReport(
+        factsReport({
+          evidence: evidence({
+            files_read: 0,
+            truncated: true,
+            changelog_entry: null,
+            title_problem: "author_year",
+          }),
+        }),
+      ),
+    });
+    expect(check.summary).toContain("A new title runs the review again as soon as it is saved");
+    expect(check.summary).toContain(
+      "until edits have already started the review of this commit 5 times, the most one commit gets",
+    );
+    expect(check.summary).toContain("a NEMAR administrator's start is what runs it");
   });
 });
 
@@ -1725,8 +1805,9 @@ describe("a review that ended at the facts: the naming rule decided it before an
     // That the review stage did not run and no model was asked.
     expect(check.summary).toContain("the review stage did not run and no model was asked");
     expect(check.summary).toContain("The full review did not run, so no file's content was read.");
-    // That the author fixes the title or the Name and pushes again.
+    // That a new title runs the review again on its own, and a new Name needs a push.
     expect(check.summary).toContain("Edit the title, or the Name in dataset_description.json");
+    expect(check.summary).toContain("A new title runs the review again as soon as it is saved");
     expect(check.summary).toContain("push again");
     // Nothing was assessed, and the table says so, with only the rule's own failure a No.
     expect(check.summary).toContain("| A genuine contribution, not spam | Not assessed |");

@@ -111,6 +111,8 @@ const DETAIL_WORDS: Record<string, string> = {
   rate_limited: "rate limited",
   daily_limit: "daily limit",
   unreported: "never reported",
+  // The review of a commit was refused at the cap on restarts by edits (ADR 0107).
+  edit_limit: "too many edits",
 };
 
 function detailWord(detail: string): string {
@@ -1162,8 +1164,13 @@ function gateWord(reason: string): string | undefined {
   return Object.hasOwn(NOT_STARTED, reason) ? NOT_STARTED[reason] : undefined;
 }
 
-function startedWord(r: StartReviewResponse): string {
-  return r.reason === "redispatched" ? "started again" : "started";
+/**
+ * What a start that went is called. Every word that starts with `redispatched` is a commit started
+ * again (`redispatched`, and `redispatched_after_edit`, which only a delivery says), so an equality
+ * with the first would print the second as a first start.
+ */
+export function startedWord(r: StartReviewResponse): string {
+  return r.reason.startsWith("redispatched") ? "started again" : "started";
 }
 
 /** Why a start did not start one, as the line `start` prints. Pure, so it is tested without a server. */
@@ -1187,7 +1194,7 @@ prReviewsCommand
   )
   .option(
     "--all",
-    "Every open pull request whose current commit has no review, or one that was declined or ended without a verdict (an owner's or administrator's is exempt and left out, unless a review of its current commit is on record)",
+    "Every open pull request whose current commit has no review, or one that was declined or ended without a verdict (an owner's or administrator's is exempt and left out, unless a review of its current commit is on record; one refused for too many edits is left out too, and started by name)",
   )
   .option("--dry-run", "With --all: list what would be started and start nothing")
   .option("-y, --yes", "With --all: do not ask before starting")
@@ -1195,9 +1202,10 @@ prReviewsCommand
   .addHelpText(
     "after",
     `
-The automated review runs when GitHub tells the NEMAR API a pull request was opened or pushed to. A
+The automated review runs when GitHub tells the NEMAR API that a pull request was opened, pushed to,
+reopened or marked ready for review, or that its title, description or target branch was edited. A
 pull request that was already open when the review was switched on produced no such event, so it has
-no review until its author pushes again. This asks for one by name. The API reads the pull request
+no review until one of those happens to it. This asks for one by name. The API reads the pull request
 from GitHub itself and runs it through the same gate as any other: an administrator's block on the
 contributor still applies, and a pull request opened by a NEMAR owner or administrator is not
 reviewed and nothing is started. Its check is posted all the same, as the naming rule decides:
@@ -1207,6 +1215,9 @@ read. No count of reviews, and no record of rejected pull requests, holds a star
 whose review was declined, ended in an error or never reported is started again, and so is one
 handed to GitHub more than 40 minutes ago that never came back; one that is running or has a
 result is not started again. A start that restarts a review that already ran costs a second run.
+A commit whose review was refused for too many edits (five restarts by edits, reopenings and
+markings as ready) is left out of --all, so that a bulk start never lifts the cap unasked; start it
+by name, which starts its review and lifts the cap.
 
   nemar admin pr-reviews start nm000108 12
   nemar admin pr-reviews start --all --dry-run
@@ -1295,6 +1306,11 @@ export function startAllQuestion(count: number): string {
   return `Start the automated review of ${count} pull request${count === 1 ? "" : "s"}? Each is one run of up to two model calls.`;
 }
 
+/** Whether the review of an entry's current commit was refused at the cap on restarts by edits. */
+function isCapped(e: Pick<QueueEntry, "verdict" | "detail">): boolean {
+  return e.verdict === "could_not_decide" && e.detail === "edit_limit";
+}
+
 /** The `--all` run: list, show, ask, then start one at a time. */
 async function startAll(options: {
   dryRun?: boolean;
@@ -1319,9 +1335,23 @@ async function startAll(options: {
   }
 
   const drafts = q.entries.filter((e) => e.draft);
-  const todo = q.entries.filter((e) => !e.draft);
+  // A commit whose review was refused at the cap on restarts by edits is left out. Starting it
+  // starts the review and begins the count again, which is the one thing a bulk start must not do
+  // without being asked: an administrator starts it by name and so means it.
+  const capped = q.entries.filter((e) => !e.draft && isCapped(e));
+  const todo = q.entries.filter((e) => !e.draft && !isCapped(e));
   const incomplete = q.truncated || q.skipped.unreadable > 0;
-  const common = { environment: q.environment, drafts: drafts.length, truncated: incomplete };
+  const common = {
+    environment: q.environment,
+    drafts: drafts.length,
+    // The commits left out for the cap, by name, so a script sees what it has to start itself.
+    capped: capped.map((e) => ({
+      dataset_id: e.dataset_id,
+      pr_number: e.pr_number,
+      author_login: e.author_login,
+    })),
+    truncated: incomplete,
+  };
 
   if (!json) {
     console.log();
@@ -1345,6 +1375,19 @@ async function startAll(options: {
     }
     if (drafts.length > 0) {
       console.log(chalk.dim(`${drafts.length} draft${drafts.length === 1 ? "" : "s"} left out.`));
+    }
+    if (capped.length > 0) {
+      console.log();
+      console.log(
+        chalk.yellow(
+          `${capped.length} left out, capped by too many edits (the most one commit gets): starting one by name starts its review and lifts the cap.`,
+        ),
+      );
+      for (const e of capped) {
+        console.log(
+          `  ${e.dataset_id} #${e.pr_number}  ${plain(e.author_login)}  ${chalk.dim(`capped: nemar admin pr-reviews start ${e.dataset_id} ${e.pr_number}`)}`,
+        );
+      }
     }
     if (incomplete) {
       console.log(
@@ -2147,7 +2190,9 @@ async function setContributor(
       console.log(chalk.dim(`  (it was ${r.previous} before)`));
     if (mode === "allow") {
       console.log(
-        chalk.dim("  Pull requests already opened are not re-reviewed until their next push."),
+        chalk.dim(
+          "  A pull request already opened is reviewed when it is pushed to, edited, reopened or marked ready for review, or when an administrator starts its review.",
+        ),
       );
     }
     console.log();

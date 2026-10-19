@@ -1269,12 +1269,9 @@ function outcomeOf(row: ReviewRow & { report: string | null }): StoredOutcome | 
     id: row.id,
     datasetId: row.dataset_id,
     prNumber: row.pr_number,
-    headSha: row.head_sha,
     state: (REVIEW_STATE_SET.has(row.state) ? row.state : "errored") as ReviewState,
     detail: row.detail,
     report: row.report,
-    checkRunId: null,
-    commentId: null,
   });
 }
 

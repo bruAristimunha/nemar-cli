@@ -11,7 +11,7 @@ The Worker as the gate, the per-commit row, the one-shot claim, the derived verd
 Follows ADR 0048 (account kinds), ADR 0053 and ADR 0086 (unknown is never clear), ADR 0020 (a workflow edit reaches ~785 repositories at once).
 
 This ADR records the decisions of epic #1813.
-Built so far: the exemption with the `exempt` queue verdict and its CLI wording (#1814); the removal of the counts, which is the caps, the platform's pool and the automatic tally pause, with a volume line in the admin list (#1815); readable pull request text from the CLI (#1818); and the two-stage review with report version 2, the naming rule and its one override (#1816).
+Built so far: the exemption with the `exempt` queue verdict and its CLI wording (#1814); the removal of the counts, which is the caps, the platform's pool and the automatic tally pause, with a volume line in the admin list (#1815); readable pull request text from the CLI (#1818); the two-stage review with report version 2, the naming rule and its one override (#1816); and the re-review of a pull request when its title, body or base is edited, or it is reopened or marked ready, with a cap of five such restarts for one commit (#1817).
 The rest is decided here and built by the later phases.
 The removal of the counts is released only together with the stage-1 screen, so that spend is never left without a bound.
 
@@ -62,7 +62,9 @@ And the review only ever sees a pull request's text and metadata, so a count of 
   When the rule refuses the title or the dataset's new name the check is a failure, and when the dataset's name could not be read it is `action_required`, a check that needs a person and does not pass, whatever the title says: nothing can be waived while the name is unread, so the check, the answer of a start and the list's label all say that the name has to be read first.
   No row is stored, no model is called, nothing is dispatched, and no comment is made.
 - **That applies only to a commit no review has touched.**
-  A commit that has a row keeps what its review said, whoever acts on it next: the author reopening the pull request, a force-push back to it, or an administrator's start.
+  A commit that has a row keeps what its review said, whoever acts on it next: a force-push back to it, or an administrator's start of a review that has a result.
+  The exceptions are the deliveries that change the text the review judged: an edit of the title, the body or the base, a reopening and a marking as ready restart the review of a commit that has a row, whoever caused them and an exempt author included (decision 4).
+  What takes the place of the stored result is a review that runs again, never `skipped`.
   A row means someone put the commit through review (a stranger's push to an owner's branch, or an author who was not exempt yet), `skipped` counts as passing for a required check, and writing it over a failed or undecided review would erase a verdict nobody exempt gave.
   An exempt author who wants such a commit through pushes a new commit, which is exempt in its own right.
   An administrator's start of such a commit, and an exempt author's own redelivery of one whose dispatch failed, are handled like anyone's: a review is started again if the earlier one ended without a verdict, and a block on the author holds it back.
@@ -118,7 +120,7 @@ The owner set the models, the budgets and the prompt on 2026-10-16, after a comp
   The review job decides the facts first.
   When the title, or the dataset's changed name, breaks the naming rule (3a), or the changed name cannot be read, the run ends at the `facts` stage: no model is called and no tokens are spent, `models` names none, all six criteria are not assessed, and the report says why in the rule's own sentences.
   The report stage is `facts`, and a facts report can never pass: the parser refuses one that names a model, assesses anything, spent a token, or has no naming fact to explain it.
-  The check reads "Needs changes: the naming rule", or "Could not decide: the naming rule was not checked" when the name could not be read and the rule refused nothing, and the author edits the title or the `Name` and pushes again.
+  The check reads "Needs changes: the naming rule", or "Could not decide: the naming rule was not checked" when the name could not be read and the rule refused nothing, and the author edits the title, which runs the review again (decision 4, within its cap), or fixes the `Name` and pushes.
   The title, the copy under it and the CLI's reason line are all chosen by the naming fact (`factsStop`) and never by the verdict, so they agree: a version that did not advance fails the verdict of a facts report whose name was only unreadable, and that report still reads "not checked" everywhere.
   A refusal beside an unreadable name reads "Needs changes", because the rule found something.
 - **A description is read up to 12,000 characters, and a longer one is recorded as cut.**
@@ -185,14 +187,68 @@ The owner set the models, the budgets and the prompt on 2026-10-16, after a comp
 
 - A placeholder or template title, a description that is gibberish or placeholder text, and a title that does not describe the change are blockers.
   An incomplete or slightly inaccurate description passes with a note, and a misleading one is a blocker the author fixes by editing it.
-- Editing the title, the body or the base re-runs the review and supersedes a running one.
-  That is built by phase P4 (#1817), and until it lands the next bullet is the rule.
-- **The title and the body are read once per run, and an edit does not re-run the review until phase P4 lands.**
-  The workflow reads the pull request from the API when a run starts (`--pr-json`), and the title and the body come from that read.
-  The Worker's gate takes up `opened`, `synchronize`, `reopened` and `ready_for_review` and has no `edited`, so an edit is ignored.
-  A check therefore describes the text as it was when its run started: an author who fixes a title or a description to satisfy a failed check does not clear it by editing, and a text edited after a pass is not judged again.
-  The same holds for the naming rule on an owner's or administrator's pull request, whose title is read from the delivery: editing a refused title does not clear the check, and a new commit, a reopening or an administrator's start does.
-  **The required check (decision 5) must not be turned on before phase P4 lands**, because until then a pull request could be held by text it no longer has, or passed by text that has since changed.
+- Editing the title, the body or the base re-runs the review and supersedes a running one (built by phase P4, #1817).
+  The Worker takes up an `edited` delivery only when its `changes` object names `title`, `body` or `base`; the keys are read, and what they hold (the text from before the edit) never is.
+  Any other edit is ignored.
+- **A commit that has a review is started again on the same row, from any state.**
+  A running review and a stored result are both superseded.
+  The row's nonce is replaced, so the superseded job's token no longer matches: its claim and its report are refused with the 401 any stale token gets, and its report is never stored.
+  A job that has not claimed yet spends nothing.
+  A job that had claimed is not stopped: it still makes its model calls before its report is refused, so superseding a claimed review costs that run in full.
+  The row's verdict and report are cleared (the table keeps them only for a reported row), so the check goes back to running and an old fail or pass stops standing the moment the text changes.
+  `attempts` goes up by one when the earlier run could have cost a model call, as for any restart, and the answer's reason word is `redispatched_after_edit`.
+  A review that was handed to GitHub and never claimed could not have cost one, so several quick edits before the job starts are still one run.
+  A contributor an administrator has blocked is declined again, as for any restart.
+  The restart is tried against the row as it is now.
+  If a result or the watchdog's verdict lands between the Worker's read of the row and its write, the write finds nothing to change, and the edit is tried again on a fresh read, up to three times in all, so it is not dropped for having lost that race.
+  A reopening and a marking as ready are retried the same way.
+  If the row moves under all three tries, which takes another writer moving it three times in a row, the stored result is restated and the change is dropped; that stays as designed, because the limit is what keeps a row that keeps moving from holding the webhook.
+- **A reopening and a marking as ready restart it too.**
+  An edit made while a pull request is closed or a draft is not taken up (it is not open, or is a draft, as for any delivery), so the stored review of its commit would keep judging text the pull request no longer has.
+  The first delivery that follows is the reopening or the marking as ready.
+  On a commit that has a row it restarts the review from any state, the same way an edit does, by anyone and an exempt author included, held to the same gate (a block still declines it) and counted toward the same cap below.
+  Its reason word is the plain `redispatched`.
+  Of the deliveries, only a push (a force-push back to a reviewed commit, say) changes no text, so it alone still restates what the review said.
+- **A commit with no row is a new delivery, and a commit with a row is restarted.**
+  An owner's or administrator's new delivery takes the exempt path: a new `skipped` check, or the naming rule's verdict on the new title, because the Worker reads that title from the delivery.
+  Editing a refused title on such a pull request therefore posts a new `skipped` check beside the failed one.
+  That clears the failure only if GitHub reads the newest check run of a name, which is GitHub's rule and is not verified (see Consequences).
+  An edit made by someone who is not exempt is reviewed, the rule for any delivery someone else caused.
+  An exempt author's edit on a commit someone else pushed is a commit with a row, so it restarts that review, as a reopening or a marking as ready does.
+- **A base that is not `main` is not reviewed.**
+  The delivery describes the pull request as it is after the edit, so a base moved off `main` is answered `not_main` and the commit's review is left as it was.
+  An edit that moves the base onto `main` is handled like any other: a commit without a row is a new delivery, and a commit with a row is restarted.
+- **The review judges the current text because the job reads it when it starts.**
+  The workflow reads the pull request from the API when a run starts (`--pr-json`), and the title and the body come from that read, so the run an edit starts reviews the edited text and the one it superseded can no longer report.
+  A redelivered edit starts the review once more, and counts.
+- **Five restarts caused by a change of the text are allowed for one head commit, and the sixth is refused (the owner, 2026-10-19).**
+  The count is `pr_reviews.edit_restarts` (migration 0099).
+  It goes up by one at each restart an edit, a reopening or a marking as ready causes, from 0 at the commit's first row.
+  A restart is counted in its own write, before its dispatch, so a restart whose dispatch then fails counts, and so does a redelivered edit: the conservative way to be wrong, and a race-safe one.
+  What adds nothing is a commit with no row (a new delivery), a restart that lost a race and was tried again (it counts once), a restart a block declined (a decline is no run), and a push that restarts a review whose dispatch failed (it changes no text).
+  An administrator's start resets the count to 0 when it starts the review again; a start that a block declines does not.
+  A push is a new commit with a new row, so it starts at 0.
+  The cap comes after the gate, so a blocked contributor is declined and is never told "too many edits".
+  The sixth change is refused and not restarted, and the refusal fails closed.
+  The row becomes an errored review with the detail `edit_limit`, whatever state it was in, a running review and a stored pass or fail included, because a result that judged the text from before the edit must not stand for the commit.
+  Its check is the same one, now `action_required` and titled "Could not decide: too many edits", the comment says the same, and both name the way out: a push, or an administrator's start.
+  Every later edit, reopening or marking as ready, and a repeated push of the commit, only restates the refusal, and nothing is dispatched.
+  The word `edit_limit` is the Worker's alone, so a job's callback that names it is `workflow_failed`.
+  A refusal whose publish fails is published again by the watchdog's sweep like any unpublished result, and is never marked `unreported`, because the sweep that does that looks only at running reviews.
+  A reopening and a marking as ready are counted with edits because a close-and-reopen cycle costs what an edit does and would otherwise be unbounded.
+  The owner's decision named edits, so counting them is a reading of it, which stands until the owner confirms or reverses it.
+- **A publish is checked against the row once GitHub has answered, so a slow write cannot leave a stale check.**
+  A callback can store a pass and start updating the check, the sixth edit can refuse the row and publish the refusal, and the callback's slower update can then land last, so GitHub would show a pass for a row that says a person is needed.
+  After the check or the comment is acknowledged, the Worker reads the row again, and when it no longer stands for what was published (its state, decision time, verdict, reason or report moved) it publishes what the row says now, three publishes at most in all.
+  `published_at` is stamped only while the row still has the state and decision time that were published, so a result that moved on is not marked as shown and the watchdog's republish sweep, which looks for the unstamped, corrects it; after the third publish the row is left unstamped for the same reason.
+  Every publisher goes through that one function (the callback's store, the refusal, the running check, a decline and the sweep), so every one of them has it.
+- **The comment can lag the check, and a superseded run is in no token total.**
+  A running review publishes its check only (the comment is written when an outcome is decided), so the pull request's comment keeps the text of the last completed review until the new result lands, while the check already shows running.
+  The check is what the commit shows and what a required check reads.
+  The report of a superseded run is never stored, so the volume line's token and cost sums leave it out, as they leave out any earlier attempt of a restarted review (decision 2).
+  Its run is in `review_runs`, through `attempts`, when it had claimed.
+- **Re-review on an edit is a condition of the required check (decision 5).**
+  Without it a pull request could be held by text it no longer has, or passed by text that has since changed, so it is built before the check can be turned on.
 - An empty description is a blocker decided by a git-free fact, not by the model, and `nemar dataset update` requires a title and a description and writes the CHANGES entry for the version it creates.
   The owner confirmed both.
 
@@ -234,7 +290,7 @@ The owner set the models, the budgets and the prompt on 2026-10-16, after a comp
 
 - The workflow's timeout, wording and install order (after the token is minted, with `--ignore-scripts`, as the publication review's workflow does) change first and are mirrored to `nemarDatasets/.github`, because the parity test makes any edit a two-repository change.
   Every dispatch, staging included, runs `main`'s script, so the new reviewer cannot run on staging before a release.
-- There is therefore no staging soak of the reviewer: its screen and its review first run on production, in an advisory shadow mode on production pull requests after the release, and the check is made required only after the shadow run, the calibration gate and the re-review on an edit (decision 4, phase P4).
+- There is therefore no staging soak of the reviewer: its screen and its review first run on production, in an advisory shadow mode on production pull requests after the release, and the check is made required only after the shadow run and the calibration gate, with the re-review on an edit (decision 4, phase P4) built before either.
 - The Worker's side is soaked on staging, as a rollout step of its own.
   The dev Worker deploys from `dev` with the epic, before the release, and the exempt path never dispatches, so a pull request opened by an administrator against a dev-owned exemplar exercises the naming rule's reads, the check posted for it and the override on staging.
   That step verifies two statements of this ADR and no others: how long the naming rule's GitHub reads take against the ten seconds GitHub gives a delivery (decision 3a), and that GitHub reads the newest check run of a name, which is what lets a waiver release a required check (Consequences).
@@ -254,7 +310,7 @@ The owner set the models, the budgets and the prompt on 2026-10-16, after a comp
 - **ADR 0092, "Green and red are real; everything else needs a person":** plus `skipped`, for an exempt pull request alone.
 - **ADR 0092, "The check is not required by any ruleset yet", and the Consequences that lean on it** ("acceptable only because the check is not required", "This is why the check is not required", "only matter once the check is required"): the check is required on reviewable datasets, and the risk that a model's false green lets a maintainer merge is accepted, bounded by facts, calibration and re-review on edit.
 - **ADR 0092, the accepted risks "Many new accounts" and "Padding the tally":** replaced by the stage-1 cost bound and the workspace spend limit.
-- **ADR 0092, the amendment of 2026-10-10:** the allowances and the pool (and so `start --all` stopping when the daily pool is spent), and "A new delivery of the same commit still restarts nothing but a dispatch GitHub did not run", which now has one more exception, an edit.
+- **ADR 0092, the amendment of 2026-10-10:** the allowances and the pool (and so `start --all` stopping when the daily pool is spent), and "A new delivery of the same commit still restarts nothing but a dispatch GitHub did not run", which now has three more exceptions, an edit, a reopening and a marking as ready.
 - **ADR 0093:** `allow` lifting the tally's pause (it now only clears a block); the queue verdicts gain `exempt` (built in phase P1); the two required checks it reads are joined by the review where its ruleset exists; and the `blocked` refusal, whose rule is unchanged, names the review.
 
 ## Consequences
@@ -272,6 +328,10 @@ The owner set the models, the budgets and the prompt on 2026-10-16, after a comp
   The same holds for an exempt author who marks a draft ready, and for an administrator's start of a pull request whose current commit has no review.
 - **A demotion or a revocation does not retract a `skipped` check already posted.**
   It stays valid for its commit until the commit changes, and the next delivery reads the role afresh.
+- **An edit holds the check running for as long as a run takes, and a restart may be one nobody wanted.**
+  A maintainer's typo fix on a pull request that already had a result puts its check back to running for up to about 28 minutes (the job's own limit) and costs a run.
+  An exempt author's edit, reopening or marking as ready on a commit someone else pushed restarts that review, because the commit has a row and the exemption is judged only for a commit no review has touched.
+  The cap bounds both at five restarts a commit.
 - **An exempt push stores no row, so it does not supersede a review of the previous commit that is still running.**
   That review's late result can rewrite the pull request's review comment, which names the commit it is about; the check on the new commit is unaffected.
 - **A review that starts for the same commit between the row read and the exempt publish leaves the commit with two checks of the same name.**
@@ -327,12 +387,13 @@ The owner set the models, the budgets and the prompt on 2026-10-16, after a comp
 
 ## Receipts
 
-- Epic #1813 and its phases #1814, #1815, #1818 and #1816.
+- Epic #1813 and its phases #1814, #1815, #1818, #1816 and #1817.
 - The two stages and report version 2 (#1816): `scripts/ci/pr-review.ts` (`STAGE_BUDGETS`, `callStage`, `reviewPullRequest`), `scripts/ci/pr-review-prompt.ts` (`SCREEN_SYSTEM_PROMPT`, `REVIEW_SYSTEM_PROMPT`, `V3_RULES`, `assembleReport`), `scripts/ci/pr-review-evidence.ts` (`gatherListing`, `gatherContent`), `shared/pr-review.ts` (`parsePrReviewReport`, `parseStoredPrReviewReport`).
 - The naming rule and its override (#1816): `shared/naming-rule.ts` (`namingProblemOf`), `backend/src/services/pr-review-naming.ts`, `backend/src/services/pr-review-waiver.ts`, `src/commands/admin-pr-reviews.ts` (`allow --admin`).
 - The calibration: `scripts/ci/pr-review-calibrate.ts`.
 - Exemption: `backend/src/services/pr-review-exemption.ts`, `backend/src/services/pr-review.ts` (`isExemptDelivery`, `publishExempt`), `shared/pr-review.ts` (`exempt`, `skipped`).
 - The gate and the removal of the counts (#1815): `backend/src/services/pr-review.ts` (`gateDecision`: exempt, then blocked, then reviewed), `shared/pr-review.ts` (`PRODUCED_DECLINE_REASONS`, `HISTORICAL_DECLINE_REASONS`, `standingOf`).
 - The volume line: `backend/src/services/pr-review-queue.ts` (`readVolume`), `shared/contract/pr-review-admin.ts` (`QueueVolume`), `src/commands/admin-pr-reviews.ts` (`volumeLines`).
+- The re-review on an edit, a reopening and a marking as ready, and its cap (#1817): `backend/src/services/pr-review.ts` (`readPullRequestEvent`, `handleRepeat`, `restartReview`, `refuseEdit`), `backend/src/db/migrations/0099_pr_review_edit_limit.sql`, `shared/pr-review.ts` (`PR_REVIEW_EDIT_CAP`, `WORKER_ONLY_RUN_ERRORS`).
 - Queue and labels: `backend/src/services/pr-review-queue.ts`, `shared/contract/pr-review-admin.ts`, `src/commands/admin-pr-reviews.ts`.
-- Tests: `backend/test/pr-review-exemption.test.ts`, `backend/test/pr-review-flow.test.ts`, `backend/test/pr-review-queue.test.ts`, `backend/test/pr-review-start.test.ts`, `test/pr-review.test.ts`, `test/pr-review-workflow.test.ts` (the budgets), `test/admin-pr-reviews-cli.test.ts`, `test/pr-reviews-render.unit.test.ts`.
+- Tests: `backend/test/pr-review-exemption.test.ts`, `backend/test/pr-review-flow.test.ts`, `backend/test/pr-review-queue.test.ts`, `backend/test/pr-review-start.test.ts`, `backend/test/pr-review-edit-limit-migration.test.ts`, `test/pr-review.test.ts`, `test/pr-review-workflow.test.ts` (the budgets), `test/admin-pr-reviews-cli.test.ts`, `test/pr-reviews-render.unit.test.ts`.

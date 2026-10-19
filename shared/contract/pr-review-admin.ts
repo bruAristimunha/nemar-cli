@@ -236,8 +236,11 @@ export interface QueueResponse {
 
 /**
  * What starting the review of one open pull request came to. `reason` is one of the review's own
- * fixed words (ADR 0092): `dispatched`, `redispatched` (a commit started again) or `dispatch_claimed`
- * (GitHub's answer was lost but the workflow had already claimed it) when it was handed to GitHub,
+ * fixed words (ADR 0092): `dispatched`, `redispatched` (a commit started again),
+ * `redispatched_after_edit` (a commit started again because its title, body or base was edited,
+ * ADR 0107; only a delivery says it, an administrator's start never edits anything) or
+ * `dispatch_claimed` (GitHub's answer was lost but the workflow had already claimed it) when it was
+ * handed to GitHub,
  * otherwise why not (`duplicate`, `contributor_paused`, `exempt_author` (its author is an owner or
  * administrator, so it is not reviewed and its check was posted as skipped), `naming_rule` (its
  * author is exempt, and the naming rule refused its title or its new dataset name, so its check was
