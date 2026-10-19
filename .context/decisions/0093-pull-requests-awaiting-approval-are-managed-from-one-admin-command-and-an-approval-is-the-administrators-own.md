@@ -4,6 +4,10 @@
 **Date:** 2026-10-08
 **Owner:** Seyed Yahya Shirazi
 
+Partially superseded by [ADR 0107](0107-dataset-pull-requests-are-screened-on-content-owners-and-administrators-are-exempt-and-the-review-check-is-required.md) (proposed with epic #1813; the `exempt` verdict and the changes to `allow`, `start --all` and the list's volume line are built so far):
+`allow` only clears an administrator's block, `start --all` no longer stops on a daily pool, the queue gains the verdict `exempt` and a volume line, and the review will join the required checks where its ruleset exists.
+Its "What this supersedes" section lists what it replaces here.
+
 Follows ADR 0092 (the review this command lists and acts on), ADR 0001 (published datasets are
 PR-only), ADR 0054 and ADR 0086 (unknown is never zero, and never clear).
 

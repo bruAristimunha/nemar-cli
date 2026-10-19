@@ -252,6 +252,15 @@ export type GitHubAuth =
   | { kind: "pat"; token: string }
   | { kind: "app"; installationId: number; getToken: () => Promise<string> };
 
+/** The bindings that make up the App configuration, and nothing else of the Worker's environment. */
+export type GitHubAppEnv = Pick<
+  Bindings,
+  | "GITHUB_APP_ID"
+  | "GITHUB_APP_PRIVATE_KEY"
+  | "GITHUB_APP_INSTALLATION_ID_NEMAR_DATASETS"
+  | "GITHUB_APP_INSTALLATION_ID_NEMAR_ORG"
+>;
+
 /** Parsed GitHub App configuration, or `null` when not configured. */
 export interface GitHubAppConfig {
   appId: string;
@@ -265,7 +274,7 @@ export interface GitHubAppConfig {
  *  silently omitted, and the caller will fall back to PAT for that org.
  *  This is the single place that decides "App auth is available"; all
  *  callers should route through here rather than re-reading env. */
-export function getGitHubAppConfig(env: Bindings): GitHubAppConfig | null {
+export function getGitHubAppConfig(env: GitHubAppEnv): GitHubAppConfig | null {
   if (!env.GITHUB_APP_ID || !env.GITHUB_APP_PRIVATE_KEY) return null;
   const installationIdsByOrg: Record<string, number> = {};
   const orgs: ReadonlyArray<readonly [string, string | undefined]> = [

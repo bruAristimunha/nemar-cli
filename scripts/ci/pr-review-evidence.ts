@@ -1,5 +1,5 @@
 /**
- * What a pull request changed, read as git data (ADR 0092).
+ * What a pull request changed, read as git data (ADR 0092, ADR 0107).
  *
  * Runs inside the central review workflow against a repository made with `git init` and
  * `git fetch`, which has no working tree. **Nothing is checked out and nothing from the pull
@@ -7,7 +7,16 @@
  * in the pull request can run, and a fork's content is read exactly like a branch's. Every git
  * call passes its arguments as an array (no shell) after the commit ids have been checked against
  * a 40-hex shape, and with `--literal-pathspecs`, so a path or a branch name is only ever data and
- * a file named like a pathspec (`:(glob)*.json`) cannot make git read another file's content.
+ * a file named like a pathspec (`:(glob)*.json`) cannot make git read another file's content. Each
+ * call also runs with {@link childEnv}, this process's environment less the model credential, the
+ * request for an identity token and the callback token, so the git that reads a contributor's
+ * objects is handed none of them.
+ *
+ * **Two passes, for the two stages.** {@link gatherListing} reads what the screen is shown: the
+ * change list, the version and name in `dataset_description.json` (the one file whose content it
+ * reads), the subject counts and the commit subjects. {@link gatherContent} reads what only the
+ * full review is shown: the cosmetic checks, the diffs and the change log. A pull request the
+ * screen stops never has a file's content read beyond `dataset_description.json`.
  *
  * The output has two halves with different trust. {@link buildEvidence} is the deterministic
  * account (counts per area, versions, subjects, a file list) that goes into the report whatever
@@ -24,20 +33,25 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { hasVisibleText } from "../../shared/naming-rule";
 import {
   AREAS,
   type Area,
   type AreaCounts,
   type ChangeStatus,
   type ChangedFile,
+  type ChangelogEntry,
   MAX_LISTED,
   MAX_MODEL_FILES,
+  type NameFinding,
+  type NamingProblem,
   type ReviewEvidence,
   SEMVER,
 } from "../../shared/pr-review";
 import { shouldAnnex } from "../../src/lib/git-annex/policy";
 
 export { MAX_MODEL_FILES };
+export type { ChangelogEntry };
 /** At most this many files have their content (a diff) shown to the model. */
 export const MAX_PATCH_FILES = 40;
 /** Characters of one file's diff shown to the model. */
@@ -62,6 +76,7 @@ export const EVIDENCE_ERRORS = [
   "no_merge_base",
   "changes_unreadable",
   "commits_unreadable",
+  "timed_out",
 ] as const;
 export type EvidenceErrorCode = (typeof EVIDENCE_ERRORS)[number];
 
@@ -136,18 +151,64 @@ export interface Patch {
   truncated: boolean;
 }
 
-export interface GitFacts {
+/**
+ * What the screen is shown, read without any file's content but `dataset_description.json`'s: the
+ * change list, the commit subjects, the version and name at both ends, and the subject counts.
+ */
+export interface Listing {
+  /** The commit the pull request branched from `main` at: what it is compared against. */
+  mergeBase: string;
+  /** The pull request's head commit. */
+  head: string;
   changes: RawChange[];
-  /** Diffs of the changed metadata files that fit the budget, most important first. */
-  patches: Patch[];
   /** Subject lines of the commits being merged. Attacker-controlled. */
   commits: string[];
   versionBefore: string | null;
   versionAfter: string | null;
+  /**
+   * The dataset's `Name` in `dataset_description.json` at the merge base and at the head, or null
+   * where the file is absent, unparseable, or has no `Name` that is text a reader can see (a `Name`
+   * of blanks or of invisible characters is none). Attacker-controlled at the head.
+   */
+  nameBefore: string | null;
+  nameAfter: string | null;
+  /**
+   * The pull request adds or edits `dataset_description.json` and there is no readable name at the
+   * head: the file is not JSON, or has no `Name`, or its `Name` is not text or shows nothing.
+   * `nameAfter` is null for that and for a file the pull request does not touch, and only this says
+   * which it was, so a name nobody could read is not mistaken for a dataset with no name to check.
+   */
+  nameUnreadable: boolean;
   subjectsBefore: number | null;
   subjectsAfter: number | null;
   /** True when the change list was longer than {@link MAX_MODEL_FILES}. */
   listCut: boolean;
+  /**
+   * A file named CHANGES or CHANGELOG (any case, optionally `.md`, `.txt` or `.rst`) at the dataset
+   * root was added or modified. A deleted one does not count. Read from the change list alone.
+   */
+  changelogTouched: boolean;
+  /**
+   * The changed metadata files by the shape of their path, with how many of each, and nothing a
+   * content read would add (what was shown, what was cosmetic): the screen's view of a bulk edit.
+   * Ordered and cut as {@link GitFacts.groups} is.
+   */
+  shapes: PathShape[];
+  /** Changed metadata files that belong to a path shape cut by {@link MAX_GROUPS}. */
+  shapesOmittedFiles: number;
+}
+
+/** One shape of changed path, counted from the change list alone. */
+export interface PathShape {
+  status: ChangeStatus;
+  pattern: string;
+  files: number;
+}
+
+/** What only the full review is shown: the diffs, the cosmetic proofs and the change log. */
+export interface ContentFacts {
+  /** Diffs of the changed metadata files that fit the budget, most important first. */
+  patches: Patch[];
   /**
    * True when a MODIFIED or REMOVED metadata file with a real change was not shown in full: it did
    * not fit the file or character budget, its diff was cut, or reading it failed. A file the
@@ -175,26 +236,35 @@ export interface GitFacts {
   /** Changed metadata files that belong to a path shape cut by {@link MAX_GROUPS}. */
   groupsOmittedFiles: number;
   /**
-   * A file named CHANGES or CHANGELOG (any case, optionally `.md`, `.txt` or `.rst`) at the dataset
-   * root was added or modified. A deleted one does not count.
+   * Whether this pull request adds an entry for the new version to the change log, in the words of
+   * {@link ChangelogEntry} (declared with the report, which enforces them). The report carries it
+   * as `changelog_entry`, and a version without an entry cannot advance the revision.
    */
-  changelogTouched: boolean;
-  /** Whether this pull request adds an entry for the new version to the change log. */
   changelogEntry: ChangelogEntry;
 }
 
+/** Everything the full review is shown: the listing and the content pass together. */
+export type GitFacts = Listing & ContentFacts;
+
 /**
- * What the change log says about the new version:
- *  - `added`: a heading for the new version is in the head's change log and was not in the merge
- *    base's (a heading is a line that starts with the version, after any `#` or `[`, and an
- *    optional `v`, `version` or `release`; a bullet is not a heading);
- *  - `not_added`: the head has a change log but no new heading for the new version, which includes
- *    a heading that was already there, a date-only heading, and a version only mentioned in prose;
- *  - `no_file`: the head has no change log file;
- *  - `unknown_version`: the new version is unknown (absent or not `X.Y.Z`), so the platform cannot
- *    tell what to look for. This is decided first, so it wins over `no_file`.
+ * The four facts decided before any model is asked (ADR 0107), from the pull request's own text and
+ * the dataset's name: whether the description is empty, whether it is cut, and how the title and a
+ * changed dataset name break the naming rule. An empty description and a naming problem fail a
+ * criterion whatever a model says; a cut description and an unreadable name only lower one to
+ * `unknown` (see `factsOf` in `shared/pr-review.ts`). The change log is not among them: it is read
+ * after the screen.
  */
-export type ChangelogEntry = "added" | "not_added" | "no_file" | "unknown_version";
+export interface TextFacts {
+  descriptionEmpty: boolean;
+  /**
+   * The description, as the models read it (after `tidy`), is longer than they are shown, so they
+   * read its start and the mark `[cut]`. The cap is `MAX_BODY_CHARS` in `pr-review-prompt.ts`.
+   */
+  descriptionCut: boolean;
+  titleProblem: NamingProblem | null;
+  /** How the new name breaks the rule, or `unchecked` when it changed and cannot be read. */
+  nameProblem: NameFinding | null;
+}
 
 /** One shape of changed path: `sub-*` and `ses-*` and `run-*` stand for any value. */
 export interface PathGroup {
@@ -215,37 +285,77 @@ const MAX_COSMETIC_CHECKS = 2_000;
 
 const CHANGELOG_NAME = /^(CHANGES|CHANGELOG)(\.(md|txt|rst))?$/i;
 
-function git(dir: string, args: string[]): string {
-  return execFileSync(
-    "git",
-    [
-      "--literal-pathspecs",
-      "-C",
-      dir,
-      "-c",
-      "core.hooksPath=/dev/null",
-      "-c",
-      "core.fsmonitor=false",
-      "-c",
-      "protocol.ext.allow=never",
-      ...args,
-    ],
-    {
-      encoding: "utf8",
-      maxBuffer: 256 * 1024 * 1024,
-      env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0" },
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
+/**
+ * How long each evidence pass may spend in git, all its calls together: the listing, before the
+ * screen, and the content, after it. The job reads a partial clone, whose missing blobs git fetches
+ * from GitHub inside these calls, so a stalled fetch would otherwise run on to the job's own
+ * timeout. A pass that runs out is `timed_out`, which is no verdict. The workflow test counts both
+ * in the job's worst case.
+ */
+export const EVIDENCE_BUDGET_MS = { listing: 60_000, content: 120_000 } as const;
+
+/** When the pass now running must be done by (epoch ms); null outside a pass. */
+let gitDeadline: number | null = null;
+
+/** A shorter budget for a test of a stall; production never sets one. */
+let budgetOverride: Partial<Record<keyof typeof EVIDENCE_BUDGET_MS, number>> = {};
+
+export function __setEvidenceBudgetForTests(
+  ms: Partial<Record<keyof typeof EVIDENCE_BUDGET_MS, number>> | null,
+): void {
+  budgetOverride = ms ?? {};
+}
+
+/** Run one pass under its budget. The passes are synchronous, so one deadline at a time holds. */
+function withinBudget<T>(pass: keyof typeof EVIDENCE_BUDGET_MS, read: () => T): T {
+  const saved = gitDeadline;
+  gitDeadline = Date.now() + (budgetOverride[pass] ?? EVIDENCE_BUDGET_MS[pass]);
+  try {
+    return read();
+  } finally {
+    gitDeadline = saved;
+  }
 }
 
 /**
- * The same call as {@link tryGit} but with the bytes kept: each byte becomes the one character with
- * that code (latin1), so two blobs that differ only in bytes that are not valid UTF-8 (`caf\xe9`
- * and `caf\xe8`) are still different strings. Decoding them as UTF-8 would turn both into the same
- * replacement characters.
+ * What no child process of the review is handed: the model credential and everything that
+ * redirects or federates it (every `ANTHROPIC_*` variable, in any case, because a name that only
+ * looks different is not worth the risk); the request for an identity token
+ * (`ACTIONS_ID_TOKEN_REQUEST_URL` and `ACTIONS_ID_TOKEN_REQUEST_TOKEN`, which the runner puts in
+ * every step of a job with `id-token: write`, and with which a holder can mint a token for the
+ * federation; the workflow minted the one the SDK reads in an earlier step, into a file); and the
+ * callback token the job posts its report with.
  */
-function tryGitBytes(dir: string, args: string[]): string | null {
+const WITHHELD_FROM_CHILDREN =
+  /^(?:ANTHROPIC_|ACTIONS_ID_TOKEN_REQUEST_|PR_REVIEW_CALLBACK_TOKEN$)/i;
+
+/**
+ * The environment every child of the review is run with, here and in the calibration script
+ * (`pr-review-calibrate.ts`): `env` (this process's own, read when the child starts, unless a test
+ * hands one in) without the variables of {@link WITHHELD_FROM_CHILDREN}, and with no prompt and no
+ * system git configuration. The children are `git`, which reads a contributor's objects and has no
+ * use for either credential, and `gh`. Everything else stays, which is what they need: `PATH`,
+ * `HOME`, and what `gh` signs in with (`GH_TOKEN`, `GITHUB_TOKEN`, its configuration directory).
+ */
+export function childEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const kept: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(env)) {
+    if (!WITHHELD_FROM_CHILDREN.test(name)) kept[name] = value;
+  }
+  return { ...kept, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0" };
+}
+
+/**
+ * One git call, bounded by what is left of the pass's budget. Running out, before the call or
+ * during it, is {@link EvidenceError} `timed_out`, which no caller swallows; any other failure is
+ * thrown as git's own error, for the caller to turn into its word.
+ */
+function runGit(dir: string, args: string[], encoding: "utf8" | "latin1"): string {
+  let timeout: number | undefined;
+  if (gitDeadline !== null) {
+    timeout = gitDeadline - Date.now();
+    if (timeout <= 0) throw new EvidenceError("timed_out");
+  }
   try {
     return execFileSync(
       "git",
@@ -262,21 +372,40 @@ function tryGitBytes(dir: string, args: string[]): string | null {
         ...args,
       ],
       {
-        encoding: "latin1",
+        encoding,
         maxBuffer: 256 * 1024 * 1024,
-        env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0" },
+        env: childEnv(),
         stdio: ["ignore", "pipe", "pipe"],
+        ...(timeout === undefined ? {} : { timeout }),
       },
     );
-  } catch {
+  } catch (e) {
+    if ((e as { code?: unknown }).code === "ETIMEDOUT") throw new EvidenceError("timed_out");
+    throw e;
+  }
+}
+
+/**
+ * The same call as {@link tryGit} but with the bytes kept: each byte becomes the one character with
+ * that code (latin1), so two blobs that differ only in bytes that are not valid UTF-8 (`caf\xe9`
+ * and `caf\xe8`) are still different strings. Decoding them as UTF-8 would turn both into the same
+ * replacement characters.
+ */
+function tryGitBytes(dir: string, args: string[]): string | null {
+  try {
+    return runGit(dir, args, "latin1");
+  } catch (e) {
+    if (e instanceof EvidenceError) throw e;
     return null;
   }
 }
 
+/** A git call whose failure is null, for the caller to name; running out of time is thrown. */
 function tryGit(dir: string, args: string[]): string | null {
   try {
-    return git(dir, args);
-  } catch {
+    return runGit(dir, args, "utf8");
+  } catch (e) {
+    if (e instanceof EvidenceError) throw e;
     return null;
   }
 }
@@ -304,24 +433,35 @@ export function parseNameStatus(raw: string): RawChange[] {
 }
 
 /**
- * The `Version` in `dataset_description.json` at a revision, or null when the file has none (absent
- * file, no `Version`, or one that is not `X.Y.Z`). A file that EXISTS but cannot be read is not
- * "no version": it is an {@link EvidenceError}, so a failed fetch of a blob cannot pass as
- * "this dataset has no version".
+ * The `Version` and the `Name` in `dataset_description.json` at a revision. Either is null when the
+ * file has none: an absent file, a file that is not JSON, a missing field, a `Version` that is not
+ * `X.Y.Z`, a `Name` that is not a string or shows a reader nothing (empty, blanks, or only
+ * characters nobody sees, see `hasVisibleText`). A file that EXISTS but cannot be read is not "no
+ * version": it is an {@link EvidenceError}, so a failed fetch of a blob cannot pass as "this
+ * dataset has no version".
  */
-function versionAt(dir: string, rev: string): string | null {
+function descriptionAt(dir: string, rev: string): { version: string | null; name: string | null } {
   // Ask the TREE whether the file exists: that needs no blob, so a blob that cannot be fetched
   // is told apart from a file that is not there.
   const entry = tryGit(dir, ["ls-tree", rev, "--", "dataset_description.json"]);
   if (entry === null) throw new EvidenceError("tree_unreadable");
-  if (entry.trim() === "") return null;
+  if (entry.trim() === "") return { version: null, name: null };
   const raw = tryGit(dir, ["show", `${rev}:dataset_description.json`]);
   if (raw === null) throw new EvidenceError("description_unreadable");
   try {
-    const v = (JSON.parse(raw) as { Version?: unknown }).Version;
-    return typeof v === "string" && SEMVER.test(v) ? v : null;
+    const parsed: unknown = JSON.parse(raw);
+    const doc =
+      typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : {};
+    const v = doc.Version;
+    const n = doc.Name;
+    return {
+      version: typeof v === "string" && SEMVER.test(v) ? v : null,
+      // A name that shows nothing is no name to ask the naming rule about: it is unreadable, and
+      // a changed one is `unchecked`, never clean.
+      name: typeof n === "string" && hasVisibleText(n) ? n : null,
+    };
   } catch {
-    return null;
+    return { version: null, name: null };
   }
 }
 
@@ -500,13 +640,38 @@ function changelogEntryFor(
 }
 
 /**
- * Read what `headSha` changes relative to the point it branched from `baseSha`.
+ * The metadata files a review would read, in the order it would read them: removals and
+ * modifications first, because that is where a loss hides, and additions last, so a budget that runs
+ * out costs the least important reads.
+ */
+function readableChanges(changes: readonly RawChange[]): RawChange[] {
+  return changes.filter((c) => READABLE_AREAS.has(classifyPath(c.path))).sort(byReviewOrder);
+}
+
+/** Removed shapes first, then modified, then added; within a status the largest first. */
+function byShapeOrder(a: PathShape, b: PathShape): number {
+  return (
+    STATUS_RANK[a.status] - STATUS_RANK[b.status] ||
+    b.files - a.files ||
+    codeUnitOrder(a.pattern, b.pattern)
+  );
+}
+
+/**
+ * Read what `headSha` changes relative to the point it branched from `baseSha`, without reading
+ * any file's content but `dataset_description.json`'s: the screen's whole view.
  *
  * `baseSha` is the tip of `main`; the diff is taken against the merge base, so a pull request
  * is judged on what IT changes and not on what `main` gained since. Throws {@link EvidenceError}
- * when the commits are not present or share no history.
+ * when the commits are not present or share no history, or when the pass runs past its share of
+ * {@link EVIDENCE_BUDGET_MS}. Every call here reads a tree, a commit or that one file, so a partial
+ * clone fetches no other blob for it.
  */
-export function gatherGitFacts(dir: string, baseSha: string, headSha: string): GitFacts {
+export function gatherListing(dir: string, baseSha: string, headSha: string): Listing {
+  return withinBudget("listing", () => readListing(dir, baseSha, headSha));
+}
+
+function readListing(dir: string, baseSha: string, headSha: string): Listing {
   requireSha(baseSha);
   requireSha(headSha);
   const mergeBase = tryGit(dir, ["merge-base", baseSha, headSha])?.trim();
@@ -516,11 +681,59 @@ export function gatherGitFacts(dir: string, baseSha: string, headSha: string): G
   if (raw === null) throw new EvidenceError("changes_unreadable");
   const changes = parseNameStatus(raw);
 
-  // Removals and modifications first: that is where a loss hides. Added files come last, so a
-  // budget that runs out costs the least important reads.
-  const wanted = changes
-    .filter((c) => READABLE_AREAS.has(classifyPath(c.path)))
-    .sort(byReviewOrder);
+  const shapeMap = new Map<string, PathShape>();
+  for (const c of readableChanges(changes)) {
+    const pattern = pathPattern(c.path);
+    const key = `${c.status}\t${pattern}`;
+    const shape = shapeMap.get(key) ?? { status: c.status, pattern, files: 0 };
+    shape.files++;
+    shapeMap.set(key, shape);
+  }
+  // Removed shapes first: that is where a loss hides, and the cut must never take them.
+  const ordered = [...shapeMap.values()].sort(byShapeOrder);
+
+  const before = descriptionAt(dir, mergeBase);
+  const after = descriptionAt(dir, headSha);
+  // A removed file has no name to read, and its removal is a fact of its own.
+  const descriptionKept = changes.some(
+    (c) => c.path === "dataset_description.json" && c.status !== "removed",
+  );
+  // An empty list would read to the model as "no commits", so a failed read is an error.
+  const log = tryGit(dir, ["log", "--format=%s", `-n${MAX_COMMITS}`, `${mergeBase}..${headSha}`]);
+  if (log === null) throw new EvidenceError("commits_unreadable");
+  return {
+    mergeBase,
+    head: headSha,
+    changes,
+    commits: log.split("\n").filter(Boolean),
+    versionBefore: before.version,
+    versionAfter: after.version,
+    nameBefore: before.name,
+    nameAfter: after.name,
+    nameUnreadable: descriptionKept && after.name === null,
+    subjectsBefore: subjectsAt(dir, mergeBase),
+    subjectsAfter: subjectsAt(dir, headSha),
+    listCut: changes.length > MAX_MODEL_FILES,
+    changelogTouched: changes.some((c) => c.status !== "removed" && CHANGELOG_NAME.test(c.path)),
+    shapes: ordered.slice(0, MAX_GROUPS),
+    shapesOmittedFiles: ordered.slice(MAX_GROUPS).reduce((n, g) => n + g.files, 0),
+  };
+}
+
+/**
+ * Read what only the full review is shown, for a listing {@link gatherListing} made: the cosmetic
+ * proofs, the diffs of the changed metadata files that fit the budget, and the change log. Called
+ * only when the screen let the pull request through, and bounded by its share of
+ * {@link EVIDENCE_BUDGET_MS}.
+ */
+export function gatherContent(dir: string, listing: Listing): ContentFacts {
+  return withinBudget("content", () => readContent(dir, listing));
+}
+
+function readContent(dir: string, listing: Listing): ContentFacts {
+  const { mergeBase } = listing;
+  const headSha = listing.head;
+  const wanted = readableChanges(listing.changes);
 
   // A modified file that differs only cosmetically needs no reading: nothing in it was lost. The
   // test is exact (see GitFacts.cosmeticOnlyFiles) and falls back to "not cosmetic" whenever git
@@ -606,40 +819,22 @@ export function gatherGitFacts(dir: string, baseSha: string, headSha: string): G
     groupMap.set(key, g);
   }
   // Removed shapes first: that is where a loss hides, and the cut must never take them.
-  const ordered = [...groupMap.values()].sort(
-    (a, b) =>
-      STATUS_RANK[a.status] - STATUS_RANK[b.status] ||
-      b.files - a.files ||
-      codeUnitOrder(a.pattern, b.pattern),
-  );
-  const groups = ordered.slice(0, MAX_GROUPS);
-  const groupsOmittedFiles = ordered.slice(MAX_GROUPS).reduce((n, g) => n + g.files, 0);
+  const ordered = [...groupMap.values()].sort(byShapeOrder);
 
-  const changelogTouched = changes.some(
-    (c) => c.status !== "removed" && CHANGELOG_NAME.test(c.path),
-  );
-  const versionAfter = versionAt(dir, headSha);
-  const changelogEntry = changelogEntryFor(dir, mergeBase, headSha, versionAfter);
-
-  // An empty list would read to the model as "no commits", so a failed read is an error.
-  const log = tryGit(dir, ["log", "--format=%s", `-n${MAX_COMMITS}`, `${mergeBase}..${headSha}`]);
-  if (log === null) throw new EvidenceError("commits_unreadable");
   return {
-    changes,
     patches,
-    commits: log.split("\n").filter(Boolean),
-    versionBefore: versionAt(dir, mergeBase),
-    versionAfter,
-    subjectsBefore: subjectsAt(dir, mergeBase),
-    subjectsAfter: subjectsAt(dir, headSha),
-    listCut: changes.length > MAX_MODEL_FILES,
     readIncomplete,
     cosmeticOnlyFiles: cosmeticOnly.size,
-    groups,
-    groupsOmittedFiles,
-    changelogTouched,
-    changelogEntry,
+    groups: ordered.slice(0, MAX_GROUPS),
+    groupsOmittedFiles: ordered.slice(MAX_GROUPS).reduce((n, g) => n + g.files, 0),
+    changelogEntry: changelogEntryFor(dir, mergeBase, headSha, listing.versionAfter),
   };
+}
+
+/** Both passes, for a caller that wants everything the full review is shown. */
+export function gatherGitFacts(dir: string, baseSha: string, headSha: string): GitFacts {
+  const listing = gatherListing(dir, baseSha, headSha);
+  return { ...listing, ...gatherContent(dir, listing) };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -652,25 +847,54 @@ function emptyAreas(): Record<Area, AreaCounts> {
   return out;
 }
 
-/**
- * The report's evidence block, from git alone. Every change is counted in exactly one area, so
- * the areas add up to `files_changed` by construction (the Worker refuses a report where they do
- * not). The file list is the first {@link MAX_LISTED} a reviewer would open, in
- * {@link byReviewOrder}.
- */
-export function buildEvidence(facts: GitFacts): ReviewEvidence {
+/** The parts of the evidence block a listing alone decides, and the text facts. */
+function listedEvidence(listing: Listing, text: TextFacts) {
   const areas = emptyAreas();
-  for (const c of facts.changes) areas[classifyPath(c.path)][c.status]++;
-  const listed: ChangedFile[] = [...facts.changes].sort(byReviewOrder).slice(0, MAX_LISTED);
+  for (const c of listing.changes) areas[classifyPath(c.path)][c.status]++;
+  const listed: ChangedFile[] = [...listing.changes].sort(byReviewOrder).slice(0, MAX_LISTED);
   return {
-    files_changed: facts.changes.length,
-    files_read: facts.patches.length,
-    truncated: facts.listCut || facts.readIncomplete,
-    version_before: facts.versionBefore,
-    version_after: facts.versionAfter,
-    subjects_before: facts.subjectsBefore,
-    subjects_after: facts.subjectsAfter,
+    files_changed: listing.changes.length,
+    version_before: listing.versionBefore,
+    version_after: listing.versionAfter,
+    subjects_before: listing.subjectsBefore,
+    subjects_after: listing.subjectsAfter,
     areas,
     listed,
+    description_empty: text.descriptionEmpty,
+    description_cut: text.descriptionCut,
+    title_problem: text.titleProblem,
+    name_problem: text.nameProblem,
+  };
+}
+
+/**
+ * The report's evidence block for a full review, from git and the text facts alone. Every change is
+ * counted in exactly one area, so the areas add up to `files_changed` by construction (the Worker
+ * refuses a report where they do not). The file list is the first {@link MAX_LISTED} a reviewer
+ * would open, in {@link byReviewOrder}.
+ */
+export function buildEvidence(facts: GitFacts, text: TextFacts): ReviewEvidence {
+  return {
+    ...listedEvidence(facts, text),
+    files_read: facts.patches.length,
+    truncated: facts.listCut || facts.readIncomplete,
+    changelog_entry: facts.changelogEntry,
+  };
+}
+
+/**
+ * The evidence block of a report that ended before the review read any content, at the screen or at
+ * the facts: the same account, built from the listing alone, and no content read. `truncated` keeps
+ * its meaning: the change list was cut, or a modified or removed metadata file was not shown, which,
+ * with nothing read, is any such file at all. The change log is content, so it was not read either:
+ * `changelog_entry` is null.
+ */
+export function buildListingEvidence(listing: Listing, text: TextFacts): ReviewEvidence {
+  return {
+    ...listedEvidence(listing, text),
+    files_read: 0,
+    truncated:
+      listing.listCut || readableChanges(listing.changes).some((c) => c.status !== "added"),
+    changelog_entry: null,
   };
 }

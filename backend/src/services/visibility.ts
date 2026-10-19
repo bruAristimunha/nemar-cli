@@ -27,6 +27,7 @@ import type { Bindings } from "../types/bindings.js";
 import { FIRST_PUBLICATION_STAMP_SQL, expectedRepoVisibility } from "./anonymity.js";
 import { getDatasetsToken } from "./github-auth.js";
 import { ensureRepoToSpec, setRepoVisibility } from "./github.js";
+import { readReviewIntent } from "./pr-review-eligibility.js";
 import { mirrorReconcileRemovals, resolveRepoCollaborators } from "./repo-spec.js";
 import { type PresignedUrlOptions, markDatasetPrivate, markDatasetPublic } from "./s3.js";
 
@@ -201,8 +202,9 @@ export async function applyDatasetVisibility(
 
   // Enforce the target repo spec for the new visibility (epic #713): public ->
   // lock main (branch + tag ruleset, green-gated) + reconcile collaborators;
-  // private -> remove the branch ruleset + reconcile. Non-fatal: visibility is
-  // already changed at GitHub/S3/D1.
+  // private -> remove the branch ruleset + reconcile. The required pull-request
+  // review follows the row (ADR 0107). Non-fatal: visibility is already changed
+  // at GitHub/S3/D1.
   let specEnforcement: Awaited<ReturnType<typeof ensureRepoToSpec>> | undefined;
   try {
     const { ownerLogin, approvedWriters } = await resolveRepoCollaborators(db, datasetId);
@@ -215,6 +217,11 @@ export async function applyDatasetVisibility(
       // commit their restored attribution (#1408). The same literal was a bug
       // in the publication orchestrator; an exhaustive scan found this one.
       visibility: isPrivate ? "private" : "public",
+      // The row after the update above, so a dataset made public and reviewed is given the
+      // required review and one made private has it taken off (ADR 0107). The owner's switch
+      // (PR_REVIEW_AUTO_REQUIRE) gates only the addition of the requirement: with it off a
+      // reviewed dataset's review ruleset is left as it is, and a removal is asked for anyway.
+      review: await readReviewIntent(env, datasetId),
       collaborators: { ownerLogin, approvedWriters },
     });
   } catch (specError) {

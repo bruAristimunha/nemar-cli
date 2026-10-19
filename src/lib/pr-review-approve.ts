@@ -338,7 +338,7 @@ export type ReviewForApproval =
       detail: string | null;
       staleVerdict: ReadVerdict | null;
       reviewCurrent: boolean | null;
-      /** Set when the contributor's reviews are paused, in words, so the approver sees why. */
+      /** Set when an administrator has paused the contributor's reviews, in words, so the approver sees why. */
       contributorNote: string | null;
       /**
        * The stored report of the review of THIS commit, for display; null when there is none, it
@@ -382,9 +382,10 @@ export function reviewForApproval(d: unknown, head: string): ReviewForApproval {
   }
   const standing = (r.author as { standing?: { paused?: unknown; because?: unknown } } | null)
     ?.standing;
+  // A Worker older than this CLI can still pause by the record, and its pause is not a block.
   const contributorNote =
     standing?.paused === true
-      ? `The contributor's pull requests are not reviewed automatically (paused ${standing.because === "maintainer" ? "by a maintainer" : "by their record"}).`
+      ? `The contributor's pull requests are not reviewed automatically (paused${standing.because === "maintainer" ? " by an administrator's block" : ""}).`
       : null;
   return {
     ok: true,
@@ -455,6 +456,18 @@ export function approvalGate(input: {
           input.staleVerdict === null
             ? "The automated review has not read this commit."
             : `The automated review read a different commit of this pull request (it said: ${input.staleVerdict}), not this one.`,
+      };
+    case "exempt":
+      // Not a pass and not a failure: nothing was asked of a review of this commit. An earlier
+      // commit of it may have been (an owner's push on top of someone else's), and its verdict is
+      // said, as for a review of another commit, because that change is still in this one.
+      return {
+        kind: "confirm",
+        warning: `The automated review did not run on this commit: a NEMAR owner or administrator opened this pull request, and they are not reviewed.${
+          input.staleVerdict === null
+            ? ""
+            : ` An earlier commit of it was reviewed and read ${input.staleVerdict}.`
+        }`,
       };
   }
 }
@@ -650,7 +663,19 @@ const MERGEABLE = "clean";
  * more) is still refused, with the last sentence.
  */
 const NOT_CLEAN_WHY = new Map<string, string>([
-  ["blocked", "a required check or review is not satisfied"],
+  [
+    "blocked",
+    // GitHub says `blocked` for any required check or review that is not satisfied, and does not say
+    // which, so this names what they can be. Where its ruleset is in force (ADR 0107) one of them
+    // is the NEMAR PR Review check, and that is the one this tool names as overridable in the GitHub
+    // UI, for an owner or administrator; the bypass is theirs on GitHub, and this tool never uses
+    // it (ADR 0093). That is what this tool names, not all that GitHub allows: an organization
+    // owner also bypasses the NEMAR branch protection ruleset, which carries the BIDS validation
+    // and the version check, and nothing here points anyone at that one. It is said of the review
+    // alone, and only where its ruleset is in force, because where the review is not required a
+    // pull request is not held by it at all.
+    "a required check or review is not satisfied (the BIDS validation, the version check or, where its ruleset is in force, the NEMAR PR Review); this tool names the NEMAR PR Review check, and no other, as one an owner or administrator can override in the GitHub UI, and only where its ruleset is in force, and it never uses the bypass itself",
+  ],
   ["behind", "the branch is behind main"],
   ["dirty", "it has merge conflicts"],
   [

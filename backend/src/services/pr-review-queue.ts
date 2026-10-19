@@ -17,6 +17,16 @@
  * - **Nothing here trusts a pull request's words.** Titles go through `sanitizeNote`, branch names
  *   are reduced to a conservative character set, links are built from the dataset id and number, and
  *   no body is read.
+ * - **An owner's or administrator's pull request is `exempt`** (ADR 0107). It is not reviewed and
+ *   stores no row, so without a word of its own it would read `not_reviewed` for ever and be offered
+ *   to an administrator to review by hand. The word is given only while the current commit has no
+ *   review of its own: a push by someone who is not exempt IS reviewed, and that review's verdict
+ *   stands. It is inferred from who opened the pull request, not read from GitHub: nothing here
+ *   checks that the review check was posted as `skipped`. The one thing read of that check is
+ *   whether the naming rule holds the pull request (the check failed, or asks for a person), which
+ *   the row says in `detail`, so the list shows it waits for a fix or for `allow --admin`. Which
+ *   authors are exempt is `isReviewExempt`'s to say, asked once per dataset and login for the
+ *   length of one request, a few at a time and within a time budget, and never kept.
  * - **Overrides are keyed by GitHub's numeric id**, because a login can be renamed and reused.
  */
 
@@ -34,19 +44,24 @@ import {
   type QueueResponse,
   type QueueSkipped,
   type QueueVerdict,
+  type QueueVolume,
   type ReadVerdict,
   type ReviewHistoryItem,
   type ReviewRecord,
+  STORED_VERDICTS,
   type SetOverrideResponse,
+  type StoredVerdict,
   type VerdictDetail,
+  type VolumeWindow,
 } from "../../../shared/contract/pr-review-admin.js";
 import {
   type AuthorOverride,
-  REJECTION_COUNT,
-  REJECTION_PERCENT,
+  DECLINE_REASONS,
+  PR_REVIEW_CHECK_NAME,
   REVIEW_STATES,
-  type ReviewOutcome,
   type ReviewState,
+  type StoredOutcome,
+  estimateCostUsd,
   isDeclineReason,
   isRunError,
   sanitizeNote,
@@ -61,11 +76,13 @@ import { getDatasetsTokenWithRefresher } from "./github-auth.js";
 import { deriveContexts } from "./github/branch-protection.js";
 import { GITHUB_API, ORG_NAME, ghHeaders } from "./github/shared.js";
 import { githubFetchWithRetry } from "./github/transport.js";
+import { isReviewExempt } from "./pr-review-exemption.js";
 import {
   PR_REVIEW_DEADLINE_MINUTES,
   outcomeOfRow,
   readAuthorOverride,
   readAuthorTally,
+  spentACall,
 } from "./pr-review.js";
 
 /** The GitHub search that defines the queue: open pull requests to `main` across the datasets org. */
@@ -95,7 +112,8 @@ const GRAPHQL_TOTAL_MS = 90_000;
  * this is deadline plus one tick, after which the queue says it never reported rather than showing a
  * review that will not finish as one still running.
  */
-const OVERDUE_AFTER_MS = (PR_REVIEW_DEADLINE_MINUTES + 30) * 60_000;
+const OVERDUE_GRACE_MINUTES = 30;
+const OVERDUE_AFTER_MS = (PR_REVIEW_DEADLINE_MINUTES + OVERDUE_GRACE_MINUTES) * 60_000;
 /** How many reviews of one pull request `show` lists. */
 const HISTORY_LIMIT = 20;
 /** D1 allows 100 bound parameters per query; stay under it. */
@@ -151,6 +169,12 @@ export interface CheckContext {
    * check run whose App could not be read.
    */
   appId: number | null;
+  /**
+   * A completed check run's conclusion as GitHub words it (`FAILURE`, `ACTION_REQUIRED`, ...). Only
+   * `state` decides whether a required check is green; this is for telling a failure from a check
+   * that asks for a person, which `state` calls `fail` for both.
+   */
+  conclusion?: string;
 }
 
 const CHECK_FAIL = new Set([
@@ -183,10 +207,19 @@ export function readCheckContext(node: unknown): CheckContext | null {
       return { name: n.name, kind: "run", state: "pass", at: started, appId };
     }
     if (typeof n.conclusion === "string" && CHECK_FAIL.has(n.conclusion)) {
-      return { name: n.name, kind: "run", state: "fail", at: started, appId };
+      return {
+        name: n.name,
+        kind: "run",
+        state: "fail",
+        at: started,
+        appId,
+        conclusion: n.conclusion,
+      };
     }
-    // NEUTRAL and SKIPPED count as passing for a required check on GitHub. Neither of NEMAR's
-    // checks emits them, so seeing one means something else is posting under the name.
+    // NEUTRAL and SKIPPED count as passing for a required check on GitHub. Neither of the two
+    // checks read here (BIDS and version) emits them, so seeing one means something else is posting
+    // under the name. (The review's own check does emit SKIPPED, for an exempt pull request, but it
+    // is not one of the names this queue reads.)
     return { name: n.name, kind: "run", state: "unknown", at: started, appId };
   }
   if (n.__typename === "StatusContext" && typeof n.context === "string") {
@@ -239,6 +272,33 @@ export function checkStateOf(
   return listComplete ? "missing" : "unknown";
 }
 
+/**
+ * Why an exempt pull request is held by the naming rule, if it is, read from GitHub's record of the
+ * review's own check on the current commit: `naming_rule` when that check failed (the rule refused
+ * the title or the new dataset name, which an administrator can waive for the commit), and
+ * `naming_unchecked` when it asks for a person (the dataset's name could not be read, whatever the
+ * title says, so there is nothing to waive until a start reads it). The queue infers who is exempt
+ * from who opened the pull request and posts nothing itself, so this is the only place it learns the
+ * rule's answer. A review check that passed, was skipped, is still running or is absent is no hold,
+ * and neither is one on a list that was cut short, where the check might be on the next page. Only
+ * informs: a workflow job named like the check could make the label wrong, and nothing is decided
+ * by it.
+ */
+export function namingHoldOf(
+  contexts: readonly CheckContext[],
+  listComplete: boolean,
+): "naming_rule" | "naming_unchecked" | null {
+  if (!listComplete) return null;
+  let newest: CheckContext | null = null;
+  for (const c of contexts) {
+    if (c.kind !== "run" || c.name !== PR_REVIEW_CHECK_NAME) continue;
+    if (!newest || c.at >= newest.at) newest = c;
+  }
+  if (newest?.conclusion === "FAILURE") return "naming_rule";
+  if (newest?.conclusion === "ACTION_REQUIRED") return "naming_unchecked";
+  return null;
+}
+
 // ---------------------------------------------------------------------------------------------
 // The GitHub side
 // ---------------------------------------------------------------------------------------------
@@ -257,6 +317,8 @@ export interface OpenPullRequest {
   authorId: number | null;
   bids: CheckState;
   version: CheckState;
+  /** How the naming rule left the review's own check on the head commit, if it held it ({@link namingHoldOf}). */
+  namingHold: "naming_rule" | "naming_unchecked" | null;
 }
 
 export interface OpenPullRequests {
@@ -408,6 +470,7 @@ function readOpenPullRequest(node: unknown): { pr: OpenPullRequest } | { skip: S
       // post it as a plain workflow job.
       bids: checkStateOf(list, [bidsCtx.context], readable, bidsCtx.integration_id),
       version: checkStateOf(list, [versionCtx.context], readable, versionCtx.integration_id),
+      namingHold: namingHoldOf(list, readable),
     },
   };
 }
@@ -621,7 +684,7 @@ export function meaningOf(
   row: Pick<ReviewRow, "state" | "verdict" | "detail"> & { created_at?: string },
   now: number = Date.now(),
 ): {
-  verdict: QueueVerdict;
+  verdict: StoredVerdict;
   detail: VerdictDetail | null;
 } {
   switch (row.state) {
@@ -743,7 +806,9 @@ async function loadReviews(db: D1Database, datasetIds: readonly string[]): Promi
 /**
  * Verdicts an administrator can act on: approve a pass, or review by hand what the automation
  * could not or did not decide. A fail is the author's to fix and an in-progress review is waiting
- * on the machine, so neither is yours yet.
+ * on the machine, so neither is yours yet, and an exempt pull request is not reviewed at all, so
+ * there is no review for a person to read (when the naming rule holds one, its row says so in
+ * `detail`, and the author's fix or an `allow --admin` is what releases it).
  */
 const NEEDS_YOU: ReadonlySet<QueueVerdict> = new Set([
   "pass",
@@ -764,6 +829,7 @@ const VERDICT_RANK: Record<QueueVerdict, number> = {
   not_reviewed: 3,
   in_progress: 4,
   fail: 5,
+  exempt: 6,
 };
 
 function checkRank(e: Pick<QueueEntry, "bids" | "version">): number {
@@ -835,6 +901,213 @@ export function ownedHere(env: Bindings, datasetId: string): boolean {
   return isNonProductionEnv(env) ? isDevOwnedDatasetId(datasetId) : !isDevOwnedDatasetId(datasetId);
 }
 
+/**
+ * How many exemption lookups run at once while a list is built. Each may ask GitHub whether a login
+ * holds admin on a repository, and an administrator who has pull requests open in dozens of
+ * datasets would otherwise cost that many questions one after another.
+ */
+const EXEMPT_LOOKUP_CONCURRENCY = 6;
+
+/**
+ * The longest a list waits for its exemption lookups, in all. A lookup not started by then is
+ * skipped and its pull request reads as not exempt (what the list said before there was an
+ * exemption), so a GitHub that is slow or refusing makes the list less informative and never
+ * slower than this plus one lookup.
+ */
+let exemptLookupBudgetMs = 20_000;
+
+export function __setExemptLookupBudgetForTests(ms: number | null): void {
+  exemptLookupBudgetMs = ms ?? 20_000;
+}
+
+/**
+ * `isReviewExempt`, asked once per (dataset, login) for the length of ONE request and never kept
+ * beyond it: an author with several open pull requests costs one lookup, and a role that changes
+ * is seen by the next request. The dataset is part of the key because the answer is about a
+ * repository, not only a person. `warm` runs a known set of lookups a few at a time within the
+ * budget, so that the list can then read what finished from memory with `known` (a lookup that
+ * never ran reads as not exempt); `ask` is for the one lookup of a detail view.
+ */
+function exemptionLookup(env: Bindings) {
+  const answers = new Map<string, Promise<boolean>>();
+  const finished = new Map<string, boolean>();
+  const keyOf = (datasetId: string, login: string) => `${datasetId}#${login.toLowerCase()}`;
+  const ask = (datasetId: string, login: string): Promise<boolean> => {
+    const key = keyOf(datasetId, login);
+    let answer = answers.get(key);
+    if (answer === undefined) {
+      answer = isReviewExempt(env, { login, repo: datasetId }).then((exempt) => {
+        finished.set(key, exempt);
+        return exempt;
+      });
+      answers.set(key, answer);
+    }
+    return answer;
+  };
+  const warm = async (
+    wanted: ReadonlyArray<{ datasetId: string; login: string }>,
+  ): Promise<void> => {
+    const pending = [...wanted];
+    const deadline = Date.now() + exemptLookupBudgetMs;
+    let outOfTime = false;
+    const worker = async (): Promise<void> => {
+      try {
+        for (let next = pending.shift(); next !== undefined; next = pending.shift()) {
+          if (Date.now() >= deadline) {
+            if (!outOfTime) {
+              outOfTime = true;
+              console.warn(
+                "[pr-queue] exemption lookups ran out of time; the rest are listed as not exempt",
+              );
+            }
+            return;
+          }
+          await ask(next.datasetId, next.login);
+        }
+      } catch (err) {
+        // A lookup failed (the database), which fails the whole list: no more are started for it.
+        pending.length = 0;
+        throw err;
+      }
+    };
+    const workers = Math.min(EXEMPT_LOOKUP_CONCURRENCY, pending.length);
+    await Promise.all(Array.from({ length: workers }, worker));
+  };
+  const known = (datasetId: string, login: string): boolean =>
+    finished.get(keyOf(datasetId, login)) ?? false;
+  return { ask, warm, known };
+}
+
+// ---------------------------------------------------------------------------------------------
+// The volume line
+// ---------------------------------------------------------------------------------------------
+
+/** A row whose stored report is version 2, the first to carry its usage. */
+const V2_REPORT = "state = 'reported' AND json_valid(report) AND json_extract(report, '$.v') = 2";
+
+/**
+ * The token sums of a group: each stage's input and output tokens from the reports that carry them
+ * (a version 2 report, stored only for a reported review), and how many reports were summed. A
+ * stored report is the parsed report re-serialized, so its usage is the parser's counts; a review
+ * that ended without a report has none, and `counted` is how the line says so.
+ */
+const USAGE_SUMS = `COALESCE(SUM(CASE WHEN ${V2_REPORT} THEN json_extract(report, '$.usage.screen.input_tokens') END), 0) AS screen_input,
+         COALESCE(SUM(CASE WHEN ${V2_REPORT} THEN json_extract(report, '$.usage.screen.output_tokens') END), 0) AS screen_output,
+         COALESCE(SUM(CASE WHEN ${V2_REPORT} THEN json_extract(report, '$.usage.review.input_tokens') END), 0) AS review_input,
+         COALESCE(SUM(CASE WHEN ${V2_REPORT} THEN json_extract(report, '$.usage.review.output_tokens') END), 0) AS review_output,
+         COALESCE(SUM(CASE WHEN ${V2_REPORT} THEN 1 ELSE 0 END), 0) AS counted`;
+
+/**
+ * The records of the last week, grouped by everything a count needs, with their runs. One
+ * group is a state, a verdict, a reason, the stage of a stored version 2 report (a run that ended
+ * at the facts stage made no model call and is not a run, see `spentACall`), whether a running
+ * review is overdue and whether it is inside the last day. The one bound value is how many minutes
+ * after it was handed over a review that never reported stops reading as running, which is the
+ * list's own rule (`OVERDUE_AFTER_MS`).
+ */
+const VOLUME_SQL = `
+  SELECT state, verdict, detail,
+         CASE WHEN ${V2_REPORT} THEN json_extract(report, '$.stage') END AS stage,
+         CASE WHEN state = 'dispatched'
+               AND created_at < datetime('now', '-' || ? || ' minutes') THEN 1 ELSE 0 END AS overdue,
+         CASE WHEN created_at >= datetime('now', '-1 day') THEN 1 ELSE 0 END AS in_day,
+         COUNT(*) AS reviews,
+         COALESCE(SUM(attempts), 0) AS attempts,
+         ${USAGE_SUMS}
+    FROM pr_reviews
+   WHERE created_at >= datetime('now', '-7 days')
+   GROUP BY state, verdict, detail, stage, overdue, in_day`;
+
+interface VolumeGroup {
+  state: string;
+  verdict: string | null;
+  detail: string | null;
+  stage: string | null;
+  overdue: number;
+  in_day: number;
+  reviews: number;
+  attempts: number;
+  screen_input: number;
+  screen_output: number;
+  review_input: number;
+  review_output: number;
+  counted: number;
+}
+
+function emptyWindow(): VolumeWindow {
+  return {
+    reviews: 0,
+    review_runs: 0,
+    by_verdict: Object.fromEntries(
+      STORED_VERDICTS.map((v) => [v, 0]),
+    ) as VolumeWindow["by_verdict"],
+    declines: Object.fromEntries(DECLINE_REASONS.map((w) => [w, 0])) as VolumeWindow["declines"],
+    tokens: {
+      screen_input: 0,
+      screen_output: 0,
+      review_input: 0,
+      review_output: 0,
+      reviews_counted: 0,
+    },
+    estimated_cost_usd: 0,
+  };
+}
+
+/**
+ * What the review has done over the last 24 hours and the last 7 days, for the administrator who
+ * reads the list: the records created, the runs of the review they cost, what they came to and why
+ * the declined ones were. Counted from the records and used for nothing else: it informs and never
+ * blocks (ADR 0107), so nothing here, or anywhere, reads it to decide whether a pull request is
+ * reviewed. A record is counted when it was created, and a commit started again is created anew.
+ */
+export async function readVolume(db: D1Database): Promise<QueueVolume> {
+  const { results } = await db
+    .prepare(VOLUME_SQL)
+    .bind(PR_REVIEW_DEADLINE_MINUTES + OVERDUE_GRACE_MINUTES)
+    .all<VolumeGroup>();
+  const day = emptyWindow();
+  const week = emptyWindow();
+  for (const g of results) {
+    // The list's own reading of a row, so the two never disagree about what a record came to.
+    const meant =
+      g.state === "dispatched" && g.overdue === 1
+        ? { verdict: "could_not_decide" as const }
+        : meaningOf(g);
+    for (const w of g.in_day === 1 ? [week, day] : [week]) {
+      w.reviews += g.reviews;
+      if (spentACall(g)) w.review_runs += g.attempts;
+      w.by_verdict[meant.verdict] += g.reviews;
+      if (g.state === "declined" && isDeclineReason(g.detail)) w.declines[g.detail] += g.reviews;
+      const t = w.tokens;
+      if (t) {
+        t.screen_input += g.screen_input;
+        t.screen_output += g.screen_output;
+        t.review_input += g.review_input;
+        t.review_output += g.review_output;
+        t.reviews_counted += g.counted;
+      }
+    }
+  }
+  for (const w of [day, week]) {
+    if (w.tokens) w.estimated_cost_usd = estimateCostUsd(w.tokens);
+  }
+  return { last_24_hours: day, last_7_days: week };
+}
+
+/**
+ * {@link readVolume}, except that a failure to read it is a null and a log line and not a failed
+ * list: the volume only informs, and a count that could not be read is told apart from a count of
+ * zero by the null.
+ */
+async function readVolumeIfPossible(db: D1Database): Promise<QueueVolume | null> {
+  try {
+    return await readVolume(db);
+  } catch (err) {
+    console.error(`[pr-queue] the volume could not be read (${errMessage(err)})`);
+    return null;
+  }
+}
+
 export async function buildQueue(env: Bindings, filters: QueueFilters): Promise<QueueResponse> {
   const open = await fetchOpenPullRequests(env);
   const skipped: QueueSkipped = {
@@ -848,17 +1121,37 @@ export async function buildQueue(env: Bindings, filters: QueueFilters): Promise<
     return owned;
   });
   const reviews = await loadReviews(env.DB, [...new Set(mine.map((pr) => pr.datasetId))]);
+  const exempt = exemptionLookup(env);
 
-  const all: QueueEntry[] = mine.map((pr) => {
+  const staged = mine.map((pr) => {
     // The review of the current commit if there is one; else the newest, which `classify` will
     // show as another commit's.
     const row =
       reviews.byHead.get(headKey(pr.datasetId, pr.prNumber, pr.headSha)) ??
       reviews.newest.get(`${pr.datasetId}#${pr.prNumber}`) ??
       null;
-    const classified = classify(row, pr.headSha);
+    const base = classify(row, pr.headSha);
+    // An exempt pull request has no review of its current commit, by design. A bot or a ghost
+    // (no GitHub user id) is never an owner or administrator.
+    const mayBeExempt = base.review_current !== true && pr.authorId !== null;
+    return { pr, base, mayBeExempt };
+  });
+  await exempt.warm(
+    staged
+      .filter((s) => s.mayBeExempt)
+      .map((s) => ({ datasetId: s.pr.datasetId, login: s.pr.authorLogin })),
+  );
+
+  const all: QueueEntry[] = [];
+  for (const { pr, base, mayBeExempt } of staged) {
+    // An exempt row says when the naming rule holds it (its check failed, or asks for a person), so
+    // the list shows it waits on a fix or an `allow --admin`; otherwise it carries no detail.
+    const classified: Classified =
+      mayBeExempt && exempt.known(pr.datasetId, pr.authorLogin)
+        ? { ...base, verdict: "exempt", detail: pr.namingHold }
+        : base;
     const verdictAndDraft = { verdict: classified.verdict, draft: pr.draft };
-    return {
+    all.push({
       dataset_id: pr.datasetId,
       pr_number: pr.prNumber,
       url: pullUrl(pr.datasetId, pr.prNumber),
@@ -875,8 +1168,8 @@ export async function buildQueue(env: Bindings, filters: QueueFilters): Promise<
       bids: pr.bids,
       version: pr.version,
       needs_you: needsYou(verdictAndDraft),
-    };
-  });
+    });
+  }
   return {
     environment: environmentName(env),
     review_enabled: env.PR_REVIEW_ENABLED === "1",
@@ -885,6 +1178,7 @@ export async function buildQueue(env: Bindings, filters: QueueFilters): Promise<
     truncated: open.truncated,
     skipped,
     filters,
+    volume: await readVolumeIfPossible(env.DB),
   };
 }
 
@@ -970,17 +1264,14 @@ export async function fetchLivePullRequest(
  * What a stored row stands for, by the review's own rules (`outcomeOfRow`, which also logs a report
  * that no longer parses and says why). Null for a review still waiting for its report.
  */
-function outcomeOf(row: ReviewRow & { report: string | null }): ReviewOutcome | null {
+function outcomeOf(row: ReviewRow & { report: string | null }): StoredOutcome | null {
   return outcomeOfRow({
     id: row.id,
     datasetId: row.dataset_id,
     prNumber: row.pr_number,
-    headSha: row.head_sha,
     state: (REVIEW_STATE_SET.has(row.state) ? row.state : "errored") as ReviewState,
     detail: row.detail,
     report: row.report,
-    checkRunId: null,
-    commentId: null,
   });
 }
 
@@ -1061,7 +1352,7 @@ export async function readPrReviewDetail(
   let derived: Pick<ReviewRow, "state" | "verdict" | "detail"> | null = row;
   if (row && row.state === "reported") {
     const stored = isReadVerdict(row.verdict) ? row.verdict : null;
-    let verdict: QueueVerdict;
+    let verdict: StoredVerdict;
     if (outcome?.kind === "reported") {
       const fromReport = verdictOf(outcome.report);
       if (stored !== null && stored !== fromReport) {
@@ -1092,7 +1383,17 @@ export async function readPrReviewDetail(
           outcome,
         }
       : null;
-  const effective = classify(row && derived ? { ...row, ...derived } : null, head);
+  let effective = classify(row && derived ? { ...row, ...derived } : null, head);
+  // The same word as the list gives, on the same terms (see `buildQueue`): an owner's or
+  // administrator's pull request with no review of its current commit.
+  if (
+    effective.review_current !== true &&
+    livePr !== null &&
+    livePr.author_id !== null &&
+    (await exemptionLookup(env).ask(datasetId, livePr.author_login))
+  ) {
+    effective = { ...effective, verdict: "exempt", detail: null };
+  }
 
   const history: ReviewHistoryItem[] = results.slice(0, HISTORY_LIMIT).map((r) => {
     const state: ReviewState = REVIEW_STATE_SET.has(r.state) ? (r.state as ReviewState) : "errored";
@@ -1147,7 +1448,10 @@ const RECENT_SQL = `
   SELECT dataset_id, pr_number, head_sha, verdict, decided_at
     FROM latest WHERE rn = 1 ORDER BY seen_at DESC, id DESC LIMIT 10`;
 
-/** The tally, override and standing of one contributor, as the review gate would see them now. */
+/**
+ * The tally, override and standing of one contributor, as the review gate would see them now. The
+ * tally is the record beside the decision, not an input to it: only a block pauses anyone.
+ */
 export async function standingFor(
   db: D1Database,
   login: string,
@@ -1185,9 +1489,7 @@ export async function standingFor(
             set_by: row.set_by ? plainRef(row.set_by, 60) : null,
           }
         : null,
-    standing: standingOf(tally, mode),
-    by_record: standingOf(tally, null),
-    thresholds: { rejected_more_than: REJECTION_COUNT, percent_more_than: REJECTION_PERCENT },
+    standing: standingOf(mode),
     recent: recent.results,
     resolved_from: resolvedFrom,
   };
@@ -1243,7 +1545,7 @@ async function resolveAtGitHub(
       throw new QueueError(
         422,
         "not_a_user",
-        `${u.login} is a GitHub ${sanitizeNote(u.type, 20) || "account"}, not a person. Reviews are counted per person.`,
+        `${u.login} is a GitHub ${sanitizeNote(u.type, 20) || "account"}, not a person. A block or an allow applies to a person's account.`,
       );
     }
     return { id: u.id, login: u.login, from: "github" };
