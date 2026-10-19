@@ -188,6 +188,7 @@ const MODULE_EXPORTS: Record<string, string[]> = {
     "validateCi",
     "verifyImport",
     "verifyUserById",
+    "waivePrReviewNaming",
     "withdrawDataset",
     "zarrFidelitySweep",
   ],
@@ -268,6 +269,7 @@ const POST_SPLIT_ADDITIONS = [
   "setPrReviewAuthor", // ADR 0093: PUT /admin/pr-review-authors/:login (allow or block)
   "clearPrReviewAuthor", // ADR 0093: DELETE /admin/pr-review-authors/:login
   "startPrReview", // ADR 0092: POST /admin/pr-reviews/:dataset/:pr/start (review an open pull request)
+  "waivePrReviewNaming", // ADR 0107: POST /admin/pr-reviews/:dataset/:pr/allow (the naming rule's one override)
   "getPublicationReview", // ADR 0102: GET /admin/publish/:id/review
   "startPublicationReview", // ADR 0102: POST /admin/publish/:id/review/start
   "commentOnPublication", // ADR 0102: POST /admin/publish/:id/comment (mails the depositor an administrator's words)

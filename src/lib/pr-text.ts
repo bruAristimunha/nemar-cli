@@ -20,6 +20,12 @@
 
 import { lstatSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { findAuthorYearKey, findDoi, findTemplateField } from "../../shared/naming-rule.js";
+
+// The naming rule (an author-year key or a DOI anywhere, an unfilled template field) lives in
+// `shared/naming-rule.ts`, where the review job and the Worker read it too; what this module
+// exports of it is exported from here, so the CLI and its tests ask the one rule.
+export { findAuthorYearKey, findDoi } from "../../shared/naming-rule.js";
 
 // ---------------------------------------------------------------------------------------------
 // Readable text
@@ -31,6 +37,7 @@ export type TextKind = "title" | "description";
 export const TEXT_PROBLEMS = [
   "empty",
   "author_year",
+  "doi",
   "machine_output",
   "placeholder",
   "template_field",
@@ -78,69 +85,6 @@ const STAND_IN_TEXT: readonly RegExp[] = [
   /^lorem ipsum\b/,
 ];
 
-/**
- * A template field left where its value belongs. The first three are syntax: the shapes an
- * unfilled template, or a shell that did not expand a variable, leaves behind. The fourth is the
- * one real instance this was written for: a dataset's rename PR was titled with the naming rule
- * "FirstAuthorSurname-year-keyword-paperDOI" instead of the name that rule produces.
- *
- * There is deliberately NO rule for "a long CamelCase word". BIDS field names are CamelCase by
- * specification (`PowerLineFrequency`, `DatasetDOI`, `ReferencesAndLinks`), as are task labels
- * (`task-RestingStateEyesClosed`), and they are the vocabulary of an ordinary dataset update.
- *
- * A bracket asks the reader to write something only when its first word is one that asks (your,
- * insert, enter, describe, write, fill in, replace) and more words follow inside it, and it is not
- * the text of a Markdown link. `<your title here>` and `[describe the change]` are refused;
- * `<Enter>`, `[Replace]`, `[Write-up](url)`, `[your lab](url)` and
- * `sub-<label>_task-<label>_eeg.edf` stay ordinary text.
- *
- * The lookahead after the whitespace is not decoration: without it `\s+` and the characters after
- * it overlap on blanks, and an unclosed `[your` followed by a long run of them is tried as every
- * split of the run, which is quadratic. With it the run has one way to match.
- */
-const TEMPLATE_FIELDS: readonly RegExp[] = [
-  /\{\{[^{}]*\}\}/, // {{title}}
-  /\$\{[^{}]*\}/, // ${TITLE}
-  /[<[]\s*(?:your|insert|enter|describe|write|fill in|replace)\s+(?=[^\s<>[\]])[^<>[\]]*[>\]](?![([])/i, // <your title>
-  /\b(?:FirstAuthorSurname|paperDOI)\b/,
-];
-
-/**
- * A word of letters with an apostrophe (straight or curly) or a hyphen allowed inside it, then one
- * optional hyphen or underscore, then a year from 1900 to 2099 that is not the start of a longer
- * number. Each repeated part is set off by a character the part before it cannot match, so a long
- * first word is judged in linear time. That shape is the whole argument, so a test checks it on the
- * pattern itself, which is why the pattern is exported; nothing in the suite is timed.
- */
-export const AUTHOR_YEAR_PREFIX =
-  /^[\p{L}\p{M}]+(?:[-'\u{2019}][\p{L}\p{M}]+)*[-_]?(?:19|20)\d{2}(?!\d)/u;
-
-/**
- * What `text` opens with when that is a name and a year, as it was typed (`Lee-2019` for
- * `Lee-2019-EEG`, `MOVING2024` for `MOVING2024 release`), or null. That is how a dataset is named
- * (the atlas naming rule is FirstAuthorSurname-year-keyword-paperDOI), and a pull request title says
- * what the change does, not what the dataset is called: `Lee2019 EEG dataset`, `Lee-2019-EEG`,
- * `O'Brien_2020` and `MOVING2024 release` are refused. The function is pure and exported so that
- * the pull request review, and any check on a dataset name, ask the same question.
- *
- * The name is the first word: letters of any case, with an apostrophe or a hyphen allowed inside it
- * (`O'Brien`, `Smith-Jones`). The year is four digits from 1900 to 2099 that are not the start of a
- * longer number, and it follows the name directly or after one hyphen or underscore; whatever comes
- * after the year does not matter. A space ends the word, so `Release 2019` and `Add 2019
- * recordings` are ordinary sentences, and a title that begins with the year (`2019 release notes`)
- * has no name before it. Only the start of the text is looked at: `Rename the dataset to
- * Lee-2019-EEG` is a sentence.
- *
- * Nothing here can tell a surname from any other letters, so an acronym such as `BNCI2014_001`, a
- * funding code such as `H2020` and a BIDS label such as `ses-2019` are refused too.
- *
- * Blanks before the text are skipped, so the answer is the same before and after
- * {@link normalizeTitle}.
- */
-export function findAuthorYearPrefix(text: string): string | null {
-  return text.trimStart().match(AUTHOR_YEAR_PREFIX)?.[0] ?? null;
-}
-
 /** Seven to 64 hex digits holding at least one digit and one letter: a git or checksum digest. */
 const DIGEST =
   /^(?:(?:sha\d*|md5|git|commit)[:\s-]*)?(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,64}$/i;
@@ -171,6 +115,14 @@ function quoted(text: string): string {
 }
 
 /**
+ * What a citation is told, whether it was found as an author and a year or as a DOI: the same plain
+ * words either way, what was found, and where the paper is cited instead.
+ */
+function citationReason(found: string): string {
+  return `has a citation (an author and a year, or a DOI) in it (${quoted(found)}); describe the change in plain words, such as "Add three EEG recordings", and cite the paper in ReferencesAndLinks and the README instead`;
+}
+
+/**
  * The first reason `raw` cannot go into a pull request as the title or the description of a
  * change, or null when it can. A missing value is `empty`. The text is judged as
  * {@link cleanPrText} returns it.
@@ -181,13 +133,10 @@ export function findTextProblem(kind: TextKind, raw: string | undefined): TextPr
   // A title only: a description may cite a paper the way the paper is cited. Before the digest
   // check, because a name of the letters a to f and a year (`Decade2019`) is also seven or more hex
   // digits, and it is a name that was typed.
-  const authorYear = kind === "title" ? findAuthorYearPrefix(text) : null;
-  if (authorYear !== null) {
-    return {
-      code: "author_year",
-      reason: `starts with a name and a year (${quoted(authorYear)}); describe the change in plain words, such as "Add three EEG recordings"`,
-    };
-  }
+  const authorYear = kind === "title" ? findAuthorYearKey(text) : null;
+  if (authorYear !== null) return { code: "author_year", reason: citationReason(authorYear) };
+  const doi = kind === "title" ? findDoi(text) : null;
+  if (doi !== null) return { code: "doi", reason: citationReason(doi) };
   if (DIGEST.test(text) || isJsonDocument(text)) {
     return {
       code: "machine_output",
@@ -201,14 +150,12 @@ export function findTextProblem(kind: TextKind, raw: string | undefined): TextPr
       reason: `is placeholder text (${quoted(text)}); say what actually changed`,
     };
   }
-  for (const re of TEMPLATE_FIELDS) {
-    const field = text.match(re)?.[0];
-    if (field !== undefined) {
-      return {
-        code: "template_field",
-        reason: `still has an unfilled template field (${quoted(field)}); put the real value in its place`,
-      };
-    }
+  const field = findTemplateField(text);
+  if (field !== null) {
+    return {
+      code: "template_field",
+      reason: `still has an unfilled template field (${quoted(field)}); put the real value in its place`,
+    };
   }
   if (!/\p{L}{2,}/u.test(text)) {
     return {

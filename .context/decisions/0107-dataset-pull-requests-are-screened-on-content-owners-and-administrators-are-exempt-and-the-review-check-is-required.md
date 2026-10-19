@@ -11,8 +11,8 @@ The Worker as the gate, the per-commit row, the one-shot claim, the derived verd
 Follows ADR 0048 (account kinds), ADR 0053 and ADR 0086 (unknown is never clear), ADR 0020 (a workflow edit reaches ~785 repositories at once).
 
 This ADR records the decisions of epic #1813.
-Two phases are built so far: the exemption with the `exempt` queue verdict and its CLI wording (#1814), and the removal of the counts, which is the caps, the platform's pool and the automatic tally pause, with a volume line in the admin list (#1815).
-The rest is decided here and built by the later phases; until they ship, the three-question review of ADR 0092 is what runs.
+Built so far: the exemption with the `exempt` queue verdict and its CLI wording (#1814); the removal of the counts, which is the caps, the platform's pool and the automatic tally pause, with a volume line in the admin list (#1815); readable pull request text from the CLI (#1818); and the two-stage review with report version 2, the naming rule and its one override (#1816).
+The rest is decided here and built by the later phases.
 The removal of the counts is released only together with the stage-1 screen, so that spend is never left without a bound.
 
 ## Context
@@ -56,8 +56,10 @@ And the review only ever sees a pull request's text and metadata, so a count of 
   A delivery that names no usable sender is reviewed.
   An administrator's start has no sender (its payload is GitHub's own record of the pull request, built by the Worker) and is judged on the author alone.
   The owner confirmed this check for a push, and on 2026-10-16 confirmed applying it to every action.
-- **An exempt pull request gets one completed `skipped` check and no review.**
-  The title says the review is not required for an owner or administrator, and the text says skipped is not a pass.
+- **An exempt pull request gets one completed check and no review, and the naming rule (decision 3a) decides which check.**
+  The check is `skipped` when the rule finds nothing on the commit, or when an administrator has waived it for that commit.
+  The skipped title says the review is not required for an owner or administrator, and the text says skipped is not a pass.
+  When the rule refuses the title or the dataset's new name the check is a failure, and when the dataset's name could not be read it is `action_required`, a check that needs a person and does not pass, whatever the title says: nothing can be waived while the name is unread, so the check, the answer of a start and the list's label all say that the name has to be read first.
   No row is stored, no model is called, nothing is dispatched, and no comment is made.
 - **That applies only to a commit no review has touched.**
   A commit that has a row keeps what its review said, whoever acts on it next: the author reopening the pull request, a force-push back to it, or an administrator's start.
@@ -87,24 +89,110 @@ And the review only ever sees a pull request's text and metadata, so a count of 
   Rows written while the pause was automatic hold the same word, so its copy does not say who paused the contributor.
   The standing answer no longer carries `by_record` or `thresholds`, which described the rule that is gone.
 - **The admin list carries a volume line.**
-  For the last 24 hours and the last 7 days it gives the review records created, the model calls they cost (the sum of their attempts, leaving out a decline and a run that never reached the model), what they came to, and the declined ones by reason word.
+  For the last 24 hours and the last 7 days it gives the review records created, the review runs they cost (`review_runs`: the sum of their attempts, leaving out a decline, a run that never reached the model, and a run the naming rule ended at the facts stage, which asked no model; a run makes up to two model calls), what they came to, and the declined ones by reason word.
+  Each window also sums the tokens of each stage and an estimated cost in dollars at the list prices under Consequences, an estimate for orientation and not a bill.
+  Only a version 2 report carries its usage, so only version 2 reports are counted, and the line says how many were: a refusal, a truncation, an earlier attempt of a restarted review and a report from before the screen cost tokens that are not in the sum.
+  For example, 30,000 screen input tokens, 60,000 screen output tokens, 380,000 review input tokens and 35,000 review output tokens come to about $1.14 (30,000 x $0.10 + 60,000 x $0.50 + 380,000 x $2 + 35,000 x $10, per million tokens).
   It informs and never blocks: nothing reads it to decide whether a pull request is reviewed, and a volume that could not be read is said so and is never shown as zero.
 
-### 3. Two model calls, at the highest effort Haiku 5.5 offers
+### 3. Two model calls at the highest effort: a screen, then a review
 
-- **Stage 1 sees metadata only**, with the pull request's text fenced as untrusted, and can reject only spam, vandalism or a change with no plausible purpose.
-  When unsure it proceeds.
-  A reject, or a steering attempt, ends the run with a screen report; stage 2 is never called and no file content is read.
-- **Stage 2 reads the content and answers five questions**: nothing lost, the revision advances, materially better, a clear title and description, and a description that is not misleading.
+The owner set the models, the budgets and the prompt on 2026-10-16, after a comparison of `claude-haiku-5-5` and `claude-sonnet-5-5` on labeled pull request text.
+
+- **Stage 1, the screen, runs on `claude-haiku-5-5`.**
+  It sees the pull request's text, fenced as untrusted, and the platform's account of which files changed, never a file's content.
+  It may reject only spam: promotional content, content unrelated to the dataset, content with no purpose, or repeated links.
+  Everything else proceeds, including placeholder or unreadable text, an empty or misleading description and an attempt to steer it, which stage 2 judges; when unsure it proceeds.
+  A reject ends the run with a screen report; stage 2 is never called and no file's content is read beyond `dataset_description.json`.
+- **Stage 2, the review, runs on `claude-sonnet-5-5`.**
+  It reads the content, answers the three questions about the files (nothing lost, the revision advances, materially better), and judges the pull request's text with prompt v3's rules, copied word for word: whether the title and the description say what changed, whether the description misleads, and whether anything steers the reviewer (a claim that someone other than the author approved the change, or text that tells the reviewer what to answer).
+- **Both stages run at effort `max`, streamed, with `max_tokens` 32000**, each under a deadline for the whole stage (every attempt and the streamed answer together, through an abort signal).
+  The screen's deadline is 4 minutes and the review's 11, each with a 5-second grace for the sign-in that takes no signal.
+  The worst case adds the other steps, each at its budget: the setup steps 4 minutes (an allowance, because GitHub's own steps bound them and not the script), the evidence passes 3 minutes (60 seconds for the change list and the trees, 120 for the diffs and the change log), and the callback's four attempts of 60 seconds with pauses of 2, 4 and 8 seconds, 4 minutes 14 seconds.
+  That is 4 + 3 + 4 min 5 s + 11 min 5 s + 4 min 14 s, which is 26.4 minutes, inside the job's 28, which is inside the Worker's 40-minute deadline (`PR_REVIEW_DEADLINE_MINUTES`); a test (`test/pr-review-workflow.test.ts`) reads the workflow and the script's budgets and checks the inequalities.
+- **A refusal or a truncation at either stage is no verdict.**
+  The check is `action_required`, which does not pass a required check, and its text says a NEMAR administrator needs to look.
 - **The verdict stays derived.**
   The model never writes it, a fact can lower an answer and never raise one, and a screen report can never pass.
-  Both calls use `claude-haiku-5-5` at effort `max`, streamed, with per-stage token budgets and a job timeout that sits inside the Worker's deadline; a test checks the inequality.
+- **A naming failure ends the review before any model is asked.**
+  The review job decides the facts first.
+  When the title, or the dataset's changed name, breaks the naming rule (3a), or the changed name cannot be read, the run ends at the `facts` stage: no model is called and no tokens are spent, `models` names none, all six criteria are not assessed, and the report says why in the rule's own sentences.
+  The report stage is `facts`, and a facts report can never pass: the parser refuses one that names a model, assesses anything, spent a token, or has no naming fact to explain it.
+  The check reads "Needs changes: the naming rule", or "Could not decide: the naming rule was not checked" when the name could not be read and the rule refused nothing, and the author edits the title or the `Name` and pushes again.
+  The title, the copy under it and the CLI's reason line are all chosen by the naming fact (`factsStop`) and never by the verdict, so they agree: a version that did not advance fails the verdict of a facts report whose name was only unreadable, and that report still reads "not checked" everywhere.
+  A refusal beside an unreadable name reads "Needs changes", because the rule found something.
+- **A description is read up to 12,000 characters, and a longer one is recorded as cut.**
+  Both models are shown the first 12,000 characters of the tidied description and the mark `[cut]`, and the evidence records `description_cut`.
+  A cut description cannot pass: `description_not_misleading` is no better than unknown, because whether the rest misleads, or tries to instruct the reviewer, was not assessed.
+  A steering finding on the part that was read still fails the review.
+  The description is judged as the models read it, so one made of invisible characters is empty.
+- **A new version needs a CHANGES entry, and that is a fact.**
+  The evidence reader looks for a heading for the new version in the head's change log that the merge base's did not have (`changelog_entry`: `added`, `not_added`, `no_file` or `unknown_version`).
+  When there is none (`not_added` or `no_file`) `advances_revision` fails with `changes_log_missing`, whatever a model said; an unknown new version is not this rule's to judge.
+  A full report that says nothing about the log is refused, so the rule cannot be skipped by leaving it out.
+- **The report is version 2:** its stage, both models, six criteria (the screen's `genuine_contribution`, the three questions, and the two text criteria), the facts, and the tokens each call used.
+  The evidence carries exactly five fact keys, and they differ in when they are read and in what they do.
+  Four are decided before any model is asked: `description_empty`, `description_cut`, and the naming rule's `title_problem` and `name_problem`.
+  The fifth, `changelog_entry`, is read from git after the screen lets the pull request through, so it is null in a screen report and in a facts report, and a full report always has one.
+  An empty description, a refused title or name, and a new version with no change-log entry each fail a criterion.
+  A description that was cut and a changed name that could not be read only lower a criterion to unknown (`description_not_misleading` and `no_degradation`) and never fail it: nothing was found wrong, it was not assessed, and a person looks.
+  A callback must carry version 2; a version 1 report sent by callback is refused as `report_invalid`, a check that needs a person.
+  Rows stored before the screen keep their version 1 reports, which are read back by their own rules, so no stored verdict changes.
+
+### 3a. The naming rule runs first, on every pull request
+
+- **A pull request title, and the dataset's new name when a pull request changes it, may not hold a citation, an author and a year or a DOI, anywhere in it, or a naming-template token.**
+  The rule refuses an author-year key anywhere in the text: a run of letters, of any case and script, directly followed by an optional single hyphen or underscore and a four-digit year from 1900 to 2099 that does not start a longer number (`Lee2019`, `Lee-2019-EEG`, `BNCI2014_001`, `Results from Zhou-2016 cohort`, `(Mainsah2025_L)`).
+  It refuses a DOI anywhere in the text: the characters `10.`, four to nine digits and a slash, which covers a `doi.org` link, a bare `doi:10.1234/x` and a DOI that ends a name in parentheses.
+  And it refuses a template token (`FirstAuthorSurname`, `paperDOI`, `{{x}}`, `${x}`, `<your title>`, `[describe the change]`).
+  The three are asked in that order, as the closed words `author_year`, `doi` and `template_field`, and a text that breaks several is told about the first.
+  An author-year key and a DOI are told to the author in the same plain words, "a citation (an author and a year, or a DOI)", with the advice to cite the paper in `ReferencesAndLinks` and the README instead.
+  The letters of a key must touch the year, or the one separator before it, and that is a deliberate boundary: `Release 2019`, `Andreev 2012` and `Add 2019 recordings` are ordinary sentences, and a rule that read a word and a year across a space would refuse every title that mentions a year.
+  The price is that a citation typed with a space (`Sawada 2022`) is not caught, and that letters attached to a year (`H2020`, `ses-2019`, `R2019b`) are refused wherever they stand.
+  A description is not held to the rule, so it may cite the paper the way the paper is cited.
+  The scan is linear in the length of the text, because a dataset `Name` can be long: it has no repetition that repeats another, and the tests that say so give it texts of hundreds of thousands of characters.
+  The name is the `Name` field of `dataset_description.json` at the head, compared with the merge base: a name the pull request did not change is not its problem.
+- **One pure function decides, in `shared/naming-rule.ts`**, which the CLI asks before it opens a pull request, the review job asks before any model call, and the Worker asks of a pull request it does not review.
+  A refusal fails the verdict whatever a model says.
+- **Owners and administrators are not exempt from it.**
+  The exemption still skips the review, but the Worker applies the rule first: a refused title or name fails the check, and a name that cannot be read makes it a check that needs a person, never a skip, even when the title is also refused (the title's problem is stated in the check, and the unread name is what decides its conclusion).
+- **A name that cannot be read is checked as `unchecked`, and unchecked cannot pass.**
+  In the review job, a pull request that changes `dataset_description.json` and leaves a `Name` that is not text or shows a reader nothing (empty, blanks, or only characters nobody sees), or a file that is not JSON, has the finding `unchecked`: the run ends at the facts stage and the check does not pass.
+  The Worker, for a pull request it does not review, compares the base with the head and, when the comparison says `dataset_description.json` may have changed, reads the file at the head and at the merge base.
+  It asks for a page of 100 commits and believes the comparison's list of changed files only when the answer holds every commit of the comparison (`commits` as long as `total_commits`, both present); a longer comparison, or an answer without the counts, is treated as having no list, so both names are read.
+  A head file that is not JSON, has no `Name` that is text and shows something, or is not found where the comparison does not list it as removed is `unchecked`, as in the job.
+  A file the comparison lists as removed (or renamed to another name) has no name to refuse, and a removal is not a naming failure.
+  The merge base is held to less: no file there, or one with no readable name, means the pull request gives the dataset its first name, and that name is checked.
+- **The Worker's reads are bounded, and the bounds are unmeasured on large pull requests.**
+  The comparison and the two file reads (made together) are each bounded to 3 seconds.
+  GitHub may take longer to compute a comparison for a pull request with many commits or files, and that has not been measured.
+  A read that times out makes the name `unchecked`: a check that needs a person, never a pass.
+  The reads run inside the webhook's own request, and at their worst the permission lookups (two, 4 seconds each), the comparison (3), the file reads (3) and the check post (5) add up to more than the 10 seconds GitHub gives a delivery; the sum has not been measured either.
+  GitHub does not retry a failed delivery by itself, so a delivery that times out or fails is recovered by redelivering it from the App's delivery log, and a redelivered exempt commit posts the same check again.
+  The staging step of the rollout (decision 6) measures these durations before the required check is turned on; if they come near the limit, the reads move off the request.
+- **The only way past the rule without a change is an explicit override**, `nemar admin pr-reviews allow <dataset> <pr> --admin --reason <why>`, which replaces the exemption for this rule.
+  The Worker reads the pull request itself, refuses it for an author who is not exempt (their review includes the rule) and for a commit a review has touched, records the waiver in the audit log (who, the commit, what the rule found as closed words, the reason given; never the title or the name), and then posts a `skipped` check that says the rule was waived.
+  The record comes first: if it cannot be written, nothing is posted, and a recorded waiver whose check did not land is posted by asking again.
+  The reason is required, because it is what the record keeps: a request without one, or with one that has no plain words left once links, mentions and markup are removed (a letter or a digit must remain, so a link alone or punctuation alone is no reason), is a 400, and nothing is recorded or posted.
+  The administrator may name the commit they looked at (`--commit`, the first 7 to 40 characters of its id).
+  A pull request that has moved on from it is refused with `head_moved` (409), and nothing is recorded or posted; without a commit the current one is waived, and the answer and the record name it.
+  The waiver is for that commit only: a new commit is checked again.
+  A name that could not be read is not waived, because a waiver covers only what the rule found.
+  Two things cause an unread name and they are cured differently, so every message about it (the check, the answer of a start or an override, and the list's label) says both: GitHub may not have answered, which one more start settles, or the file at the head has no readable `Name`, which the same start will find again, so the file has to be fixed and pushed.
+  A contributor's pull request that the rule refuses is fixed by its author, or merged in the GitHub UI by an owner or administrator (decision 5).
 
 ### 4. Titles and descriptions must be meaningful, and an edit re-runs the review
 
 - A placeholder or template title, a description that is gibberish or placeholder text, and a title that does not describe the change are blockers.
   An incomplete or slightly inaccurate description passes with a note, and a misleading one is a blocker the author fixes by editing it.
 - Editing the title, the body or the base re-runs the review and supersedes a running one.
+  That is built by phase P4 (#1817), and until it lands the next bullet is the rule.
+- **The title and the body are read once per run, and an edit does not re-run the review until phase P4 lands.**
+  The workflow reads the pull request from the API when a run starts (`--pr-json`), and the title and the body come from that read.
+  The Worker's gate takes up `opened`, `synchronize`, `reopened` and `ready_for_review` and has no `edited`, so an edit is ignored.
+  A check therefore describes the text as it was when its run started: an author who fixes a title or a description to satisfy a failed check does not clear it by editing, and a text edited after a pass is not judged again.
+  The same holds for the naming rule on an owner's or administrator's pull request, whose title is read from the delivery: editing a refused title does not clear the check, and a new commit, a reopening or an administrator's start does.
+  **The required check (decision 5) must not be turned on before phase P4 lands**, because until then a pull request could be held by text it no longer has, or passed by text that has since changed.
 - An empty description is a blocker decided by a git-free fact, not by the model, and `nemar dataset update` requires a title and a description and writes the CHANGES entry for the version it creates.
   The owner confirmed both.
 
@@ -123,8 +211,11 @@ And the review only ever sees a pull request's text and metadata, so a count of 
 
 - The workflow's timeout, wording and install order (after the token is minted, with `--ignore-scripts`, as the publication review's workflow does) change first and are mirrored to `nemarDatasets/.github`, because the parity test makes any edit a two-repository change.
   Every dispatch, staging included, runs `main`'s script, so the new reviewer cannot run on staging before a release.
-- There is therefore no staging soak.
-  After the release the new review runs in an advisory shadow mode on production pull requests, and the check is made required only after the shadow run and the calibration gate.
+- There is therefore no staging soak of the reviewer: its screen and its review first run on production, in an advisory shadow mode on production pull requests after the release, and the check is made required only after the shadow run, the calibration gate and the re-review on an edit (decision 4, phase P4).
+- The Worker's side is soaked on staging, as a rollout step of its own.
+  The dev Worker deploys from `dev` with the epic, before the release, and the exempt path never dispatches, so a pull request opened by an administrator against a dev-owned exemplar exercises the naming rule's reads, the check posted for it and the override on staging.
+  That step verifies two statements of this ADR and no others: how long the naming rule's GitHub reads take against the ten seconds GitHub gives a delivery (decision 3a), and that GitHub reads the newest check run of a name, which is what lets a waiver release a required check (Consequences).
+  It is done before the check is made required, and until it is done both statements stand as unverified.
 - The calibration gate, approved by the owner: no false pass on a blocking problem; at most 10 percent false fails among the pull requests labeled pass; no stage-1 reject of a legitimate pull request; no steering flag on a legitimate pull request.
 - The production canary is a data author's account named in the epic, and its pull requests exercise the gate first.
   No dataset is special-cased (more than 900 are live): every reviewable dataset is in scope, applied in batches, with a dry run as the default and an explicit apply flag.
@@ -135,8 +226,8 @@ And the review only ever sees a pull request's text and metadata, so a count of 
 
 - **ADR 0092, the second Decision bullet:** the hourly, daily and platform caps and the tally pause.
   The per-commit row and the administrator's block stay.
-- **ADR 0092, the reviewer bullet and "The model has no tools and writes little":** effort `high`, and a model that "answers three questions".
-  Now two calls, five questions, effort `max`.
+- **ADR 0092, the reviewer bullet and "The model has no tools and writes little":** effort `high`, one model, and a model that "answers three questions".
+  Now two calls on two models (decision 3), five questions and the naming rule's facts, effort `max`.
 - **ADR 0092, "Green and red are real; everything else needs a person":** plus `skipped`, for an exempt pull request alone.
 - **ADR 0092, "The check is not required by any ruleset yet", and the Consequences that lean on it** ("acceptable only because the check is not required", "This is why the check is not required", "only matter once the check is required"): the check is required on reviewable datasets, and the risk that a model's false green lets a maintainer merge is accepted, bounded by facts, calibration and re-review on edit.
 - **ADR 0092, the accepted risks "Many new accounts" and "Padding the tally":** replaced by the stage-1 cost bound and the workspace spend limit.
@@ -150,7 +241,7 @@ And the review only ever sees a pull request's text and metadata, so a count of 
 - **An exempt pull request has no row.**
   There is no history to show and nothing for the watchdog to publish again.
   A check that cannot be published is thrown and the webhook answers 500, so the delivery shows as failed in the App's delivery log and can be redelivered.
-  A redelivery of an exempt commit posts a second `skipped` check of the same name, which is harmless.
+  A redelivery of an exempt commit posts a second check of the same name and the same conclusion, which is harmless.
   The only record that a commit was exempted is that check and a fixed-word log line (dataset, pull request, commit; no login).
 - **A commit an owner pushes on top of a stranger's is the owner's.**
   The exemption judges who caused each delivery, not who wrote each commit, so an exempt account that pushes over someone else's earlier commits vouches for them.
@@ -162,11 +253,22 @@ And the review only ever sees a pull request's text and metadata, so a count of 
   That review's late result can rewrite the pull request's review comment, which names the commit it is about; the check on the new commit is unaffected.
 - **A review that starts for the same commit between the row read and the exempt publish leaves the commit with two checks of the same name.**
   The window is the length of the permission lookups, only an exempt actor can cause the exempt delivery, and which of the two checks a required check reads is GitHub's rule, not verified here.
+- **The waiver depends on GitHub reading the newest check run of a name, and that is not yet verified.**
+  A waiver posts a new `NEMAR PR Review` check run beside the failed one on the same commit, because a check run is created and an old one is never updated (an exempt pull request has no row to update).
+  It releases a required check only if GitHub reads the newest run of a name, which is GitHub's rule and the same unverified rule as the two checks of the same name above.
+  The staging step of the rollout (decision 6) verifies it with a first run of `allow --admin` against a required check on a dev-owned exemplar, and until that is done, a waiver is not known to release one.
 - **The `exempt` label is inferred from who opened the pull request, not read from GitHub.**
-  It does not prove the check was posted: a publish that fails answers 500 and shows in the App's delivery log, and the queue says nothing about a check it does not read.
+  It does not prove the check was posted: a publish that fails answers 500 and shows in the App's delivery log.
+  The one thing the list reads of that check is whether the newest `NEMAR PR Review` check run on the current commit failed or asks for a person, which the row says in `detail` (`naming_rule` or `naming_unchecked`) and the CLI prints as "exempt, naming rule failed: needs allow --admin" or "exempt, naming rule not checked: start once, else fix the file".
+  A list of checks cut short, a check that is skipped or still running, and no check at all leave the plain label.
+  It informs and decides nothing: a workflow job of the same name could make it wrong, and the row is still not marked as yours to act on.
 - **GitHub's `author_association` is not a reason to exempt or to reject anyone.**
   It reads `CONTRIBUTOR` for a private organization member, so neither the exemption nor the screen uses it.
-- **The cross-check costs one GitHub call per role-matched account on a delivery** (two when someone other than the author caused it; one delivery asks about each account once), each bounded to a few seconds.
+- **An exempt delivery makes up to five GitHub reads: the cross-check, then the naming rule's three.**
+  The cross-check is one call per role-matched account, so two at most (the author's, and the sender's when someone other than the author caused the delivery and is role-matched too; one delivery asks about each account once), each bounded to 4 seconds.
+  An administrator's start has no sender, so its cross-check is one call and its most is four reads.
+  The naming rule then compares the base with the head and, only when that says `dataset_description.json` may have changed (it is listed, the list may have been cut at GitHub's 300 files, or there is no list that can be believed, see decision 3a), reads the file at the head and at the merge base, together; each read is bounded to 3 seconds.
+  A delivery that is not exempt makes none of the three: the review job applies the rule to it.
   An admin queue request asks once per exempt author and dataset, a few at a time and within 20 seconds, and a pull request whose lookup did not run in time is listed as not exempt.
 - **An installed CLI older than this change cannot read the standing answer.**
   It reads `thresholds`, which is gone, so `standing` and `show` fail, and `allow`, `block` and `clear` report a failure after the Worker has stored the change.
@@ -175,10 +277,15 @@ And the review only ever sees a pull request's text and metadata, so a count of 
   Both are administrators' tools, the Worker itself is unaffected, and the remedy is to upgrade the CLI; the two fields are not kept, because they would describe a rule that no longer exists.
 - **Until the screen ships, nothing bounds spend but the workspace limit.**
   Phase P2 removes the counts and phase P3 adds the screen, so the epic's branch must not be released with the first and without the second.
-- **Without caps, cost is bounded by the screen and the spend limit.**
-  One account pushing every minute to a pull request that passes stage 1 could cost up to about $70 a day at $0.10 and $0.50 per million input and output tokens (the planning pass's estimate, which assumes prompts under 100,000 tokens: above that the price is five times higher, and the review's input caps keep it below).
-  Spam that fails stage 1 costs under one cent a pull request.
-  The workspace spend limit ($175 a month, the owner's Console action) is what makes that a bound and not an estimate, and when it trips the checks read "Could not decide" and required repositories wait for an administrator.
+- **Without caps, cost is bounded by the screen and the spend limit, and the review on `claude-sonnet-5-5` is what costs.**
+  At list prices ($0.10 and $0.50 per million input and output tokens for Haiku 5.5 on prompts under 100,000 tokens; $2 and $10 for Sonnet 5.5), the screen costs under a cent and the review is the bill.
+  The first calibration run (2026-10-16, two public pull requests) measured $0.13 and $0.29 a full review, the review writing 11,000 and 28,000 output tokens; the earlier planning estimate of about a cent assumed Haiku for both stages.
+  At the observed eligible volume of 7 to 167 reviews a day, that is roughly $1 to $50 a day, so the workspace spend limit of $175 a month (about $6 a day, some 20 to 45 full reviews) can trip on a busy day.
+  When it trips the checks read "Could not decide" and required repositories wait for an administrator.
+  The owner decides whether to raise the limit, before the check is required.
+- **A long answer can run out of room.**
+  The same run's second review used 28,000 of its 32,000 output tokens on a one-file pull request, and in the model comparison Haiku once used more than 32,000 on a text-only screen.
+  Either is a truncation, which is no verdict and a check that needs a person; the calibration gate counts them.
 - **The production canary exercises the gate because it is not exempt.**
   An exempt account cannot, so the canary is a data author whose pull requests are reviewed.
 - **A wrong identity match would exempt the wrong person.**
@@ -197,9 +304,12 @@ And the review only ever sees a pull request's text and metadata, so a count of 
 
 ## Receipts
 
-- Epic #1813 and its first two phases, #1814 and #1815.
+- Epic #1813 and its phases #1814, #1815, #1818 and #1816.
+- The two stages and report version 2 (#1816): `scripts/ci/pr-review.ts` (`STAGE_BUDGETS`, `callStage`, `reviewPullRequest`), `scripts/ci/pr-review-prompt.ts` (`SCREEN_SYSTEM_PROMPT`, `REVIEW_SYSTEM_PROMPT`, `V3_RULES`, `assembleReport`), `scripts/ci/pr-review-evidence.ts` (`gatherListing`, `gatherContent`), `shared/pr-review.ts` (`parsePrReviewReport`, `parseStoredPrReviewReport`).
+- The naming rule and its override (#1816): `shared/naming-rule.ts` (`namingProblemOf`), `backend/src/services/pr-review-naming.ts`, `backend/src/services/pr-review-waiver.ts`, `src/commands/admin-pr-reviews.ts` (`allow --admin`).
+- The calibration: `scripts/ci/pr-review-calibrate.ts`.
 - Exemption: `backend/src/services/pr-review-exemption.ts`, `backend/src/services/pr-review.ts` (`isExemptDelivery`, `publishExempt`), `shared/pr-review.ts` (`exempt`, `skipped`).
 - The gate and the removal of the counts (#1815): `backend/src/services/pr-review.ts` (`gateDecision`: exempt, then blocked, then reviewed), `shared/pr-review.ts` (`PRODUCED_DECLINE_REASONS`, `HISTORICAL_DECLINE_REASONS`, `standingOf`).
 - The volume line: `backend/src/services/pr-review-queue.ts` (`readVolume`), `shared/contract/pr-review-admin.ts` (`QueueVolume`), `src/commands/admin-pr-reviews.ts` (`volumeLines`).
 - Queue and labels: `backend/src/services/pr-review-queue.ts`, `shared/contract/pr-review-admin.ts`, `src/commands/admin-pr-reviews.ts`.
-- Tests: `backend/test/pr-review-exemption.test.ts`, `backend/test/pr-review-flow.test.ts`, `backend/test/pr-review-queue.test.ts`, `backend/test/pr-review-start.test.ts`, `test/pr-review.test.ts`, `test/admin-pr-reviews-cli.test.ts`.
+- Tests: `backend/test/pr-review-exemption.test.ts`, `backend/test/pr-review-flow.test.ts`, `backend/test/pr-review-queue.test.ts`, `backend/test/pr-review-start.test.ts`, `test/pr-review.test.ts`, `test/pr-review-workflow.test.ts` (the budgets), `test/admin-pr-reviews-cli.test.ts`, `test/pr-reviews-render.unit.test.ts`.

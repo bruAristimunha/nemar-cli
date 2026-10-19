@@ -6,9 +6,10 @@
  * The Worker decides whether to review it, records the attempt in `pr_reviews`, and dispatches a
  * workflow to `nemarDatasets/.github`. The workflow CLAIMS the review (the Worker accepts the
  * one-shot token and records the time) before it spends anything, reads the change as git
- * data, and asks a model three questions. It posts a report back; the Worker validates it against
- * the closed vocabulary in `shared/pr-review.ts`, derives the verdict, and publishes a check-run
- * and one pull-request comment.
+ * data, applies the naming rule, and runs two model stages: a screen that may stop only spam, and a
+ * review of the content. It posts a report back; the Worker validates it against the closed
+ * vocabulary in `shared/pr-review.ts` (version 2 only, by callback), derives the verdict, and
+ * publishes a check-run and one pull-request comment.
  *
  * **Why the Worker is the gate.** Every pull request reaches it, a fork's included, from a
  * delivery GitHub signs; no workflow in a dataset repository takes part, so no collaborator can
@@ -28,6 +29,10 @@
  * nothing else: no row, no model call. {@link isReviewExempt} decides from the accounts, never from
  * anything the pull request says, and before any row is written. A commit that already has a row
  * keeps what its review said, whoever acts on it next: `skipped` is never written over a review.
+ * They are not exempt from the naming rule, which runs first: a title or a new dataset name it
+ * refuses fails their check, and only an administrator's recorded waiver for that commit
+ * (`nemar admin pr-reviews allow <dataset> <pr> --admin --reason <why>`) turns it back into
+ * `skipped`.
  *
  * **Nothing here trusts the pull request.** The event is read by {@link readPullRequestEvent},
  * which accepts only the shapes it expects; the dispatch carries the review's coordinates and not
@@ -60,7 +65,7 @@ import {
   isDeclineReason,
   isOverrideMode,
   isRunError,
-  parsePrReviewReport,
+  parseStoredPrReviewReport,
   renderCheck,
   renderComment,
   standingOf,
@@ -75,6 +80,12 @@ import { approvalDispatchEnvironment, triggerPrReviewRun } from "./github/dispat
 import { upsertReviewCheckRun, upsertReviewComment } from "./github/pr-review-api.js";
 import { ORG_NAME } from "./github/shared.js";
 import { isReviewExempt } from "./pr-review-exemption.js";
+import {
+  type NamingSubject,
+  isNamingWaived,
+  namingClean,
+  namingFactsFor,
+} from "./pr-review-naming.js";
 
 /** `pull_request` actions that put new content in front of a reviewer. */
 export const PR_REVIEW_ACTIONS: ReadonlySet<string> = new Set([
@@ -89,10 +100,13 @@ export const PR_REVIEW_BASE_BRANCH = "main";
 
 /**
  * How long a dispatched review may take, counted from when its row was recorded, before the
- * watchdog gives up on it. The review workflow's `timeout-minutes` is kept below this (a test in
- * `test/pr-review-workflow.test.ts` checks the order).
+ * watchdog gives up on it. The review workflow's `timeout-minutes` (28) is kept below this, and the
+ * job's worst case (the setup steps, both model stages at their deadlines, the callback's retries)
+ * below that; a test in `test/pr-review-workflow.test.ts` checks both. The deadline runs from when
+ * the row was recorded and the job's limit from when it starts, so the gap between them is the time
+ * a dispatch may wait in GitHub's queue.
  */
-export const PR_REVIEW_DEADLINE_MINUTES = 30;
+export const PR_REVIEW_DEADLINE_MINUTES = 40;
 
 /**
  * A result that did not reach GitHub is eligible to be tried again this long after it was decided,
@@ -157,6 +171,14 @@ export interface PrIntake {
    * sender. It is read only to decide the exemption, never shown or stored.
    */
   senderLogin: string | null;
+  /**
+   * The pull request's title, read for one purpose: the naming rule on an exempt pull request
+   * (`pr-review-naming.ts`), which the review job applies to everyone else's from its own read of
+   * the pull request. It is never shown, stored, logged or sent anywhere.
+   */
+  title: string;
+  /** The base branch's commit GitHub named with the pull request, for the naming rule; or null. */
+  baseSha: string | null;
 }
 
 /** Why a delivery was not taken up. Fixed words, safe to return and log. */
@@ -187,8 +209,9 @@ function posInt(x: unknown): number | null {
 
 /**
  * Read a `pull_request` delivery. Everything in it is attacker-influenced (the title, the branch
- * names, the fork's name), and none of that text is used: only ids, the head commit, the base
- * branch and fixed-shape logins are read, each checked against the shape it must have.
+ * names, the fork's name). Only ids, the head and base commits, the base branch and fixed-shape
+ * logins are read, each checked against the shape it must have, and the title, which only the
+ * naming rule reads (see {@link PrIntake.title}).
  */
 export function readPullRequestEvent(payload: unknown): IntakeResult {
   const p = rec(payload);
@@ -220,12 +243,15 @@ export function readPullRequestEvent(payload: unknown): IntakeResult {
   const user = rec(pr.user);
   const prNumber = posInt(pr.number);
   const authorId = posInt(user?.id);
+  // GitHub always sends a title. One that is not a string is a delivery this cannot read, and the
+  // naming rule must never take it for a clean one.
   if (
     prNumber === null ||
     authorId === null ||
     typeof head?.sha !== "string" ||
     !SHA40.test(head.sha) ||
-    typeof user?.login !== "string"
+    typeof user?.login !== "string" ||
+    typeof pr.title !== "string"
   ) {
     return { ok: false, reason: "malformed" };
   }
@@ -256,6 +282,8 @@ export function readPullRequestEvent(payload: unknown): IntakeResult {
       fromFork,
       senderLogin:
         typeof sender?.login === "string" && LOGIN.test(sender.login) ? sender.login : null,
+      title: pr.title,
+      baseSha: typeof base.sha === "string" && SHA40.test(base.sha) ? base.sha : null,
     },
   };
 }
@@ -371,11 +399,18 @@ async function readRowByKey(
   return r ? toRow(r) : null;
 }
 
-/** The outcome a stored row stands for, or null for a review still waiting for its report. */
+/**
+ * The outcome a stored row stands for, or null for a review still waiting for its report. A stored
+ * report is read by the stored parser, which reads a version 1 report by its own rules, so a review
+ * stored before the screen existed keeps the verdict it had.
+ */
 export function outcomeOfRow(row: ReviewRow): StoredOutcome | null {
   if (row.state === "reported") {
     try {
-      return { kind: "reported", report: parsePrReviewReport(JSON.parse(row.report ?? "null")) };
+      return {
+        kind: "reported",
+        report: parseStoredPrReviewReport(JSON.parse(row.report ?? "null")),
+      };
     } catch (err) {
       // A stored report that no longer parses (the contract moved under it, or the column was
       // edited by hand) is shown as "could not decide". Anything else is a bug and surfaces.
@@ -674,8 +709,68 @@ export class ExemptCheckNotPublished extends Error {
 }
 
 /**
+ * What an exempt pull request's commit comes to under the naming rule (ADR 0107), which runs
+ * before the exemption takes effect: `exempt` when the rule finds nothing, `exempt` and `waived`
+ * when it finds something an administrator waived for this commit, and `naming` otherwise (a
+ * failure, or a check that needs a person when the dataset's name could not be read).
+ */
+export async function exemptOutcomeFor(
+  env: Bindings,
+  pr: NamingSubject,
+): Promise<Extract<ReviewOutcome, { kind: "exempt" | "naming" }>> {
+  const facts = await namingFactsFor(env, pr);
+  if (namingClean(facts)) return { kind: "exempt" };
+  if (await isNamingWaived(env.DB, pr, facts)) return { kind: "exempt", waived: true };
+  return { kind: "naming", facts };
+}
+
+/**
+ * The fixed word an exempt outcome is answered with, for the webhook and an administrator's start.
+ * A name that could not be read is `naming_unchecked` whatever the title says, because that is what
+ * the check says (it needs a person) and what a waiver answers: nothing can be waived until the
+ * name is read.
+ */
+export function exemptReason(
+  outcome: Extract<ReviewOutcome, { kind: "exempt" | "naming" }>,
+): string {
+  if (outcome.kind === "exempt") return outcome.waived ? "exempt_naming_waived" : "exempt_author";
+  return outcome.facts.name === "unchecked" ? "naming_unchecked" : "naming_rule";
+}
+
+/**
+ * Post an exempt pull request's one check: a NEW check run on the commit. Throws
+ * {@link ExemptCheckNotPublished} when GitHub will not take it.
+ */
+export async function postExemptCheck(
+  env: Bindings,
+  pr: { datasetId: string; prNumber: number; headSha: string },
+  outcome: Extract<ReviewOutcome, { kind: "exempt" | "naming" }>,
+): Promise<void> {
+  try {
+    const { token, refresh } = await getDatasetsTokenWithRefresher(env);
+    await upsertReviewCheckRun({
+      token,
+      refresh,
+      quick: true,
+      repo: pr.datasetId,
+      headSha: pr.headSha,
+      checkRunId: null,
+      conclusion: conclusionOf(outcome),
+      ...renderCheck(outcome),
+    });
+  } catch (err) {
+    console.error(
+      `[pr-review] ${pr.datasetId}#${pr.prNumber}: exempt check not published (${errName(err)})`,
+    );
+    throw new ExemptCheckNotPublished();
+  }
+}
+
+/**
  * Answer a pull request nobody reviews (ADR 0107) with the one check that says so, and nothing
- * else: no row, no dispatch, no model call, no "in progress" check, no comment.
+ * else: no row, no dispatch, no model call, no "in progress" check, no comment. The naming rule
+ * runs first (see {@link exemptOutcomeFor}): a title or a new dataset name it refuses fails the
+ * check, because owners and administrators are exempt from the review and not from the rule.
  *
  * It is only reached for a commit that has no row (see `handlePullRequestEvent`): a commit a review
  * has touched keeps what the review said, so `skipped` is never written over a verdict, a decline
@@ -691,26 +786,14 @@ export class ExemptCheckNotPublished extends Error {
  */
 async function publishExempt(env: Bindings, pr: PrIntake): Promise<PrReviewResponse> {
   const where = `${pr.datasetId}#${pr.prNumber}`;
-  const outcome: ReviewOutcome = { kind: "exempt" };
-  try {
-    const { token, refresh } = await getDatasetsTokenWithRefresher(env);
-    await upsertReviewCheckRun({
-      token,
-      refresh,
-      quick: true,
-      repo: pr.datasetId,
-      headSha: pr.headSha,
-      checkRunId: null,
-      conclusion: conclusionOf(outcome),
-      ...renderCheck(outcome),
-    });
-  } catch (err) {
-    console.error(`[pr-review] ${where}: exempt check not published (${errName(err)})`);
-    throw new ExemptCheckNotPublished();
-  }
-  // The only record that a commit was exempted: it has no row and no comment. No login in it.
-  console.info(`[pr-review] ${where}: exempt, skipped check posted for ${pr.headSha.slice(0, 7)}`);
-  return no("exempt_author");
+  const outcome = await exemptOutcomeFor(env, pr);
+  await postExemptCheck(env, pr, outcome);
+  const reason = exemptReason(outcome);
+  // The only record that a commit was exempted: it has no row and no comment. No login, no title.
+  console.info(
+    `[pr-review] ${where}: exempt, ${conclusionOf(outcome)} check posted for ${pr.headSha.slice(0, 7)} (${reason})`,
+  );
+  return no(reason);
 }
 
 /**
@@ -911,12 +994,20 @@ async function isRestartable(db: Db, row: ReviewRow, options: PrReviewOptions): 
 }
 
 /**
- * Whether a row's attempt may have cost a model call: the complement of a decline or an attempt
- * GitHub never ran. A restart of a row that did adds a second call to its `attempts`, and the
- * administrator's volume count sums `attempts` over the rows that did.
+ * Whether a row's attempt may have reached the model (one run, of up to two calls): the complement
+ * of a decline, an attempt GitHub never ran, and a run that ended at the facts stage (`stage` is
+ * `facts`: the naming rule decided it before any model was asked, so it made no call). A restart of
+ * a row that did adds a second run to its `attempts`, and the administrator's volume count sums
+ * `attempts` over the rows that did. `stage` is the stage of a stored version 2 report and is
+ * absent for any other row; a row a restart reads is never a reported one.
  */
-export function spentACall(row: { state: string; detail: string | null }): boolean {
+export function spentACall(row: {
+  state: string;
+  detail: string | null;
+  stage?: string | null;
+}): boolean {
   if (row.state === "declined") return false;
+  if (row.stage === "facts") return false;
   return !(
     row.state === "errored" &&
     (row.detail === "stale_head" || row.detail === "dispatch_failed")
@@ -1069,10 +1160,11 @@ const NEWER_REVIEW_EXISTS = `EXISTS (
 
 /**
  * The workflow's first real step, before it mints an identity or reads anything: take the review. The
- * caller has verified the token. A review is claimed once, so one dispatch buys one model call;
- * a dispatch for a commit that is no longer the latest delivery recorded by the Worker is refused
- * and recorded as `stale_head`. The workflow also compares the dispatched SHA against the fetched
- * pull ref and current pull-request API response before the model call.
+ * caller has verified the token. A review is claimed once, so one dispatch buys one run (the
+ * screen, and the review unless the screen stops it); a dispatch for a commit that is no longer the
+ * latest delivery recorded by the Worker is refused and recorded as `stale_head`. The workflow also
+ * compares the dispatched SHA against the fetched pull ref and current pull-request API response
+ * before any model call.
  */
 export async function claimPrReview(
   env: Bindings,

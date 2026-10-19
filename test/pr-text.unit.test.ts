@@ -38,8 +38,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn } from "bun";
 import { gatherGitFacts } from "../scripts/ci/pr-review-evidence";
+import { DOI_PATTERN, TEMPLATE_FIELDS, YEAR_PATTERN } from "../shared/naming-rule";
 import {
-  AUTHOR_YEAR_PREFIX,
   type ChangedFile,
   MAX_NAMED_FILES,
   MAX_TITLE_LENGTH,
@@ -53,7 +53,8 @@ import {
   describeChangelogWrite,
   describeTextProblem,
   describeUnopenedPullRequest,
-  findAuthorYearPrefix,
+  findAuthorYearKey,
+  findDoi,
   findTextProblem,
   hasChangelogHeading,
   inspectChangelog,
@@ -67,6 +68,56 @@ import {
 
 // Each command test starts the CLI (a transpile) and git, and the interactive ones wait on prompts.
 setDefaultTimeout(60_000);
+
+/**
+ * Whether a regular expression's source repeats a part that itself repeats (`(a+)+`, `(?:\s*x)*`),
+ * the shape that makes a backtracking engine try a long input in more than polynomially many ways.
+ * Escapes and character classes are skipped as the atoms they are; `?` makes a part optional and is
+ * not a repetition. A small reader for the patterns this file checks, not a full parser.
+ */
+function nestedRepetition(source: string): boolean {
+  // One frame per open group: whether its body holds a repetition so far.
+  const frames: boolean[] = [false];
+  const repeats = (at: number): boolean =>
+    source[at] === "*" ||
+    source[at] === "+" ||
+    (source[at] === "{" &&
+      /^\{\d+,\d*\}/.test(source.slice(at)) &&
+      !/^\{\d+,1\}/.test(source.slice(at)));
+  for (let i = 0; i < source.length; i++) {
+    const c = source[i];
+    if (c === "\\") {
+      // An escape, with the braces of \u{...} and \p{...} when it has them.
+      if (source[i + 2] === "{" && /[upP]/.test(source[i + 1] ?? "")) i = source.indexOf("}", i);
+      else i++;
+      if (repeats(i + 1)) frames[frames.length - 1] = true;
+      continue;
+    }
+    if (c === "[") {
+      for (i++; i < source.length && source[i] !== "]"; i++) if (source[i] === "\\") i++;
+      if (repeats(i + 1)) frames[frames.length - 1] = true;
+      continue;
+    }
+    if (c === "(") {
+      frames.push(false);
+      continue;
+    }
+    if (c === ")") {
+      const inner = frames.pop() ?? false;
+      if (repeats(i + 1)) {
+        if (inner) return true;
+        frames[frames.length - 1] = true;
+      } else if (inner) {
+        frames[frames.length - 1] = true;
+      }
+      continue;
+    }
+    if (c !== "*" && c !== "+" && c !== "?" && c !== "{" && c !== "|" && c !== "^" && c !== "$") {
+      if (repeats(i + 1)) frames[frames.length - 1] = true;
+    }
+  }
+  return false;
+}
 
 const CLI_ENTRY = join(import.meta.dir, "..", "src", "index.ts");
 const REPO_ROOT = join(import.meta.dir, "..");
@@ -162,6 +213,10 @@ const CASES: Record<TextProblemCode, { refused: [TextKind, string][]; passes: st
       ["description", "FirstAuthorSurname"],
       ["title", "Rename it to year-keyword-paperDOI"],
       ["description", "paperDOI"],
+      // The tokens joined to other text by an underscore or a digit, and in another case.
+      ["title", "FirstAuthorSurname_year_keyword_paperDOI"],
+      ["description", "paperDOI10.1234"],
+      ["title", "Rename it to firstauthorsurname-keyword"],
     ],
     passes: [
       // BIDS field and label names are CamelCase by specification: the vocabulary of an update.
@@ -209,21 +264,54 @@ const CASES: Record<TextProblemCode, { refused: [TextKind, string][]; passes: st
       // Judged as the one trimmed line the title becomes.
       ["title", "  Lee2019 EEG dataset  "],
       ["title", "\nLee-2019-EEG"],
+      // And with what no reader sees in front of it: a zero-width space, a soft hyphen, a byte-order mark.
+      ["title", "\u{200b}Lee2019 EEG dataset"],
+      ["title", "\u{ad}\u{feff} Lee-2019-EEG"],
+      // Wherever it stands in the title, not only at its start: the middle, the end, in parentheses.
+      ["title", "Add the Lee2019 recordings"],
+      ["title", "Add the BNCI2014_001 recordings"],
+      ["title", "Rename the dataset to Lee-2019-EEG"],
+      ["title", "Results from Zhou-2016 cohort"],
+      ["title", "sourcedata: add the validation files the MOABB loader reads (Mainsah2025_L)"],
+      // A template token joined to a year is also a key, and the key is asked about first.
+      ["title", "Rename it to firstauthorsurname-2019"],
+      // The key is the letters that touch the year: an underscore or a doubled hyphen before them
+      // does not hide it.
+      ["title", "Lee_Brien2019 EEG"],
+      ["title", "Lee--Brien2019 EEG"],
     ],
     passes: [
-      // A year, or a name, in an ordinary sentence. A space ends the first word.
+      // A year, or a name, in an ordinary sentence. A space ends a key: the letters must touch the
+      // year or the one separator before it.
       "Add 2019 recordings",
       "2019 release notes",
       "Release 2019",
+      "Andreev 2012 is not refused",
+      "2019-2020 study",
       "Update Lee dataset",
       "Save changes to the channel locations",
       "Add three EEG recordings",
-      // Only the start of a title is looked at: later on, a name and a year are part of a sentence.
-      "Add the Lee2019 recordings",
-      "Add the BNCI2014_001 recordings",
-      "Rename the dataset to Lee-2019-EEG",
-      // A digit inside the first word means it is not a name: a study number, not an author.
+      // A digit before the separator means it is not a name: a study number, not an author.
       "Study2-2019 recordings added",
+    ],
+  },
+  doi: {
+    refused: [
+      // A DOI as a link, as a bare prefix, at the start, joined by a hyphen, and with an invisible
+      // character inside its prefix.
+      ["title", "Described in 10.1038/s41597-020-0532-5"],
+      ["title", "Add the recordings from https://doi.org/10.7910/DVN/ABC123"],
+      ["title", "See doi:10.1234/abc"],
+      ["title", "10.5281/zenodo.1234567 recordings"],
+      ["title", "Add recordings (taxonomy-10.7910/x)"],
+      ["title", "Described in 10.\u{200b}1038/s41597"],
+    ],
+    passes: [
+      // A number with a dot is no DOI without its four to nine digits and its slash.
+      "Recordings of 10.5 Hz tones",
+      "Version 10.2019 notes",
+      "Add 10.123/day recordings",
+      "Described in the README, which links doi.org",
     ],
   },
   no_words: {
@@ -330,28 +418,56 @@ describe("findTextProblem", () => {
     expect(findTextProblem("description", "Adds new recordings. ".repeat(500))).toBeNull();
   });
 
-  test("a very long run of punctuation is judged in linear time", () => {
-    // Trimming it with `/[\s.!:;,]+$/` took ten seconds on 160,000 characters: the run is tried
-    // again from every start. The text is whatever was pasted, so a hang is a defect.
-    const hostile = `${".".repeat(200_000)}a`;
-    const started = performance.now();
+  test("a very long run of punctuation is judged, and trimmed, without error", () => {
+    // Trimming it with `/[\s.!:;,]+$/` is quadratic, because the run is tried again from every
+    // start: 160,000 characters took ten seconds. The trim is now a loop over the end of the text,
+    // which looks at each character once. Nothing here is timed (a wall-clock bound fails on a
+    // loaded runner). The run is the shortest one the quadratic trim cannot get through inside this
+    // file's test timeout, about a minute and a half of work against sixty seconds, while the loop
+    // takes a few milliseconds: a regression fails this test by timeout, and a longer run would only
+    // make it fail later.
+    const hostile = `${".".repeat(500_000)}a`;
     expect(findTextProblem("description", hostile)?.code).toBe("no_words");
-    expect(findTextProblem("title", hostile)?.code).toBe("no_words");
-    expect(performance.now() - started).toBeLessThan(2_000);
+    // A title is judged on the same trim, so a shorter run is enough to check its answer.
+    expect(findTextProblem("title", `${".".repeat(20_000)}a`)?.code).toBe("no_words");
+    // The trailing run is really trimmed: what it hides is found under it.
+    expect(findTextProblem("title", `Save changes${".!:;, ".repeat(2_000)}`)?.code).toBe(
+      "placeholder",
+    );
   });
 
-  test("an unclosed instruction bracket and a long run of blanks is judged in linear time", () => {
+  test("an unclosed instruction bracket and a long run of blanks is judged without error", () => {
     // `\s+` and the characters after it overlap on blanks, so an unclosed `[your` or `<insert`
     // followed by tens of thousands of them was tried as every split of the run: 64,000 took
-    // eleven seconds. A description is only trimmed, so its whitespace reaches the rule.
-    const started = performance.now();
+    // seconds. A description is only trimmed, so its whitespace reaches the rule. What keeps it
+    // linear is the pattern's shape, and the next test is the one that fails when the shape goes:
+    // a run long enough to push the old pattern past this file's test timeout would take minutes to
+    // fail, so these are the answers on runs that are long for a pull request and short for a test.
     for (const opener of ["[your", "<insert", "[fill in"]) {
       for (const blank of [" ", " \t", "\n"]) {
-        const hostile = `Adds data.\n\n${opener}${blank.repeat(64_000 / blank.length)}x`;
+        const hostile = `Adds data.\n\n${opener}${blank.repeat(30_000 / blank.length)}x`;
         expect(findTextProblem("description", hostile)).toBeNull();
       }
     }
-    expect(performance.now() - started).toBeLessThan(2_000);
+  });
+
+  test("the instruction-bracket pattern gives a run of blanks one way to match", () => {
+    // Checked on the pattern itself, not by timing a hostile text (which flakes with the machine).
+    // The run of blanks after the asking word is followed by a lookahead that refuses a blank, so
+    // the run must end where the blanks do and cannot be shared with the words after it; the match
+    // can only begin at a bracket; and no repetition repeats another.
+    const bracket = TEMPLATE_FIELDS.find((re) => re.source.includes("your|insert"));
+    if (!bracket)
+      throw new Error("the instruction-bracket pattern is gone from the template fields");
+    expect(bracket.source).toContain("\\s+(?=[^\\s");
+    expect(bracket.source.startsWith("[<[]")).toBe(true);
+    for (const re of TEMPLATE_FIELDS) {
+      expect(nestedRepetition(re.source), re.source).toBe(false);
+    }
+    // The checker is not blind: it sees the shapes that are quadratic or worse.
+    expect(nestedRepetition("(a+)+$")).toBe(true);
+    expect(nestedRepetition("(?:\\s*x)*y")).toBe(true);
+    expect(nestedRepetition("[(a+)]*")).toBe(false);
   });
 
   test("a bracket that is closed after blanks is still a template", () => {
@@ -376,16 +492,18 @@ describe("findTextProblem", () => {
     expect(problem?.reason).toContain('"FirstAuthorSurname"');
   });
 
-  describe("a title that opens with a name and a year", () => {
+  describe("a title with an author-year key in it", () => {
     test("is refused as a title and left alone in a description", () => {
       for (const text of [
         "Lee2019 EEG dataset",
         "Lee-2019-EEG",
         "Smith2020",
         "MOVING2024 release",
+        "Add the Lee2019 recordings",
+        "Results from Zhou-2016 cohort",
       ]) {
-        expect(findTextProblem("title", text)?.code).toBe("author_year");
-        expect(findTextProblem("description", text)).toBeNull();
+        expect(findTextProblem("title", text)?.code, text).toBe("author_year");
+        expect(findTextProblem("description", text), text).toBeNull();
       }
       // A description may cite a paper the way the paper is cited.
       expect(
@@ -397,21 +515,22 @@ describe("findTextProblem", () => {
       for (const [title, found] of [
         ["Lee-2019-EEG", "Lee-2019"],
         ["MOVING2024 release", "MOVING2024"],
+        ["Results from Zhou-2016 cohort", "Zhou-2016"],
       ] as const) {
         const problem = findTextProblem("title", title);
         expect(problem?.code).toBe("author_year");
         if (!problem) throw new Error("expected a problem");
         expect(describeTextProblem("The title (--message)", problem)).toBe(
-          `The title (--message) starts with a name and a year ("${found}"); describe the change in plain words, such as "Add three EEG recordings".`,
+          `The title (--message) has a citation (an author and a year, or a DOI) in it ("${found}"); describe the change in plain words, such as "Add three EEG recordings", and cite the paper in ReferencesAndLinks and the README instead.`,
         );
       }
       // The title it offers is one that is accepted.
       expect(findTextProblem("title", "Add three EEG recordings")).toBeNull();
     });
 
-    test("the name is any letters: an acronym, capitals, one letter or lower case is refused too", () => {
+    test("the letters are any letters: an acronym, capitals, one letter or lower case is refused too", () => {
       // Dataset names (MOVING2024, BNCI2014_001), codes (H2020, R2019b) and labels (ses-2019) are
-      // not told from a surname. The name stops where the year begins.
+      // not told from a surname. The key stops where the year ends.
       const refused: [string, string][] = [
         ["MOVING2024 release", "MOVING2024"],
         ["BNCI2014_001 recordings", "BNCI2014"],
@@ -423,7 +542,7 @@ describe("findTextProblem", () => {
         ["ses-2019 sidecars fixed", "ses-2019"],
       ];
       for (const [title, found] of refused) {
-        expect(findAuthorYearPrefix(title), title).toBe(found);
+        expect(findAuthorYearKey(title), title).toBe(found);
         expect(findTextProblem("title", title)?.code, title).toBe("author_year");
       }
     });
@@ -450,74 +569,116 @@ describe("findTextProblem", () => {
       expect(findTextProblem("title", "Lee20195 EEG")).toBeNull(); // five digits: a number, not a year
     });
 
-    test("the year follows the name directly or after one hyphen or underscore, and nothing else", () => {
-      // A dot, a colon, a doubled or mixed separator, and an underscore inside the name each end
-      // the first word before a year, so what is left is an ordinary sentence.
-      for (const title of [
-        "Lee.2019 EEG",
-        "Lee:2019 EEG",
-        "Lee--2019 EEG",
-        "Lee-_2019 EEG",
-        "Lee_Brien2019 EEG",
-        "Lee--Brien2019 EEG",
-      ]) {
+    test("the year follows the letters directly or after one hyphen or underscore, and nothing else", () => {
+      // A dot, a colon and a doubled or mixed separator each stand between the letters and the year,
+      // so what is left is an ordinary sentence.
+      for (const title of ["Lee.2019 EEG", "Lee:2019 EEG", "Lee--2019 EEG", "Lee-_2019 EEG"]) {
         expect(findTextProblem("title", title), title).toBeNull();
+      }
+      // An underscore or a doubled hyphen inside a longer name ends a run of letters, and the
+      // letters that touch the year are the key: it is found, wherever the name began.
+      for (const title of ["Lee_Brien2019 EEG", "Lee--Brien2019 EEG"]) {
+        expect(findAuthorYearKey(title), title).toBe("Brien2019");
+        expect(findTextProblem("title", title)?.code, title).toBe("author_year");
       }
     });
 
-    test("findAuthorYearPrefix gives what the text opens with, as typed, or null", () => {
-      expect(findAuthorYearPrefix("Lee2019 EEG dataset")).toBe("Lee2019");
-      expect(findAuthorYearPrefix("Lee-2019-EEG")).toBe("Lee-2019");
-      expect(findAuthorYearPrefix("Smith-Jones_2020 EEG")).toBe("Smith-Jones_2020");
-      // Blanks before the text are skipped, as normalizeTitle skips them.
-      expect(findAuthorYearPrefix("  \n O'Brien2019")).toBe("O'Brien2019");
-      expect(findAuthorYearPrefix("Add 2019 recordings")).toBeNull();
-      expect(findAuthorYearPrefix("2019 release notes")).toBeNull();
-      expect(findAuthorYearPrefix("")).toBeNull();
+    test("findAuthorYearKey gives the first key in the text, as typed, or null", () => {
+      expect(findAuthorYearKey("Lee2019 EEG dataset")).toBe("Lee2019");
+      expect(findAuthorYearKey("Lee-2019-EEG")).toBe("Lee-2019");
+      // The key is the letters that touch the year: a hyphen or an apostrophe ends a run of letters.
+      expect(findAuthorYearKey("Smith-Jones_2020 EEG")).toBe("Jones_2020");
+      expect(findAuthorYearKey("  \n O'Brien2019")).toBe("Brien2019");
+      // Anywhere in the text, and the first key of several.
+      expect(findAuthorYearKey("Results from Zhou-2016 cohort")).toBe("Zhou-2016");
+      expect(findAuthorYearKey("Lee2019 and Zhou-2016")).toBe("Lee2019");
+      expect(findAuthorYearKey("Add 2019 recordings")).toBeNull();
+      expect(findAuthorYearKey("2019 release notes")).toBeNull();
+      expect(findAuthorYearKey("")).toBeNull();
     });
 
-    test("a very long first word is judged without error, and found whole when a year completes it", () => {
-      // The name takes hyphens and apostrophes inside it, so a long run of letters and those is the
-      // shape a pasted word could have. Nothing here is timed: the next test checks the pattern's
-      // shape, which is what keeps it linear.
+    test("a very long word is judged without error, and its last run of letters is the key", () => {
+      // A long run of letters with hyphens and apostrophes inside it is the shape a pasted word
+      // could have. Nothing here is timed: naming-rule.unit.test.ts runs inputs a quadratic scan
+      // cannot finish inside the test timeout.
       for (const unit of ["a", "a-", "a'", "ab-c'"]) {
         const word = unit.repeat(100_000);
         for (const tail of ["20", "-20", "x"]) {
-          expect(findAuthorYearPrefix(`${word}${tail}`)).toBeNull();
+          expect(findAuthorYearKey(`${word}${tail}`)).toBeNull();
         }
+        // A year after a run of letters completes a key made of that run alone: the whole word when
+        // it is all letters, and the letters after its last hyphen or apostrophe otherwise.
         const completes = `${word}a2019`;
-        expect(findAuthorYearPrefix(`${completes} EEG`)).toBe(completes);
+        expect(findAuthorYearKey(`${completes} EEG`)).toBe(unit === "a" ? completes : "a2019");
       }
     });
 
-    test("the pattern keeps the shape that makes it linear", () => {
-      // The pattern runs on whatever a person pastes, and a backtracking engine stays linear on this
-      // shape only: anchored, so it is tried once; a run of letters; then one repeated group that
-      // starts with a delimiter the letters cannot match, so a word can be split in only one way;
-      // and no repetition of a repetition. Timing a hostile word says the same and flakes with the
-      // machine (a first version of this test did), so the shape is what is checked. A change that
-      // keeps these facts true keeps this test green, and one that breaks them has to show why the
-      // pattern is still linear. The flags are not part of `source`.
-      const { source } = AUTHOR_YEAR_PREFIX;
-      const shape = /^\^(\[[^\]]+\])\+\(\?:(\[[^\]]+\])(\[[^\]]+\])\+\)\*/.exec(source);
-      if (!shape)
-        throw new Error(`the pattern is no longer a run of letters and one group: ${source}`);
-      const [, letters, delimiter, lettersAgain] = shape;
-      expect(lettersAgain).toBe(letters);
-      // Exactly one group is repeated, the one just found.
-      expect([...source.matchAll(/\)[*+?]|\)\{/g)]).toHaveLength(1);
-      // No delimiter is a letter, anywhere in Unicode, so the run of letters never reaches into the
-      // group and the group never reaches into the next letters.
-      const isLetter = new RegExp(`^${letters}$`, "u");
-      const isDelimiter = new RegExp(`^${delimiter}$`, "u");
-      const delimiters: string[] = [];
-      for (let code = 0; code <= 0x10ffff; code++) {
-        const character = String.fromCodePoint(code);
-        if (isDelimiter.test(character)) delimiters.push(character);
+    test("the year and DOI patterns keep the shape that makes the rule linear", () => {
+      // The pattern runs on whatever a person pastes. A backtracking engine stays linear on it
+      // because it has no unbounded repetition at all, so nothing is tried in more than one way, and
+      // no repetition repeats another. Timing a hostile text says the same and flakes with the
+      // machine, so the shape is what is checked.
+      for (const { source } of [YEAR_PATTERN, DOI_PATTERN]) {
+        expect(source).not.toMatch(/[*+]|\{\d+,\}/);
+        expect(nestedRepetition(source), source).toBe(false);
       }
-      expect(delimiters).toContain("-");
-      expect(delimiters).toContain("'");
-      expect(delimiters.filter((character) => isLetter.test(character))).toEqual([]);
+      // The pattern is exactly the year: 19 or 20 and two digits, and not the start of a number.
+      expect(YEAR_PATTERN.test("1900")).toBe(true);
+      expect(YEAR_PATTERN.test("2099")).toBe(true);
+      expect(YEAR_PATTERN.test("1899")).toBe(false);
+      expect(YEAR_PATTERN.test("2100")).toBe(false);
+      expect(YEAR_PATTERN.test("20195")).toBe(false);
+      // The DOI pattern is exactly `10.`, four to nine digits and a slash.
+      expect(DOI_PATTERN.test("10.1234/")).toBe(true);
+      expect(DOI_PATTERN.test("10.123456789/")).toBe(true);
+      expect(DOI_PATTERN.test("10.123/")).toBe(false);
+      expect(DOI_PATTERN.test("10.1234567890/")).toBe(false);
+      expect(DOI_PATTERN.test("10.1234")).toBe(false);
+    });
+  });
+
+  describe("a title with a DOI in it", () => {
+    test("is refused as a title and left alone in a description", () => {
+      for (const text of [
+        "Described in 10.1038/s41597-020-0532-5",
+        "Add recordings (taxonomy-10.7910/x)",
+      ]) {
+        expect(findTextProblem("title", text)?.code, text).toBe("doi");
+        expect(findTextProblem("description", text), text).toBeNull();
+      }
+      // A description may cite a paper by its DOI, the way the paper is cited.
+      expect(
+        findTextProblem("description", "Recorded for https://doi.org/10.1038/s41597-020-0532-5."),
+      ).toBeNull();
+    });
+
+    test("says what it found, in the words an author and a year are told", () => {
+      for (const [title, found] of [
+        ["Described in 10.1038/s41597-020-0532-5", "10.1038/"],
+        ["Add the recordings from https://doi.org/10.7910/DVN/ABC123", "10.7910/"],
+      ] as const) {
+        expect(findDoi(title), title).toBe(found);
+        const problem = findTextProblem("title", title);
+        expect(problem?.code).toBe("doi");
+        if (!problem) throw new Error("expected a problem");
+        expect(describeTextProblem("The title (--message)", problem)).toBe(
+          `The title (--message) has a citation (an author and a year, or a DOI) in it ("${found}"); describe the change in plain words, such as "Add three EEG recordings", and cite the paper in ReferencesAndLinks and the README instead.`,
+        );
+      }
+      // The same sentence as for a key, apart from what was found.
+      const key = findTextProblem("title", "Results from Zhou-2016 cohort");
+      const doi = findTextProblem("title", "Results from 10.1234/x cohort");
+      expect(key?.reason.replace('"Zhou-2016"', "FOUND")).toBe(
+        doi?.reason.replace('"10.1234/"', "FOUND"),
+      );
+    });
+
+    test("a title with both an author and a year and a DOI is told about the author and the year", () => {
+      // The first of the two the rule asks about, as namingProblemOf orders them.
+      const title =
+        "Mapping effective connectivity (Sawada-2022-mapping-10.1038/s41467-022-32644-y)";
+      expect(findTextProblem("title", title)?.code).toBe("author_year");
+      expect(findDoi(title)).toBe("10.1038/");
     });
   });
 });
@@ -757,15 +918,16 @@ describe("the changed-file summary", () => {
     expect(summary).toContain("- and 5 more files at the dataset root");
   });
 
-  test("a change of a hundred thousand files in one folder is summarized in linear time", () => {
-    // Copying the folder's array on every file took six seconds here, after the branch was pushed
-    // and while the pull request spinner showed.
-    const paths = Array.from({ length: 100_000 }, (_, i) => `sub-01/eeg/run-${i}_eeg.json`);
-    const started = performance.now();
+  test("a change of four hundred thousand files in one folder is summarized whole", () => {
+    // Copying the folder's array on every file is quadratic: a hundred thousand took six seconds,
+    // after the branch was pushed and while the pull request spinner showed. Each file is now added
+    // to its folder's list once. Nothing is timed. This is the smallest change the copying cannot
+    // get through inside this file's test timeout, about ninety seconds of work against sixty, while
+    // the list takes a fraction of a second: a regression fails this test by timeout.
+    const paths = Array.from({ length: 400_000 }, (_, i) => `sub-01/eeg/run-${i}_eeg.json`);
     const summary = summarizeChangedFiles(filesNamed("added", paths));
-    expect(performance.now() - started).toBeLessThan(2_000);
     expect(summary).toBe(
-      "100000 files changed: 100000 added.\n\n- `sub-01/`: 100000 files (100000 added)",
+      "400000 files changed: 400000 added.\n\n- `sub-01/`: 400000 files (400000 added)",
     );
   });
 
@@ -1376,7 +1538,7 @@ describe("nemar dataset update refuses before it does anything", () => {
     expect(said(r)).toContain('still has an unfilled template field ("FirstAuthorSurname")');
   });
 
-  test("refuses a title that starts with a name and a year, and says what to write", async () => {
+  test("refuses a title that has a name and a year in it, and says what to write", async () => {
     const cwd = fresh("empty");
     mkdirSync(cwd, { recursive: true });
     const r = await runNemar(
@@ -1394,7 +1556,7 @@ describe("nemar dataset update refuses before it does anything", () => {
     );
     expect(r.exitCode).toBe(1);
     expect(said(r)).toContain(
-      'The title (--message) starts with a name and a year ("Lee2019"); describe the change in plain words, such as "Add three EEG recordings".',
+      'The title (--message) has a citation (an author and a year, or a DOI) in it ("Lee2019"); describe the change in plain words, such as "Add three EEG recordings", and cite the paper in ReferencesAndLinks and the README instead.',
     );
     expect(said(r)).not.toContain("The description");
     // Refused before sign-in, like every other refusal of the text.
@@ -1419,12 +1581,12 @@ describe("nemar dataset update refuses before it does anything", () => {
     );
     expect(r.exitCode).toBe(1);
     expect(said(r)).toContain(
-      'The title (--message) starts with a name and a year ("BNCI2014"); describe the change in plain words, such as "Add three EEG recordings".',
+      'The title (--message) has a citation (an author and a year, or a DOI) in it ("BNCI2014"); describe the change in plain words, such as "Add three EEG recordings", and cite the paper in ReferencesAndLinks and the README instead.',
     );
     expect(said(r)).not.toContain("Not authenticated");
   });
 
-  test("control: the same name later in a title is a sentence, so it meets sign-in", async () => {
+  test("refuses the same name later in a title too, before sign-in", async () => {
     const cwd = fresh("empty");
     mkdirSync(cwd, { recursive: true });
     const r = await runNemar(
@@ -1441,8 +1603,75 @@ describe("nemar dataset update refuses before it does anything", () => {
       signedOut(),
     );
     expect(r.exitCode).toBe(1);
+    expect(said(r)).toContain(
+      'The title (--message) has a citation (an author and a year, or a DOI) in it ("BNCI2014"); describe the change in plain words, such as "Add three EEG recordings", and cite the paper in ReferencesAndLinks and the README instead.',
+    );
+    expect(said(r)).not.toContain("Not authenticated");
+  });
+
+  test("refuses a DOI in the title in the same words, before sign-in", async () => {
+    const cwd = fresh("empty");
+    mkdirSync(cwd, { recursive: true });
+    const r = await runNemar(
+      [
+        "dataset",
+        "update",
+        "--yes",
+        "-m",
+        "Described in 10.1038/s41597-020-0532-5",
+        "--description",
+        GOOD_DESCRIPTION,
+      ],
+      cwd,
+      signedOut(),
+    );
+    expect(r.exitCode).toBe(1);
+    expect(said(r)).toContain(
+      'The title (--message) has a citation (an author and a year, or a DOI) in it ("10.1038/"); describe the change in plain words, such as "Add three EEG recordings", and cite the paper in ReferencesAndLinks and the README instead.',
+    );
+    expect(said(r)).not.toContain("Not authenticated");
+  });
+
+  test("control: a number with a dot is no DOI, so it meets sign-in", async () => {
+    const cwd = fresh("empty");
+    mkdirSync(cwd, { recursive: true });
+    const r = await runNemar(
+      [
+        "dataset",
+        "update",
+        "--yes",
+        "-m",
+        "Add recordings of 10.5 Hz tones",
+        "--description",
+        GOOD_DESCRIPTION,
+      ],
+      cwd,
+      signedOut(),
+    );
+    expect(r.exitCode).toBe(1);
     expect(said(r)).toContain("Not authenticated");
-    expect(said(r)).not.toContain("starts with a name and a year");
+    expect(said(r)).not.toContain("has a citation");
+  });
+
+  test("control: a year after a space is a sentence, so it meets sign-in", async () => {
+    const cwd = fresh("empty");
+    mkdirSync(cwd, { recursive: true });
+    const r = await runNemar(
+      [
+        "dataset",
+        "update",
+        "--yes",
+        "-m",
+        "Add the 2019 recordings",
+        "--description",
+        GOOD_DESCRIPTION,
+      ],
+      cwd,
+      signedOut(),
+    );
+    expect(r.exitCode).toBe(1);
+    expect(said(r)).toContain("Not authenticated");
+    expect(said(r)).not.toContain("has a citation");
   });
 
   test("an empty description is text that was given and got wrong, not text left out", async () => {
@@ -1770,7 +1999,7 @@ describe("nemar dataset push --pr settles the text before it pushes", () => {
     expect(ghArgs()).toBeNull();
   });
 
-  test("refuses a title that starts with a name and a year, and pushes nothing", async () => {
+  test("refuses a title that has a name and a year in it, and pushes nothing", async () => {
     const { work, remote } = newAnnexFeatureClone();
     const r = await runNemar(
       ["dataset", "push", "--pr", "--no-s3", "-t", "Lee-2019-EEG", "-b", GOOD_DESCRIPTION],
@@ -1778,7 +2007,30 @@ describe("nemar dataset push --pr settles the text before it pushes", () => {
     );
     expect(r.exitCode).toBe(1);
     expect(said(r)).toContain(
-      'The title (--title) starts with a name and a year ("Lee-2019"); describe the change in plain words, such as "Add three EEG recordings".',
+      'The title (--title) has a citation (an author and a year, or a DOI) in it ("Lee-2019"); describe the change in plain words, such as "Add three EEG recordings", and cite the paper in ReferencesAndLinks and the README instead.',
+    );
+    expect(pushed(remote)).toBe("");
+    expect(ghArgs()).toBeNull();
+  });
+
+  test("refuses a title with a DOI in it, and pushes nothing", async () => {
+    const { work, remote } = newAnnexFeatureClone();
+    const r = await runNemar(
+      [
+        "dataset",
+        "push",
+        "--pr",
+        "--no-s3",
+        "-t",
+        "Add the recordings from doi:10.7910/DVN/ABC123",
+        "-b",
+        GOOD_DESCRIPTION,
+      ],
+      work,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(said(r)).toContain(
+      'The title (--title) has a citation (an author and a year, or a DOI) in it ("10.7910/"); describe the change in plain words, such as "Add three EEG recordings", and cite the paper in ReferencesAndLinks and the README instead.',
     );
     expect(pushed(remote)).toBe("");
     expect(ghArgs()).toBeNull();
@@ -1900,7 +2152,7 @@ describe("nemar dataset update at a terminal asks for what the command line left
     // A name and a year is refused the same way, with what to write instead.
     term.type("Lee2019 EEG dataset\r");
     await term.until(
-      'That starts with a name and a year ("Lee2019"); describe the change in plain words, such as "Add three EEG recordings".',
+      'That has a citation (an author and a year, or a DOI) in it ("Lee2019"); describe the change in plain words, such as "Add three EEG recordings", and cite the paper in ReferencesAndLinks and the README instead.',
     );
     await term.until("Title (one line saying what changed):");
     // Typed with padding and doubled spaces: the stored title is the one-line form of it.

@@ -373,6 +373,54 @@ describe("nemar admin pr-reviews (list)", () => {
     expect((await cli([...PR, "--needs-me"])).stdout).not.toContain("nm000201");
   });
 
+  test("an exempt pull request the naming rule holds says it waits for allow --admin, and the plain one does not", async () => {
+    const reviewCheck = (conclusion: string) => ({
+      type: "run" as const,
+      name: "NEMAR PR Review",
+      status: "COMPLETED",
+      conclusion,
+    });
+    nodes(
+      {
+        ds: "nm000201",
+        n: 5,
+        author: "queueadmin-gh",
+        authorId: 4001,
+        checks: [bidsOk("nm000201"), versionOk, reviewCheck("FAILURE")],
+      },
+      {
+        ds: "nm000202",
+        n: 6,
+        author: "queueadmin-gh",
+        authorId: 4001,
+        checks: [bidsOk("nm000202"), versionOk, reviewCheck("ACTION_REQUIRED")],
+      },
+      {
+        ds: "nm000203",
+        n: 7,
+        author: "queueadmin-gh",
+        authorId: 4001,
+        checks: [bidsOk("nm000203"), versionOk, reviewCheck("SKIPPED")],
+      },
+    );
+    const r = await cli(PR);
+    expect(r.exitCode).toBe(0);
+    const lines = r.stdout.split("\n");
+    const row = (ds: string) => lines.find((l) => l.includes(ds)) ?? "";
+    expect(row("nm000201")).toMatch(/exempt, naming rule failed: needs allow --admin\s+ok\s+ok/);
+    expect(row("nm000202")).toMatch(
+      /exempt, naming rule not checked: start once, else fix the file\s+ok\s+ok/,
+    );
+    expect(row("nm000203")).toMatch(/exempt \(owner or admin\)\s+ok\s+ok/);
+    // The word reaches the JSON as a closed word, not a sentence.
+    const json = JSON.parse((await cli([...PR, "--json"])).stdout) as QueueResponse;
+    expect(json.entries.map((e) => [e.dataset_id, e.verdict, e.detail])).toEqual([
+      ["nm000201", "exempt", "naming_rule"],
+      ["nm000202", "exempt", "naming_unchecked"],
+      ["nm000203", "exempt", null],
+    ]);
+  });
+
   test("a bad filter is refused before anything is asked of the API", async () => {
     for (const [args, message] of [
       [["--verdict", "great"], "is not a verdict"],
@@ -501,8 +549,8 @@ describe("nemar admin pr-reviews (list)", () => {
       expect(r.stdout).toContain(
         [
           "Review volume, for information only (no count limits reviews):",
-          "  Last 24 hours: 4 reviews recorded, 3 model calls; 2 pass, 1 fail, 1 not reviewed (1 contributor paused).",
-          "  Last 7 days:   5 reviews recorded, 4 model calls; 3 pass, 1 fail, 1 not reviewed (1 contributor paused).",
+          "  Last 24 hours: 4 reviews recorded, 3 review runs; 2 pass, 1 fail, 1 not reviewed (1 contributor paused).",
+          "  Last 7 days:   5 reviews recorded, 4 review runs; 3 pass, 1 fail, 1 not reviewed (1 contributor paused).",
         ].join("\n"),
       );
       // Sentences, not a dump: no JSON, no quoted keys, no underscored words.
@@ -515,11 +563,41 @@ describe("nemar admin pr-reviews (list)", () => {
       const q = JSON.parse((await cli([...PR, "--json"])).stdout) as QueueResponse;
       expect(q.volume?.last_24_hours).toMatchObject({
         reviews: 4,
-        model_calls: 3,
+        review_runs: 3,
         by_verdict: { pass: 2, fail: 1, not_reviewed: 1 },
         declines: { contributor_paused: 1, rate_limited: 0, daily_limit: 0 },
       });
       expect(q.volume?.last_7_days.reviews).toBe(5);
+    });
+
+    test("adds the tokens of the reports that carry them, with an estimate in dollars", async () => {
+      seedVolume();
+      const usage = (screen: [number, number], review: [number, number]) =>
+        JSON.stringify({
+          v: 2,
+          stage: "full",
+          usage: {
+            screen: { input_tokens: screen[0], output_tokens: screen[1] },
+            review: { input_tokens: review[0], output_tokens: review[1] },
+          },
+        });
+      seed({
+        ds: "nm000302",
+        n: 1,
+        authorId: 42,
+        login: "alice",
+        createdAt: hoursAgo(1),
+        state: "reported",
+        verdict: "pass",
+        report: usage([3000, 1200], [20000, 8000]),
+      });
+      const r = await cli(PR);
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout).toContain(
+        "  Tokens, 24 hours: 23,000 in and 9,200 out over 1 report (screen 3,000 in, 1,200 out; review 20,000 in, 8,000 out), about $0.12 at list prices; runs that ended without a report are not counted.",
+      );
+      const block = r.stdout.slice(r.stdout.indexOf("Review volume"));
+      expect(block).not.toMatch(/[{}"]|_/);
     });
 
     test("says when the Worker could not read it, and prints nothing for a server that sends none", async () => {
@@ -581,6 +659,27 @@ function livePull(
   gh.pulls["nm000201#7"] = { sha, author: "alice", ...over };
 }
 
+describe("the REVIEW column legend", () => {
+  test("says what a pass needs: the three questions, and for a version 2 report a clear title and description", async () => {
+    const r = await cli([...PR, "--help-all"]);
+    expect(r.exitCode).toBe(0);
+    const help = r.stdout.replace(/\s+/g, " ");
+    expect(help).toContain(
+      "pass nothing lost, the revision advances, the dataset is materially better (a version 2 report also needs a clear title and description)",
+    );
+  });
+
+  test("says what the words on an exempt row mean, and how to release one", async () => {
+    const r = await cli([...PR, "--help-all"]);
+    const help = r.stdout.replace(/\s+/g, " ");
+    expect(help).toContain('"naming rule failed: needs allow --admin"');
+    expect(help).toContain('"naming rule not checked: start once, else fix the file"');
+    // And why the label does not say to wait: a file with no readable Name is found unreadable again.
+    expect(help).toContain("a file with no readable Name has to be fixed and pushed");
+    expect(help).toContain("allow <dataset> <pr> --admin --reason <why>");
+  });
+});
+
 describe("nemar admin pr-reviews allow and block say an owner or administrator is exempt", () => {
   test("in their detailed help, so a block is not read as holding one back", async () => {
     for (const verb of ["allow", "block"]) {
@@ -591,6 +690,299 @@ describe("nemar admin pr-reviews allow and block say an owner or administrator i
         "A NEMAR owner or administrator is exempt from the review whatever is decided here",
       );
     }
+  });
+});
+
+describe("nemar admin pr-reviews allow <dataset> <pr> --admin: the naming rule's one override", () => {
+  /** The dataset the pull request is in, as a live, named publication the review applies to. */
+  function reviewable(id: string) {
+    db.run(
+      `INSERT OR IGNORE INTO users (id, username, email, password_hash, status, role, email_verified)
+       VALUES (1, 'owner', 'owner@example.org', 'x', 'approved', 'member', 1)`,
+    );
+    db.run(
+      `INSERT INTO datasets
+         (dataset_id, name, owner_user_id, status, visibility, is_sandbox, github_repo, first_published_at)
+       VALUES (?, 'A dataset', 1, 'active', 'public', 0, ?, '2026-01-01 00:00:00')`,
+      [id, `nemarDatasets/${id}`],
+    );
+  }
+  /** The reason every waiver here is given, because the command requires one. */
+  const REASON = "Kept until the rename";
+  const waivers = () =>
+    db
+      .query("SELECT details FROM audit_log WHERE action = 'pr_review_naming_waived'")
+      .all() as Array<{
+      details: string;
+    }>;
+
+  test("waives it for an administrator's pull request at its current commit, and says so in sentences", async () => {
+    reviewable("nm000201");
+    gh.pulls["nm000201#7"] = { sha: SHA_A, author: "queueadmin-gh", title: "Lee2019 EEG rename" };
+    const r = await cli([
+      ...PR,
+      "allow",
+      "nm000201",
+      "7",
+      "--admin",
+      "--reason",
+      "Kept until the rename",
+    ]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain(`Waived the naming rule for nm000201 #7 at ${SHA_A.slice(0, 7)}.`);
+    expect(r.stdout).toContain(
+      "The rule found: the title has a citation (an author and a year, or a DOI).",
+    );
+    expect(r.stdout).toContain("it is for this commit only: a new commit is checked again");
+    expect(r.stdout).not.toMatch(/[{}"]|author_year|_waived/);
+    expect(waivers()).toHaveLength(1);
+    expect(JSON.parse(waivers()[0]?.details ?? "{}")).toMatchObject({
+      head_sha: SHA_A,
+      reason: "Kept until the rename",
+    });
+    const check = gh.seen.find((x) => x.method === "POST" && x.path.endsWith("/check-runs"));
+    expect(check?.body).toMatchObject({ conclusion: "skipped" });
+  });
+
+  test("waives a DOI in the title the same way: the record holds the closed word, the terminal does not", async () => {
+    reviewable("nm000201");
+    gh.pulls["nm000201#7"] = {
+      sha: SHA_A,
+      author: "queueadmin-gh",
+      title: "Add the recordings described in 10.1038/s41597-020-0532-5",
+    };
+    const r = await cli([
+      ...PR,
+      "allow",
+      "nm000201",
+      "7",
+      "--admin",
+      "--reason",
+      "Kept until the rename",
+    ]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain(`Waived the naming rule for nm000201 #7 at ${SHA_A.slice(0, 7)}.`);
+    expect(r.stdout).toContain(
+      "The rule found: the title has a citation (an author and a year, or a DOI).",
+    );
+    expect(r.stdout).not.toMatch(/[{}"]|\bdoi\b|_waived/);
+    expect(waivers()).toHaveLength(1);
+    expect(JSON.parse(waivers()[0]?.details ?? "{}")).toMatchObject({
+      head_sha: SHA_A,
+      title: "doi",
+      name: null,
+    });
+    const check = gh.seen.find((x) => x.method === "POST" && x.path.endsWith("/check-runs"));
+    expect(check?.body).toMatchObject({ conclusion: "skipped" });
+  });
+
+  describe("--commit", () => {
+    const checkPosts = () =>
+      gh.seen.filter((x) => x.method === "POST" && x.path.endsWith("/check-runs"));
+
+    test("waives the commit named, and the success text names its first seven characters", async () => {
+      reviewable("nm000201");
+      gh.pulls["nm000201#7"] = { sha: SHA_A, author: "queueadmin-gh", title: "Lee2019 EEG rename" };
+      const r = await cli([
+        ...PR,
+        "allow",
+        "nm000201",
+        "7",
+        "--admin",
+        "--commit",
+        SHA_A.slice(0, 9),
+        "--reason",
+        "Kept until the rename",
+      ]);
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout).toContain(`Waived the naming rule for nm000201 #7 at ${SHA_A.slice(0, 7)}.`);
+      // The request carried the commit, and the Worker recorded the commit it waived in full.
+      const sent = apiRequests.filter((x) => x === "POST /admin/pr-reviews/nm000201/7/allow");
+      expect(sent).toHaveLength(1);
+      expect(JSON.parse(waivers()[0]?.details ?? "{}")).toMatchObject({ head_sha: SHA_A });
+    });
+
+    test("a pull request pushed to since is not waived: the command says so, exits 1, and nothing is recorded or posted", async () => {
+      reviewable("nm000201");
+      gh.pulls["nm000201#7"] = { sha: SHA_B, author: "queueadmin-gh", title: "Lee2019 EEG rename" };
+      const r = await cli([
+        ...PR,
+        "allow",
+        "nm000201",
+        "7",
+        "--admin",
+        "--commit",
+        SHA_A.slice(0, 7),
+        "--reason",
+        "Looked at it",
+      ]);
+      expect(r.exitCode).toBe(1);
+      expect(r.stdout + r.stderr).toContain("no longer at that commit");
+      expect(r.stdout + r.stderr).toContain(SHA_B.slice(0, 7));
+      expect(r.stdout + r.stderr).not.toContain("--debug");
+      expect(waivers()).toHaveLength(0);
+      expect(checkPosts()).toHaveLength(0);
+    });
+
+    test("a head_moved sentence longer than the Worker's own is cut, whoever sent it", async () => {
+      reviewable("nm000201");
+      apiOverride = (req) =>
+        new URL(req.url).pathname === "/admin/pr-reviews/nm000201/7/allow"
+          ? Response.json(
+              {
+                error: `The pull request is no longer at that commit. ${"x".repeat(5000)}`,
+                code: "head_moved",
+              },
+              { status: 409 },
+            )
+          : null;
+      const r = await cli([
+        ...PR,
+        "allow",
+        "nm000201",
+        "7",
+        "--admin",
+        "--commit",
+        SHA_A.slice(0, 7),
+        "--reason",
+        "Looked at it",
+      ]);
+      expect(r.exitCode).toBe(1);
+      const said = (r.stdout + r.stderr)
+        .split("\n")
+        .find((l) => l.includes("no longer at that commit"));
+      expect(said).toBeDefined();
+      expect(said?.length).toBeLessThan(400);
+      expect(said).toContain("…");
+      expect(r.stdout + r.stderr).not.toContain("x".repeat(400));
+    });
+
+    test("is refused before the API is asked when it is not a commit prefix, or when --admin is missing", async () => {
+      for (const bad of ["abc12", "not-a-sha-at-all", "a".repeat(41)]) {
+        apiRequests = [];
+        const r = await cli([
+          ...PR,
+          "allow",
+          "nm000201",
+          "7",
+          "--admin",
+          "--commit",
+          bad,
+          "--reason",
+          "x",
+        ]);
+        expect(r.exitCode, bad).toBe(1);
+        expect(r.stdout, bad).toContain("is not a commit id");
+        // The command it offers to run instead is a whole one: --reason is required with --admin.
+        expect(r.stdout, bad).toContain("--admin --commit 1a2b3c4 --reason");
+        expect(
+          apiRequests.filter((x) => x.includes("/admin/")),
+          bad,
+        ).toHaveLength(0);
+      }
+      apiRequests = [];
+      const noAdmin = await cli([...PR, "allow", "alice", "--commit", SHA_A.slice(0, 7)]);
+      expect(noAdmin.exitCode).toBe(1);
+      expect(noAdmin.stdout).toContain("--commit goes with --admin");
+      expect(noAdmin.stdout).toContain("--admin --commit 1a2b3c4 --reason");
+      expect(apiRequests.filter((x) => x.includes("/admin/"))).toHaveLength(0);
+    });
+  });
+
+  test("refuses a contributor's pull request, says why, and exits 1", async () => {
+    reviewable("nm000201");
+    gh.pulls["nm000201#7"] = { sha: SHA_A, author: "alice", title: "Lee2019 EEG rename" };
+    const r = await cli([...PR, "allow", "nm000201", "7", "--admin", "--reason", REASON]);
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toContain("Not waived: the author of nm000201 #7");
+    expect(r.stdout).toContain("is not a NEMAR owner or administrator");
+    expect(waivers()).toHaveLength(0);
+  });
+
+  test("with --json the answer is the Worker's, and a clean title has nothing to waive (exit 0)", async () => {
+    reviewable("nm000201");
+    gh.pulls["nm000201#7"] = { sha: SHA_A, author: "queueadmin-gh", title: "Add three recordings" };
+    const r = await cli([...PR, "allow", "nm000201", "7", "--admin", "--reason", REASON, "--json"]);
+    expect(r.exitCode).toBe(0);
+    expect(JSON.parse(r.stdout)).toMatchObject({ waived: false, reason: "nothing_to_waive" });
+  });
+
+  test("a pull request GitHub does not have says so, and exits 1", async () => {
+    reviewable("nm000201");
+    const r = await cli([...PR, "allow", "nm000201", "99", "--admin", "--reason", REASON]);
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout + r.stderr).toContain("GitHub has no such pull request");
+    expect(r.stdout + r.stderr).not.toContain("--debug");
+    expect(waivers()).toHaveLength(0);
+  });
+
+  test("a dataset name GitHub would not show is not waived: it says so in words, and exits 1", async () => {
+    reviewable("nm000201");
+    gh.pulls["nm000201#7"] = { sha: SHA_A, author: "queueadmin-gh", title: "Lee2019 EEG rename" };
+    gh.naming.nm000201 = { files: ["dataset_description.json"], names: { [SHA_A]: 502 } };
+    const r = await cli([...PR, "allow", "nm000201", "7", "--admin", "--reason", REASON]);
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toContain(
+      `Not waived: the dataset name of nm000201 #7 at ${SHA_A.slice(0, 7)} could not be read, so there is nothing definite to waive.`,
+    );
+    // Either GitHub did not answer or the file is unreadable: one more try, then the file.
+    expect(r.stdout).toContain(
+      "GitHub may not have answered, or dataset_description.json has no readable Name",
+    );
+    expect(r.stdout).toContain(
+      "Run the same command once more; if it says the same, fix dataset_description.json and push",
+    );
+    expect(r.stdout).not.toContain("in a moment");
+    expect(r.stdout).not.toMatch(/naming_unchecked|unchecked/);
+    expect(waivers()).toHaveLength(0);
+  });
+
+  test("--admin needs a pull request, and a login takes none", async () => {
+    const missing = await cli([...PR, "allow", "nm000201", "--admin"]);
+    expect(missing.exitCode).toBe(1);
+    expect(missing.stdout).toContain("give a dataset and a pull request number");
+    const stray = await cli([...PR, "allow", "alice", "7"]);
+    expect(stray.exitCode).toBe(1);
+    expect(stray.stdout).toContain("To waive the naming rule for a pull request, add --admin.");
+  });
+
+  test("the detailed help says what the override does and what it is refused for", async () => {
+    const r = await cli([...PR, "allow", "--help-all"]);
+    expect(r.exitCode).toBe(0);
+    const help = r.stdout.replace(/\s+/g, " ");
+    expect(help).toContain("allow <dataset> <pr> --admin");
+    // The one-line description names the whole command, reason included.
+    expect(help).toContain("(allow <dataset> <pr> --admin --reason <why>)");
+    expect(help).toContain("waives the rule for the pull request's CURRENT commit");
+    expect(help).toContain("records the waiver");
+    // The reason it records is required, and the help says so where the option and the override are.
+    expect(help).toContain("Required with --admin");
+    expect(help).toContain("and your --reason, which is required");
+  });
+
+  describe("--reason", () => {
+    test("is required: without one, or with a blank one, nothing is asked of the API and nothing is waived", async () => {
+      reviewable("nm000201");
+      gh.pulls["nm000201#7"] = { sha: SHA_A, author: "queueadmin-gh", title: "Lee2019 EEG rename" };
+      for (const extra of [[], ["--reason", ""], ["--reason", "   "]]) {
+        apiRequests = [];
+        const r = await cli([...PR, "allow", "nm000201", "7", "--admin", ...extra]);
+        expect(r.exitCode, extra.join(" ")).toBe(1);
+        expect(r.stdout, extra.join(" ")).toContain("--admin needs --reason");
+        expect(r.stdout, extra.join(" ")).toContain("recorded with the waiver");
+        expect(apiRequests.filter((x) => x.includes("/admin/"))).toHaveLength(0);
+        expect(waivers()).toHaveLength(0);
+        expect(gh.seen.some((x) => x.path.endsWith("/check-runs"))).toBe(false);
+      }
+    });
+
+    test("is not needed to lift a block, which has no waiver to record it with", async () => {
+      gh.users.alice = { id: 77, login: "alice", type: "User" };
+      expect((await cli([...PR, "block", "alice"])).exitCode).toBe(0);
+      const r = await cli([...PR, "allow", "alice"]);
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout).toContain("Allowed alice");
+    });
   });
 });
 
@@ -840,6 +1232,33 @@ describe("who is reviewed", () => {
     expect(r.exitCode).toBe(1);
     expect(r.stdout).toContain("200 is the most that is kept");
     expect(db.query("SELECT COUNT(*) AS n FROM pr_review_overrides").get()).toEqual({ n: 0 });
+  });
+
+  test("block refuses a reason longer than the Worker keeps, before anything is asked of the API, and takes exactly that many", async () => {
+    gh.users.dave = { id: 88, login: "dave", type: "User" };
+    apiRequests = [];
+    const tooLong = await cli([...PR, "block", "dave", "--reason", "x".repeat(201)]);
+    expect(tooLong.exitCode).toBe(1);
+    expect(tooLong.stdout).toContain("The reason is 201 characters; 200 is the most that is kept.");
+    expect(apiRequests.filter((x) => x.includes("/admin/"))).toHaveLength(0);
+    expect(db.query("SELECT COUNT(*) AS n FROM pr_review_overrides").get()).toEqual({ n: 0 });
+
+    const exact = await cli([...PR, "block", "dave", "--reason", "x".repeat(200)]);
+    expect(exact.exitCode).toBe(0);
+    expect(db.query("SELECT mode, reason FROM pr_review_overrides").get()).toEqual({
+      mode: "block",
+      reason: "x".repeat(200),
+    });
+  });
+
+  test("allow --admin refuses a reason longer than the Worker keeps, and waives nothing", async () => {
+    // (The same check as above, on the other command that records a reason; it runs before the
+    // pull request is looked at, so nothing needs to be set up on GitHub.)
+    apiRequests = [];
+    const r = await cli([...PR, "allow", "nm000201", "7", "--admin", "--reason", "y".repeat(201)]);
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toContain("The reason is 201 characters; 200 is the most that is kept.");
+    expect(apiRequests.filter((x) => x.includes("/admin/"))).toHaveLength(0);
   });
 
   test("a login GitHub does not know, and a malformed one, are refused", async () => {

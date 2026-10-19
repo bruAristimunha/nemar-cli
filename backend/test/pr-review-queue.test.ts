@@ -20,7 +20,13 @@ import type {
   SetOverrideResponse,
   VolumeWindow,
 } from "../../shared/contract/pr-review-admin";
-import { renderCheck } from "../../shared/pr-review";
+import {
+  NAMING_PROBLEMS,
+  type NameFinding,
+  type NamingProblem,
+  conclusionOf,
+  renderCheck,
+} from "../../shared/pr-review";
 import { adminRoutes } from "../src/routes/admin";
 import {
   __resetRateLimitStateForTests,
@@ -48,6 +54,7 @@ import {
 } from "./helpers/github-permission";
 import { projectOnto } from "./helpers/graphql-select";
 import {
+  type CheckSpec,
   type PrSpec,
   SHA_A,
   SHA_B,
@@ -271,6 +278,7 @@ function openPullRequest(authorId: number, login: string, number: number, headSh
         state: "open",
         draft: false,
         merged: false,
+        title: "Add a subject",
         author_association: "COLLABORATOR",
         user: { id: authorId, login, type: "User" },
         base: { ref: "main" },
@@ -943,6 +951,32 @@ describe("GET /admin/pr-reviews/:dataset/:pr", () => {
     expect((await detail("nm1", 7)).status).toBe(400);
     const r = await get("/admin/pr-reviews/nm000201/abc");
     expect(r.status).toBe(400);
+  });
+
+  test("says which of the two it refused, in the same words on every route that takes them", async () => {
+    const badDataset = { error: "That is not a dataset id.", code: "bad_dataset" };
+    const badPr = { error: "A pull request number is a positive whole number.", code: "bad_pr" };
+    for (const method of ["GET", "POST"]) {
+      // The detail read and the start take the same two path parameters; so does the waiver.
+      const suffix = method === "GET" ? "" : "/start";
+      const ask = (path: string) =>
+        app.request(
+          `/admin/pr-reviews/${path}${suffix}`,
+          { method, headers: { Authorization: `Bearer ${ADMIN_KEY}` } },
+          env(),
+        );
+      for (const [path, expected] of [
+        ["nm1/7", badDataset],
+        ["nm000201/abc", badPr],
+        ["nm000201/0", badPr],
+        ["nm000201/-3", badPr],
+        ["nm000201/1.5", badPr],
+      ] as const) {
+        const res = await ask(path);
+        expect(res.status, `${method} ${path}`).toBe(400);
+        expect(await res.json(), `${method} ${path}`).toEqual(expected);
+      }
+    }
   });
 
   test("another environment's dataset is not answered here", async () => {
@@ -1929,11 +1963,50 @@ describe("the volume of reviews in the list: information, never a gate", () => {
     r: Omit<Parameters<typeof seedReview>[0], "ds" | "n" | "createdAt">,
   ) => seedReview({ ...r, ds: "nm000201", n, createdAt: ago(hours) });
 
+  const NO_TOKENS = {
+    screen_input: 0,
+    screen_output: 0,
+    review_input: 0,
+    review_output: 0,
+    reviews_counted: 0,
+  };
+
+  /** A version 2 report with the usage given, as the job posts it. */
+  const v2Report = (screen: [number, number], review: [number, number] | null) =>
+    JSON.stringify({
+      v: 2,
+      stage: review === null ? "screen" : "full",
+      models: { screen: "claude-haiku-5-5", review: review === null ? null : "claude-sonnet-5-5" },
+      criteria: {},
+      findings: [],
+      summary: "",
+      steering: false,
+      evidence: {},
+      usage: {
+        screen: { input_tokens: screen[0], output_tokens: screen[1] },
+        review: review === null ? null : { input_tokens: review[0], output_tokens: review[1] },
+      },
+    });
+
+  /** A version 2 report that ended at the facts stage: the naming rule decided it, no model was asked. */
+  const factsReport = () =>
+    JSON.stringify({
+      v: 2,
+      stage: "facts",
+      models: { screen: null, review: null },
+      criteria: {},
+      findings: [],
+      summary: "",
+      steering: false,
+      evidence: {},
+      usage: { screen: { input_tokens: 0, output_tokens: 0 }, review: null },
+    });
+
   function seedWeek() {
     // The last 24 hours: ten records.
     seedAt(1, 2, { state: "reported", verdict: "pass" });
     seedAt(2, 2, { state: "reported", verdict: "fail" });
-    withAttempts(2, 2); // restarted once: two model calls
+    withAttempts(2, 2); // restarted once: two runs
     seedAt(3, 2, { state: "reported", verdict: "uncertain" });
     seedAt(4, 2, { state: "declined", detail: "contributor_paused" });
     seedAt(5, 2, { state: "errored", detail: "model_unavailable" });
@@ -1957,7 +2030,7 @@ describe("the volume of reviews in the list: information, never a gate", () => {
     reviews: 10,
     // pass 1 + fail 2 + uncertain 1 + model_unavailable 1 + running 1 + unreported 1 + overdue 1:
     // a decline and the two runs that never reached the model cost none.
-    model_calls: 8,
+    review_runs: 8,
     by_verdict: {
       pass: 1,
       fail: 1,
@@ -1967,10 +2040,13 @@ describe("the volume of reviews in the list: information, never a gate", () => {
       not_reviewed: 1,
     },
     declines: { contributor_paused: 1, rate_limited: 0, daily_limit: 0 },
+    // The seeded reports are version 1, which carry no usage: nothing to sum, and it says so.
+    tokens: NO_TOKENS,
+    estimated_cost_usd: 0,
   };
   const week: VolumeWindow = {
     reviews: 15,
-    model_calls: 10,
+    review_runs: 10,
     by_verdict: {
       pass: 2,
       fail: 2,
@@ -1980,9 +2056,11 @@ describe("the volume of reviews in the list: information, never a gate", () => {
       not_reviewed: 4,
     },
     declines: { contributor_paused: 1, rate_limited: 1, daily_limit: 2 },
+    tokens: NO_TOKENS,
+    estimated_cost_usd: 0,
   };
 
-  test("the list carries the records and model calls of the last day and week, with verdicts and declines", async () => {
+  test("the list carries the records and review runs of the last day and week, with verdicts and declines", async () => {
     seedWeek();
     const { status, body } = await queue();
     expect(status).toBe(200);
@@ -1999,16 +2077,77 @@ describe("the volume of reviews in the list: information, never a gate", () => {
   test("an empty history is zeros, which is a count, and not an unread volume", async () => {
     const { body } = await queue();
     expect(body.volume?.last_24_hours.reviews).toBe(0);
-    expect(body.volume?.last_7_days.model_calls).toBe(0);
+    expect(body.volume?.last_7_days.review_runs).toBe(0);
     expect(Object.values(body.volume?.last_7_days.by_verdict ?? {})).toEqual([0, 0, 0, 0, 0, 0]);
     expect(Object.values(body.volume?.last_7_days.declines ?? {})).toEqual([0, 0, 0]);
+  });
+
+  test("the tokens of version 2 reports are summed by stage and priced as an estimate; others are not counted", async () => {
+    seedAt(1, 2, {
+      state: "reported",
+      verdict: "pass",
+      report: v2Report([1000, 500], [20000, 8000]),
+    });
+    seedAt(2, 2, { state: "reported", verdict: "fail", report: v2Report([2000, 700], null) });
+    // A version 1 report (no usage) and a run that ended without a report (no report at all).
+    seedAt(3, 2, { state: "reported", verdict: "pass" });
+    seedAt(4, 2, { state: "errored", detail: "model_truncated" });
+    // A week ago: in the week, out of the day.
+    seedAt(5, 72, {
+      state: "reported",
+      verdict: "pass",
+      report: v2Report([1000, 1000], [1000, 1000]),
+    });
+    const volume = await readVolume(realD1(db));
+    expect(volume.last_24_hours.tokens).toEqual({
+      screen_input: 3000,
+      screen_output: 1200,
+      review_input: 20000,
+      review_output: 8000,
+      reviews_counted: 2,
+    });
+    // 3,000 x 0.10 + 1,200 x 0.50 + 20,000 x 2 + 8,000 x 10, per million: $0.12.
+    expect(volume.last_24_hours.estimated_cost_usd).toBe(0.12);
+    expect(volume.last_7_days.tokens).toMatchObject({ reviews_counted: 3, screen_input: 4000 });
+  });
+
+  test("a run that ended at the facts stage made no model call, so it is not a review run, and a full run is", async () => {
+    const runs = async () => {
+      const { last_24_hours: day, last_7_days: week } = await readVolume(realD1(db));
+      return [day.review_runs, week.review_runs];
+    };
+    // Each record is one run. A full run costs a run.
+    seedAt(1, 2, {
+      state: "reported",
+      verdict: "pass",
+      report: v2Report([1000, 500], [20000, 8000]),
+    });
+    expect(await runs()).toEqual([1, 1]);
+    // The naming rule ended these before any model was asked: records, but no run. One is in the
+    // last day and one is older, so both windows are shown to leave them out.
+    seedAt(2, 2, { state: "reported", verdict: "fail", report: factsReport() });
+    seedAt(3, 72, { state: "reported", verdict: "uncertain", report: factsReport() });
+    expect(await runs()).toEqual([1, 1]);
+    const { last_24_hours: day, last_7_days: week } = await readVolume(realD1(db));
+    // They are still reviews, with the verdicts they came to: only the runs are fewer.
+    expect(day).toMatchObject({ reviews: 2, by_verdict: { pass: 1, fail: 1 } });
+    expect(week).toMatchObject({ reviews: 3, by_verdict: { pass: 1, fail: 1, uncertain: 1 } });
+    // A run the screen stopped made a call, so it is a run, and raises the count again.
+    seedAt(4, 2, { state: "reported", verdict: "fail", report: v2Report([2000, 700], null) });
+    expect(await runs()).toEqual([2, 2]);
+  });
+
+  test("a report that is not JSON is not summed and does not fail the volume", async () => {
+    seedAt(1, 2, { state: "reported", verdict: "pass", report: "not json" });
+    const volume = await readVolume(realD1(db));
+    expect(volume.last_24_hours).toMatchObject({ reviews: 1, tokens: NO_TOKENS });
   });
 
   test("a restart that spent a second call is counted as two calls and one record", async () => {
     seedAt(2, 1, { state: "reported", verdict: "fail" });
     withAttempts(2, 3);
     const volume = await readVolume(realD1(db));
-    expect(volume.last_24_hours).toMatchObject({ reviews: 1, model_calls: 3 });
+    expect(volume.last_24_hours).toMatchObject({ reviews: 1, review_runs: 3 });
   });
 
   test("it never holds up the list: when it cannot be read the list is answered and says null, not zero", async () => {
@@ -2072,6 +2211,273 @@ describe("an owner's or administrator's pull request is exempt (ADR 0107)", () =
     expect(by.nm000202).toMatchObject({ verdict: "not_reviewed", needs_you: true });
     // Not reviewed, then a failure, then the exempt one, though it was opened first.
     expect(body.entries.map((e) => e.dataset_id)).toEqual(["nm000202", "nm000203", "nm000201"]);
+  });
+
+  describe("when the naming rule holds it", () => {
+    /** The review's own check on a commit, as the exempt path posts it. */
+    const reviewCheck = (conclusion: string, over: Partial<CheckSpec> = {}): CheckSpec => ({
+      type: "run",
+      name: "NEMAR PR Review",
+      status: "COMPLETED",
+      conclusion,
+      ...over,
+    });
+    const withChecks = (ds: string, ...extra: CheckSpec[]) => [bidsOk(ds), versionOk, ...extra];
+    const detailOf = async () => {
+      const { body } = await queue();
+      return Object.fromEntries(body.entries.map((e) => [e.dataset_id, e]));
+    };
+
+    test("a check that failed reads naming_rule, one that asks for a person reads naming_unchecked, and neither is yours to act on", async () => {
+      nodes(
+        {
+          ds: "nm000201",
+          n: 1,
+          author: ADMIN_GH,
+          authorId: 4001,
+          checks: withChecks("nm000201", reviewCheck("FAILURE")),
+        },
+        {
+          ds: "nm000202",
+          n: 2,
+          author: ADMIN_GH,
+          authorId: 4001,
+          checks: withChecks("nm000202", reviewCheck("ACTION_REQUIRED")),
+        },
+      );
+      const by = await detailOf();
+      expect(by.nm000201).toMatchObject({
+        verdict: "exempt",
+        detail: "naming_rule",
+        needs_you: false,
+      });
+      expect(by.nm000202).toMatchObject({
+        verdict: "exempt",
+        detail: "naming_unchecked",
+        needs_you: false,
+      });
+    });
+
+    test("a refused title beside a name that could not be read reads naming_unchecked, as the check the Worker posts for it: no waiver is offered", async () => {
+      // The conclusion the exempt path posts for the facts, in GitHub's words. A failure would be
+      // listed as "needs allow --admin", and the waiver is refused while the name is unread.
+      const posted = (title: NamingProblem | null, name: NameFinding | null) =>
+        conclusionOf({ kind: "naming", facts: { title, name } }).toUpperCase();
+      nodes(
+        {
+          ds: "nm000201",
+          n: 1,
+          author: ADMIN_GH,
+          authorId: 4001,
+          checks: withChecks("nm000201", reviewCheck(posted("author_year", "unchecked"))),
+        },
+        {
+          ds: "nm000202",
+          n: 2,
+          author: ADMIN_GH,
+          authorId: 4001,
+          checks: withChecks("nm000202", reviewCheck(posted("author_year", null))),
+        },
+        {
+          ds: "nm000203",
+          n: 3,
+          author: ADMIN_GH,
+          authorId: 4001,
+          checks: withChecks("nm000203", reviewCheck(posted(null, "unchecked"))),
+        },
+      );
+      const by = await detailOf();
+      expect(by.nm000201).toMatchObject({ verdict: "exempt", detail: "naming_unchecked" });
+      // The controls: a refusal alone is waivable, and an unread name alone is as it was.
+      expect(by.nm000202).toMatchObject({ verdict: "exempt", detail: "naming_rule" });
+      expect(by.nm000203).toMatchObject({ verdict: "exempt", detail: "naming_unchecked" });
+    });
+
+    test("a title or a name the rule refuses reads naming_rule whatever the problem is, a DOI among them", async () => {
+      // Each closed word of the rule, as a refused title and as a refused new name, posted as the
+      // exempt path posts it: the list's label does not say which problem it was, so a word the
+      // rule gains cannot be listed as anything but a failure an administrator may waive.
+      const posted = (title: NamingProblem | null, name: NameFinding | null) =>
+        conclusionOf({ kind: "naming", facts: { title, name } }).toUpperCase();
+      const specs = NAMING_PROBLEMS.flatMap((problem, i) =>
+        [posted(problem, null), posted(null, problem)].map((conclusion, j) => {
+          const ds = `nm0002${i}${j + 1}`;
+          return {
+            ds,
+            n: i * 2 + j + 1,
+            author: ADMIN_GH,
+            authorId: 4001,
+            checks: withChecks(ds, reviewCheck(conclusion)),
+          };
+        }),
+      );
+      expect(specs).toHaveLength(NAMING_PROBLEMS.length * 2);
+      nodes(...specs);
+      const by = await detailOf();
+      for (const spec of specs) {
+        expect(by[spec.ds], spec.ds).toMatchObject({
+          verdict: "exempt",
+          detail: "naming_rule",
+          needs_you: false,
+        });
+      }
+      // The words are the ones the closed list holds, the DOI among them.
+      expect([...NAMING_PROBLEMS]).toContain("doi");
+    });
+
+    test("a check that was skipped, is running, or is not there is the plain exemption", async () => {
+      nodes(
+        {
+          ds: "nm000201",
+          n: 1,
+          author: ADMIN_GH,
+          authorId: 4001,
+          checks: withChecks("nm000201", reviewCheck("SKIPPED")),
+        },
+        {
+          ds: "nm000202",
+          n: 2,
+          author: ADMIN_GH,
+          authorId: 4001,
+          checks: withChecks(
+            "nm000202",
+            reviewCheck("", { status: "IN_PROGRESS", conclusion: null }),
+          ),
+        },
+        { ds: "nm000203", n: 3, author: ADMIN_GH, authorId: 4001 },
+        { ds: "nm000204", n: 4, author: ADMIN_GH, authorId: 4001, checks: null },
+      );
+      const by = await detailOf();
+      for (const ds of ["nm000201", "nm000202", "nm000203", "nm000204"]) {
+        expect(by[ds], ds).toMatchObject({ verdict: "exempt", detail: null });
+      }
+    });
+
+    test("the newest run of the check wins: a waiver's skipped check after the failure releases it, a later failure holds it", async () => {
+      nodes(
+        {
+          ds: "nm000201",
+          n: 1,
+          author: ADMIN_GH,
+          authorId: 4001,
+          checks: withChecks(
+            "nm000201",
+            reviewCheck("FAILURE", { at: "2026-10-01T10:00:00Z" }),
+            reviewCheck("SKIPPED", { at: "2026-10-01T11:00:00Z" }),
+          ),
+        },
+        {
+          ds: "nm000202",
+          n: 2,
+          author: ADMIN_GH,
+          authorId: 4001,
+          checks: withChecks(
+            "nm000202",
+            reviewCheck("SKIPPED", { at: "2026-10-01T10:00:00Z" }),
+            reviewCheck("FAILURE", { at: "2026-10-01T11:00:00Z" }),
+          ),
+        },
+      );
+      const by = await detailOf();
+      expect(by.nm000201).toMatchObject({ verdict: "exempt", detail: null });
+      expect(by.nm000202).toMatchObject({ verdict: "exempt", detail: "naming_rule" });
+    });
+
+    test("a list of checks cut short is not read for it", async () => {
+      nodes({
+        ds: "nm000201",
+        n: 1,
+        author: ADMIN_GH,
+        authorId: 4001,
+        checks: withChecks("nm000201", reviewCheck("FAILURE")),
+        moreChecks: true,
+      });
+      const by = await detailOf();
+      expect(by.nm000201).toMatchObject({ verdict: "exempt", detail: null });
+    });
+
+    test("a commit status of the same name is not a check run: it neither holds a pull request nor releases one", async () => {
+      const status = (state: string, at: string): CheckSpec => ({
+        type: "status",
+        name: "NEMAR PR Review",
+        state,
+        at,
+      });
+      nodes(
+        {
+          ds: "nm000201",
+          n: 1,
+          author: ADMIN_GH,
+          authorId: 4001,
+          checks: withChecks("nm000201", status("FAILURE", "2026-10-01T11:00:00Z")),
+        },
+        {
+          ds: "nm000202",
+          n: 2,
+          author: ADMIN_GH,
+          authorId: 4001,
+          checks: withChecks(
+            "nm000202",
+            reviewCheck("FAILURE", { at: "2026-10-01T10:00:00Z" }),
+            status("SUCCESS", "2026-10-01T11:00:00Z"),
+          ),
+        },
+      );
+      const by = await detailOf();
+      expect(by.nm000201).toMatchObject({ verdict: "exempt", detail: null });
+      expect(by.nm000202).toMatchObject({ verdict: "exempt", detail: "naming_rule" });
+    });
+
+    test("only an exempt row carries it: another author's failed check is not labeled, and a review of the commit wins", async () => {
+      seedReview({
+        ds: "nm000203",
+        n: 3,
+        sha: SHA_A,
+        state: "reported",
+        verdict: "fail",
+        authorId: 4001,
+        login: ADMIN_GH,
+      });
+      nodes(
+        {
+          ds: "nm000201",
+          n: 1,
+          author: "stranger",
+          authorId: 700,
+          checks: withChecks("nm000201", reviewCheck("FAILURE")),
+        },
+        {
+          ds: "nm000203",
+          n: 3,
+          sha: SHA_A,
+          author: ADMIN_GH,
+          authorId: 4001,
+          checks: withChecks("nm000203", reviewCheck("FAILURE")),
+        },
+      );
+      const by = await detailOf();
+      expect(by.nm000201).toMatchObject({ verdict: "not_reviewed", detail: null });
+      expect(by.nm000203).toMatchObject({ verdict: "fail", detail: null, review_current: true });
+    });
+
+    test("the word can be filtered for with exempt, and sorts with the exempt rows", async () => {
+      nodes(
+        {
+          ds: "nm000201",
+          n: 1,
+          author: ADMIN_GH,
+          authorId: 4001,
+          checks: withChecks("nm000201", reviewCheck("FAILURE")),
+        },
+        { ds: "nm000202", n: 2, author: "stranger", authorId: 700 },
+      );
+      const only = await queue("?verdict=exempt");
+      expect(only.body.entries.map((e) => [e.dataset_id, e.detail])).toEqual([
+        ["nm000201", "naming_rule"],
+      ]);
+      const all = await queue();
+      expect(all.body.entries.map((e) => e.dataset_id)).toEqual(["nm000202", "nm000201"]);
+    });
   });
 
   test("an owner and an administrator are both exempt, a member and a test persona are not", async () => {

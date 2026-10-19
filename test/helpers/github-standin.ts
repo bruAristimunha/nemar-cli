@@ -10,8 +10,12 @@
  */
 
 import type { Server } from "bun";
+import { type NamingRepo, namingResponse } from "../../backend/test/helpers/github-naming";
 import { permissionResponse } from "../../backend/test/helpers/github-permission";
 import { projectOnto } from "../../backend/test/helpers/graphql-select";
+
+/** The base branch's commit every pull request read names, for the naming rule's comparison. */
+export const STANDIN_BASE_SHA = "9".repeat(40);
 
 export const WORKER_TOKEN = "ghp_worker_datasets_token";
 export const ADMIN_TOKEN = "gho_admin_own_token";
@@ -30,6 +34,8 @@ export interface Seen {
 }
 
 export interface PullState {
+  /** The pull request's title; "Add subjects" unless a test says otherwise. */
+  title?: string;
   state?: "open" | "closed";
   merged?: boolean;
   draft?: boolean;
@@ -74,6 +80,11 @@ export interface GitHubStandin {
   seen: Seen[];
   /** Pull requests the REST read serves, keyed `dataset#number`. */
   pulls: Record<string, PullState>;
+  /**
+   * What the naming rule's reads find, per repository (see backend/test/helpers/github-naming.ts):
+   * the dataset name is unchanged unless a test says otherwise.
+   */
+  naming: Record<string, NamingRepo>;
   /** The GraphQL search pages. */
   searchPages: unknown[][];
   /** The `issueCount` the search reports, when a test needs it to differ from the nodes returned. */
@@ -121,6 +132,7 @@ export function startGitHubStandin(): GitHubStandin {
   const state = {
     seen: [] as Seen[],
     pulls: {} as Record<string, PullState>,
+    naming: {} as Record<string, NamingRepo>,
     searchPages: [] as unknown[][],
     searchTotal: null as number | null,
     dispatchStatus: 204,
@@ -186,6 +198,9 @@ export function startGitHubStandin(): GitHubStandin {
       // so in the Worker's own suites (backend/test/pr-review-*.test.ts), where the table lives.
       const permission = req.method === "GET" ? await permissionResponse(url, {}) : null;
       if (permission) return permission;
+      // The naming rule's reads on an owner's or administrator's pull request (ADR 0107).
+      const named = req.method === "GET" ? await namingResponse(url, state.naming) : null;
+      if (named) return named;
 
       const user = url.pathname.match(/^\/users\/([^/]+)$/);
       if (req.method === "GET" && user) {
@@ -249,11 +264,12 @@ export function startGitHubStandin(): GitHubStandin {
                 : unknown
                   ? "unknown"
                   : (p.mergeableState ?? "clean"),
-            title: "Add subjects",
+            title: p.title ?? "Add subjects",
             author_association: p.assoc ?? "COLLABORATOR",
             user: { login: p.author ?? "contributor", id: p.authorId ?? 501, type: "User" },
             base: {
               ref: p.base ?? "main",
+              sha: STANDIN_BASE_SHA,
               repo: {
                 name: pull[1],
                 full_name: `nemarDatasets/${pull[1]}`,
@@ -322,6 +338,9 @@ export function startGitHubStandin(): GitHubStandin {
     },
     get pulls() {
       return state.pulls;
+    },
+    get naming() {
+      return state.naming;
     },
     get searchPages() {
       return state.searchPages;
@@ -417,6 +436,7 @@ export function startGitHubStandin(): GitHubStandin {
       state.closeStatus = null;
       state.comments.length = 0;
       for (const k of Object.keys(state.pulls)) delete state.pulls[k];
+      for (const k of Object.keys(state.naming)) delete state.naming[k];
       for (const k of Object.keys(state.users)) delete state.users[k];
       for (const k of Object.keys(reads)) delete reads[k];
       for (const k of Object.keys(adminReads)) delete adminReads[k];

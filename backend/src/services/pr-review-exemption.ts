@@ -26,6 +26,8 @@
  *
  * A database failure throws, like every read in the review's intake: the webhook answers 500 and
  * the delivery can be redelivered. A GitHub failure never throws here; it answers not exempt, and says so in the log.
+ * A caller that must tell "not exempt" from "GitHub did not say" (an administrator's override, which
+ * would otherwise be refused for a reason that is not true) asks {@link reviewExemption}.
  */
 
 import type { AccountKind } from "../../../shared/contract/user.js";
@@ -89,15 +91,20 @@ export function __setPermissionTimeoutForTests(ms: number | null): void {
 const ADMIN_ROLE = "admin";
 
 /**
- * Whether GitHub says this login holds the `admin` role on this repository. Never throws: a login
- * GitHub does not know (404), a refusal, a throttle, a timeout, no token to ask with, and a body
- * that is not an object with `role_name: "admin"` are all `false`. `role_name`, not the legacy
- * `permission` field: `permission` folds `maintain` into `write` and cannot tell a role apart.
+ * What GitHub says about this login on this repository: `admin` when it holds the `admin` role,
+ * `not_admin` when GitHub answered and it does not (a login GitHub does not know, 404, is an answer
+ * too), and `unknown` when GitHub did not say: a refusal, a throttle, a timeout, no token to ask
+ * with, or a body that is not an object with a string `role_name`. Never throws. `role_name`, not
+ * the legacy `permission` field: `permission` folds `maintain` into `write` and cannot tell a role
+ * apart.
  *
  * The endpoint answers `read` for ANY login on a public repository, so only an explicit `admin`
  * means anything here.
  */
-async function holdsRepositoryAdmin(env: Bindings, who: ReviewExemptSubject): Promise<boolean> {
+async function repositoryRole(
+  env: Bindings,
+  who: ReviewExemptSubject,
+): Promise<"admin" | "not_admin" | "unknown"> {
   try {
     const { token, refresh } = await getDatasetsTokenWithRefresher(env);
     const res = await githubFetchWithRetry(
@@ -110,9 +117,12 @@ async function holdsRepositoryAdmin(env: Bindings, who: ReviewExemptSubject): Pr
       // Anything else is GitHub or the credential failing, which every exempt account feels at
       // once, so it is logged as the fault it is.
       const line = `[pr-review-exempt] ${who.repo}: GitHub answered HTTP ${res.status} to the permission check; not exempt`;
-      if (res.status === 404) console.warn(line);
-      else console.error(line);
-      return false;
+      if (res.status === 404) {
+        console.warn(line);
+        return "not_admin";
+      }
+      console.error(line);
+      return "unknown";
     }
     const body: unknown = await res.json().catch(() => null);
     const role =
@@ -125,15 +135,15 @@ async function holdsRepositoryAdmin(env: Bindings, who: ReviewExemptSubject): Pr
       console.error(
         `[pr-review-exempt] ${who.repo}: the permission check answered with no usable role_name; not exempt`,
       );
-      return false;
+      return "unknown";
     }
-    return role === ADMIN_ROLE;
+    return role === ADMIN_ROLE ? "admin" : "not_admin";
   } catch (err) {
     // Fixed words and the error's own message (a status or a timeout), never a token or a login.
     console.error(
       `[pr-review-exempt] ${who.repo}: the permission check failed (${err instanceof Error ? err.message.slice(0, 120) : "unknown"}); not exempt`,
     );
-    return false;
+    return "unknown";
   }
 }
 
@@ -144,9 +154,23 @@ async function holdsRepositoryAdmin(env: Bindings, who: ReviewExemptSubject): Pr
  * GitHub is asked only after the accounts have said yes. Nothing is remembered between calls.
  */
 export async function isReviewExempt(env: Bindings, who: ReviewExemptSubject): Promise<boolean> {
-  if (!GITHUB_LOGIN.test(who.login)) return false;
+  return (await reviewExemption(env, who)) === "exempt";
+}
+
+/**
+ * {@link isReviewExempt}, with GitHub's silence kept apart: `unknown` when the accounts said yes
+ * and GitHub did not answer the question. The review's own gate treats that as not exempt, which
+ * is the safe side there; an administrator's override must not, because "the author is not an
+ * owner or administrator" would be false.
+ */
+export async function reviewExemption(
+  env: Bindings,
+  who: ReviewExemptSubject,
+): Promise<"exempt" | "not_exempt" | "unknown"> {
+  if (!GITHUB_LOGIN.test(who.login)) return "not_exempt";
   const row = await env.DB.prepare(REVIEW_EXEMPT_SQL).bind(who.login).first<{ exempt: number }>();
   // `!row`, not `=== null`: anything but a row is "no account", whatever D1 answers with.
-  if (!row) return false;
-  return await holdsRepositoryAdmin(env, who);
+  if (!row) return "not_exempt";
+  const role = await repositoryRole(env, who);
+  return role === "admin" ? "exempt" : role === "not_admin" ? "not_exempt" : "unknown";
 }

@@ -3462,9 +3462,10 @@ Title and description (both required):
   the dataset has none), and reads there as you wrote it.
   An empty value, placeholder text such as "Save changes", an unfilled
   template field, text with no words in it, a pasted hash or JSON, and a
-  title that starts with a name and a year (Lee2019 EEG dataset) are
-  refused. At a terminal the command asks for what you leave out; with
-  --yes, or without a terminal, it refuses instead.
+  title with a citation in it, an author and a year such as Lee2019 or a
+  DOI, anywhere in it, are refused (cite the paper in ReferencesAndLinks
+  and the README instead). At a terminal the command asks for what you
+  leave out; with --yes, or without a terminal, it refuses instead.
 
 Note:
   This is the recommended way to update public datasets. It creates a
@@ -5258,9 +5259,9 @@ Description:
   The title (-t) and the body (-b) are required: a reviewer reads them, and
   so does NEMAR's automated review, so say in plain words what changed and
   why. Placeholder text, an empty value, a pasted hash or JSON, and a title
-  that starts with a name and a year (Lee2019 EEG dataset) are refused. At
-  a terminal the command asks for what you leave out; without one it
-  refuses, before anything is pushed.
+  with a citation in it, an author and a year such as Lee2019 or a DOI,
+  anywhere in it, are refused. At a terminal the command asks for what you
+  leave out; without one it refuses, before anything is pushed.
 
   S3 push uses temporary credentials from the NEMAR API. Falls back to
   environment AWS credentials if not logged in.

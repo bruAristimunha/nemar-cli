@@ -9,6 +9,9 @@
  *   nemar admin pr-reviews start --all       every open pull request waiting for a review
  *   nemar admin pr-reviews approve <ds> <pr> approve as YOU, with your own GitHub login
  *   nemar admin pr-reviews allow|block|clear <login>   who the automated review is spent on
+ *   nemar admin pr-reviews allow <ds> <pr> --admin --reason <why> [--commit <sha>]
+ *                                            waive the naming rule for an owner's or an
+ *                                            administrator's pull request, at its current commit
  *   nemar admin pr-reviews standing <login>  a contributor's record and what it means
  *
  * The list, the report and the contributor controls come from the NEMAR API. The approval does
@@ -30,11 +33,16 @@ import {
   type ReadVerdict,
   type StartReviewResponse,
   type VolumeWindow,
+  type WaiveNamingResponse,
 } from "../../shared/contract/pr-review-admin.js";
 import {
+  type NamingFacts,
+  type ReviewEvidence,
   type ReviewOutcome,
   factsOf,
+  factsStop,
   findingLines,
+  namingLines,
   renderCheck,
   verdictOf,
 } from "../../shared/pr-review.js";
@@ -47,6 +55,7 @@ import {
   listPrReviews,
   setPrReviewAuthor,
   startPrReview,
+  waivePrReviewNaming,
 } from "../lib/api/admin.js";
 import { getCurrentUser } from "../lib/api/auth.js";
 import { ApiError, errorDetail } from "../lib/api/errors.js";
@@ -142,11 +151,23 @@ function verdictColor(v: string): (s: string) => string {
   }
 }
 
-/** The verdict as a person reads it, with the closed word behind it when there is one. */
+/**
+ * The verdict as a person reads it, with the closed word behind it when there is one. An exempt
+ * pull request the naming rule holds says what releases it, because "exempt" alone reads as nothing
+ * waiting: the rule failed it (waive it for the commit, or the author fixes it), or could not check
+ * it (GitHub may not have answered, which one more start settles, or the file has no readable name,
+ * which only a fix to the file does; nothing is waivable until the name is read).
+ */
 export function verdictText(e: Pick<QueueEntry, "verdict" | "detail" | "review_current">): string {
   const word = verdictWord(e.verdict);
   if (e.verdict === "not_reviewed" && e.review_current === false) {
     return `${word} (other commit)`;
+  }
+  if (e.verdict === "exempt" && e.detail === "naming_rule") {
+    return "exempt, naming rule failed: needs allow --admin";
+  }
+  if (e.verdict === "exempt" && e.detail === "naming_unchecked") {
+    return "exempt, naming rule not checked: start once, else fix the file";
   }
   return e.detail ? `${word} (${detailWord(e.detail)})` : word;
 }
@@ -174,7 +195,8 @@ export function renderQueue(entries: QueueEntry[], now: number = Date.now()): st
     pr: `#${plain(String(e.pr_number))}`,
     author: clip(e.author_login, 20),
     from: clip(e.from_fork ? `fork ${e.head_label}` : `branch ${e.head_label}`, 34),
-    verdict: clip(`${verdictText(e)}${e.draft ? " [draft]" : ""}`, 40),
+    // Wide enough for the longest word a row can carry: an exempt row the naming rule holds, drafted.
+    verdict: clip(`${verdictText(e)}${e.draft ? " [draft]" : ""}`, 72),
     age: ageOf(e.created_at, now),
   }));
   const w = (f: (r: (typeof rows)[number]) => string, min: number) =>
@@ -232,7 +254,7 @@ function declineWords(declines: unknown): string {
 
 /**
  * One window as a sentence, or null when what the server sent for it cannot be read.
- * `5 reviews recorded, 6 model calls; 3 pass, 1 fail, 1 not reviewed (1 contributor paused)`.
+ * `5 reviews recorded, 6 review runs; 3 pass, 1 fail, 1 not reviewed (1 contributor paused)`.
  * A count that cannot be read is a question mark and a missing breakdown is said to be missing,
  * never a zero: the words are the list's own, a word a newer server adds is shown as itself after
  * them, and a real zero is left out.
@@ -240,10 +262,10 @@ function declineWords(declines: unknown): string {
 function volumeWindowText(w: VolumeWindow | null | undefined): string | null {
   if (typeof w !== "object" || w === null) return null;
   const reviews = countOf(w.reviews);
-  const calls = countOf(w.model_calls);
-  if (reviews === null || calls === null) return null;
+  const runs = countOf(w.review_runs);
+  if (reviews === null || runs === null) return null;
   if (reviews === 0) return "no reviews recorded";
-  const head = `${plural(reviews, "review", "reviews")} recorded, ${plural(calls, "model call", "model calls")}`;
+  const head = `${plural(reviews, "review", "reviews")} recorded, ${plural(runs, "review run", "review runs")}`;
   if (typeof w.by_verdict !== "object" || w.by_verdict === null) {
     return `${head}; what they came to could not be read`;
   }
@@ -276,12 +298,55 @@ export function volumeLines(volume: QueueVolume | null | undefined): string[] {
     ["Last 24 hours:", volume.last_24_hours],
     ["Last 7 days:", volume.last_7_days],
   ];
-  return [
+  const lines = [
     chalk.dim("Review volume, for information only (no count limits reviews):"),
     ...windows.map(
       ([label, w]) => `  ${label.padEnd(15)}${plain(volumeWindowText(w) ?? "could not be read")}.`,
     ),
   ];
+  const tokenWindows: Array<[string, VolumeWindow | null | undefined]> = [
+    ["Tokens, 24 hours:", volume.last_24_hours],
+    ["Tokens, 7 days:", volume.last_7_days],
+  ];
+  for (const [label, w] of tokenWindows) {
+    const tokens = tokenText(w);
+    if (tokens !== null) lines.push(`  ${label.padEnd(18)}${plain(tokens)}.`);
+  }
+  return lines;
+}
+
+/** A whole number with thousands separated, the way the list prints counts of tokens. */
+function grouped(n: number): string {
+  return Math.round(n).toLocaleString("en-US");
+}
+
+/**
+ * The tokens of a window as one sentence, with the estimate in dollars. Null when there is nothing
+ * to say: the server sent no token counts (an older server), or no report in the window carries
+ * them (reports from before the screen do not). Says how many reports the sum is over, because a
+ * report from before the screen and a run that ended without a report are not in it.
+ * `410,000 in and 95,000 out over 12 reports (screen 30,000 in, 60,000 out; review 380,000 in,
+ * 35,000 out), about $1.14 at list prices; runs that ended without a report are not counted`.
+ */
+export function tokenText(w: VolumeWindow | null | undefined): string | null {
+  if (typeof w !== "object" || w === null) return null;
+  const t = w.tokens;
+  if (typeof t !== "object" || t === null) return null;
+  const counts = [
+    t.screen_input,
+    t.screen_output,
+    t.review_input,
+    t.review_output,
+    t.reviews_counted,
+  ].map(countOf);
+  if (counts.some((n) => n === null)) return "token counts could not be read";
+  const [si, so, ri, ro, counted] = counts as number[];
+  if (counted === 0) return null;
+  const cost =
+    typeof w.estimated_cost_usd === "number" && Number.isFinite(w.estimated_cost_usd)
+      ? `, about $${w.estimated_cost_usd.toFixed(2)} at list prices`
+      : "";
+  return `${grouped(si + ri)} in and ${grouped(so + ro)} out over ${plural(counted, "report", "reports")} (screen ${grouped(si)} in, ${grouped(so)} out; review ${grouped(ri)} in, ${grouped(ro)} out)${cost}; runs that ended without a report are not counted`;
 }
 
 /**
@@ -322,17 +387,45 @@ export function reportLines(outcome: ReviewOutcome): string[] {
   }
 }
 
-/** `Version:  1.0.0 to 1.1.0   revision advances: yes`, from the review's own evidence and answer. */
+/**
+ * Why a review ended at the facts, in the words of the check's own title: the naming rule found a
+ * problem (`Needs changes: the naming rule`), or it could not check the dataset's name (`Could not
+ * decide: the naming rule was not checked`). Both come from the same answer, `factsStop`, so this
+ * line and the title cannot disagree, whatever the verdict is.
+ */
+function factsReason(e: ReviewEvidence): string {
+  return factsStop(e) === "refused"
+    ? "the naming rule found a problem"
+    : "the naming rule could not check the dataset name";
+}
+
+/**
+ * `Version:  1.0.0 to 1.1.0   revision advances: yes`, from the review's own evidence and answer.
+ * A report that ended before the review read anything says so instead of "unknown": the screen
+ * stopped it, or, at the facts stage, the naming rule ended it and no model was asked, so the
+ * revision was never assessed. A git fact that failed the revision anyway (the version did not go
+ * up) is still said, and the facts stage is said after it.
+ */
 function versionLine(report: Extract<ReviewOutcome, { kind: "reported" }>["report"]): string {
   const { version_before: before, version_after: after } = report.evidence;
   const advances = factsOf(report).criteria.advances_revision;
+  const screened = report.v === 2 && report.stage === "screen";
+  const factsOnly = report.v === 2 && report.stage === "facts";
+  const stage = factsOnly
+    ? chalk.dim(`stage: facts only; the review did not run (${factsReason(report.evidence)})`)
+    : null;
   const word =
     advances === "pass"
       ? chalk.green("revision advances: yes")
       : advances === "fail"
         ? chalk.red("revision advances: NO")
-        : chalk.yellow("revision advances: unknown");
-  return `Version:  ${plain(before ?? "unknown")} to ${plain(after ?? "unknown")}   ${word}`;
+        : screened
+          ? chalk.dim("revision advances: not assessed (stopped by the screen)")
+          : factsOnly
+            ? null
+            : chalk.yellow("revision advances: unknown");
+  const said = [word, stage].filter((w): w is string => w !== null).join("; ");
+  return `Version:  ${plain(before ?? "unknown")} to ${plain(after ?? "unknown")}   ${said}`;
 }
 
 /**
@@ -350,6 +443,8 @@ export function briefLines(outcome: unknown): string[] {
     const lines = [chalk.bold(plain(r.title))];
     if (o.report.summary) lines.push(plain(o.report.summary));
     lines.push(versionLine(o.report));
+    const naming = namingLines(o.report);
+    if (naming.length > 0) lines.push(chalk.bold("Naming rule:"), ...naming.map((l) => `- ${l}`));
     const findings = findingLines(o.report);
     if (findings.length > 0) lines.push(chalk.bold("Findings:"), ...findings.map(terminalize));
     return lines;
@@ -514,6 +609,7 @@ with a comment, c comments).
 
 REVIEW column (the automated review of the pull request's CURRENT commit):
   pass              nothing lost, the revision advances, the dataset is materially better
+                    (a version 2 report also needs a clear title and description)
   fail              the review found a problem; the author needs to change something
   uncertain         the review could not decide whether it is a good change
   not reviewed      no review of this commit is on record: the review is off, the contributor was
@@ -527,7 +623,14 @@ REVIEW column (the automated review of the pull request's CURRENT commit):
   exempt (owner or admin)
                     a NEMAR owner or administrator opened it, so it is not reviewed (its review
                     check is posted as skipped, which this list does not verify); nothing waits
-                    for you, and a push by anyone else IS reviewed
+                    for you, and a push by anyone else IS reviewed. The naming rule still applies:
+                    a title or a new dataset name it refuses fails the check instead, until the
+                    title or the name is fixed or the rule is waived for that commit with
+                    'nemar admin pr-reviews allow <dataset> <pr> --admin --reason <why>'. The row
+                    says so when the check failed ("naming rule failed: needs allow --admin") or
+                    when the name could not be read ("naming rule not checked: start once, else fix
+                    the file": a start asks GitHub again, and a file with no readable Name has to be
+                    fixed and pushed; nothing is waivable until the name is read)
 A verdict is never carried over to a commit it did not read. '*' marks the pull requests you can
 act on now: a pass to approve, or one nobody has decided for you (drafts are never marked).
 
@@ -750,6 +853,11 @@ prReviewsCommand
       console.log(
         chalk.dim(
           "             The review check on an exempt pull request is posted as skipped, which is not a pass; this view does not verify that it was.",
+        ),
+      );
+      console.log(
+        chalk.dim(
+          "             The naming rule still applies: a title or a new dataset name it refuses fails the check instead (waive it for this commit with: nemar admin pr-reviews allow <dataset> <pr> --admin --reason <why>).",
         ),
       );
       if (d.review) {
@@ -981,7 +1089,7 @@ async function assessPullRequest(
   };
 }
 
-/** The review as one coloured cell: its verdict and reason, or "unknown" when it could not be read. */
+/** The review as one colored cell: its verdict and reason, or "unknown" when it could not be read. */
 function reviewCell(a: {
   verdict: QueueVerdict;
   detail: string | null;
@@ -1015,6 +1123,12 @@ const NOT_STARTED: Record<string, string> = {
   duplicate: "this commit already has a review (running or finished)",
   contributor_paused: "the contributor is blocked by an administrator",
   exempt_author: "its author is a NEMAR owner or administrator, so it is not reviewed",
+  exempt_naming_waived:
+    "its author is a NEMAR owner or administrator, and the naming rule was waived for this commit",
+  naming_rule:
+    "its author is a NEMAR owner or administrator, and the naming rule refused its title or its new dataset name, so its check failed",
+  naming_unchecked:
+    "its author is a NEMAR owner or administrator, and its dataset name could not be read to check the naming rule, so its check needs a person",
   draft: "it is a draft",
   not_open: "it is not open any more",
   not_main: "it does not target main",
@@ -1034,18 +1148,35 @@ const START_FAULTS = new Set([
   "misconfigured",
   "unknown_dataset",
   "malformed",
+  // The dataset's name could not be read (GitHub did not answer, or the file has no readable Name),
+  // so the check needs a person until a start reads it or the file is fixed.
+  "naming_unchecked",
 ]);
+
+/**
+ * The sentence for one of the gate's fixed words, or undefined for any other. Only the table's own
+ * keys are words: `NOT_STARTED` is a plain object, so `constructor` or `toString` would otherwise
+ * find an inherited function, and printing it would print that function's source.
+ */
+function gateWord(reason: string): string | undefined {
+  return Object.hasOwn(NOT_STARTED, reason) ? NOT_STARTED[reason] : undefined;
+}
 
 function startedWord(r: StartReviewResponse): string {
   return r.reason === "redispatched" ? "started again" : "started";
 }
 
-function notStartedText(r: StartReviewResponse): string {
-  const why = NOT_STARTED[r.reason] ?? plain(r.reason).replaceAll("_", " ");
+/** Why a start did not start one, as the line `start` prints. Pure, so it is tested without a server. */
+export function notStartedText(r: StartReviewResponse): string {
+  const why = gateWord(r.reason) ?? plain(r.reason).replaceAll("_", " ");
   const hint =
     r.reason === "contributor_paused" && r.author_login
       ? ` (lift it with: nemar admin pr-reviews allow ${plain(r.author_login)})`
-      : "";
+      : r.reason === "naming_rule"
+        ? " (the author fixes the title or the name; to waive the rule for this commit: nemar admin pr-reviews allow <dataset> <pr> --admin --reason <why>)"
+        : r.reason === "naming_unchecked"
+          ? " (GitHub may not have answered, or dataset_description.json has no readable Name: run the same command once more, which reads the name again and posts the check it comes to; if it says the same, fix dataset_description.json and push, because nothing can be waived until the name can be read)"
+          : "";
   return `not started: ${why}${hint}`;
 }
 
@@ -1069,19 +1200,22 @@ pull request that was already open when the review was switched on produced no s
 no review until its author pushes again. This asks for one by name. The API reads the pull request
 from GitHub itself and runs it through the same gate as any other: an administrator's block on the
 contributor still applies, and a pull request opened by a NEMAR owner or administrator is not
-reviewed (its check is posted as skipped and nothing is started). No count of reviews, and no
-record of rejected pull requests, holds a start back. A commit whose review was declined, ended in
-an error or never reported is started again, and so is one handed to GitHub more than 30 minutes
-ago that never came back; one that is running or has a result is not started again. A start that
-restarts a review that already cost a model call costs a second one.
+reviewed and nothing is started. Its check is posted all the same, as the naming rule decides:
+skipped when the rule finds nothing (or an administrator waived it for this commit), failed when it
+refuses the title or the new dataset name, and one that needs a person when the name could not be
+read. No count of reviews, and no record of rejected pull requests, holds a start back. A commit
+whose review was declined, ended in an error or never reported is started again, and so is one
+handed to GitHub more than 40 minutes ago that never came back; one that is running or has a
+result is not started again. A start that restarts a review that already ran costs a second run.
 
   nemar admin pr-reviews start nm000108 12
   nemar admin pr-reviews start --all --dry-run
   nemar admin pr-reviews start --all --yes
 
-Each review is one model call. A blocked contributor is asked about like any other and declined by the
-Worker, which says so; after 'allow', the same command starts it. --all leaves drafts out and asks
-before spending (--yes skips that).
+Each review is one run of up to two model calls: the screen, and then the review unless the screen
+stops it as spam; a run the naming rule ends makes none. A blocked contributor is asked about like
+any other and declined by the Worker, which says so; after 'allow', the same command starts it.
+--all leaves drafts out and asks before spending (--yes skips that).
 `,
   )
   .action(
@@ -1151,6 +1285,15 @@ before spending (--yes skips that).
 type StartResult =
   | (StartReviewResponse & { dataset_id: string; pr_number: number })
   | { dataset_id: string; pr_number: number; error: string };
+
+/**
+ * The question `start --all` asks before it spends: how many pull requests, and what a review of
+ * one costs, which is a run of up to two model calls (a run the screen or the naming rule ends
+ * makes fewer).
+ */
+export function startAllQuestion(count: number): string {
+  return `Start the automated review of ${count} pull request${count === 1 ? "" : "s"}? Each is one run of up to two model calls.`;
+}
 
 /** The `--all` run: list, show, ask, then start one at a time. */
 async function startAll(options: {
@@ -1229,10 +1372,7 @@ async function startAll(options: {
     return;
   }
   if (!json) console.log();
-  const go = await confirm(
-    `Start the automated review of ${todo.length} pull request${todo.length === 1 ? "" : "s"}? Each is one model call.`,
-    { yes: options.yes },
-  );
+  const go = await confirm(startAllQuestion(todo.length), { yes: options.yes });
   if (go !== "confirmed") {
     // Not on stdout under --json, which is read as one document.
     (json ? console.error : console.log)("Cancelled.");
@@ -1979,27 +2119,234 @@ function manualFallback(dataset: string, pr: number, url: string): void {
 
 // -- allow / block / clear / standing -----------------------------------------------------------
 
-function overrideCommand(mode: "allow" | "block"): void {
-  prReviewsCommand
-    .command(`${mode} <login>`)
-    .description(
+/** Set a contributor's allow or block, and say what it means. */
+async function setContributor(
+  mode: "allow" | "block",
+  loginArg: string,
+  options: { reason?: string; json?: boolean },
+): Promise<void> {
+  const login = checkLogin(loginArg, options.json);
+  const spinner = options.json ? null : ora(`Setting ${mode} for ${login}...`).start();
+  try {
+    const r = await setPrReviewAuthor(login, mode, options.reason);
+    spinner?.stop();
+    if (options.json) {
+      console.log(JSON.stringify(r, null, 2));
+      return;
+    }
+    console.log(
       mode === "allow"
-        ? "Lift a block: review this contributor's pull requests again (nothing else pauses anyone)"
-        : "Never review this contributor's pull requests automatically; each needs a person",
-    )
-    .option("--reason <text>", "Why, in plain words (up to 200 characters; kept with the decision)")
-    .option("--json", "Output the raw JSON")
-    .addHelpText(
-      "after",
-      `
-A NEMAR owner or administrator is exempt from the review whatever is decided here: their pull
-requests are not reviewed, so a block does not hold them back and an allow changes nothing. (A
-commit a review is already on record for is handled as before, a block included.)
+        ? chalk.green(
+            `Allowed ${plain(r.standing.login)}: their pull requests are reviewed automatically.`,
+          )
+        : chalk.red(
+            `Blocked ${plain(r.standing.login)}: none of their pull requests is reviewed automatically; each needs a person.`,
+          ),
+    );
+    if (r.previous && r.previous !== mode)
+      console.log(chalk.dim(`  (it was ${r.previous} before)`));
+    if (mode === "allow") {
+      console.log(
+        chalk.dim("  Pull requests already opened are not re-reviewed until their next push."),
+      );
+    }
+    console.log();
+    for (const l of standingLines(r.standing)) console.log(l);
+    envNote(r.environment);
+  } catch (err) {
+    failApi(err, spinner, `Could not ${mode} ${login}`, options.json);
+  }
+}
+
+/** What the naming rule found on a commit, in the words the check uses, for the terminal. */
+export function namingFactLines(facts: NamingFacts | null): string[] {
+  if (facts === null) return [];
+  const out: string[] = [];
+  if (facts.title === "author_year" || facts.title === "doi") {
+    out.push("the title has a citation (an author and a year, or a DOI)");
+  }
+  if (facts.title === "template_field") out.push("the title has an unfilled template field");
+  if (facts.name === "author_year" || facts.name === "doi") {
+    out.push(
+      "the pull request changes the dataset name to one that has a citation (an author and a year, or a DOI)",
+    );
+  }
+  if (facts.name === "template_field") {
+    out.push("the pull request changes the dataset name to one with an unfilled template field");
+  }
+  if (facts.name === "unchecked") out.push("the dataset name could not be read to be checked");
+  return out;
+}
+
+/**
+ * What a waiver came to, in plain sentences. Pure, so it is tested without a server. Nothing in it
+ * is trusted to be plain: the dataset, the commit and the word the server sent are cleaned here, and
+ * a word longer than a word has any reason to be is cut.
+ */
+export function waiverLines(r: WaiveNamingResponse, dataset: string, pr: number): string[] {
+  const at = r.head_sha ? ` at ${short(r.head_sha)}` : "";
+  const label = `${plain(dataset)} #${pr}${at}`;
+  switch (r.reason) {
+    case "waived": {
+      const found = namingFactLines(r.facts);
+      return [
+        chalk.green(`Waived the naming rule for ${label}.`),
+        ...(found.length > 0 ? [`  The rule found: ${found.join("; ")}.`] : []),
+        chalk.dim(
+          "  Its check is posted as skipped (not required) and says the rule was waived. The waiver is recorded with your reason, and it is for this commit only: a new commit is checked again.",
+        ),
+      ];
+    }
+    case "already_waived":
+      return [
+        chalk.green(`The naming rule was already waived for ${label}.`),
+        chalk.dim("  Its skipped check was posted again. Nothing new was recorded."),
+      ];
+    case "nothing_to_waive":
+      return [
+        chalk.green(
+          `Nothing to waive: the title and the dataset name of ${label} pass the naming rule.`,
+        ),
+        chalk.dim("  Its check was posted as skipped (not required). Nothing was recorded."),
+      ];
+    case "not_exempt":
+      return [
+        chalk.yellow(`Not waived: the author of ${label} is not a NEMAR owner or administrator.`),
+        chalk.dim(
+          "  The override replaces only the exemption of owners and administrators. Anyone else's pull request is reviewed, and the naming rule is part of that review: its author fixes the title or the name, or an owner or administrator merges it in the GitHub UI.",
+        ),
+      ];
+    case "reviewed":
+      return [
+        chalk.yellow(
+          `Not waived: ${label} was reviewed (someone who is not exempt pushed it), and that review stands.`,
+        ),
+      ];
+    case "naming_unchecked":
+      return [
+        chalk.yellow(
+          `Not waived: the dataset name of ${label} could not be read, so there is nothing definite to waive.`,
+        ),
+        chalk.dim(
+          "  A waiver covers only what the naming rule found. GitHub may not have answered, or dataset_description.json has no readable Name. Run the same command once more; if it says the same, fix dataset_description.json and push, and the new commit is checked.",
+        ),
+      ];
+    default: {
+      const why = gateWord(r.reason) ?? clip(plain(r.reason).replaceAll("_", " "), 80);
+      return [chalk.yellow(`Not waived: ${why}.`)];
+    }
+  }
+}
+
+/** The first seven to forty characters of a commit id, the way `git log --oneline` shortens one. */
+const COMMIT_PREFIX_RE = /^[0-9a-fA-F]{7,40}$/;
+
+/** The most of the Worker's `head_moved` sentence that is printed; its own is about 130 characters. */
+const HEAD_MOVED_MAX = 300;
+
+/** Waive the naming rule for a pull request's current commit, and say what came of it. */
+async function waiveNaming(
+  datasetArg: string,
+  prArg: string,
+  reason: string,
+  options: { commit?: string; json?: boolean },
+): Promise<void> {
+  const dataset = checkDataset(datasetArg, options.json);
+  const pr = checkPr(prArg, options.json);
+  if (options.commit !== undefined && !COMMIT_PREFIX_RE.test(options.commit)) {
+    die(
+      `"${plain(options.commit)}" is not a commit id: give its first 7 to 40 characters (hexadecimal).`,
+      'nemar admin pr-reviews allow nm000108 12 --admin --commit 1a2b3c4 --reason "Name kept until the rename release"',
+      options.json,
+    );
+  }
+  const spinner = options.json
+    ? null
+    : ora(`Waiving the naming rule for ${dataset} #${pr}...`).start();
+  let r: WaiveNamingResponse;
+  try {
+    r = await waivePrReviewNaming(dataset, pr, reason, options.commit);
+    spinner?.stop();
+  } catch (err) {
+    if (err instanceof ApiError && errorWord(err) === "no_such_pull_request") {
+      spinner?.fail(`${dataset} #${pr}: GitHub has no such pull request.`);
+      if (!spinner) say(options.json)(chalk.red("GitHub has no such pull request."));
+      markReportedExit();
+      process.exit(1);
+    }
+    if (err instanceof ApiError && errorWord(err) === "head_moved") {
+      // An answer about the pull request, not a fault: the commit named is no longer its head. The
+      // Worker's sentence is short; a longer one is some other server's, and is cut like any word.
+      const said = clip(err.message, HEAD_MOVED_MAX);
+      spinner?.fail(said);
+      if (!spinner) say(options.json)(chalk.red(said));
+      markReportedExit();
+      process.exit(1);
+    }
+    failApi(err, spinner, "Could not waive the naming rule", options.json);
+  }
+  if (options.json) {
+    console.log(JSON.stringify(r, null, 2));
+  } else {
+    for (const l of waiverLines(r, dataset, pr)) console.log(l);
+    envNote(r.environment);
+  }
+  // Not waived is an answer about the pull request, not a fault, but a script must be able to tell.
+  if (!r.waived && r.reason !== "nothing_to_waive") process.exit(1);
+}
+
+prReviewsCommand
+  .command("allow <subject> [pr]")
+  .description(
+    "Lift a block on a contributor (allow <login>), or, with --admin, waive the naming rule for an owner's or administrator's pull request (allow <dataset> <pr> --admin --reason <why>)",
+  )
+  .option(
+    "--admin",
+    "Waive the naming rule for <dataset> <pr> at its current commit: an explicit override, recorded with your reason",
+  )
+  .option(
+    "--reason <text>",
+    "Why, in plain words (up to 200 characters; kept with the decision). Required with --admin",
+  )
+  .option(
+    "--commit <sha>",
+    "With --admin: the commit you looked at (its first 7 to 40 characters); a pull request that has moved on is not waived",
+  )
+  .option("--json", "Output the raw JSON")
+  .addHelpText(
+    "after",
+    `
+allow <login>
+  Lift a block: review this contributor's pull requests again (nothing else pauses anyone). A NEMAR
+  owner or administrator is exempt from the review whatever is decided here: their pull requests are
+  not reviewed, so a block does not hold them back and an allow changes nothing. (A commit a review
+  is already on record for is handled as before, a block included.)
+
+allow <dataset> <pr> --admin
+  Owners and administrators are exempt from the review, not from the naming rule: a pull request
+  title that has a citation (an author and a year, as in Lee2019 EEG dataset, or a DOI) anywhere in
+  it or holds an unfilled template field, and a change of the dataset's name to such a name, fail
+  their check like anyone's. This is the one way past it without a change: it waives the rule for
+  the pull request's CURRENT commit, records the waiver (who, the commit, what the rule found, and
+  your --reason, which is required), and posts the check as skipped with a line saying the rule was
+  waived. A new commit is checked again. It is refused for a pull request whose author is not an
+  owner or administrator (their review includes the rule) and for a commit that was reviewed.
+
+  Name the commit you looked at with --commit <sha> (its first 7 to 40 characters, as git log
+  --oneline shows them). If the pull request has been pushed to since, nothing is waived or posted
+  and the command says so. Without it, whatever the pull request's current commit is gets waived,
+  and the answer says which one.
+
+  nemar admin pr-reviews allow nm000108 12 --admin --commit 1a2b3c4 --reason "Name kept until the rename release"
 `,
-    )
-    .action(async (loginArg: string, options: { reason?: string; json?: boolean }) => {
+  )
+  .action(
+    async (
+      subject: string,
+      prArg: string | undefined,
+      options: { admin?: boolean; reason?: string; commit?: string; json?: boolean },
+    ) => {
       if (!requireAuth(options.json)) process.exit(1);
-      const login = checkLogin(loginArg, options.json);
       if (options.reason && options.reason.length > MAX_REASON) {
         die(
           `The reason is ${options.reason.length} characters; ${MAX_REASON} is the most that is kept.`,
@@ -2007,41 +2354,67 @@ commit a review is already on record for is handled as before, a block included.
           options.json,
         );
       }
-      const spinner = options.json ? null : ora(`Setting ${mode} for ${login}...`).start();
-      try {
-        const r = await setPrReviewAuthor(login, mode, options.reason);
-        spinner?.stop();
-        if (options.json) {
-          console.log(JSON.stringify(r, null, 2));
-          return;
-        }
-        console.log(
-          mode === "allow"
-            ? chalk.green(
-                `Allowed ${plain(r.standing.login)}: their pull requests are reviewed automatically.`,
-              )
-            : chalk.red(
-                `Blocked ${plain(r.standing.login)}: none of their pull requests is reviewed automatically; each needs a person.`,
-              ),
+      if (options.commit !== undefined && !options.admin) {
+        die(
+          "--commit goes with --admin: it names the commit of a pull request whose naming rule is waived.",
+          'nemar admin pr-reviews allow nm000108 12 --admin --commit 1a2b3c4 --reason "Name kept until the rename release"',
+          options.json,
         );
-        if (r.previous && r.previous !== mode)
-          console.log(chalk.dim(`  (it was ${r.previous} before)`));
-        if (mode === "allow") {
-          console.log(
-            chalk.dim("  Pull requests already opened are not re-reviewed until their next push."),
+      }
+      if (options.admin) {
+        if (prArg === undefined) {
+          die(
+            "--admin waives the naming rule for one pull request: give a dataset and a pull request number.",
+            'nemar admin pr-reviews allow nm000108 12 --admin --reason "Name kept until the rename release"',
+            options.json,
           );
         }
-        console.log();
-        for (const l of standingLines(r.standing)) console.log(l);
-        envNote(r.environment);
-      } catch (err) {
-        failApi(err, spinner, `Could not ${mode} ${login}`, options.json);
+        const reason = options.reason?.trim() ?? "";
+        if (reason === "") {
+          die(
+            "--admin needs --reason: say, in plain words, why the naming rule is waived. It is recorded with the waiver.",
+            'nemar admin pr-reviews allow nm000108 12 --admin --reason "Name kept until the rename release"',
+            options.json,
+          );
+        }
+        await waiveNaming(subject, prArg, reason, options);
+        return;
       }
-    });
-}
+      if (prArg !== undefined) {
+        die(
+          "A contributor is named by a login alone. To waive the naming rule for a pull request, add --admin.",
+          'nemar admin pr-reviews allow nm000108 12 --admin --reason "Name kept until the rename release"',
+          options.json,
+        );
+      }
+      await setContributor("allow", subject, options);
+    },
+  );
 
-overrideCommand("allow");
-overrideCommand("block");
+prReviewsCommand
+  .command("block <login>")
+  .description("Never review this contributor's pull requests automatically; each needs a person")
+  .option("--reason <text>", "Why, in plain words (up to 200 characters; kept with the decision)")
+  .option("--json", "Output the raw JSON")
+  .addHelpText(
+    "after",
+    `
+A NEMAR owner or administrator is exempt from the review whatever is decided here: their pull
+requests are not reviewed, so a block does not hold them back and an allow changes nothing. (A
+commit a review is already on record for is handled as before, a block included.)
+`,
+  )
+  .action(async (loginArg: string, options: { reason?: string; json?: boolean }) => {
+    if (!requireAuth(options.json)) process.exit(1);
+    if (options.reason && options.reason.length > MAX_REASON) {
+      die(
+        `The reason is ${options.reason.length} characters; ${MAX_REASON} is the most that is kept.`,
+        undefined,
+        options.json,
+      );
+    }
+    await setContributor("block", loginArg, options);
+  });
 
 prReviewsCommand
   .command("clear <login>")

@@ -26,6 +26,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "bun";
+import { PR_REVIEW_DEADLINE_MINUTES } from "../backend/src/services/pr-review";
 import { hashApiKey } from "../backend/src/services/token";
 import type { Bindings } from "../backend/src/types/bindings";
 import { freshDb, realD1 } from "../backend/test/helpers/d1";
@@ -237,6 +238,83 @@ describe("nemar admin pr-reviews start <dataset> <pr>", () => {
     const checks = gh.seen.filter((s) => s.method === "POST" && s.path.endsWith("/check-runs"));
     expect(checks).toHaveLength(1);
     expect(checks[0].body).toMatchObject({ status: "completed", conclusion: "skipped" });
+  });
+
+  test("an administrator's pull request whose title breaks the naming rule is not started, and its check fails", async () => {
+    openPr({ ds: "nm000201", n: 12, author: "startadmin-gh", authorId: 4001 });
+    const pull = gh.pulls["nm000201#12"];
+    if (!pull) throw new Error("no pull request");
+    pull.title = "Lee2019 EEG rename";
+
+    const r = await cli([...START, "nm000201", "12"]);
+
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain(
+      "not started: its author is a NEMAR owner or administrator, and the naming rule refused its title or its new dataset name, so its check failed",
+    );
+    expect(dispatches()).toHaveLength(0);
+    const checks = gh.seen.filter((s) => s.method === "POST" && s.path.endsWith("/check-runs"));
+    expect(checks).toHaveLength(1);
+    expect(checks[0].body).toMatchObject({ status: "completed", conclusion: "failure" });
+  });
+
+  test("an administrator's pull request whose dataset name GitHub would not show is a fault: exit 1, and how to retry", async () => {
+    openPr({ ds: "nm000201", n: 12, author: "startadmin-gh", authorId: 4001 });
+    gh.naming.nm000201 = {
+      files: ["dataset_description.json"],
+      names: { [SHA_A]: 502 },
+    };
+
+    const r = await cli([...START, "nm000201", "12"]);
+
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toContain(
+      "not started: its author is a NEMAR owner or administrator, and its dataset name could not be read to check the naming rule, so its check needs a person",
+    );
+    // Either GitHub did not answer or the file is unreadable: one more try, then the file, and
+    // never a bare "again in a moment", which a file that cannot be read answers the same way.
+    expect(r.stdout).toContain(
+      "GitHub may not have answered, or dataset_description.json has no readable Name",
+    );
+    expect(r.stdout).toContain("run the same command once more");
+    expect(r.stdout).toContain("fix dataset_description.json and push");
+    expect(r.stdout).not.toContain("in a moment");
+    expect(r.stdout).not.toContain("naming_unchecked");
+    const checks = gh.seen.filter((s) => s.method === "POST" && s.path.endsWith("/check-runs"));
+    expect(checks[0]?.body).toMatchObject({ conclusion: "action_required" });
+  });
+
+  test("an administrator's pull request whose naming problem was waived for this commit says so, exit 0", async () => {
+    openPr({ ds: "nm000201", n: 12, author: "startadmin-gh", authorId: 4001 });
+    const pull = gh.pulls["nm000201#12"];
+    if (!pull) throw new Error("no pull request");
+    pull.title = "Lee2019 EEG rename";
+    db.run(
+      `INSERT INTO audit_log (user_id, action, resource_type, resource_id, details)
+       VALUES (1, 'pr_review_naming_waived', 'pr_review', 'nm000201#12', ?)`,
+      [JSON.stringify({ head_sha: SHA_A, title: "author_year", name: null })],
+    );
+
+    const r = await cli([...START, "nm000201", "12"]);
+
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain(
+      "not started: its author is a NEMAR owner or administrator, and the naming rule was waived for this commit",
+    );
+    expect(dispatches()).toHaveLength(0);
+  });
+
+  test("the help says when a review that never came back may be started again, in the Worker's minutes", async () => {
+    const r = await cli([...START, "--help-all"]);
+    expect(r.exitCode).toBe(0);
+    const help = r.stdout.replace(/\s+/g, " ");
+    expect(help).toContain(
+      `more than ${PR_REVIEW_DEADLINE_MINUTES} minutes ago that never came back`,
+    );
+    expect(help).toContain("up to two model calls");
+    expect(help).not.toContain("one or two model calls");
+    // A run the naming rule ends asked no model, so it is not a call either.
+    expect(help).toContain("a run the naming rule ends makes none");
   });
 
   test("a pull request GitHub does not have is an error with a word", async () => {
