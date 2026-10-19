@@ -226,7 +226,28 @@ invocation_logs = true
 ENVIRONMENT = "production"
 # Dataset pull-request review (ADR 0092). On in production from 2026-10-13. It lives in this
 # file because `wrangler deploy` drops dashboard-only variables (see [env.dev.vars]).
+# Not a casual switch: once any repository carries the review ruleset (ADR 0107), an unset or 0
+# value leaves every pull request on that repository waiting for a check that nothing posts, and
+# the merges stop. So the rulesets come off before the review does, in this order, and a removal
+# is allowed whatever the switches say. (a) While PR_REVIEW_AUTO_REQUIRE is still on, run `nemar
+# admin fleet require-review --all --remove --apply` and repeat it with `--after` set to the last
+# id of each page: it does ONE page (25 datasets by default, 50 at most) and prints `Next page:`
+# instead of looping, so go on until the output has no `Next page:` line. (b) Dry run the same
+# pages and expect no row that would remove. (c) Turn PR_REVIEW_AUTO_REQUIRE off through a
+# release, because the next deploy drops what was changed only in the dashboard (a switch that was
+# set as a Worker secret is deleted as one instead). (d) Repeat (a) and (b) once more, for the
+# datasets that changed in between. Only then switch the review off.
 PR_REVIEW_ENABLED = "1"
+# PR_REVIEW_AUTO_REQUIRE is deliberately not set in this file. Unset, publishing, a visibility
+# change and the enforce routes put the review ruleset on no repository (they still take it off a
+# repository whose dataset is not reviewed). The owner adds it here, in a reviewed change, when the
+# fleet step of the rollout starts, after the canary and the calibration gate (ADR 0107); it is
+# never added before. The value must be the quoted string "1": a bare 1 is a number, which the
+# Worker does not read as on, so the switch would stay off without any error.
+# This file cannot say whether the switch is on in production. A Worker secret of the same name
+# would turn it on, survives every deploy, and does not show here, so the test of this file covers
+# only the file. What the Worker holds is the `auto_require` field in the answer of `nemar admin
+# fleet require-review <dataset-id> --json`, which is a dry run.
 # Claude Platform on AWS (Anthropic-operated Messages API, AWS Marketplace
 # billing; NOT Bedrock). Used by LLM enrichment. The paired ANTHROPIC_API_KEY
 # is a worker secret; both of these are required alongside it — requests
@@ -555,7 +576,10 @@ MANIFEST_VIA_CENTRAL_WORKFLOW = "false"
 AUTO_IMPORT_ENABLED = "false"
 AUTO_IMPORT_MIN_INTERVAL_MIN = "25"
 # Automated publication pre-screen (#666). Enabled on SCCN dev, as a var here: a publish
-# request that passes BIDS readiness dispatches run-prescreen on nemarDatasets/.github.
+# request that passes BIDS readiness dispatches run-prescreen on nemarDatasets/.github, except
+# for a dataset the publication review covers while PUBLICATION_REVIEW_ENABLED is on (below). The
+# review is on in [env.dev.vars], so here run-prescreen is dispatched only for what the review
+# does not cover: an exemplar, an OpenNeuro mirror, or a dataset the other Worker owns.
 # Requires the PRESCREEN_CALLBACK_SECRET Worker secret (set on dev and on production).
 # Production is NOT dark. It is enabled there by a Worker secret named PRESCREEN_ENABLED
 # (name checked 2026-10-12), which this file does not record: the top-level [vars] sets
@@ -572,7 +596,29 @@ PRESCREEN_ENABLED = "true"
 # The variable lives in this file and not in the dashboard because `wrangler deploy` replaces
 # the Worker's variables with the ones in this file (no keep_vars), so a dashboard-only value
 # is dropped by the next deploy.
+# Not a casual switch here either: once a dev-owned repository carries the review ruleset, an
+# unset or 0 value leaves its pull requests waiting for a check nothing posts. Take the ruleset
+# off first, in the order the note on [vars] gives.
 PR_REVIEW_ENABLED = "1"
+# PR_REVIEW_AUTO_REQUIRE is not set here either, and the same caveat holds: a Worker secret of
+# that name would turn it on in this environment without showing in this file. See the note on
+# [vars]; the owner turns it on in a reviewed change, and the value must be the quoted string "1".
+# Publication review (ADR 0102). On here for the soak: a stored identifier-screen result whose
+# gate is clear or needs an acknowledgment starts a model review of the screened commit, for the
+# datasets this Worker owns. Production is dark by this file: the variable is not in [vars], and
+# it must never be added there by a change that is not reviewed for it. What turning production
+# on takes is ADR 0102's "Before it is switched on": Phases 2, 3 and 4 shipped, the soak done, and
+# then adding PUBLICATION_REVIEW_ENABLED = "1" to [vars]. Phase 3 fixed the approval attribution
+# (#1604, ADR 0105) in code: a web run proves it belongs to its click with a dispatch token, and
+# a terminal approval is recorded as its own caller. What production still must not be lit
+# without is item 7's verification: the executor's workflow sends that token, and the staging
+# audit query shows web approvals attributed to the administrators who clicked. The flag
+# switches the review and its gate, the hold on a request's admin mail until its review has
+# reported and the review's section in that mail, and
+# the hand-over from the pre-screen of ADR 0014 (a request the review covers is not
+# pre-screened); the mechanical refusals do not depend on it. It lives in this file and not in
+# the dashboard for the reason PR_REVIEW_ENABLED gives above.
+PUBLICATION_REVIEW_ENABLED = "1"
 
 # Daily maintenance cron for dev/staging (epic #923 Phase 7). Offset an hour
 # from prod's "0 3" so the two environments never contend. "0 4 * * *" does not

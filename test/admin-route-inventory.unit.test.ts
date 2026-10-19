@@ -18,12 +18,12 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { adminMiddleware, authMiddleware } from "../backend/src/middleware/auth";
+import { adminMiddleware, authMiddleware, cookieOriginGuard } from "../backend/src/middleware/auth";
 import { adminRoutes } from "../backend/src/routes/admin";
 
 const EXPECTED_ENTRIES: Record<string, number> = {
-  // Router-level middleware (authMiddleware + adminMiddleware).
-  "ALL /*": 2,
+  // Router-level middleware (authMiddleware + adminMiddleware + cookieOriginGuard, #1603/#1584).
+  "ALL /*": 3,
 
   // Users / accounts
   "GET /users": 1,
@@ -84,6 +84,10 @@ const EXPECTED_ENTRIES: Record<string, number> = {
   "POST /datasets/:id/enforce": 2,
   "POST /datasets/:id/revalidate": 1,
   "POST /datasets/enforce/bulk": 2,
+  // ADR 0107: the required pull-request review's ruleset. Both are zValidator + handler on a
+  // strict body, and the bulk one checks for the owner inside the handler.
+  "POST /datasets/:id/review-ruleset": 2,
+  "POST /datasets/review-ruleset/bulk": 2,
   "GET /datasets/:id/ci": 1,
   "POST /datasets/:id/ci": 1,
   "POST /datasets/:id/ci/validate": 1,
@@ -91,6 +95,13 @@ const EXPECTED_ENTRIES: Record<string, number> = {
 
   // Publication workflow
   "GET /publish/requests": 1,
+  // ADR 0102: the review of the active request, with its history.
+  "GET /publish/:id/review": 1,
+  // ADR 0102: start (or start again) the review of the screened commit; one route, no `--all`.
+  "POST /publish/:id/review/start": 1,
+  // ADR 0102: mail the depositor an administrator's typed message and leave the request open; the
+  // body is parsed by hand, so there is one handler and no validator.
+  "POST /publish/:id/comment": 1,
   "POST /publish/:id/deny": 2,
   "POST /publish/:id/approve": 2,
   // ADR 0080: launch an approval from the web by dispatching it to an executor.
@@ -183,6 +194,8 @@ const EXPECTED_ENTRIES: Record<string, number> = {
   "GET /pr-reviews": 1,
   "GET /pr-reviews/:dataset/:pr": 1,
   "POST /pr-reviews/:dataset/:pr/start": 1,
+  // The naming rule's one override (ADR 0107): zValidator + handler (a strict body).
+  "POST /pr-reviews/:dataset/:pr/allow": 2,
   "GET /pr-review-authors/:login": 1,
   "PUT /pr-review-authors/:login": 2,
   "DELETE /pr-review-authors/:login": 1,
@@ -218,14 +231,20 @@ describe("admin route inventory", () => {
   });
 
   test("entry total is pinned", () => {
-    expect(adminRoutes.routes.length).toBe(144);
+    expect(adminRoutes.routes.length).toBe(154);
   });
 
-  // The count pin above can't see a SWAP of the two router-level middleware
-  // entries. Order is load-bearing: authMiddleware resolves the user that
-  // adminMiddleware's role check reads.
-  test("router-level middleware order is pinned (auth before admin)", () => {
+  // The count pin above can't see a SWAP of the router-level middleware
+  // entries. Order is load-bearing: authMiddleware resolves the user and the
+  // `authMethod` that adminMiddleware's role check and cookieOriginGuard read,
+  // and the guard answers after the role check so a member hears "Admin
+  // access required" and is not asked about an Origin.
+  test("router-level middleware order is pinned (auth, admin, then the cookie Origin guard)", () => {
     const star = adminRoutes.routes.filter((r) => r.method === "ALL" && r.path === "/*");
-    expect(star.map((r) => r.handler)).toEqual([authMiddleware, adminMiddleware]);
+    expect(star.map((r) => r.handler)).toEqual([
+      authMiddleware,
+      adminMiddleware,
+      cookieOriginGuard,
+    ]);
   });
 });

@@ -563,8 +563,12 @@ export class DispatchRejectedError extends Error {
  * drives the same caller-side loop (S3 Object Lock batches, retries,
  * `--resume`) a terminal does, which is why the approval does not run inside
  * the Worker: that loop is long and its cost belongs on the runner. The payload
- * names the dataset, the request it was claimed for, whether to resume, and the
- * environment. It carries no credential and no URL.
+ * names the dataset, the request it was claimed for, whether to resume, the
+ * environment, and the claim's dispatch token (#1604; ADR 0105, decision 3): the proof the
+ * runner's `/approve` calls present so the click is recorded as the approver.
+ * It carries no GitHub credential, no Worker secret and no URL; the token is a
+ * MAC over the claim's own columns, authorizes nothing by itself, and is never
+ * logged (the error text below has any copy of it removed).
  *
  * Failure has two meanings, and the difference matters to the caller:
  *   - {@link DispatchRejectedError} with `definitelyNotSent` (a 4xx): GitHub
@@ -573,9 +577,9 @@ export class DispatchRejectedError extends Error {
  *     `TimeoutError` after `timeoutMs`, or a {@link DispatchRejectedError} for a
  *     5xx): UNKNOWN. GitHub may have accepted the dispatch and lost only the
  *     reply, so a caller must not assume nothing started.
- * The error text names GitHub's status and body, never the token. `pat` must
- * carry write access on the central repo's dispatch endpoint -- use
- * `getDatasetsToken()`.
+ * The error text names GitHub's status and body, never the GitHub credential
+ * or the dispatch token. `pat` must carry write access on the central repo's
+ * dispatch endpoint -- use `getDatasetsToken()`.
  */
 export async function triggerApprovePublication(
   datasetId: string,
@@ -583,6 +587,7 @@ export async function triggerApprovePublication(
   resume: boolean,
   environment: ApprovalDispatchEnvironment,
   pat: string,
+  dispatchToken: string,
   timeoutMs: number = APPROVE_DISPATCH_TIMEOUT_MS,
 ): Promise<void> {
   const response = await fetch(`${GITHUB_API()}/repos/${CENTRAL_WORKFLOW_REPO}/dispatches`, {
@@ -600,13 +605,20 @@ export async function triggerApprovePublication(
         request_id: requestId,
         resume,
         environment,
+        dispatch_token: dispatchToken,
       },
     }),
     signal: AbortSignal.timeout(timeoutMs),
   });
 
   if (!response.ok) {
-    throw new DispatchRejectedError(response.status, await response.text());
+    // GitHub's body is part of the error the caller logs, and a 4xx can quote what it refused.
+    // The token is a secret in the log of a Worker, so no copy of it leaves with the error.
+    const detail = await response.text();
+    throw new DispatchRejectedError(
+      response.status,
+      dispatchToken ? detail.split(dispatchToken).join("[redacted]") : detail,
+    );
   }
 }
 
@@ -658,5 +670,61 @@ export async function triggerPrReviewRun(
   });
   if (!response.ok) {
     throw new Error(`PR review dispatch rejected: HTTP ${response.status}`);
+  }
+}
+
+/**
+ * The fields the central publication review workflow needs (ADR 0102), and nothing it could use to
+ * choose a target. The workflow reads the dataset's root documents from GitHub itself, at the
+ * commit named here: it is given the review's coordinates, never the dataset's text, and it maps
+ * `environment` to an API origin from a fixed table of its own, so a payload can never steer the
+ * callback to a host it chose. `anonymous` is the release kind the review was started for; the
+ * report echoes it and the Worker refuses a report whose echo differs from the row.
+ */
+export interface PublicationReviewDispatch {
+  datasetId: string;
+  requestId: number;
+  reviewId: number;
+  headSha: string;
+  anonymous: boolean;
+  callbackToken: string;
+  environment: ApprovalDispatchEnvironment;
+}
+
+/**
+ * Trigger the publication review via `repository_dispatch[run-publication-review]` on
+ * `nemarDatasets/.github` (ADR 0102). Throws with the status only: GitHub's body is not ours to
+ * forward, and the caller logs this message. This is the only call the Worker makes to GitHub for
+ * a review; nothing is written to a dataset repository.
+ */
+export async function triggerPublicationReviewRun(
+  d: PublicationReviewDispatch,
+  pat: string,
+  timeoutMs?: number,
+): Promise<void> {
+  const response = await fetch(`${GITHUB_API()}/repos/${CENTRAL_WORKFLOW_REPO}/dispatches`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${pat}`,
+      Accept: "application/vnd.github.v3+json",
+      "User-Agent": "NEMAR-API",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      event_type: "run-publication-review",
+      client_payload: {
+        dataset_id: d.datasetId,
+        request_id: d.requestId,
+        review_id: d.reviewId,
+        head_sha: d.headSha,
+        anonymous: d.anonymous,
+        callback_token: d.callbackToken,
+        environment: d.environment,
+      },
+    }),
+    ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
+  });
+  if (!response.ok) {
+    throw new Error(`Publication review dispatch rejected: HTTP ${response.status}`);
   }
 }

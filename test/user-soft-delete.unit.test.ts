@@ -1,83 +1,24 @@
 /**
  * Real behavioral test for the user tombstone (soft delete), epic #695.
  *
- * Like catalog-fold-migration.test.ts, this applies the ACTUAL migration file
- * (0037) against an in-memory SQLite seeded to mirror the post-0026 users shape,
- * then runs the SHARED masking statement the endpoint uses (USER_TOMBSTONE_MASK_SQL
- * from backend/src/db/user-tombstone.ts — no drift) plus the cascade statements,
- * and asserts the load-bearing security properties:
+ * Runs against the FULL migrated schema (`freshDb()`, every migration applied in order, so the
+ * test sees the columns and tables production has) and drives the SHARED cascade the endpoint and
+ * the scheduled sweep both call (`tombstoneUserCascade` from backend/src/db/user-tombstone.ts), so
+ * a statement added to it is exercised here without anyone remembering to copy it. It asserts the
+ * load-bearing security properties:
  *   - PII is masked + credentials revoked
  *   - the original email/username/github are freed for re-signup (UNIQUE-safe)
  *   - the auth chokepoint predicates (`u.deleted_at IS NULL`) exclude the row
  */
 
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { beforeEach, describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
-import { USER_TOMBSTONE_MASK_SQL, maskedDeletedEmail } from "../backend/src/db/user-tombstone";
-
-const MIGRATIONS_DIR = join(import.meta.dir, "..", "backend/src/db/migrations");
-const M0037 = readFileSync(join(MIGRATIONS_DIR, "0037_user_soft_delete.sql"), "utf8");
-
-// Post-0026 schema slice the tombstone + auth queries touch (users without the
-// 0037 column, plus tokens + web_sessions for the cascade/auth assertions).
-const BASE_SCHEMA = `
-CREATE TABLE users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  username TEXT UNIQUE,
-  email TEXT NOT NULL UNIQUE,
-  password_hash TEXT,
-  github_username TEXT,
-  status TEXT NOT NULL DEFAULT 'pending'
-    CHECK (status IN ('pending','verified','approved','revoked')),
-  email_verified INTEGER NOT NULL DEFAULT 0,
-  verification_token TEXT,
-  verification_expires_at TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-  approved_at TEXT,
-  revoked_at TEXT,
-  aws_access_key_id_encrypted TEXT,
-  aws_secret_access_key_encrypted TEXT,
-  aws_iam_username TEXT,
-  orcid TEXT,
-  orcid_verified INTEGER NOT NULL DEFAULT 0,
-  role TEXT DEFAULT 'member',
-  email_preferences TEXT DEFAULT NULL,
-  description TEXT,
-  signup_source TEXT NOT NULL DEFAULT 'cli',
-  -- Later than 0026, and spelled out here rather than applied as migrations
-  -- because 0062 also references columns this slice does not carry
-  -- (sandbox_completed). The mask clears all four (ADR 0040/0042), so the
-  -- slice has to have them or the statement would fail on an unknown column.
-  service_access INTEGER NOT NULL DEFAULT 0,        -- migration 0062
-  service_access_granted_at TEXT,                   -- migration 0062
-  service_access_granted_by INTEGER,                -- migration 0062
-  upload_access_requested_at TEXT                   -- migration 0076
-);
-CREATE TABLE tokens (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL,
-  api_key_hash TEXT NOT NULL,
-  revoked_at TEXT,
-  expires_at TEXT
-);
-CREATE TABLE web_sessions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL,
-  cookie_id_hash TEXT NOT NULL,
-  revoked_at TEXT,
-  expires_at TEXT NOT NULL DEFAULT (datetime('now', '+30 days'))
-);
-CREATE TABLE auth_codes (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  email TEXT NOT NULL,
-  code_hash TEXT NOT NULL,
-  used_at TEXT,
-  expires_at TEXT NOT NULL DEFAULT (datetime('now', '+10 minutes'))
-);
-`;
+import {
+  USER_TOMBSTONE_MASK_SQL,
+  maskedDeletedEmail,
+  tombstoneUserCascade,
+} from "../backend/src/db/user-tombstone";
+import { freshDb, realD1 } from "../backend/test/helpers/d1";
 
 function seed(db: Database) {
   // Populate every column the mask is supposed to null/rewrite, so an assertion
@@ -95,43 +36,27 @@ function seed(db: Database) {
         1, '2026-09-01T00:00:00Z', 7,
         '2026-08-30T00:00:00Z')`,
   );
-  db.run("INSERT INTO tokens (user_id, api_key_hash, revoked_at) VALUES (42, 'tokenhash', NULL)");
   db.run(
-    "INSERT INTO web_sessions (user_id, cookie_id_hash, revoked_at) VALUES (42, 'cookiehash', NULL)",
+    "INSERT INTO tokens (user_id, api_key_hash, api_key_prefix, revoked_at) VALUES (42, 'tokenhash', 'tokenpfx', NULL)",
+  );
+  db.run(
+    "INSERT INTO web_sessions (user_id, cookie_id_hash, revoked_at, expires_at) VALUES (42, 'cookiehash', NULL, datetime('now', '+30 days'))",
   );
   // An outstanding (unused) login code issued for the original email.
   db.run(
-    "INSERT INTO auth_codes (email, code_hash, used_at) VALUES ('real@example.com', 'codehash', NULL)",
+    "INSERT INTO auth_codes (email, code_hash, used_at, expires_at) VALUES ('real@example.com', 'codehash', NULL, datetime('now', '+10 minutes'))",
   );
 }
 
-// Mirrors PART of the endpoint's tombstone batch (routes/admin/users.ts), and being a mirror is
-// its limitation as well as its point: the shared mask SQL cannot drift, but the surrounding
-// statements are a hand copy, so a statement ADDED to the endpoint does not appear here and
-// nothing fails. That is what happened when the docs-gate work added a `docs_grants` purge to
-// that batch (epic #1336 phase 0). The schema slice below has no `docs_grants` table, so this
-// file deliberately does not grow a copy of it; the authority for the batch's CONTENTS is
-// `backend/test/admin-credential-cascade.test.ts`, which drives the real route. What this file
-// still owns is the masking and re-signup properties below.
-function tombstone(db: Database, id: number, originalEmail = "real@example.com") {
-  db.query(USER_TOMBSTONE_MASK_SQL).run(maskedDeletedEmail(id), id);
-  db.query(
-    "UPDATE tokens SET revoked_at = datetime('now') WHERE user_id = ? AND revoked_at IS NULL",
-  ).run(id);
-  db.query(
-    "UPDATE web_sessions SET revoked_at = datetime('now') WHERE user_id = ? AND revoked_at IS NULL",
-  ).run(id);
-  db.query(
-    "UPDATE auth_codes SET used_at = datetime('now') WHERE email = ? AND used_at IS NULL",
-  ).run(originalEmail);
+// The real cascade, through the D1-shaped passthrough over the migrated SQLite database.
+async function tombstone(db: Database, id: number, originalEmail = "real@example.com") {
+  await tombstoneUserCascade(realD1(db), id, originalEmail);
 }
 
 describe("user tombstone (soft delete)", () => {
   let db: Database;
   beforeEach(() => {
-    db = new Database(":memory:");
-    db.exec(BASE_SCHEMA);
-    db.exec(M0037); // real migration: ALTER TABLE users ADD COLUMN deleted_at TEXT + index
+    db = freshDb(); // every real migration, including 0037's deleted_at column
     seed(db);
   });
 
@@ -140,8 +65,8 @@ describe("user tombstone (soft delete)", () => {
     expect(cols.some((c) => c.name === "deleted_at")).toBe(true);
   });
 
-  test("masks PII, zeroes both verified flags, stamps deleted_at, revokes creds", () => {
-    tombstone(db, 42);
+  test("masks PII, zeroes both verified flags, stamps deleted_at, revokes creds", async () => {
+    await tombstone(db, 42);
     const row = db
       .query(
         "SELECT email, username, github_username, password_hash, orcid, orcid_verified, description, email_preferences, email_verified, verification_token, verification_expires_at, aws_iam_username, aws_access_key_id_encrypted, aws_secret_access_key_encrypted, status, deleted_at, revoked_at FROM users WHERE id = 42",
@@ -179,7 +104,7 @@ describe("user tombstone (soft delete)", () => {
     expect(sess.revoked_at).not.toBeNull();
   });
 
-  test("clears the upload grant and the request behind it (ADR 0040/0042)", () => {
+  test("clears the upload grant and the request behind it (ADR 0040/0042)", async () => {
     // The mask used to leave all four set while forcing status='revoked', so a
     // tombstoned row sat on the granted side of the `status='approved' <=>
     // service_access=1` invariant, and `upload_access_requested_at` with no
@@ -201,7 +126,7 @@ describe("user tombstone (soft delete)", () => {
       upload_access_requested_at: "2026-08-30T00:00:00Z",
     });
 
-    tombstone(db, 42);
+    await tombstone(db, 42);
 
     const after = db.query(`SELECT ${columns} FROM users WHERE id = 42`).get() as Record<
       string,
@@ -215,20 +140,20 @@ describe("user tombstone (soft delete)", () => {
     });
   });
 
-  test("expires outstanding login codes for the original email", () => {
-    tombstone(db, 42);
+  test("expires outstanding login codes for the original email", async () => {
+    await tombstone(db, 42);
     const code = db
       .query("SELECT used_at FROM auth_codes WHERE email = 'real@example.com'")
       .get() as { used_at: string | null };
     expect(code.used_at).not.toBeNull();
   });
 
-  test("two tombstones produce distinct masked emails (no UNIQUE collision)", () => {
+  test("two tombstones produce distinct masked emails (no UNIQUE collision)", async () => {
     db.run(
       "INSERT INTO users (id, username, email, status) VALUES (43, 'u43', 'u43@example.com', 'approved')",
     );
-    tombstone(db, 42);
-    expect(() => tombstone(db, 43, "u43@example.com")).not.toThrow();
+    await tombstone(db, 42);
+    await expect(tombstone(db, 43, "u43@example.com")).resolves.toBeUndefined();
     const emails = db.query("SELECT email FROM users WHERE id IN (42, 43) ORDER BY id").all() as {
       email: string;
     }[];
@@ -238,8 +163,8 @@ describe("user tombstone (soft delete)", () => {
     ]);
   });
 
-  test("frees the original email/username/github for re-signup (UNIQUE-safe)", () => {
-    tombstone(db, 42);
+  test("frees the original email/username/github for re-signup (UNIQUE-safe)", async () => {
+    await tombstone(db, 42);
     // A fresh signup reusing the deleted user's identifiers must not 409.
     expect(() =>
       db.run(
@@ -248,8 +173,8 @@ describe("user tombstone (soft delete)", () => {
     ).not.toThrow();
   });
 
-  test("re-running the mask is idempotent (matches 0 rows, no error)", () => {
-    tombstone(db, 42);
+  test("re-running the mask is idempotent (matches 0 rows, no error)", async () => {
+    await tombstone(db, 42);
     const before = db.query("SELECT deleted_at FROM users WHERE id = 42").get() as {
       deleted_at: string;
     };
@@ -261,8 +186,8 @@ describe("user tombstone (soft delete)", () => {
     expect(after.deleted_at).toBe(before.deleted_at);
   });
 
-  test("bearer-token auth predicate excludes the tombstoned user", () => {
-    tombstone(db, 42);
+  test("bearer-token auth predicate excludes the tombstoned user", async () => {
+    await tombstone(db, 42);
     // Mirrors middleware/auth.ts authMiddleware: token JOIN users with the new
     // `AND u.deleted_at IS NULL` guard. Returns no row even though we query the
     // (revoked) token directly — independent of token cleanup.
@@ -275,8 +200,8 @@ describe("user tombstone (soft delete)", () => {
     expect(row).toBeNull();
   });
 
-  test("cookie-session auth predicate excludes the tombstoned user", () => {
-    tombstone(db, 42);
+  test("cookie-session auth predicate excludes the tombstoned user", async () => {
+    await tombstone(db, 42);
     // Mirrors resolveCookieUser / findSessionByCookieId with `AND u.deleted_at IS NULL`.
     const row = db
       .query(
@@ -287,11 +212,11 @@ describe("user tombstone (soft delete)", () => {
     expect(row).toBeNull();
   });
 
-  test("admin list/stats predicate hides the tombstone but a live user remains", () => {
+  test("admin list/stats predicate hides the tombstone but a live user remains", async () => {
     db.run(
       "INSERT INTO users (id, username, email, status) VALUES (43, 'live', 'live@example.com', 'approved')",
     );
-    tombstone(db, 42);
+    await tombstone(db, 42);
     const approved = db
       .query("SELECT COUNT(*) AS n FROM users WHERE status = 'approved' AND deleted_at IS NULL")
       .get() as { n: number };

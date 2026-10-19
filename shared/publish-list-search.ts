@@ -44,3 +44,36 @@ export function searchLimitProblem(text: string): string | null {
     "character counts by its UTF-8 length)",
   ].join(" ");
 }
+
+/**
+ * SQLite's LIKE and LOWER fold the 26 ASCII letters and nothing else (no ICU on D1 or on
+ * `bun:sqlite`), so `É` and `é` are different letters to the route. JavaScript's own
+ * `toLowerCase` folds far more, which is why it is not used here.
+ */
+export function foldAsciiCase(text: string): string {
+  return text.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+}
+
+/**
+ * Whether the route's search condition holds for a row, given the fields it reads (the dataset id,
+ * the depositor's username and the dataset's name): `LIKE '%text%' ESCAPE '\'` on any of them. A
+ * NULL or missing field never matches, and an empty text is no condition, as in the route.
+ *
+ * The CLI runs this over a Worker's answer, so that a Worker which did not read `search` (the
+ * 0.10.18 route never did) is not shown as if it had. On a Worker that did, every row already
+ * satisfies it and nothing is dropped. `test/publish-list-search-parity.unit.test.ts` checks it
+ * against the SQL engine itself.
+ */
+export function matchesListSearch(
+  text: string,
+  fields: ReadonlyArray<string | null | undefined>,
+): boolean {
+  if (text === "") return true;
+  const needle = foldAsciiCase(text);
+  return fields.some((field) => typeof field === "string" && foldAsciiCase(field).includes(needle));
+}
+
+/** The route's ordering key for a search: `LOWER(pr.dataset_id) = LOWER(text)`, an exact id first. */
+export function isExactIdMatch(datasetId: string, text: string): boolean {
+  return foldAsciiCase(datasetId) === foldAsciiCase(text);
+}

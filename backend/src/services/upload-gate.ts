@@ -160,9 +160,10 @@ export const EXPLICIT_ID_NOT_RESERVED_ERROR = {
   error: "explicit_id_not_reserved",
   message:
     // I-12: names the SECOND requirement too. The earlier message advertised
-    // the whole reserved band, so an operator picked nm099997 -- the next
-    // standing fixture ADR 0068 designates -- and hit a refusal this sentence
-    // had not predicted.
+    // the whole reserved band, so an operator picked nm099997 (then the next
+    // standing fixture ADR 0068 designated, since declared for ADR 0102's
+    // review) and hit a refusal this sentence had not predicted. The next
+    // undeclared one is nm099996.
     "Only ids the allocator can never mint may be named: nm099900-nm099999 and xx099900-xx099999 (ADR 0068). A reserved nm id must also be declared in DEV_OWNED_FIXTURE_IDS before it can be created.",
 } as const;
 
@@ -211,8 +212,9 @@ export function explicitDatasetIdGate(input: {
   if (!isReservedFixtureId(input.datasetId)) return EXPLICIT_ID_NOT_RESERVED_ERROR;
   // Reserved is not sufficient: the fixture must also be DECLARED as dev-owned
   // (#1440). Creation previously admitted any reserved id while ownership was
-  // declared for one, so the next fixture -- ADR 0068 names nm099997 -- would
-  // have been born in exactly the state this epic just fixed: production
+  // declared for one, so the next fixture would have been born in exactly the
+  // state this epic just fixed (nm099997 has since been declared for ADR 0102's
+  // soak, and nm099996 is the next undeclared id): production
   // dispatching enrichment for a repo it has no row for, the dev worker
   // refusing its own dataset, and delete-dataset refused on the only worker
   // that could rebuild it. Nothing warned, and the symptom surfaced days later

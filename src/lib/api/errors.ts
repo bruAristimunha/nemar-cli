@@ -69,6 +69,25 @@ export class ApiError extends Error {
 }
 
 /**
+ * Whether the Worker answered because it has no such route, as opposed to a route that looked and
+ * found nothing (a missing dataset, a missing user). The API's own not-found signature is
+ * `404 { error: "Not Found", message: "Route POST /x not found" }` (backend/src/lib/not-found.ts);
+ * the client words such an error as "this NEMAR backend does not support this command yet". A
+ * hint written for the second kind ("User not found") under the first one points at the wrong
+ * cause, so a command that has such hints asks this first.
+ */
+export function isRouteNotFound(error: unknown): boolean {
+  if (!(error instanceof ApiError) || error.statusCode !== 404) return false;
+  const body = error.rawBody;
+  return (
+    typeof body === "object" &&
+    body !== null &&
+    (body as { error?: unknown }).error === "Not Found" &&
+    typeof (body as { message?: unknown }).message === "string"
+  );
+}
+
+/**
  * Thrown when the backend is in maintenance mode (503 with a `mode` body).
  * Mode describes what the server is rejecting; CLI treats it as an expected
  * temporary state and shows a friendly banner instead of a stack trace.

@@ -6,8 +6,22 @@
  * verbatim.
  */
 
+import {
+  OVERRIDE_FIELD,
+  type PublicationCommentBody,
+  type PublicationCommentResponse,
+  type PublicationReviewDetail,
+  type PublicationReviewGateRefusalBody,
+  type PublicationReviewOverride,
+  type PublicationReviewSummary,
+  type RequestBlockedRefusalBody,
+  type StartPublicationReviewResponse,
+  type StartedPublicationReview,
+} from "../../../shared/contract/publication-review-admin.js";
+import { APPROVAL_DISPATCH_TOKEN_HEADER } from "../../../shared/contract/publication.js";
 import { APPROVE_RETRY_DELAY_MS } from "../../../shared/publication-retry.js";
 import { PUBLICATION_STEPS } from "../../../shared/publication-steps.js";
+import { isExactIdMatch, matchesListSearch } from "../../../shared/publish-list-search.js";
 import type { IdentifierScreenView } from "../identifier-screen-display.js";
 import { request } from "./client.js";
 import { ApiError } from "./errors.js";
@@ -20,6 +34,19 @@ import { ApiError } from "./errors.js";
 // the backend's `describeScreen` worded it. Optional on every response below,
 // because an older backend does not send it.
 export type { IdentifierScreenView };
+
+// The publication review's wire shapes (ADR 0102), declared once in `shared/contract` and
+// re-exported so a command imports them from the client like every other response type.
+export type {
+  PublicationCommentResponse,
+  PublicationReviewDetail,
+  PublicationReviewGateRefusalBody,
+  PublicationReviewOverride,
+  PublicationReviewSummary,
+  RequestBlockedRefusalBody,
+  StartPublicationReviewResponse,
+  StartedPublicationReview,
+};
 
 export interface PublishStatusResponse {
   dataset_id: string;
@@ -82,6 +109,14 @@ export interface PublishRequestsResponse {
     // outcomes from an identical line.
     anonymous?: number | null;
     identifier_screen?: IdentifierScreenView;
+    // The review of the request (ADR 0102), re-derived by the Worker on every list. Optional
+    // because an older backend sends none: absent is "this server has no review", not a pass.
+    publication_review?: PublicationReviewSummary;
+    // ADR 0080: a web approval holds the request (a live lease), so an administrator's approval
+    // would run beside it. Already on the wire; optional for the same reason.
+    approval_in_flight?: boolean;
+    // The request's block reason when it is blocked (`pr.*` carries the column).
+    block_reason?: string | null;
   }>;
   count: number;
 }
@@ -229,6 +264,34 @@ export async function listPublishRequests(
 ): Promise<PublishRequestsResponse> {
   const { statuses, search }: PublishListFilter =
     typeof filter === "string" ? { statuses: filter ? [filter] : [] } : filter;
+  const first = await fetchPublishRequests(statuses, search);
+
+  let answer = first;
+  if (statuses !== undefined && statuses.length > 1 && first.requests.length === 0) {
+    // A Worker that predates the multi-status filter (0.10.18) ran `WHERE pr.status = ?` with the
+    // whole comma string, so it matches nothing and the empty answer is false. This cannot be told
+    // from a true empty one, so ask once per status, which that Worker takes, and merge the rows
+    // the way it orders them. On a current Worker the answer was true and these are empty too:
+    // a few small reads, only when the list is empty, and the result is the same.
+    // One after the other: three small reads, in the order the caller named the statuses.
+    const each: PublishRequestsResponse[] = [];
+    for (const status of new Set(statuses)) each.push(await fetchPublishRequests([status], search));
+    const requests = each.flatMap((one) => one.requests).sort(newestFirst);
+    answer = { ...first, requests, count: requests.length };
+  }
+
+  return search ? keepSearchMatches(answer, search) : answer;
+}
+
+/** The route's `ORDER BY pr.requested_at DESC`. `sort` is stable, so a tie keeps its order. */
+function newestFirst(a: { requested_at: string }, b: { requested_at: string }): number {
+  return a.requested_at < b.requested_at ? 1 : a.requested_at > b.requested_at ? -1 : 0;
+}
+
+async function fetchPublishRequests(
+  statuses: string[] | undefined,
+  search: string | undefined,
+): Promise<PublishRequestsResponse> {
   const params = new URLSearchParams();
   if (statuses && statuses.length > 0) params.set("status", statuses.join(","));
   if (search) params.set("search", search);
@@ -237,18 +300,45 @@ export async function listPublishRequests(
 }
 
 /**
- * Deny publication request (admin)
+ * Keep the rows that match the search, in the order the route lists them (an exact dataset id
+ * first, then newest first). A Worker that read `search` has already done both, so on its answer
+ * this changes nothing; a Worker that ignored it (0.10.18) answered with rows that do not match,
+ * which a person must not be shown as if they did. The route matches the dataset's name too, which
+ * an old row does not carry, so such a row cannot be confirmed and is left out.
+ */
+function keepSearchMatches(
+  answer: PublishRequestsResponse,
+  search: string,
+): PublishRequestsResponse {
+  const kept = answer.requests.filter((row) =>
+    matchesListSearch(search, [row.dataset_id, row.requested_by_username, row.dataset_name]),
+  );
+  const rank = (row: { dataset_id: string }) => (isExactIdMatch(row.dataset_id, search) ? 0 : 1);
+  // `sort` is stable, so rows the route would tie keep the order they came in.
+  const requests = [...kept].sort((a, b) => rank(a) - rank(b) || newestFirst(a, b));
+  return { ...answer, requests, count: requests.length };
+}
+
+/**
+ * Deny publication request (admin). `requestId` is the request the administrator looked at: the
+ * Worker refuses (409 `request_mismatch`) when it is not the newest active one, so a request
+ * withdrawn or denied and filed again since is never denied in its place (#1579, ADR 0105
+ * decision 7). Left out, the newest active request is denied, as before.
  */
 export async function denyPublication(
   datasetId: string,
   reason: string,
+  requestId?: number,
 ): Promise<{ message: string }> {
   return request<{ message: string }>(
     `/admin/publish/${datasetId}/deny`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ reason }),
+      body: JSON.stringify({
+        reason,
+        ...(requestId !== undefined ? { request_id: requestId } : {}),
+      }),
     },
     true,
   );
@@ -265,6 +355,75 @@ export async function rerunIdentifierScreen(datasetId: string): Promise<{
   identifier_screen: IdentifierScreenView;
 }> {
   return request(`/admin/publish/${datasetId}/identifier-screen`, { method: "POST" }, true);
+}
+
+/**
+ * The review of a dataset's active publication request (admin; ADR 0102): the outcome and its
+ * reasons in the shared words, the review in force with its findings and summary, the request's
+ * screen, and the facts `approve` and `next` decide from. `GET /admin/publish/:id/review`.
+ *
+ * Throws {@link ApiError}. This route answers `{ error: sentence, code: word }`, so the closed word
+ * (`not_found`, `bad_dataset`, `internal`) is in `rawBody.code`, which {@link reviewErrorCode}
+ * reads; `ApiError.code` is the body's `error`, here the sentence.
+ */
+export async function getPublicationReview(datasetId: string): Promise<PublicationReviewDetail> {
+  return request<PublicationReviewDetail>(`/admin/publish/${datasetId}/review`, {}, true);
+}
+
+/**
+ * Start the automated review of a dataset's current screened commit, or start again one that
+ * ended without a report (admin; ADR 0102). `POST /admin/publish/:id/review/start`.
+ *
+ * Resolves on the 202 only: a run that is going (`dispatched`, `redispatched`) or already stands
+ * (`dispatch_claimed`). A request that cannot be started (409) and a review that could not be
+ * handed over (502) throw {@link ApiError}, with the closed word in `rawBody.code`
+ * ({@link reviewErrorCode}) and the route's sentence as the message.
+ */
+export async function startPublicationReview(datasetId: string): Promise<StartedPublicationReview> {
+  return request<StartedPublicationReview>(
+    `/admin/publish/${datasetId}/review/start`,
+    { method: "POST" },
+    true,
+  );
+}
+
+/**
+ * Mail the depositor an administrator's typed message and leave the request open (admin; ADR
+ * 0102). `POST /admin/publish/:id/comment`. The message is the administrator's own words and is
+ * the only thing sent: nothing of the review.
+ */
+export async function commentOnPublication(
+  datasetId: string,
+  message: string,
+): Promise<PublicationCommentResponse> {
+  const body: PublicationCommentBody = { message };
+  return request<PublicationCommentResponse>(
+    `/admin/publish/${datasetId}/comment`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+    true,
+  );
+}
+
+/**
+ * The closed word of a review route's refusal, or undefined.
+ *
+ * The backend answers in two conventions. The review routes (the detail, the start and the
+ * comment) put a fixed SENTENCE in `error` and a closed word in `code`: `ApiError.message` is the
+ * sentence, `ApiError.code` (which is the body's `error`) is the sentence too, and the word is in
+ * `rawBody.code`. The publish routes, the approval refusals included, put the word in `error` and
+ * the sentence in `message`: there `ApiError.code` is the word and the client leads with the
+ * sentence. Reading `ApiError.code` of a review route as a word is the trap this function is for.
+ */
+export function reviewErrorCode(err: unknown): string | undefined {
+  if (!(err instanceof ApiError)) return undefined;
+  const body = err.rawBody;
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return undefined;
+  const code = (body as Record<string, unknown>).code;
+  return typeof code === "string" ? code : undefined;
 }
 
 /**
@@ -371,6 +530,40 @@ export function isRetryablePublishError(err: unknown): boolean {
 }
 
 /**
+ * The wait between attempts: `APPROVE_RETRY_DELAY_MS`, or less when `NEMAR_APPROVE_RETRY_DELAY_MS`
+ * names a whole number of milliseconds from 0 up to it. It exists so a test of the retry does not
+ * sleep ten seconds per attempt. It can only SHORTEN the wait, because the backend's lease holds
+ * a failed run for longer than the default (`shared/publication-retry.ts`); anything else, a
+ * longer wait included, leaves the default.
+ */
+function retryDelayMs(): number {
+  const raw = process.env.NEMAR_APPROVE_RETRY_DELAY_MS;
+  if (raw === undefined || !/^\d+$/.test(raw)) return APPROVE_RETRY_DELAY_MS;
+  const ms = Number(raw);
+  return Number.isSafeInteger(ms) && ms <= APPROVE_RETRY_DELAY_MS ? ms : APPROVE_RETRY_DELAY_MS;
+}
+
+/**
+ * Who an approval run is for, beyond the dataset: the request it was started for and, for a run
+ * the website started, the token that ties it to that click.
+ *
+ * `requestId` is sent in the body of EVERY call of the run (the first, each batch of the lock, each
+ * retry), so a request that is denied and filed again while the run is going is refused by the
+ * Worker (409 `request_mismatch`) and not approved in the old one's place (#1579, ADR 0105
+ * decision 7). A Worker that predates the field ignores it. `dispatchToken` is the per-claim token
+ * of a run a web click started (#1604, ADR 0105 decision 3): it is sent as the
+ * `X-Approval-Dispatch-Token` header on EVERY call of the run, batches and retries included,
+ * because the Worker checks it at the top of each call and records the administrator who clicked
+ * only for a call that carries it. It is a header and never part of the body, and it is a secret:
+ * the debug log redacts it by name, and nothing prints it. A run with no token is its caller's own
+ * act.
+ */
+export interface ApprovalIdentity {
+  requestId?: number;
+  dispatchToken?: string;
+}
+
+/**
  * Approve publication request (admin) - runs orchestrator with
  * retry-with-delay across Worker invocations.
  *
@@ -395,9 +588,11 @@ export async function approvePublication(
   onRetry?: (info: PublishRetryInfo) => void,
   onProgress?: (info: PublishProgressInfo) => void,
   acknowledgeIdentifierScreen?: string,
+  overridePublicationReview?: PublicationReviewOverride,
+  identity?: ApprovalIdentity,
 ): Promise<PublishApproveResponse> {
   const MAX_ATTEMPTS = 5;
-  const RETRY_DELAY_MS = APPROVE_RETRY_DELAY_MS;
+  const RETRY_DELAY_MS = retryDelayMs();
 
   let s3_lock_continuation_token: string | undefined;
   // Total object count for s3_lock — computed by the server on the first
@@ -455,7 +650,14 @@ export async function approvePublication(
           `/admin/publish/${datasetId}/approve`,
           {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+              "Content-Type": "application/json",
+              // #1604: the proof that this run is the web click's, on every call of it (the
+              // first, each lock batch, each retry): the Worker reads it at the top of each one.
+              ...(identity?.dispatchToken
+                ? { [APPROVAL_DISPATCH_TOKEN_HEADER]: identity.dispatchToken }
+                : {}),
+            },
             body: JSON.stringify({
               resume: isFirstCall ? useResume : true,
               sandbox,
@@ -469,6 +671,17 @@ export async function approvePublication(
               ...(acknowledgeIdentifierScreen !== undefined
                 ? { acknowledge_identifier_screen: acknowledgeIdentifierScreen }
                 : {}),
+              // ADR 0102: what the administrator approves over, the review shown and the reasons
+              // shown. Sent on every call for the same reason as the acknowledgment: a retry
+              // that lands before the run is marked approving, or a resume before it has started
+              // publishing, passes the review gate again.
+              ...(overridePublicationReview !== undefined
+                ? { [OVERRIDE_FIELD]: overridePublicationReview }
+                : {}),
+              // #1579: the request this run is for, on every call for the same reason as the
+              // override: each call finds the newest active request by itself, and one that was
+              // denied and filed again since must be refused and not approved in its place.
+              ...(identity?.requestId !== undefined ? { request_id: identity.requestId } : {}),
             }),
           },
           true,

@@ -151,7 +151,7 @@ export const PRIVATE_REVOKE_ONE_SQL = `UPDATE web_sessions
  * private site too; that host's cookie cannot be cleared from here, so revoking
  * the rows is what makes its next request refuse.
  *
- * `finalizeRevocation` and the owner-only soft delete do not use this: they
+ * `finalizeRevocation` and the tombstone cascade do not use this: they
  * revoke every session of every scope for the account, which is a superset.
  *
  * DELIBERATELY NOT CALLED, and a later reader should not "fix" either:
@@ -183,9 +183,11 @@ export const PRIVATE_REVOKE_ALL_SQL = `UPDATE web_sessions
  * THREE CALLERS, and the count is the point: every path that ends this
  * account's credentials runs this statement -- `/auth/logout`,
  * `finalizeRevocation` (admin revoke, by username and by id) and the
- * owner-only soft delete. The foreign key's `ON DELETE CASCADE` covers none of
- * them, because none of them deletes the `users` row. A fourth path that ends
- * a credential needs this line too. Role demotion and API key revocation are
+ * tombstone cascade (`tombstoneUserCascade`, the one function both the
+ * owner-only soft delete and the scheduled sweep of live-test accounts run, so
+ * it counts once). The foreign key's `ON DELETE CASCADE` covers none of them,
+ * because none of them deletes the `users` row. A fourth path that ends a
+ * credential needs this line too. Role demotion and API key revocation are
  * outside the set on purpose; see {@link PRIVATE_REVOKE_ALL_SQL}.
  */
 export const PRIVATE_GRANTS_PURGE_SQL = "DELETE FROM private_grants WHERE user_id = ?";

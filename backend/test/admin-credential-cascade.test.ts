@@ -316,12 +316,11 @@ describe("POST /admin/users/:username/role cascades on demotion", () => {
 });
 
 describe("DELETE /admin/users/by-id/:id cascades too", () => {
-  /** The tombstone route is the third caller of the grants purge, and the one
-   *  the first version of this PR added without a test: deleting that statement
-   *  from the batch left the whole suite green. `test/user-soft-delete.unit.test.ts`
-   *  reimplements the batch by hand rather than driving the route, so it cannot
-   *  catch this either -- and it is now one statement behind production, which is
-   *  what that pattern costs. */
+  /** The tombstone is a caller of the grants purge, and the one the first version of this PR
+   *  added without a test: deleting that statement from the batch left the whole suite green.
+   *  The batch now lives in `tombstoneUserCascade`, which the scheduled test-account sweep runs
+   *  as well; this drives it through the real route, and `test/user-soft-delete.unit.test.ts`
+   *  drives the same function against the full migrated schema. */
   test("a tombstone revokes every session and destroys the grants", async () => {
     const userId = seedTarget();
     const { session, unspentCode } = await signInToDocs(userId);

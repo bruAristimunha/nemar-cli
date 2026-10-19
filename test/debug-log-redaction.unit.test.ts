@@ -18,6 +18,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { APPROVAL_DISPATCH_TOKEN_HEADER } from "../shared/contract/publication";
 import {
   buildCommandLabel,
   maskEmail,
@@ -41,6 +42,25 @@ describe("redactHeaders", () => {
     expect(out.cookie).toBe("[REDACTED]");
     expect(out["X-API-KEY"]).toBe("[REDACTED]");
     expect(out["Content-Type"]).toBe("application/json");
+  });
+
+  test("redacts the approval dispatch token header, whatever its casing", () => {
+    // The executor of a web approval presents this token on every `/approve` call. It is not the
+    // API key, so the three names above never covered it, and `--debug` writes the request
+    // headers into the log users are told to attach to public issues. The header is named from
+    // the shared contract, so a rename of the header that skips the redaction list fails here.
+    const token = "a".repeat(64);
+    for (const name of [
+      APPROVAL_DISPATCH_TOKEN_HEADER,
+      "X-Approval-Dispatch-Token",
+      "x-approval-dispatch-token",
+      "X-APPROVAL-DISPATCH-TOKEN",
+    ]) {
+      const out = redactHeaders({ [name]: token, "Content-Type": "application/json" });
+      expect(out[name]).toBe("[REDACTED]");
+      expect(JSON.stringify(out)).not.toContain(token);
+      expect(out["Content-Type"]).toBe("application/json");
+    }
   });
 
   test("leaves unrelated headers untouched", () => {

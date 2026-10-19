@@ -13,13 +13,18 @@
  * `shared/contract/admin-user.ts`; how a request is read and compared is in
  * `services/admin-user-edit.ts`. This file is the part that needs the database
  * and the caller: does the account exist, is it the caller's own or an owner's,
- * does anyone already hold this address, and the one batch that writes the
+ * does anyone already hold this address or iD, and the one batch that writes the
  * change with its audit row.
+ *
+ * The ORCID iD is editable here ONLY as an owner's attestation (ADR 0106): it
+ * sets the iD and marks it verified, with no ORCID sign-in record behind it, and
+ * the audit row says so. An iD the person proved by signing in is never replaced
+ * here.
  *
  * Deliberately absent, because each has a route that also carries the side
  * effects this one would skip: role (token revocation on demotion), status and
- * upload access (ADR 0040), account kind (ADR 0048), the ORCID iD (ADR 0043, it
- * is proven and never typed), the identity-conflict flag, and credentials.
+ * upload access (ADR 0040), account kind (ADR 0048), unlinking an iD (ADR 0022),
+ * the identity-conflict flag, and credentials.
  */
 
 import {
@@ -34,13 +39,19 @@ import { applyEditWithAudit } from "../../db/audit-log";
 import { flag } from "../../db/flag";
 import {
   type AdminUserCurrent,
+  type FieldChange,
   adminUserRefusal,
   diffAdminUserPatch,
   emailInboxChanged,
   parseAdminUserEdit,
 } from "../../services/admin-user-edit";
 import { notifyPreviousEmailAddress } from "../../services/email-change-notice";
-import { findEmailHolder, findGithubHolder, isUniqueViolationOn } from "../../services/identity";
+import {
+  findEmailHolder,
+  findGithubHolder,
+  findOrcidHolder,
+  isUniqueViolationOn,
+} from "../../services/identity";
 import { profileRefusal } from "../../services/profile";
 import { ADMIN_USER_DETAIL_SELECT } from "../../services/user-search";
 import type { AdminRouter } from "./shared";
@@ -96,12 +107,12 @@ type EditTarget = AdminUserCurrent & {
   orcid_verified: number;
 };
 
-/** The three "someone else holds it" refusals, each taken FROM the vocabulary
- *  that declares it: if a code leaves its vocabulary this type shrinks and the
- *  call that uses it stops compiling, instead of printing a bare token. */
+/** The "someone else holds it" refusals, each taken FROM the vocabulary that
+ *  declares it: if a code leaves its vocabulary this type shrinks and the call
+ *  that uses it stops compiling, instead of printing a bare token. */
 type HeldCode =
   | Extract<ProfileEditErrorCode, "username_taken">
-  | Extract<IdentityConflictCode, "email_in_use" | "github_in_use">;
+  | Extract<IdentityConflictCode, "email_in_use" | "github_in_use" | "orcid_in_use">;
 
 /** The refusal for a value another live account already holds. Names the
  *  holder: this is an admin route, and "who has it" is what resolves it. */
@@ -116,6 +127,22 @@ function heldBy(
     message: `That ${what} already belongs to account ${who}. One person has one account (ADR 0043); change or remove it there first.`,
     holder,
   };
+}
+
+/** The iD the person proved by signing in, or null. The one question an
+ *  attestation asks of `oauth_identities`, asked both before the write and
+ *  after a write that changed nothing, so the two answers cannot disagree. */
+async function provenOrcid(db: D1Database, userId: number): Promise<string | null> {
+  const row = await db
+    .prepare(
+      `SELECT oi.provider_subject FROM oauth_identities oi
+         JOIN users u ON u.id = oi.user_id
+        WHERE oi.user_id = ?1 AND oi.provider = 'orcid' AND u.deleted_at IS NULL
+        LIMIT 1`,
+    )
+    .bind(userId)
+    .first<{ provider_subject: string }>();
+  return row?.provider_subject ?? null;
 }
 
 export function registerUserEditRoutes(admin: AdminRouter): void {
@@ -177,12 +204,19 @@ export function registerUserEditRoutes(admin: AdminRouter): void {
 
     const changed = diffAdminUserPatch(target, patch);
     const changedFields = ADMIN_USER_EDITABLE_FIELDS.filter((field) => field in changed);
-    if (changedFields.length === 0) {
+    // An attestation is a change even when the iD on the account is already the
+    // one sent: the iD matches, but the verified flag does not yet say so.
+    const attestedOrcid =
+      patch.orcid !== undefined && (target.orcid !== patch.orcid || target.orcid_verified !== 1)
+        ? patch.orcid
+        : null;
+    if (changedFields.length === 0 && attestedOrcid === null) {
       const user = await loadUserDetail(db, id, false);
       return c.json({ message: "No changes: every value already matches", changed: {}, user });
     }
 
-    if (changedFields.some(isAdminUserIdentityField)) {
+    const identityTouched = attestedOrcid !== null || changedFields.some(isAdminUserIdentityField);
+    if (identityTouched) {
       // The owner's own account goes through the path that asks for proof.
       // Without this, a PATCH to one's own id would be a way around the
       // email-change code (ADR 0044) for the one role that can reach it.
@@ -205,11 +239,14 @@ export function registerUserEditRoutes(admin: AdminRouter): void {
     }
 
     // A verified ORCID record owns the name and rewrites it at the next sign-in
-    // (ADR 0041), so an edit here would last until then and look like a bug.
+    // (ADR 0041), so an edit here would last until then and look like a bug. The
+    // test is the state AFTER this write: an attestation makes the iD verified.
+    const postVerified = attestedOrcid !== null || flag(target.orcid_verified);
+    const postOrcid = attestedOrcid ?? target.orcid ?? "";
     if (
       ADMIN_USER_NAME_FIELDS.some((field) => field in changed) &&
-      flag(target.orcid_verified) &&
-      (target.orcid ?? "").trim() !== ""
+      postVerified &&
+      postOrcid.trim() !== ""
     ) {
       return c.json(
         profileRefusal(
@@ -218,6 +255,20 @@ export function registerUserEditRoutes(admin: AdminRouter): void {
         ),
         409,
       );
+    }
+
+    if (attestedOrcid !== null) {
+      // An iD the person proved by signing in is not replaced by an admin: that
+      // would discard the proof. The person relinks it, which mints its own
+      // intent (ADR 0022).
+      if ((await provenOrcid(db, target.id)) !== null) {
+        return c.json(
+          adminUserRefusal("orcid_already_proven", ADMIN_USER_ERROR_MESSAGES.orcid_already_proven),
+          409,
+        );
+      }
+      const holder = await findOrcidHolder(db, attestedOrcid, target.id);
+      if (holder) return c.json(heldBy("orcid_in_use", "ORCID iD", holder), 409);
     }
 
     // Uniqueness, checked up front so an admin gets a sentence naming the
@@ -251,6 +302,20 @@ export function registerUserEditRoutes(admin: AdminRouter): void {
     );
 
     const notes: string[] = [];
+    // What the caller is told changed, and what the audit row records. The verified
+    // flag is not an editable column, but an attestation that only flips it must
+    // still say so: otherwise the answer is an empty change and the audit row
+    // carries no iD.
+    const reported: Partial<Record<string, FieldChange>> = { ...changed };
+    if (attestedOrcid !== null) {
+      sets.push("orcid_verified = 1");
+      if (target.orcid_verified !== 1) {
+        reported.orcid_verified = { from: String(target.orcid_verified), to: "1" };
+      }
+      notes.push(
+        "The ORCID iD is recorded as admin-attested: it is marked verified, but no ORCID sign-in is on record for it. The person adds that record by linking the same iD with 'nemar auth profile orcid link' or in Settings; nothing else changes.",
+      );
+    }
     const inboxMoved = Boolean(
       changed.email && emailInboxChanged(changed.email.from, changed.email.to),
     );
@@ -285,13 +350,20 @@ export function registerUserEditRoutes(admin: AdminRouter): void {
     sets.push("updated_at = datetime('now')");
     const idPlaceholder = bindValue(target.id);
 
+    // An attestation re-checks the proof inside the write, so an ORCID link that
+    // completed after the read above cannot have its iD overwritten by this one.
+    const proofGuard =
+      attestedOrcid === null
+        ? ""
+        : ` AND NOT EXISTS (SELECT 1 FROM oauth_identities oi WHERE oi.user_id = ${idPlaceholder} AND oi.provider = 'orcid')`;
+
     let applied: boolean;
     try {
       applied = await applyEditWithAudit(
         db,
         db
           .prepare(
-            `UPDATE users SET ${sets.join(", ")} WHERE id = ${idPlaceholder} AND deleted_at IS NULL`,
+            `UPDATE users SET ${sets.join(", ")} WHERE id = ${idPlaceholder} AND deleted_at IS NULL${proofGuard}`,
           )
           .bind(...values),
         {
@@ -302,8 +374,13 @@ export function registerUserEditRoutes(admin: AdminRouter): void {
           details: JSON.stringify({
             changed_by: actor.username,
             target_username: target.username,
-            changed,
+            changed: reported,
             email_verified_reset: inboxMoved,
+            // An admin attestation, not an ORCID sign-in: the audit row is the
+            // only record that the verified flag came from an owner, and the iD it
+            // vouched for lives nowhere else once a later change overwrites it.
+            orcid_attested: attestedOrcid !== null,
+            orcid_attested_value: attestedOrcid,
           }),
         },
       );
@@ -334,11 +411,27 @@ export function registerUserEditRoutes(admin: AdminRouter): void {
           409,
         );
       }
+      if (isUniqueViolationOn(error, "orcid")) {
+        return c.json(
+          { error: "orcid_in_use", message: "That ORCID iD already belongs to another account" },
+          409,
+        );
+      }
       throw error;
     }
     // The account was deleted between the read and the write: nothing changed,
     // no audit row was written, and saying so beats a 200 that did not happen.
-    if (!applied) return c.json({ error: "User not found" }, 404);
+    if (!applied) {
+      // Nothing was written. For an attestation the usual cause is a proof that
+      // arrived after the read, which is the person's to keep (ADR 0022).
+      if (attestedOrcid !== null && (await provenOrcid(db, target.id)) !== null) {
+        return c.json(
+          adminUserRefusal("orcid_already_proven", ADMIN_USER_ERROR_MESSAGES.orcid_already_proven),
+          409,
+        );
+      }
+      return c.json({ error: "User not found" }, 404);
+    }
 
     // After the commit: telling the previous inbox cannot undo or block the
     // change, only report whether it was heard.
@@ -361,8 +454,8 @@ export function registerUserEditRoutes(admin: AdminRouter): void {
     if (!user) return c.json({ error: "User not found" }, 404);
     const label = target.username ?? target.email;
     return c.json({
-      message: `Updated ${label}: ${changedFields.join(", ")}`,
-      changed,
+      message: `Updated ${label}: ${Object.keys(reported).join(", ")}`,
+      changed: reported,
       notes: notes.length > 0 ? notes : undefined,
       old_address_notified: previousAddressNotified,
       user,

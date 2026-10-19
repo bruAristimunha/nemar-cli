@@ -441,7 +441,11 @@ describe("nemar admin publish approve --acknowledge-identifier-screen", () => {
       body: { dataset_id: "nm000104", status: "requested", anonymous: false },
     },
     "POST /admin/publish/nm000104/approve": {
-      body: { message: "Dataset published successfully", dataset_id: "nm000104" },
+      body: {
+        message: "Dataset published successfully",
+        dataset_id: "nm000104",
+        status: "published",
+      },
     },
   };
 

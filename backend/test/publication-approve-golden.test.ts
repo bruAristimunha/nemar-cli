@@ -3,8 +3,9 @@
  *
  * Written against the CURRENT inline handler BEFORE the orchestrator
  * extraction and kept green through every extraction commit: they pin the
- * pre-loop (426 gate, request lookup, all-completed short-circuit, the
- * 'approving' transition), resume filtering, the two no-op steps' recording
+ * pre-loop (426 gate, request lookup, all-completed short-circuit (which ends like the loop,
+ * ADR 0105 decision 12: published for an `approving` request, refused for any other),
+ * the 'approving' transition), resume filtering, the two no-op steps' recording
  * quirks, the finalize block (visibility self-heal, 'published' write, audit
  * row), and the exact response contract.
  *
@@ -25,12 +26,14 @@ import type { Database } from "bun:sqlite";
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import type { Server } from "bun";
 import { Hono } from "hono";
+import { APPROVAL_CLOSED_DURING_RUN_MESSAGE } from "../../shared/contract/publication.js";
 import { PUBLICATION_STEPS } from "../../shared/publication-steps.js";
 import { adminRoutes } from "../src/routes/admin";
 import { hashApiKey } from "../src/services/token";
 import type { Bindings, Variables } from "../src/types/bindings";
 import { freshDb, realD1 } from "./helpers/d1";
 import { mainRefAnswer, markDatasetScreensClean } from "./helpers/identifier-screen";
+import { hookedD1 } from "./helpers/publication-review-harness";
 
 const ADMIN_KEY = "golden-admin-key-0123456789abcdef0123456789abcdef";
 const DATASET = "nm098765";
@@ -204,24 +207,91 @@ describe("POST /admin/publish/:id/approve (golden characterization)", () => {
     expect(audit?.resource_id).toBe(DATASET);
   });
 
-  test("all-completed short-circuit: responds published, touches nothing", async () => {
+  test("the step loop's closing write and its audit row are one batch: a fault on the row leaves the request approving, and the retry writes the row once", async () => {
+    const done = ALL_STEPS.filter((s) => s !== "upload_to_zenodo" && s !== "sync_nemar");
+    await seed(done);
+    let armed = true;
+    const failing = {
+      ...env,
+      DB: hookedD1(realD1(db), {
+        statement: (sql, inBatch) => {
+          if (armed && inBatch && /INSERT INTO audit_log/.test(sql) && /changes\(\)/.test(sql)) {
+            throw new Error("the audit table is unwritable");
+          }
+        },
+      }),
+    } as Bindings;
+    const rows = () =>
+      db.query("SELECT user_id FROM audit_log WHERE action = 'dataset_published'").all();
+    const call = (bindings: Bindings) =>
+      app.request(
+        `/admin/publish/${DATASET}/approve`,
+        {
+          method: "POST",
+          headers: { Authorization: `Bearer ${ADMIN_KEY}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ resume: true }),
+        },
+        bindings,
+      );
+
+    expect((await call(failing)).status).toBe(500);
+    expect(requestRow()?.status).toBe("approving");
+    expect(rows()).toHaveLength(0);
+
+    // The steps were all recorded by then, so the retry is the all-steps-done branch, which ends
+    // with the same batch and writes the one row.
+    armed = false;
+    expect((await call(failing)).status).toBe(200);
+    expect(requestRow()?.status).toBe("published");
+    expect(rows()).toHaveLength(1);
+    expect((await call(failing)).status).toBe(404);
+    expect(rows()).toHaveLength(1);
+  });
+
+  test("all-completed short-circuit on a requested request: refused, the request is not touched", async () => {
     await seed(ALL_STEPS);
 
     const res = await approve({ resume: true });
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(409);
     const body = (await res.json()) as Record<string, unknown>;
-    expect(body).toEqual({
+    expect(body.error).toBe("approval_closed_during_run");
+    expect(body.message).toBe(APPROVAL_CLOSED_DURING_RUN_MESSAGE);
+
+    // The short-circuit still fires BEFORE the 'approving' transition, and it writes nothing to
+    // the request: the row stays exactly as seeded, and is no longer reported as published (it
+    // used to answer 200 `published` for a request it left `requested`). The refusal leaves one
+    // audit row that names the status it found.
+    const row = requestRow();
+    expect(row?.status).toBe("requested");
+    expect(row?.approved_by).toBeNull();
+    expect(row?.approved_at).toBeNull();
+    const audit = db
+      .query<{ action: string; details: string }, []>(
+        "SELECT action, details FROM audit_log WHERE action = 'approval_finished_on_closed_request'",
+      )
+      .all();
+    expect(audit).toHaveLength(1);
+    expect(JSON.parse(audit[0]?.details ?? "null")).toMatchObject({ request_status: "requested" });
+  });
+
+  test("all-completed short-circuit on an approving request: marked published, as the loop's end would", async () => {
+    await seed(ALL_STEPS);
+    db.run("UPDATE publication_requests SET status = 'approving' WHERE dataset_id = ?", [DATASET]);
+
+    const res = await approve({ resume: true });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
       message: "All steps already completed",
       dataset_id: DATASET,
       status: "published",
     });
 
-    // Quirk pin: the short-circuit fires BEFORE the 'approving' transition
-    // and performs NO writes — the row stays exactly as seeded.
+    // The answer is as it always was; the row now says so too.
     const row = requestRow();
-    expect(row?.status).toBe("requested");
-    expect(row?.approved_by).toBeNull();
-    expect(row?.approved_at).toBeNull();
+    expect(row?.status).toBe("published");
+    expect(row?.approved_at).not.toBeNull();
+    expect(row?.current_step).toBeNull();
+    expect(row?.last_error).toBeNull();
   });
 
   test("404 when no active publication request exists", async () => {

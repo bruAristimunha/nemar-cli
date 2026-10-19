@@ -13,6 +13,7 @@
 
 import { Hono } from "hono";
 import type { Bindings } from "../../types/bindings.js";
+import { registerApprovalReleaseRoutes } from "../callbacks/approval-release.js";
 import { registerArchiveReadyRoutes } from "../callbacks/archive-ready.js";
 import { registerIdentifierScreenRoutes } from "../callbacks/identifier-screen.js";
 import { registerIdentifierSweepCallbackRoutes } from "../callbacks/identifier-sweep.js";
@@ -21,6 +22,7 @@ import { registerLlmEnrichRoutes } from "../callbacks/llm-enrich.js";
 import { registerManifestCallbackRoutes } from "../callbacks/manifest.js";
 import { registerPrReviewRoutes } from "../callbacks/pr-review.js";
 import { registerPrescreenRoutes } from "../callbacks/prescreen.js";
+import { registerPublicationReviewRoutes } from "../callbacks/publication-review.js";
 import { registerRecordsReadyRoutes } from "../callbacks/records-ready.js";
 import { registerVersionDoiRoutes } from "../callbacks/version-doi.js";
 import { registerZarrReadyRoutes } from "../callbacks/zarr-ready.js";
@@ -36,6 +38,8 @@ registerVersionDoiRoutes(webhooks);
 registerManifestCallbackRoutes(webhooks);
 registerPrescreenRoutes(webhooks);
 registerPrReviewRoutes(webhooks);
+registerPublicationReviewRoutes(webhooks);
+registerApprovalReleaseRoutes(webhooks);
 registerIdentifierScreenRoutes(webhooks);
 registerIdentifierSweepCallbackRoutes(webhooks);
 registerImportStateRoutes(webhooks);

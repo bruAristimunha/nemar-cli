@@ -199,12 +199,13 @@ export function isOrcidIdentityUniqueViolation(err: unknown): boolean {
 export const ORCID_HOLDER_SQL = `SELECT u.id, u.username
    FROM users u
   WHERE u.deleted_at IS NULL
+    AND (?2 IS NULL OR u.id != ?2)
     AND (
-      u.orcid = ?
+      u.orcid = ?1
       OR EXISTS (SELECT 1 FROM oauth_identities oi
                   WHERE oi.user_id = u.id
                     AND oi.provider = 'orcid'
-                    AND oi.provider_subject = ?)
+                    AND oi.provider_subject = ?1)
     )
   ORDER BY u.id
   LIMIT 1`;
@@ -221,17 +222,21 @@ export const GITHUB_HOLDER_SQL = `SELECT id, username FROM users
 
 /**
  * Find the live account holding `orcid`, if any. Pass `exceptUserId` when the
- * caller is checking on behalf of an existing account (a link or a relink), so
- * the account's own iD is not reported as a conflict with itself.
+ * caller is checking on behalf of an existing account (a link, a relink or an
+ * attestation), so the account's own iD is not reported as a conflict with
+ * itself. The exclusion is in the query, not after it: a filter applied to the
+ * one row `LIMIT 1` returns would hide a different holder behind the account's
+ * own row.
  */
 export async function findOrcidHolder(
   db: D1Database,
   orcid: string,
   exceptUserId?: number,
 ): Promise<IdentityHolder | null> {
-  const row = await db.prepare(ORCID_HOLDER_SQL).bind(orcid, orcid).first<IdentityHolder>();
-  if (!row) return null;
-  return exceptUserId !== undefined && row.id === exceptUserId ? null : row;
+  return db
+    .prepare(ORCID_HOLDER_SQL)
+    .bind(orcid, exceptUserId ?? null)
+    .first<IdentityHolder>();
 }
 
 /** Find the live account holding `email` (case-insensitively), if any. */
