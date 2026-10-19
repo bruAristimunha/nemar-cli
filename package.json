@@ -1,7 +1,7 @@
 {
   "name": "nemar-cli",
   "packageManager": "bun@1.4.3",
-  "version": "0.10.20-dev10",
+  "version": "0.10.20-dev11",
   "description": "CLI for NEMAR (Neuroelectromagnetic Data Archive and Tools Resource) dataset management",
   "type": "module",
   "main": "dist/index.js",
