@@ -94,6 +94,7 @@ import { getDatasetsToken } from "./github-auth";
 import { checkApprovalScreenGate } from "./identifier-screen";
 import { generateManifest } from "./manifest";
 import { scheduleNeurobagelSync } from "./neurobagel-hooks.js";
+import { readReviewIntent } from "./pr-review-eligibility.js";
 import {
   evaluateApprovalReviewGate,
   recordApprovalOverride,
@@ -997,6 +998,12 @@ async function stepRepoPublic(c: ApproveStepContext): Promise<RespondOutcome | u
           // ruleset is not logged, and the depositor would have found out at
           // acceptance time.
           visibility: repoShouldBePrivate ? "private" : "public",
+          // Read after the visibility update and the stamp above, so a published dataset is given
+          // the required review and an anonymous release, which is not reviewed, is not (ADR 0107).
+          // The owner's switch (PR_REVIEW_AUTO_REQUIRE) gates only the addition of the
+          // requirement: with it off a reviewed dataset's review ruleset is left as it is, and a
+          // removal, which a dataset that is not reviewed gets, is asked for anyway.
+          review: await readReviewIntent(c.env, datasetId),
           collaborators: { ownerLogin, approvedWriters },
         });
         // Surface a non-green/failed protection step in the bulk-approval log,

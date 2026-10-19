@@ -171,6 +171,8 @@ const MODULE_EXPORTS: Record<string, string[]> = {
     "restoreDataset",
     "retryImport",
     "revalidateDataset",
+    "reviewRuleset",
+    "reviewRulesetBulk",
     "revokeKeyFor",
     "revokeUser",
     "revokeUserById",
@@ -269,6 +271,8 @@ const POST_SPLIT_ADDITIONS = [
   "setPrReviewAuthor", // ADR 0093: PUT /admin/pr-review-authors/:login (allow or block)
   "clearPrReviewAuthor", // ADR 0093: DELETE /admin/pr-review-authors/:login
   "startPrReview", // ADR 0092: POST /admin/pr-reviews/:dataset/:pr/start (review an open pull request)
+  "reviewRuleset", // ADR 0107: POST /admin/datasets/:id/review-ruleset (dry run by default)
+  "reviewRulesetBulk", // ADR 0107: POST /admin/datasets/review-ruleset/bulk (owner-only, a page of 50 at most)
   "waivePrReviewNaming", // ADR 0107: POST /admin/pr-reviews/:dataset/:pr/allow (the naming rule's one override)
   "getPublicationReview", // ADR 0102: GET /admin/publish/:id/review
   "startPublicationReview", // ADR 0102: POST /admin/publish/:id/review/start

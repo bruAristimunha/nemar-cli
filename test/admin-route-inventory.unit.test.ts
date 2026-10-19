@@ -84,6 +84,10 @@ const EXPECTED_ENTRIES: Record<string, number> = {
   "POST /datasets/:id/enforce": 2,
   "POST /datasets/:id/revalidate": 1,
   "POST /datasets/enforce/bulk": 2,
+  // ADR 0107: the required pull-request review's ruleset. Both are zValidator + handler on a
+  // strict body, and the bulk one checks for the owner inside the handler.
+  "POST /datasets/:id/review-ruleset": 2,
+  "POST /datasets/review-ruleset/bulk": 2,
   "GET /datasets/:id/ci": 1,
   "POST /datasets/:id/ci": 1,
   "POST /datasets/:id/ci/validate": 1,
@@ -227,7 +231,7 @@ describe("admin route inventory", () => {
   });
 
   test("entry total is pinned", () => {
-    expect(adminRoutes.routes.length).toBe(150);
+    expect(adminRoutes.routes.length).toBe(154);
   });
 
   // The count pin above can't see a SWAP of the router-level middleware

@@ -9,14 +9,18 @@
  * Target spec (see epic #713): published/public repo = main locked by the NEMAR
  * branch ruleset whose required check is green, workflows deployed, no stray
  * direct read grants, default branch `main`; private repo = open push (no
- * ruleset) but workflows + no stray read.
+ * ruleset) but workflows + no stray read. On top of that (ADR 0107), a dataset
+ * the Worker reviews has the "NEMAR PR review required" ruleset in force, and one
+ * it does not review has none.
  */
 
 import {
+  type ReviewIntent,
   checkRunGreenOnDefaultHead,
   deriveContexts,
   getBranchRulesetInfo,
   getRepoDefaultBranch,
+  getReviewRulesetInfo,
   listDirectCollaborators,
   listRepoWorkflows,
 } from "./github";
@@ -36,6 +40,8 @@ export const DRIFT_BUCKETS = [
   "CONTEXT_NAME_MISMATCH",
   "RED_REQUIRED_CHECK",
   "DEPRECATED_WORKFLOW_PRESENT",
+  "REVIEW_RULESET_MISSING",
+  "REVIEW_RULESET_STRAY",
   "COMPLIANT",
 ] as const;
 
@@ -62,6 +68,19 @@ export interface RepoDriftState {
   requiredCheckGreen: boolean | null;
   /** Any deprecated per-repo workflow present (version-doi / generate-archive / llm-enrichment). */
   hasDeprecatedWorkflow: boolean;
+  /**
+   * What the dataset's row calls for as to the required review (`reviewIntentOf`): `require` for
+   * a dataset the Worker reviews while the requirement is the target (the review is on and the
+   * owner has turned the automatic requirement on), `remove` for one it does not review whatever
+   * the switches say, and `undefined` where the tooling has no say (the requirement is not the
+   * target yet, or a standing fixture).
+   */
+  reviewIntent: ReviewIntent | undefined;
+  /**
+   * The review ruleset on the repository, or null when it was not asked about (no intent) or
+   * GitHub could not say. An unknown is never an absence: no review bucket is reported for it.
+   */
+  reviewRuleset: { present: boolean; active: boolean } | null;
 }
 
 /** Sorted, deduped contexts for order-independent comparison. */
@@ -99,6 +118,23 @@ export function classifyDatasetDrift(state: RepoDriftState): DriftBucket[] {
     }
   }
 
+  // The required review. A ruleset that is present and not enforcing (the break-glass rollback
+  // switches it off and leaves it) requires nothing, so it counts as missing. On a repository
+  // whose default branch is not main the ruleset would not be written (it follows the default
+  // branch, the Worker reviews pull requests to main), so that is the outlier's finding and
+  // not this one's.
+  const review = state.reviewRuleset;
+  if (review !== null) {
+    if (
+      state.reviewIntent === "require" &&
+      state.defaultBranch === "main" &&
+      !(review.present && review.active)
+    ) {
+      buckets.push("REVIEW_RULESET_MISSING");
+    }
+    if (state.reviewIntent === "remove" && review.present) buckets.push("REVIEW_RULESET_STRAY");
+  }
+
   return buckets.length > 0 ? buckets : ["COMPLIANT"];
 }
 
@@ -111,13 +147,18 @@ export async function gatherRepoDriftState(
   repo: string,
   visibility: "public" | "private",
   pat: string,
+  reviewIntent?: ReviewIntent,
 ): Promise<RepoDriftState> {
   const expected = deriveContexts(repo);
-  const [defaultBranch, ruleset, workflows, collaborators] = await Promise.all([
+  const [defaultBranch, ruleset, workflows, collaborators, reviewRuleset] = await Promise.all([
     getRepoDefaultBranch(repo, pat).catch(() => "main"),
     getBranchRulesetInfo(repo, pat).catch(() => ({ present: false, contexts: [] as string[] })),
     listRepoWorkflows(repo, pat).catch(() => [] as string[]),
     listDirectCollaborators(repo, pat).catch(() => []),
+    // Only asked when the dataset calls for something, and unknown (null) when GitHub cannot say.
+    reviewIntent === undefined
+      ? Promise.resolve(null)
+      : getReviewRulesetInfo(repo, pat).catch(() => null),
   ]);
 
   let requiredCheckGreen: boolean | null = null;
@@ -140,5 +181,7 @@ export async function gatherRepoDriftState(
       .length,
     requiredCheckGreen,
     hasDeprecatedWorkflow: workflows.some((w) => DEPRECATED_WORKFLOWS.has(w)),
+    reviewIntent,
+    reviewRuleset,
   };
 }

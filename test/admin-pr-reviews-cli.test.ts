@@ -2010,6 +2010,9 @@ describe("nemar admin pr-reviews approve", () => {
       expect(r.exitCode).toBe(1);
       expect(r.stdout).toContain("Approved nm000201 #7");
       expect(r.stdout).toContain("a required check or review is not satisfied");
+      expect(r.stdout).toContain(
+        "this tool names the NEMAR PR Review check, and no other, as one an owner or administrator can override in the GitHub UI, and only where its ruleset is in force",
+      );
       expect(r.stdout).toContain("The approval stands.");
       expect(mergePuts()).toHaveLength(0);
     });

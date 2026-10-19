@@ -203,9 +203,32 @@ The owner set the models, the budgets and the prompt on 2026-10-16, after a comp
 - **The bypass is the NEMAR App (the enrichment workflow pushes to `main` with its token), organization administrators, and the repository `admin` role.**
   Maintainers and outside collaborators get none.
   The `dataset-admin` team is the GitHub side of "admin"; org owners manage it and NEMAR code does not.
-- **It is applied to exactly the datasets the Worker reviews** (active, public, named, first-published), removed when a dataset stops being one, and refused while `PR_REVIEW_ENABLED` is not `1`.
+- **It is applied to exactly the datasets the Worker reviews** (active, public, named, first-published), and removed when a dataset stops being one.
+  Apart from the standing test fixtures, which the tooling never touches in either direction, only a live request to REQUIRE it is ever refused, and for three reasons.
+  The review is off in this environment (`PR_REVIEW_ENABLED` is not `1`), so nothing would post the check and requiring it would block every merge (a 409, `review_disabled`).
+  Or the Worker's GitHub App is not the one the ruleset names: the ruleset requires the check from App 3679074, and the Worker posts it as the App in its `GITHUB_APP_ID`, so unless that is exactly `3679074` the check never arrives (a 409, `review_app_mismatch`, in a sentence that names both ids and says whether the binding is unset, is not a number, or holds another id; a dry run prints them too).
+  Or the Worker cannot sign in as that App for `nemarDatasets`: it posts the check with an installation token, and when the App's private key or its `nemarDatasets` installation id is missing or malformed it falls back to the administrator's personal access token, which GitHub does not let post a check run, so the check never arrives however right the id is (a 409, `review_app_not_configured`; a dry run says so too).
+  A removal is never refused for any of these reasons, because taking the ruleset off is the way out.
+  The test is the intent a dataset's row works out to and not the shape of the request: a live request for a private dataset is a removal and goes through, and a page of datasets applies its removals and refuses its require rows one by one.
+- **The paths that act on their own wait for the owner's switch, `PR_REVIEW_AUTO_REQUIRE`, to ADD the requirement.**
+  Publishing a dataset, a visibility change and the enforce routes put the review ruleset on a repository only while the switch is exactly `1`, `PR_REVIEW_ENABLED` is exactly `1` too, the App ids agree, and the Worker can sign in as the App.
+  Otherwise a reviewed dataset's review ruleset is left as it is and they make no review-ruleset call for it (the branch and tag rulesets are written as before); when the Worker cannot post the check as the App they also log why.
+  The switch does not gate a removal: a dataset that is not reviewed has the review ruleset taken off whatever the switches say, so a dataset made private while the switch is off does not keep a ruleset that nothing will satisfy.
+  The review runs from the day the Worker is deployed, so without a switch of its own the first publication or enforce run after a deploy would require the check before the canary and the calibration gate.
+  The owner turns it on when the fleet step starts, after both, and it is never on before; it is absent from every vars block of the Worker's configuration file until then, and a test says so.
+  That test reads the file and nothing else: the switch can also be set as a Worker secret, which survives a deploy and does not show in the file.
+  So the single and the bulk review-ruleset routes answer with `auto_require`, which is what the Worker itself reads, and a dry run of `nemar admin fleet require-review <dataset-id> --json` shows it.
+  The explicit tools, the review-ruleset routes and `nemar admin fleet require-review`, do not read it: the canary and the fleet are applied with them, a dry run first.
+  A fleet rollback has four steps, in this order, and a removal is allowed whatever the switches say.
+  (a) Start the removal while the switch is still on: `nemar admin fleet require-review --all --remove --apply` does ONE page (25 datasets by default, 50 at most) and prints a `Next page:` line instead of looping, so repeat it with `--after` set to the last id of the page just done, until the output has no `Next page:` line.
+  (b) Dry run the same pages (the same command without `--apply`) and expect no row that would remove.
+  (c) Turn the switch off through a release: the next deploy replaces the Worker's variables with the ones in the configuration file, so a change made in the dashboard does not last.
+  A switch that was ever set as a Worker secret is deleted as a secret instead, because a secret survives a deploy.
+  (d) Repeat (a) and (b) once more, to catch the datasets that were published or changed between the first pass and the release, because the automatic paths can put the requirement back until the release lands.
+  `PR_REVIEW_ENABLED` itself is not turned off while any repository carries the ruleset: every pull request there would wait for a check nothing posts.
 - **A pull request whose required review failed is merged in the GitHub UI by an owner or administrator.**
-  The CLI never uses the bypass (ADR 0093 stands), and its message says so.
+  The CLI never uses the bypass (ADR 0093 stands), and its message says so: it names what can block a merge (the BIDS validation, the version check, the review) and names the review check, and no other, as the one an owner or administrator can override in the GitHub UI, and only where its ruleset is in force.
+  That is what the message names and not all that GitHub allows: an organization owner also bypasses the "NEMAR branch protection" ruleset, which carries the BIDS validation and the version check, and the message does not point anyone at it.
 
 ### 6. Rollout is its own gated step
 

@@ -53,6 +53,7 @@ import {
   screenView,
   startScreenAndNotify,
 } from "../../services/identifier-screen";
+import { readReviewIntent } from "../../services/pr-review-eligibility";
 import { ownedHere } from "../../services/pr-review-queue";
 import {
   publicationReviewApplies,
@@ -1449,6 +1450,11 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
         // than by construction, and that is the shape of the bug the
         // orchestrator had.
         visibility: repoShouldBePrivate ? "private" : "public",
+        // The row after the update above: a published dataset is given the required review
+        // (ADR 0107). The owner's switch (PR_REVIEW_AUTO_REQUIRE) and the review itself
+        // (PR_REVIEW_ENABLED) gate only the addition of the requirement: without either, a
+        // reviewed dataset's review ruleset is left as it is, and a removal is asked for anyway.
+        review: await readReviewIntent(c.env, datasetId),
         collaborators: { ownerLogin, approvedWriters },
       });
     } catch (specError) {
