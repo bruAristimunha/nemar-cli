@@ -78,6 +78,14 @@ let checkStatus = 200;
 let claimDuringDispatchFailure = false;
 /** Which GitHub objects answer 404 to an update, as one deleted by hand would. */
 let patchNotFound = new Set<string>();
+/**
+ * The statuses the stand-in answers, in order, to the next updates that put a check run back to
+ * `in_progress` (the one transition GitHub's documentation neither allows nor forbids). Each is
+ * used once; when the list is empty such an update is accepted.
+ */
+let runningRefusals: number[] = [];
+/** What the stand-in's GitHub holds for each check run, as the last accepted write left it. */
+let checkRunState = new Map<number, { status?: unknown; conclusion?: unknown }>();
 /** What GitHub says each login holds on a repository (see helpers/github-permission.ts). */
 let permissions: Record<string, PermissionAnswer> = {};
 /** What the naming rule's reads find, per repository (see helpers/github-naming.ts). */
@@ -140,8 +148,11 @@ beforeAll(() => {
       if (/\/check-runs(\/\d+)?$/.test(url.pathname)) {
         if (req.method === "PATCH" && patchNotFound.has("check"))
           return new Response("{}", { status: 404 });
+        if (req.method === "PATCH" && body?.status === "in_progress" && runningRefusals.length > 0)
+          return new Response("{}", { status: runningRefusals.shift() });
         if (checkStatus >= 300) return new Response("{}", { status: checkStatus });
-        const id = ++nextId;
+        const id = req.method === "PATCH" ? Number(url.pathname.split("/").pop()) : ++nextId;
+        checkRunState.set(id, { status: body?.status, conclusion: body?.conclusion });
         return Response.json({ id }, { status: req.method === "POST" ? 201 : 200 });
       }
       if (/\/issues\/(comments\/\d+|\d+\/comments)$/.test(url.pathname)) {
@@ -177,6 +188,8 @@ afterEach(() => {
   commentStatus = 201;
   checkStatus = 200;
   patchNotFound = new Set();
+  runningRefusals = [];
+  checkRunState = new Map();
   permissions = {};
   naming = {};
   envOverrides = {};
@@ -4085,6 +4098,85 @@ describe("the check-run and comment lifecycle", () => {
     const last = checks().at(-1);
     expect(last?.method).toBe("POST");
     expect(last?.body).toMatchObject({ conclusion: "success", head_sha: SHA_A });
+  });
+
+  describe("a restart puts a completed check back to running", () => {
+    /**
+     * A reviewed commit whose pass stands on the check, then a title edit that restarts the review.
+     * GitHub's documentation neither allows nor forbids moving a completed check run back to
+     * `in_progress`, so the stand-in refuses the updates that `runningRefusals` lists.
+     */
+    async function restartAfterPass(refusals: number[]) {
+      const id = (await deliver(prEvent())).body.review_id as number;
+      expect((await claim(id)).status).toBe(200);
+      await callback(id, { outcome: "reported", report: goodReport() });
+      const checkRunId = rows()[0].check_run_id as number;
+      expect(checkRunState.get(checkRunId)).toMatchObject({
+        status: "completed",
+        conclusion: "success",
+      });
+      const before = checks().length;
+      runningRefusals = [...refusals];
+      const logged: string[] = [];
+      const original = console.error;
+      console.error = (...a: unknown[]) => void logged.push(a.join(" "));
+      let restarted: Awaited<ReturnType<typeof deliver>>;
+      try {
+        restarted = await deliver(
+          prEvent({
+            action: "edited",
+            changes: { title: { from: "An older title" } },
+            title: "Add three EEG recordings",
+          }),
+        );
+      } finally {
+        console.error = original;
+      }
+      return {
+        id,
+        checkRunId,
+        restarted,
+        logged,
+        updates: checks()
+          .slice(before)
+          .filter((c) => c.method === "PATCH" && c.body?.status === "in_progress"),
+      };
+    }
+
+    test("an update GitHub refuses once is tried again, and the check ends running", async () => {
+      const r = await restartAfterPass([422]);
+      expect(r.restarted.body).toMatchObject({
+        dispatched: true,
+        reason: "redispatched_after_edit",
+      });
+      // The refused update and its retry, both on the check the commit already had.
+      expect(r.updates).toHaveLength(2);
+      for (const u of r.updates) {
+        expect(u.path).toBe(`/repos/nemarDatasets/${DATASET}/check-runs/${r.checkRunId}`);
+      }
+      expect(checkRunState.get(r.checkRunId)).toMatchObject({ status: "in_progress" });
+      expect(r.logged.filter((l) => l.includes("may still stand"))).toEqual([]);
+      expect(dispatchesMade()).toHaveLength(2);
+    });
+
+    test("an update GitHub refuses twice is logged, once, with the review", async () => {
+      const r = await restartAfterPass([422, 422]);
+      // Nothing is lost by it: the review still starts, and the callback's result replaces the check.
+      expect(r.restarted.body).toMatchObject({
+        dispatched: true,
+        reason: "redispatched_after_edit",
+      });
+      expect(r.updates).toHaveLength(2);
+      // The stand-in shows what the log line says: the old pass still stands on the check.
+      expect(checkRunState.get(r.checkRunId)).toMatchObject({
+        status: "completed",
+        conclusion: "success",
+      });
+      const said = r.logged.filter((l) => l.includes("may still stand"));
+      expect(said).toHaveLength(1);
+      expect(said[0]).toContain(`review ${r.id} (${DATASET}#7)`);
+      expect(dispatchesMade()).toHaveLength(2);
+    });
   });
 
   test("a comment deleted by hand is created again for the next commit", async () => {

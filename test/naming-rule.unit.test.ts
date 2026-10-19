@@ -91,6 +91,17 @@ describe("there is one copy of the rule", () => {
     ).toBe(false);
   });
 
+  test("a title that is not text fails closed, as the Worker's intake refuses it", () => {
+    // Read as an empty title it would be clean: a pass for text nobody read.
+    for (const title of [undefined, null, 42, ["Lee2019"], { text: "Lee2019" }]) {
+      expect(() => textFactsOf({ title, body: "x" }, listing("A", "A")), `${title}`).toThrow(
+        "evidence_unavailable",
+      );
+    }
+    // The empty string is text, and has no problem with the rule.
+    expect(textFactsOf({ title: "", body: "x" }, listing("A", "A")).titleProblem).toBeNull();
+  });
+
   test("a changed description with no readable name is unchecked, never clean", () => {
     const facts = (l: Listing) => textFactsOf({ title: "t", body: "x" }, l).nameProblem;
     expect(facts(listing("A", null, true))).toBe("unchecked");

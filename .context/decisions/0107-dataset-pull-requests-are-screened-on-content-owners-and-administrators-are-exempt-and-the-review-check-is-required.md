@@ -11,8 +11,9 @@ The Worker as the gate, the per-commit row, the one-shot claim, the derived verd
 Follows ADR 0048 (account kinds), ADR 0053 and ADR 0086 (unknown is never clear), ADR 0020 (a workflow edit reaches ~785 repositories at once).
 
 This ADR records the decisions of epic #1813.
-Built so far: the exemption with the `exempt` queue verdict and its CLI wording (#1814); the removal of the counts, which is the caps, the platform's pool and the automatic tally pause, with a volume line in the admin list (#1815); readable pull request text from the CLI (#1818); the two-stage review with report version 2, the naming rule and its one override (#1816); and the re-review of a pull request when its title, body or base is edited, or it is reopened or marked ready, with a cap of five such restarts for one commit (#1817).
-The rest is decided here and built by the later phases.
+Built so far, on the epic branch: phases P1 to P6, all of them.
+They are the exemption with the `exempt` queue verdict and its CLI wording (#1814); the removal of the counts, which is the caps, the platform's pool and the automatic tally pause, with a volume line in the admin list (#1815); readable pull request text from the CLI (#1818); the two-stage review with report version 2, the naming rule and its one override (#1816); the re-review of a pull request when its title, body or base is edited, or it is reopened or marked ready, with a cap of five such restarts for one commit (#1817); and the tooling for the required check, which is its ruleset, the routes and `nemar admin fleet require-review` that apply it, the drift report and the switch that keeps the automatic paths from adding it (#1819).
+The required check is not switched on: the switch that lets the automatic paths add it, `PR_REVIEW_AUTO_REQUIRE`, is absent from the Worker's configuration file, and decision 6 says what has to be done before it is.
 The removal of the counts is released only together with the stage-1 screen, so that spend is never left without a bound.
 
 ## Context
@@ -91,7 +92,10 @@ And the review only ever sees a pull request's text and metadata, so a count of 
   Rows written while the pause was automatic hold the same word, so its copy does not say who paused the contributor.
   The standing answer no longer carries `by_record` or `thresholds`, which described the rule that is gone.
 - **The admin list carries a volume line.**
-  For the last 24 hours and the last 7 days it gives the review records created, the review runs they cost (`review_runs`: the sum of their attempts, leaving out a decline, a run that never reached the model, and a run the naming rule ended at the facts stage, which asked no model; a run makes up to two model calls), what they came to, and the declined ones by reason word.
+  For the last 24 hours and the last 7 days it gives the review records created, the review runs they cost (`review_runs`: the sum of their attempts; a run makes up to two model calls), what they came to, and the declined ones by reason word.
+  `review_runs` leaves out what is known not to have asked a model: a decline, a run the naming rule ended at the facts stage, a review handed to GitHub that no job has claimed, and an attempt GitHub never ran (`dispatch_failed`) or that was superseded before its claim (`stale_head`).
+  It counts every other run as spent, and that is conservative: an errored run is counted whatever its reason, `auth_failed`, `evidence_unavailable`, `too_large` and `workflow_failed` among them, though a run that ended for one of those words may never have reached the model, because the row does not say whether a call was made.
+  So the number can be higher than the calls made and never lower, which is the safe way for it to be wrong, since nothing decides on it.
   Each window also sums the tokens of each stage and an estimated cost in dollars at the list prices under Consequences, an estimate for orientation and not a bill.
   Only a version 2 report carries its usage, so only version 2 reports are counted, and the line says how many were: a refusal, a truncation, an earlier attempt of a restarted review and a report from before the screen cost tokens that are not in the sum.
   For example, 30,000 screen input tokens, 60,000 screen output tokens, 380,000 review input tokens and 35,000 review output tokens come to about $1.14 (30,000 x $0.10 + 60,000 x $0.50 + 380,000 x $2 + 35,000 x $10, per million tokens).
@@ -151,10 +155,15 @@ The owner set the models, the budgets and the prompt on 2026-10-16, after a comp
   An author-year key and a DOI are told to the author in the same plain words, "a citation (an author and a year, or a DOI)", with the advice to cite the paper in `ReferencesAndLinks` and the README instead.
   The letters of a key must touch the year, or the one separator before it, and that is a deliberate boundary: `Release 2019`, `Andreev 2012` and `Add 2019 recordings` are ordinary sentences, and a rule that read a word and a year across a space would refuse every title that mentions a year.
   The price is that a citation typed with a space (`Sawada 2022`) is not caught, and that letters attached to a year (`H2020`, `ses-2019`, `R2019b`) are refused wherever they stand.
+  **A calendar version in a title is refused by the author-year rule.**
+  `nemar dataset update` sends the author's title with the version after it, `Add subject 03 (v2020.1.1)`, and `nemar dataset release` sends `Release v2020.1.1`; in both, `v2020` is a letter touching a year.
+  The CLI asks the rule about the title exactly as it will be sent, before it changes or pushes anything (before sign-in, when the clone's own `dataset_description.json` says which version `update` will release), and the message names that title; before this it asked only about the title as typed, and the review refused the sent one after the push.
+  Whether a calendar version should be refused is a question for the owner, who decides if it is wanted: it is refused today because the rule has no exception for a version, and a dataset whose version starts with a year cannot have a pull request opened by the CLI until that is decided or its version changes.
   A description is not held to the rule, so it may cite the paper the way the paper is cited.
   The scan is linear in the length of the text, because a dataset `Name` can be long: it has no repetition that repeats another, and the tests that say so give it texts of hundreds of thousands of characters.
   The name is the `Name` field of `dataset_description.json` at the head, compared with the merge base: a name the pull request did not change is not its problem.
-- **One pure function decides, in `shared/naming-rule.ts`**, which the CLI asks before it opens a pull request, the review job asks before any model call, and the Worker asks of a pull request it does not review.
+- **One pure function decides, in `shared/naming-rule.ts`**, which the CLI asks about the title it sends before it opens a pull request, the review job asks before any model call, and the Worker asks of a pull request it does not review.
+  The CLI asks about the title and nothing else: it does not check a description, and it never asks about a changed dataset `Name`, which only the review job and the Worker read, so a `Name` that breaks the rule is first refused after the pull request is open.
   A refusal fails the verdict whatever a model says.
 - **Owners and administrators are not exempt from it.**
   The exemption still skips the review, but the Worker applies the rule first: a refused title or name fails the check, and a name that cannot be read makes it a check that needs a person, never a skip, even when the title is also refused (the title's problem is stated in the check, and the unread name is what decides its conclusion).
@@ -195,7 +204,14 @@ The owner set the models, the budgets and the prompt on 2026-10-16, after a comp
   The row's nonce is replaced, so the superseded job's token no longer matches: its claim and its report are refused with the 401 any stale token gets, and its report is never stored.
   A job that has not claimed yet spends nothing.
   A job that had claimed is not stopped: it still makes its model calls before its report is refused, so superseding a claimed review costs that run in full.
-  The row's verdict and report are cleared (the table keeps them only for a reported row), so the check goes back to running and an old fail or pass stops standing the moment the text changes.
+  The row's verdict and report are cleared (the table keeps them only for a reported row), so the row says running, and the check is meant to go back to running with it, which is what stops an old fail or pass standing the moment the text changes.
+  **That last step is unverified against GitHub.**
+  The check goes back to running by updating the commit's completed check run to `in_progress`, a transition GitHub's documentation neither allows nor forbids, and no run of it has been read back.
+  A restarted check that stays completed would leave the old pass on a required check until the job reports or the 40-minute watchdog decides.
+  The Worker does not rely on the transition succeeding: a refused or timed-out update is tried again once, after one second, and if it fails again one error line is logged that names the review and says the old result may still stand on the check.
+  The retry sits inside the webhook's own request, so a delivery whose first attempt failed spends at most that second plus the update's own 5-second bound more, and nothing is written to the row about it.
+  The staging step (decision 6) settles it before the check is required.
+  If GitHub refuses the transition, a restart has to create a new check run beside the completed one, which rests on the same unverified rule as the waiver (GitHub reading the newest run of a name, see Consequences).
   `attempts` goes up by one when the earlier run could have cost a model call, as for any restart, and the answer's reason word is `redispatched_after_edit`.
   A review that was handed to GitHub and never claimed could not have cost one, so several quick edits before the job starts are still one run.
   A contributor an administrator has blocked is declined again, as for any restart.
@@ -226,7 +242,12 @@ The owner set the models, the budgets and the prompt on 2026-10-16, after a comp
   It goes up by one at each restart an edit, a reopening or a marking as ready causes, from 0 at the commit's first row.
   A restart is counted in its own write, before its dispatch, so a restart whose dispatch then fails counts, and so does a redelivered edit: the conservative way to be wrong, and a race-safe one.
   What adds nothing is a commit with no row (a new delivery), a restart that lost a race and was tried again (it counts once), a restart a block declined (a decline is no run), and a push that restarts a review whose dispatch failed (it changes no text).
+  A restart whose earlier run ended at the facts stage (a refused title) costs no model call, but it counts toward the five like any other, because the count is of changes of the text and not of calls.
+  So an author who fixes a refused title in steps reaches the cap after five edits, and then needs a push or an administrator's start.
+  That is the current behavior, and the owner decides whether naming refusals should be exempt from the count.
   An administrator's start resets the count to 0 when it starts the review again; a start that a block declines does not.
+  `start --all` therefore leaves a capped commit out, because starting it lifts the cap, which a bulk start must not do unasked; an administrator starts it by name and so means it.
+  Its text output lists the commits it left out, each with the command that starts it, and its JSON carries them in the `capped` array (the dataset, the pull request number and the author's login of each), beside `drafts` and `truncated`; `src/commands/admin-pr-reviews.ts` (`startAll`) builds both.
   A push is a new commit with a new row, so it starts at 0.
   The cap comes after the gate, so a blocked contributor is declined and is never told "too many edits".
   The sixth change is refused and not restarted, and the refusal fails closed.
@@ -256,9 +277,15 @@ The owner set the models, the budgets and the prompt on 2026-10-16, after a comp
 
 - **A separate ruleset, "NEMAR PR review required", requires the `NEMAR PR Review` check from the NEMAR App.**
   It is not a third required check inside "NEMAR branch protection": that ruleset is gated on BIDS validation, is missing on most public repositories, and adding the repository-admin role to its bypass would also bypass the BIDS and version checks.
-- **The bypass is the NEMAR App (the enrichment workflow pushes to `main` with its token), organization administrators, and the repository `admin` role.**
+- **The bypass is the NEMAR App (the enrichment workflow pushes to `main` with its token), organization administrators, and the repository `admin` role, and the id of that role is unverified.**
   Maintainers and outside collaborators get none.
   The `dataset-admin` team is the GitHub side of "admin"; org owners manage it and NEMAR code does not.
+  The ruleset names the role by its id, 5, and GitHub's ruleset documentation lists no role ids.
+  The 5 comes from the Terraform GitHub provider's documentation (admin 5, write 4, maintain 2) and nothing has read it back from GitHub, so which role the bypass reaches is not known.
+  A wrong id would hand the bypass to Maintain or Write in place of Admin.
+  The first apply, on a dev-owned exemplar and before any other repository gets the ruleset, reads it back: the ruleset is fetched through GraphQL and must show exactly one `RepositoryRole` bypass actor whose role name is `admin`.
+  If it names another role, the ruleset is removed and the id is corrected before anything else is applied.
+  The query is in the comment on `REPOSITORY_ADMIN_ROLE_ID` in `backend/src/services/github/branch-protection.ts`, which says the same.
 - **It is applied to exactly the datasets the Worker reviews** (active, public, named, first-published), and removed when a dataset stops being one.
   Apart from the standing test fixtures, which the tooling never touches in either direction, only a live request to REQUIRE it is ever refused, and for three reasons.
   The review is off in this environment (`PR_REVIEW_ENABLED` is not `1`), so nothing would post the check and requiring it would block every merge (a 409, `review_disabled`).
@@ -283,6 +310,7 @@ The owner set the models, the budgets and the prompt on 2026-10-16, after a comp
   (d) Repeat (a) and (b) once more, to catch the datasets that were published or changed between the first pass and the release, because the automatic paths can put the requirement back until the release lands.
   `PR_REVIEW_ENABLED` itself is not turned off while any repository carries the ruleset: every pull request there would wait for a check nothing posts.
 - **A pull request whose required review failed is merged in the GitHub UI by an owner or administrator.**
+  An owner does it through the organization administrator bypass; an administrator who is not an owner depends on the repository `admin` role's bypass, whose role id is unverified until the first apply is read back.
   The CLI never uses the bypass (ADR 0093 stands), and its message says so: it names what can block a merge (the BIDS validation, the version check, the review) and names the review check, and no other, as the one an owner or administrator can override in the GitHub UI, and only where its ruleset is in force.
   That is what the message names and not all that GitHub allows: an organization owner also bypasses the "NEMAR branch protection" ruleset, which carries the BIDS validation and the version check, and the message does not point anyone at it.
 
@@ -293,8 +321,10 @@ The owner set the models, the budgets and the prompt on 2026-10-16, after a comp
 - There is therefore no staging soak of the reviewer: its screen and its review first run on production, in an advisory shadow mode on production pull requests after the release, and the check is made required only after the shadow run and the calibration gate, with the re-review on an edit (decision 4, phase P4) built before either.
 - The Worker's side is soaked on staging, as a rollout step of its own.
   The dev Worker deploys from `dev` with the epic, before the release, and the exempt path never dispatches, so a pull request opened by an administrator against a dev-owned exemplar exercises the naming rule's reads, the check posted for it and the override on staging.
-  That step verifies two statements of this ADR and no others: how long the naming rule's GitHub reads take against the ten seconds GitHub gives a delivery (decision 3a), and that GitHub reads the newest check run of a name, which is what lets a waiver release a required check (Consequences).
-  It is done before the check is made required, and until it is done both statements stand as unverified.
+  That step verifies three statements of this ADR and no others: how long the naming rule's GitHub reads take against the ten seconds GitHub gives a delivery (decision 3a); that GitHub reads the newest check run of a name, which is what lets a waiver release a required check (Consequences); and that GitHub lets a completed check run be updated back to `in_progress`, which is what a restart does to take an old result off the check (decision 4).
+  The third is settled by restarting a review whose check run has completed on a dev-owned exemplar, with an edit of the title, and reading the check run back from GitHub.
+  The first apply of the review ruleset, on a dev-owned exemplar, is done in the same step, and it reads the repository `admin` role's id back (decision 5); no other repository gets the ruleset before that read-back shows the role named `admin`.
+  It is done before the check is made required, and until it is done the three statements and the role id stand as unverified.
 - The calibration gate, approved by the owner: no false pass on a blocking problem; at most 10 percent false fails among the pull requests labeled pass; no stage-1 reject of a legitimate pull request; no steering flag on a legitimate pull request.
 - The production canary is a data author's account named in the epic, and its pull requests exercise the gate first.
   No dataset is special-cased (more than 900 are live): every reviewable dataset is in scope, applied in batches, with a dry run as the default and an explicit apply flag.
@@ -329,7 +359,7 @@ The owner set the models, the budgets and the prompt on 2026-10-16, after a comp
 - **A demotion or a revocation does not retract a `skipped` check already posted.**
   It stays valid for its commit until the commit changes, and the next delivery reads the role afresh.
 - **An edit holds the check running for as long as a run takes, and a restart may be one nobody wanted.**
-  A maintainer's typo fix on a pull request that already had a result puts its check back to running for up to about 28 minutes (the job's own limit) and costs a run.
+  A maintainer's typo fix on a pull request that already had a result puts its check back to running for up to about 28 minutes (the job's own limit) and costs a run, if GitHub lets a completed check run go back to running (decision 4 says that is unverified).
   An exempt author's edit, reopening or marking as ready on a commit someone else pushed restarts that review, because the commit has a row and the exemption is judged only for a commit no review has touched.
   The cap bounds both at five restarts a commit.
 - **An exempt push stores no row, so it does not supersede a review of the previous commit that is still running.**
@@ -358,6 +388,12 @@ The owner set the models, the budgets and the prompt on 2026-10-16, after a comp
   A newer CLI against an older Worker shows a pause by the record as a plain pause and not as a block.
   The package publish and the Worker deploy are separate workflows, within minutes of each other, in either order (CHANGELOG, Deploy coupling), so either skew can happen for a few minutes.
   Both are administrators' tools, the Worker itself is unaffected, and the remedy is to upgrade the CLI; the two fields are not kept, because they would describe a rule that no longer exists.
+- **The job and the Worker deploy separately, and a report that crosses the release is refused for a few minutes.**
+  The job runs `main`'s script as soon as the release is on `main`, while the Worker is deployed by its own workflow (`deploy-backend.yml`), minutes before or after.
+  In that gap a version 2 callback from the new script reaches a Worker that still has the old parser, which accepts version 1 only, and a version 1 callback from a job that started before the release reaches the new Worker, which accepts version 2 only; each is refused as `report_invalid`, and its check is `action_required` until a person starts the review again (a push, an edit of the text, or an administrator's start).
+  No verdict is wrong and nothing but that review's run is lost, but it falls on the pull requests of authors in flight, where the skew above falls only on administrators' tools.
+  The job and the Worker should therefore ship in the same release window: merge the release to `main`, wait for the Worker's deploy to finish, and then start any review that reads `report_invalid` with `nemar admin pr-reviews start`.
+  On the staging Worker the skew does not end by itself, because it deploys from `dev` with the epic and every dispatch, staging included, runs `main`'s script until the release (decision 6); a review dispatched there reports version 1 and is refused the same way.
 - **Until the screen ships, nothing bounds spend but the workspace limit.**
   Phase P2 removes the counts and phase P3 adds the screen, so the epic's branch must not be released with the first and without the second.
 - **Without caps, cost is bounded by the screen and the spend limit, and the review on `claude-sonnet-5-5` is what costs.**
@@ -387,7 +423,7 @@ The owner set the models, the budgets and the prompt on 2026-10-16, after a comp
 
 ## Receipts
 
-- Epic #1813 and its phases #1814, #1815, #1818, #1816 and #1817.
+- Epic #1813 and its phases #1814, #1815, #1816, #1817, #1818 and #1819.
 - The two stages and report version 2 (#1816): `scripts/ci/pr-review.ts` (`STAGE_BUDGETS`, `callStage`, `reviewPullRequest`), `scripts/ci/pr-review-prompt.ts` (`SCREEN_SYSTEM_PROMPT`, `REVIEW_SYSTEM_PROMPT`, `V3_RULES`, `assembleReport`), `scripts/ci/pr-review-evidence.ts` (`gatherListing`, `gatherContent`), `shared/pr-review.ts` (`parsePrReviewReport`, `parseStoredPrReviewReport`).
 - The naming rule and its override (#1816): `shared/naming-rule.ts` (`namingProblemOf`), `backend/src/services/pr-review-naming.ts`, `backend/src/services/pr-review-waiver.ts`, `src/commands/admin-pr-reviews.ts` (`allow --admin`).
 - The calibration: `scripts/ci/pr-review-calibrate.ts`.
@@ -395,5 +431,6 @@ The owner set the models, the budgets and the prompt on 2026-10-16, after a comp
 - The gate and the removal of the counts (#1815): `backend/src/services/pr-review.ts` (`gateDecision`: exempt, then blocked, then reviewed), `shared/pr-review.ts` (`PRODUCED_DECLINE_REASONS`, `HISTORICAL_DECLINE_REASONS`, `standingOf`).
 - The volume line: `backend/src/services/pr-review-queue.ts` (`readVolume`), `shared/contract/pr-review-admin.ts` (`QueueVolume`), `src/commands/admin-pr-reviews.ts` (`volumeLines`).
 - The re-review on an edit, a reopening and a marking as ready, and its cap (#1817): `backend/src/services/pr-review.ts` (`readPullRequestEvent`, `handleRepeat`, `restartReview`, `refuseEdit`), `backend/src/db/migrations/0099_pr_review_edit_limit.sql`, `shared/pr-review.ts` (`PR_REVIEW_EDIT_CAP`, `WORKER_ONLY_RUN_ERRORS`).
+- The required check's ruleset and its tooling (#1819): `backend/src/services/github/branch-protection.ts` (`REVIEW_RULESET_NAME`, `buildReviewRulesetPayload`, `ensureReviewRuleset`, `REPOSITORY_ADMIN_ROLE_ID`), `backend/src/services/pr-review-eligibility.ts` (`isReviewableRow`, `reviewIntentOf`, `automaticReviewIntent`), `backend/src/routes/admin/fleet.ts` (the review-ruleset routes), `backend/src/services/fleet-drift.ts` (`REVIEW_RULESET_MISSING`, `REVIEW_RULESET_STRAY`), `src/commands/admin.ts` (`nemar admin fleet require-review`).
 - Queue and labels: `backend/src/services/pr-review-queue.ts`, `shared/contract/pr-review-admin.ts`, `src/commands/admin-pr-reviews.ts`.
-- Tests: `backend/test/pr-review-exemption.test.ts`, `backend/test/pr-review-flow.test.ts`, `backend/test/pr-review-queue.test.ts`, `backend/test/pr-review-start.test.ts`, `backend/test/pr-review-edit-limit-migration.test.ts`, `test/pr-review.test.ts`, `test/pr-review-workflow.test.ts` (the budgets), `test/admin-pr-reviews-cli.test.ts`, `test/pr-reviews-render.unit.test.ts`.
+- Tests: `backend/test/review-ruleset.test.ts`, `backend/test/review-ruleset-routes.test.ts`, `backend/test/pr-review-eligibility.test.ts`, `test/admin-fleet-require-review-cli.test.ts`, `backend/test/pr-review-exemption.test.ts`, `backend/test/pr-review-flow.test.ts`, `backend/test/pr-review-queue.test.ts`, `backend/test/pr-review-start.test.ts`, `backend/test/pr-review-edit-limit-migration.test.ts`, `test/pr-review.test.ts`, `test/pr-review-workflow.test.ts` (the budgets), `test/admin-pr-reviews-cli.test.ts`, `test/pr-reviews-render.unit.test.ts`.

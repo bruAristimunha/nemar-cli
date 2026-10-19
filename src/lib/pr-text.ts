@@ -122,17 +122,44 @@ function citationReason(found: string): string {
   return `has a citation (an author and a year, or a DOI) in it (${quoted(found)}); describe the change in plain words, such as "Add three EEG recordings", and cite the paper in ReferencesAndLinks and the README instead`;
 }
 
+/** What an unfilled template field is told: what was found, and that its real value belongs there. */
+function templateReason(found: string): string {
+  return `still has an unfilled template field (${quoted(found)}); put the real value in its place`;
+}
+
+/**
+ * The naming rule's finding on `text`, in the words that tell the author, or null when it holds
+ * none: an author-year key, a DOI, a template field, asked in the order of `namingProblemOf`. What
+ * a citation is told is `citation`'s to say, because the advice for a title the author typed (cite
+ * the paper elsewhere) is not the advice for a title the CLI built.
+ */
+function namingTextProblem(
+  text: string,
+  citation: (found: string) => string = citationReason,
+): TextProblem | null {
+  const authorYear = findAuthorYearKey(text);
+  if (authorYear !== null) return { code: "author_year", reason: citation(authorYear) };
+  const doi = findDoi(text);
+  if (doi !== null) return { code: "doi", reason: citation(doi) };
+  const field = findTemplateField(text);
+  if (field !== null) return { code: "template_field", reason: templateReason(field) };
+  return null;
+}
+
 /**
  * The first reason `raw` cannot go into a pull request as the title or the description of a
- * change, or null when it can. A missing value is `empty`. The text is judged as
+ * change, or null when it can. The naming rule (a citation, a template field) is asked of a title
+ * only; a description is held to what a person can read, and to nothing about naming. A missing
+ * value is `empty`. The text is judged as
  * {@link cleanPrText} returns it.
  */
 export function findTextProblem(kind: TextKind, raw: string | undefined): TextProblem | null {
   const text = cleanPrText(kind, raw);
   if (text === "") return { code: "empty", reason: "is empty; say in plain words what changed" };
-  // A title only: a description may cite a paper the way the paper is cited. Before the digest
-  // check, because a name of the letters a to f and a year (`Decade2019`) is also seven or more hex
-  // digits, and it is a name that was typed.
+  // The naming rule is for a title only (and, in the review, the dataset's Name): a description may
+  // cite a paper the way the paper is cited, and may show a template token or a field in an example.
+  // Before the digest check, because a name of the letters a to f and a year (`Decade2019`) is also
+  // seven or more hex digits, and it is a name that was typed.
   const authorYear = kind === "title" ? findAuthorYearKey(text) : null;
   if (authorYear !== null) return { code: "author_year", reason: citationReason(authorYear) };
   const doi = kind === "title" ? findDoi(text) : null;
@@ -150,13 +177,8 @@ export function findTextProblem(kind: TextKind, raw: string | undefined): TextPr
       reason: `is placeholder text (${quoted(text)}); say what actually changed`,
     };
   }
-  const field = findTemplateField(text);
-  if (field !== null) {
-    return {
-      code: "template_field",
-      reason: `still has an unfilled template field (${quoted(field)}); put the real value in its place`,
-    };
-  }
+  const field = kind === "title" ? findTemplateField(text) : null;
+  if (field !== null) return { code: "template_field", reason: templateReason(field) };
   if (!/\p{L}{2,}/u.test(text)) {
     return {
       code: "no_words",
@@ -175,6 +197,31 @@ export function findTextProblem(kind: TextKind, raw: string | undefined): TextPr
 /** One sentence about a refused text: `subject` is what to call it ("The title (--message)"). */
 export function describeTextProblem(subject: string, problem: TextProblem): string {
   return `${subject} ${problem.reason}.`;
+}
+
+/**
+ * Why the title a command is about to SEND would be refused by the review, or null when it would
+ * not. The review judges the title on the pull request, and that is not always the one the author
+ * typed: `update` adds the version in parentheses ({@link buildUpdateTitle}) and `release` writes
+ * the whole title ({@link buildReleaseTitle}). A version that starts with a year (`2020.1.0`) makes
+ * `(v2020.1.1)`, which is a letter touching a year, which the naming rule reads as an author and a
+ * year; the typed title alone passes. So the rule is asked of `sent` exactly as it will be sent,
+ * with the one question the review and the Worker ask (`namingProblemOf`).
+ *
+ * Whether a calendar version should be refused at all is the owner's to decide (ADR 0107); this is
+ * what the review does with one today, and the author is told before anything is pushed.
+ */
+export function findSentTitleProblem(sent: string): TextProblem | null {
+  return namingTextProblem(
+    sent,
+    (found) =>
+      `has an author and a year in it (${quoted(found)}): the version added to the title starts with a year, as a calendar version such as 2020.1.0 does, and the review refuses a title that reads that way`,
+  );
+}
+
+/** One sentence about a title that would be refused as sent, naming the title exactly as sent. */
+export function describeSentTitleProblem(sent: string, problem: TextProblem): string {
+  return `The title as it will be sent, "${sent}", ${problem.reason}.`;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -316,6 +363,11 @@ export function summarizeChangedFiles(files: readonly ChangedFile[]): string {
 /** The pull request title of an update: the author's title, then the version it releases. */
 export function buildUpdateTitle(title: string, version: string): string {
   return `${title} (v${version})`;
+}
+
+/** The pull request title of a release, which is a version bump and has no title of its own. */
+export function buildReleaseTitle(version: string): string {
+  return `Release v${version}`;
 }
 
 /**

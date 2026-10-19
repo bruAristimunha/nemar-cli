@@ -785,6 +785,19 @@ describe("runReview: the job around the model call", () => {
     expect(res).toMatchObject({ outcome: "error", error: "stale_head" });
   });
 
+  test("a title that is not text is an evidence error, and the model is never called", async () => {
+    const r = setup("run-title-not-text");
+    const head = { sha: r.head, repo: { full_name: "nemarDatasets/nm000460" } };
+    for (const title of [42, null, ["Lee2019"], { text: "Lee2019" }]) {
+      const res = await runReview(args(r, prJson(r.dir, { head, title })));
+      expect(res, JSON.stringify(title)).toMatchObject({
+        outcome: "error",
+        error: "evidence_unavailable",
+      });
+    }
+    expect(modelRequests).toHaveLength(0);
+  });
+
   test("an unreadable pull request file is an evidence error, not a crash", async () => {
     const r = setup("run-nopr");
     const res = await runReview(args(r, join(r.dir, "nope.json")));

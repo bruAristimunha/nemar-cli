@@ -197,12 +197,15 @@ import {
 import {
   type ChangedFile,
   type TextKind,
+  buildReleaseTitle,
   buildUpdateBody,
   buildUpdateTitle,
   cleanPrText,
   describeChangelogWrite,
+  describeSentTitleProblem,
   describeTextProblem,
   describeUnopenedPullRequest,
+  findSentTitleProblem,
   findTextProblem,
   inspectChangelog,
   localIsoDate,
@@ -3037,6 +3040,10 @@ Examples:
         `  ${chalk.bold("Version bump:")} ${currentVersion} -> ${chalk.green(newVersion)}`,
       );
 
+      // The pull request is titled "Release v<version>", and the review reads that title: a version
+      // that starts with a year makes an author-year key of it.
+      requireSentTitle(buildReleaseTitle(newVersion));
+
       // Confirm
       const result = await confirm(`Create release PR for ${datasetId} v${newVersion}?`, {
         yes: options.yes,
@@ -3151,7 +3158,7 @@ Examples:
       let prCreated = false;
       const prSpinner = ora("Creating pull request...").start();
       try {
-        const prTitle = `Release v${newVersion}`;
+        const prTitle = buildReleaseTitle(newVersion);
         const prBody = `## Version Bump\n\nBumps ${datasetId} from ${currentVersion} to ${newVersion}.\n\nOn merge, CI will:\n- Tag the release (v${newVersion})\n- Publish a version DOI (if concept DOI exists)`;
 
         const prProc = spawn({
@@ -3383,6 +3390,40 @@ function requirePrText(given: PrTextGiven, flags: PrTextFlags, mode: AskMode): P
 }
 
 /**
+ * Refuse a title the review would refuse as it will be SENT, before anything is changed or pushed.
+ * `update` adds the version to the author's title and `release` writes the title itself, so a title
+ * that passed {@link requirePrText} can still be refused: a calendar version such as 2020.1.0 makes
+ * `(v2020.1.1)`, which the naming rule reads as an author and a year. The message names the title
+ * exactly as it would be sent.
+ */
+function requireSentTitle(sent: string): void {
+  const problem = findSentTitleProblem(sent);
+  if (problem === null) return;
+  console.log(chalk.red(`Error: ${describeSentTitleProblem(sent, problem)}`));
+  console.log(chalk.dim("  Nothing was changed."));
+  // A refusal of the title, which is not a failure worth a bug report (see the exit hook in index.ts).
+  markUsageExit();
+  process.exit(1);
+}
+
+/**
+ * The version `update` will release, read from the clone's own `dataset_description.json`, or null
+ * when it cannot be told from here: no file, no `Version`, a version or a bump it cannot read. The
+ * steps after sign-in report each of those in their own words; this only answers when it can, so
+ * the title as sent can be checked before sign-in.
+ */
+function plannedUpdateVersion(workDir: string, bump: string): string | null {
+  if (!["patch", "minor", "major"].includes(bump)) return null;
+  try {
+    const desc = JSON.parse(readFileSync(join(workDir, "dataset_description.json"), "utf-8"));
+    if (typeof desc.Version !== "string" || !desc.Version) return null;
+    return bumpVersion(desc.Version, bump as "patch" | "minor" | "major");
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Ask until the text is one a person can read. A refusal asks again on a fresh line rather than
  * validating in place: inquirer writes the refused text back onto the line to be edited, and under
  * `TERM=dumb` (an Emacs shell, some wrappers) no editing key works, so the person could never
@@ -3460,11 +3501,14 @@ Title and description (both required):
   and so does NEMAR's automated review, so say in plain words what changed
   and why. The title is also the new version's entry in CHANGES (created if
   the dataset has none), and reads there as you wrote it.
-  An empty value, placeholder text such as "Save changes", an unfilled
-  template field, text with no words in it, a pasted hash or JSON, and a
-  title with a citation in it, an author and a year such as Lee2019 or a
-  DOI, anywhere in it, are refused (cite the paper in ReferencesAndLinks
-  and the README instead). At a terminal the command asks for what you
+  An empty value, placeholder text such as "Save changes", text with no
+  words in it, a pasted hash or JSON, and a title with a citation in it,
+  an author and a year such as Lee2019 or a DOI, anywhere in it, or an
+  unfilled template field, are refused (cite the paper in
+  ReferencesAndLinks and the README instead). The description may cite the
+  paper as the paper is cited. The title is refused as it will be sent,
+  with the version after it, so a version that starts with a year, such
+  as 2020.1.0, is refused too. At a terminal the command asks for what you
   leave out; with --yes, or without a terminal, it refuses instead.
 
 Note:
@@ -3500,6 +3544,14 @@ Examples:
         UPDATE_TEXT_FLAGS,
         { yes: options.yes === true, terminal: process.stdin.isTTY === true },
       );
+
+      // The title the review will see is the author's title and the version, so it is asked about
+      // as sent, here, before sign-in, whenever the clone says which version that will be. A title
+      // typed at a prompt, or a version that cannot be read yet, is asked about again below.
+      const plannedVersion = plannedUpdateVersion(resolve(path || "."), options.bump);
+      if (givenText.title !== undefined && plannedVersion !== null) {
+        requireSentTitle(buildUpdateTitle(givenText.title, plannedVersion));
+      }
 
       requireAuth();
 
@@ -3660,6 +3712,7 @@ Examples:
       // At a terminal, ask for whatever the command line left out; every other path already
       // holds both (requirePrText refused the run above otherwise).
       const { title, description } = await askForPrText(givenText);
+      requireSentTitle(buildUpdateTitle(title, newVersion));
 
       // Confirm
       const confirmResult = await confirm(`Create update PR for ${datasetId}?`, {

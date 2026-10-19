@@ -404,8 +404,14 @@ interface PullRequestJson {
  * mark, and a description of nothing but blanks is empty however long it is). It is cut when the
  * tidied text is longer than {@link MAX_BODY_CHARS}, the cap the prompt cuts at, so the fact is true
  * exactly when a model was shown the `[cut]` mark.
+ *
+ * Throws the run error `evidence_unavailable` for a title that is not a string.
  */
 export function textFactsOf(pr: { title?: unknown; body?: unknown }, listing: Listing): TextFacts {
+  // A title that is not text cannot be asked about the rule, and reading it as empty would call it
+  // clean: a pass for text nobody read. The Worker's intake refuses such a delivery as malformed;
+  // the job fails closed the same way, with the run error for evidence it could not read.
+  if (typeof pr.title !== "string") throw new RunFailure("evidence_unavailable", "title_not_text");
   const changedName =
     listing.nameAfter !== null && listing.nameAfter !== listing.nameBefore
       ? listing.nameAfter
@@ -414,7 +420,7 @@ export function textFactsOf(pr: { title?: unknown; body?: unknown }, listing: Li
   return {
     descriptionEmpty: body.trim() === "",
     descriptionCut: body.length > MAX_BODY_CHARS,
-    titleProblem: namingProblemOf(typeof pr.title === "string" ? pr.title : ""),
+    titleProblem: namingProblemOf(pr.title),
     nameProblem:
       changedName !== null
         ? namingProblemOf(changedName)

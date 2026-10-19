@@ -38,7 +38,12 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn } from "bun";
 import { gatherGitFacts } from "../scripts/ci/pr-review-evidence";
-import { DOI_PATTERN, TEMPLATE_FIELDS, YEAR_PATTERN } from "../shared/naming-rule";
+import {
+  DOI_PATTERN,
+  TEMPLATE_FIELDS,
+  YEAR_PATTERN,
+  findTemplateField,
+} from "../shared/naming-rule";
 import {
   type ChangedFile,
   MAX_NAMED_FILES,
@@ -47,14 +52,17 @@ import {
   type TextKind,
   type TextProblemCode,
   addChangelogEntry,
+  buildReleaseTitle,
   buildUpdateBody,
   buildUpdateTitle,
   cleanPrText,
   describeChangelogWrite,
+  describeSentTitleProblem,
   describeTextProblem,
   describeUnopenedPullRequest,
   findAuthorYearKey,
   findDoi,
+  findSentTitleProblem,
   findTextProblem,
   hasChangelogHeading,
   inspectChangelog,
@@ -206,16 +214,16 @@ const CASES: Record<TextProblemCode, { refused: [TextKind, string][]; passes: st
       ["title", "Add {{title}} data"],
       ["title", "Add ${N} subjects"],
       ["title", "<your title here>"],
-      ["description", "[describe the change]"],
-      ["description", "[Describe your change]"],
-      ["description", "[Fill in the description]"],
+      ["title", "[describe the change]"],
+      ["title", "[Describe your change]"],
+      ["title", "[Fill in the description]"],
       ["title", "<insert title>"],
-      ["description", "FirstAuthorSurname"],
+      ["title", "FirstAuthorSurname"],
       ["title", "Rename it to year-keyword-paperDOI"],
-      ["description", "paperDOI"],
+      ["title", "paperDOI"],
       // The tokens joined to other text by an underscore or a digit, and in another case.
       ["title", "FirstAuthorSurname_year_keyword_paperDOI"],
-      ["description", "paperDOI10.1234"],
+      ["title", "paperDOI10.1234"],
       ["title", "Rename it to firstauthorsurname-keyword"],
     ],
     passes: [
@@ -446,7 +454,8 @@ describe("findTextProblem", () => {
     for (const opener of ["[your", "<insert", "[fill in"]) {
       for (const blank of [" ", " \t", "\n"]) {
         const hostile = `Adds data.\n\n${opener}${blank.repeat(30_000 / blank.length)}x`;
-        expect(findTextProblem("description", hostile)).toBeNull();
+        // The rule itself: a description is not held to it, and a title has its blanks collapsed.
+        expect(findTemplateField(hostile)).toBeNull();
       }
     }
   });
@@ -471,11 +480,33 @@ describe("findTextProblem", () => {
   });
 
   test("a bracket that is closed after blanks is still a template", () => {
-    expect(findTextProblem("description", `[your${" ".repeat(50_000)}title]`)?.code).toBe(
-      "template_field",
-    );
+    expect(findTemplateField(`[your${" ".repeat(50_000)}title]`)).not.toBeNull();
     // No words inside, so nothing is asked of the reader: not a template.
-    expect(findTextProblem("description", "Adds data. [your   ]")).toBeNull();
+    expect(findTemplateField("Adds data. [your   ]")).toBeNull();
+  });
+
+  describe("a description is not held to the naming rule", () => {
+    // The rule is for the title (and, in the review, the dataset's Name). A description may show a
+    // template token or an unfilled field as an example, so the CLI does not refuse it for one.
+    const TOKENS = [
+      "Renames the dataset to FirstAuthorSurname-year-keyword-paperDOI as the atlas rule asks.",
+      "Replaces {{old_name}} with the new task name in every events file.",
+      "Documents the ${LAB_PREFIX} variable that the conversion script reads.",
+      "Fills in the <your title here> line of the README template.",
+      "Removes the [describe the change] line left in CHANGES.",
+    ];
+
+    test("a description with a template token is accepted", () => {
+      for (const text of TOKENS) {
+        expect(findTextProblem("description", text), text).toBeNull();
+      }
+    });
+
+    test("the same text is refused as a title", () => {
+      for (const text of TOKENS) {
+        expect(findTextProblem("title", text)?.code, text).toBe("template_field");
+      }
+    });
   });
 
   test("a placeholder is refused as a description too, and says which text it saw", () => {
@@ -745,6 +776,56 @@ beforeAll(() => {
 
 afterAll(() => {
   rmSync(root, { recursive: true, force: true });
+});
+
+describe("the title as it will be sent", () => {
+  const TYPED = "Add subject 03";
+
+  test("a calendar version makes an author-year key of the suffix, though the typed title passes", () => {
+    expect(findTextProblem("title", TYPED)).toBeNull();
+    const sent = buildUpdateTitle(TYPED, "2020.1.1");
+    expect(sent).toBe("Add subject 03 (v2020.1.1)");
+    const problem = findSentTitleProblem(sent);
+    expect(problem?.code).toBe("author_year");
+    if (!problem) throw new Error("expected a problem");
+    // The message names the title exactly as it will be sent, and the key it found in it.
+    expect(describeSentTitleProblem(sent, problem)).toBe(
+      'The title as it will be sent, "Add subject 03 (v2020.1.1)", has an author and a year in it ("v2020"): the version added to the title starts with a year, as a calendar version such as 2020.1.0 does, and the review refuses a title that reads that way.',
+    );
+  });
+
+  test("an ordinary version is not read as a year, whatever its digits", () => {
+    for (const version of [
+      "1.0.1",
+      "2.3.4",
+      "10.2.3",
+      "0.2020.0",
+      "1.2019.1",
+      "19.0.0",
+      "2.0.20",
+    ]) {
+      expect(findSentTitleProblem(buildUpdateTitle(TYPED, version)), version).toBeNull();
+    }
+  });
+
+  test("a version that starts with a year is refused, wherever the year sits in the date range", () => {
+    for (const version of ["1900.1.0", "2019.12.1", "2020.1.0", "2099.0.0"]) {
+      expect(findSentTitleProblem(buildUpdateTitle(TYPED, version))?.code, version).toBe(
+        "author_year",
+      );
+    }
+  });
+
+  test("a release is titled by its version alone, and the same rule is asked of it", () => {
+    expect(buildReleaseTitle("2.0.0")).toBe("Release v2.0.0");
+    expect(findSentTitleProblem(buildReleaseTitle("2.0.0"))).toBeNull();
+    expect(findSentTitleProblem(buildReleaseTitle("2020.1.1"))?.code).toBe("author_year");
+  });
+
+  test("the citation and the template rules are asked of the sent title in their own words", () => {
+    expect(findSentTitleProblem("Described in 10.1038/s41597 (v1.0.1)")?.code).toBe("doi");
+    expect(findSentTitleProblem("Add {{title}} data (v1.0.1)")?.code).toBe("template_field");
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -1273,6 +1354,8 @@ let binDir: string;
 let ghRecord: string;
 let api: ReturnType<typeof Bun.serve>;
 let apiPaths: string[] = [];
+/** The version the stand-in API reports as the dataset's current one, for `release`. */
+let releaseCurrentVersion = "v1.0.0";
 
 const GH_STANDIN = `#!/bin/sh
 # Stands in for the GitHub CLI: answers the version probe, records \`pr create\`, prints a URL.
@@ -1314,6 +1397,13 @@ beforeAll(() => {
             concept_doi: null,
             created_at: "2026-01-01",
           },
+        });
+      }
+      if (path === `/datasets/${DATASET_ID}/versions`) {
+        return Response.json({
+          dataset_id: DATASET_ID,
+          current_version: releaseCurrentVersion,
+          versions: [],
         });
       }
       return Response.json({ error: "not found" }, { status: 404 });
@@ -1698,6 +1788,130 @@ describe("nemar dataset update refuses before it does anything", () => {
     expect(r.exitCode).toBe(1);
     expect(said(r)).toContain("Not authenticated");
     expect(said(r)).not.toContain("pull request title and description");
+  });
+
+  test("a description with a template token is accepted and meets sign-in", async () => {
+    const cwd = fresh("empty");
+    mkdirSync(cwd, { recursive: true });
+    const r = await runNemar(
+      [
+        "dataset",
+        "update",
+        "--yes",
+        "-m",
+        GOOD_TITLE,
+        "--description",
+        "Documents the ${LAB_PREFIX} variable and the FirstAuthorSurname-year naming template.",
+      ],
+      cwd,
+      signedOut(),
+    );
+    expect(r.exitCode).toBe(1);
+    expect(said(r)).toContain("Not authenticated");
+    expect(said(r)).not.toContain("The description");
+  });
+
+  describe("the title as it will be sent, with the version after it", () => {
+    /** A clone whose version is `version`, with a change for `update` to describe. */
+    function cloneAt(version: string): string {
+      const { work } = newClone();
+      write(work, "dataset_description.json", desc(version));
+      return work;
+    }
+    const update = (cwd: string, title = "Add subject 03") =>
+      runNemar(
+        ["dataset", "update", "--yes", "-m", title, "--description", GOOD_DESCRIPTION],
+        cwd,
+        signedOut(),
+      );
+
+    test("a calendar version is refused before sign-in, and the message names the title as sent", async () => {
+      const work = cloneAt("2020.1.0");
+      const r = await update(work);
+      expect(r.exitCode).toBe(1);
+      expect(said(r)).toContain(
+        'The title as it will be sent, "Add subject 03 (v2020.1.1)", has an author and a year in it ("v2020")',
+      );
+      expect(said(r)).toContain("Nothing was changed.");
+      expect(said(r)).not.toContain("Not authenticated");
+      // Nothing was pushed, committed or branched: the clone is as it was.
+      expect(ghArgs()).toBeNull();
+      expect(git(work, "branch", "--list", "update/*")).toBe("");
+      expect(git(work, "log", "-1", "--format=%s")).toBe("initial");
+    });
+
+    test("the version the bump gives is the one in the message", async () => {
+      const work = cloneAt("2020.1.0");
+      const r = await runNemar(
+        [
+          "dataset",
+          "update",
+          "--yes",
+          "--bump",
+          "minor",
+          "-m",
+          "Add subject 03",
+          "--description",
+          GOOD_DESCRIPTION,
+        ],
+        work,
+        signedOut(),
+      );
+      expect(r.exitCode).toBe(1);
+      expect(said(r)).toContain('"Add subject 03 (v2020.2.0)"');
+    });
+
+    test("control: an ordinary version, and the same title, meets sign-in", async () => {
+      const work = cloneAt("2.0.3");
+      const r = await update(work);
+      expect(r.exitCode).toBe(1);
+      expect(said(r)).toContain("Not authenticated");
+      expect(said(r)).not.toContain("as it will be sent");
+    });
+
+    test("a clone whose version cannot be read is left to the later steps, which say so", async () => {
+      const { work } = newClone();
+      write(work, "dataset_description.json", '{"Name": "No version here"}\n');
+      const r = await update(work);
+      expect(r.exitCode).toBe(1);
+      expect(said(r)).not.toContain("as it will be sent");
+      expect(said(r)).toContain("Not authenticated");
+    });
+  });
+});
+
+describe("nemar dataset release asks about the title it sends", () => {
+  const said = (r: Run) => r.stdout + r.stderr;
+
+  test("a calendar version is refused before anything is changed", async () => {
+    const { work } = newClone();
+    releaseCurrentVersion = "v2020.1.0";
+    try {
+      const r = await runNemar(
+        ["dataset", "release", DATASET_ID, "--version", "2020.1.1", "--dir", work, "--yes"],
+        work,
+      );
+      expect(r.exitCode).toBe(1);
+      expect(said(r)).toContain(
+        'The title as it will be sent, "Release v2020.1.1", has an author and a year in it ("v2020")',
+      );
+      expect(said(r)).toContain("Nothing was changed.");
+      expect(ghArgs()).toBeNull();
+      expect(git(work, "branch", "--list", "release/*")).toBe("");
+    } finally {
+      releaseCurrentVersion = "v1.0.0";
+    }
+  });
+
+  test("control: an ordinary version opens the pull request with the same title", async () => {
+    const { work } = newClone();
+    const r = await runNemar(
+      ["dataset", "release", DATASET_ID, "--version", "2.0.0", "--dir", work, "--yes"],
+      work,
+    );
+    expect(r.exitCode, said(r)).toBe(0);
+    expect(valueAfter(ghArgs() ?? [], "--title")).toBe("Release v2.0.0");
+    expect(said(r)).not.toContain("as it will be sent");
   });
 });
 
@@ -2171,6 +2385,27 @@ describe("nemar dataset update at a terminal asks for what the command line left
     expect(valueAfter(args, "--title")).toBe(`${GOOD_TITLE} (v1.0.1)`);
     expect(valueAfter(args, "--body")?.startsWith(`${GOOD_DESCRIPTION}\n\nBumps`)).toBe(true);
     expect(git(work, "show", "update/pr-text-pty:CHANGES")).toContain(`  - ${GOOD_TITLE}`);
+  });
+
+  test("a title typed at the prompt is asked about as sent, before anything is changed", async () => {
+    // No title on the command line, so the version cannot be put after it until it is typed.
+    const { work } = newClone();
+    write(work, "dataset_description.json", desc("2020.1.0"));
+    const term = onTerminal(["dataset", "update", "--branch", "update/pr-text-calendar"], work);
+    await term.until("Title (one line saying what changed):");
+    term.type("Add subject 03\r");
+    await term.until("Description (what changed and why):");
+    term.type(`${GOOD_DESCRIPTION}\r`);
+    const exitCode = await term.exited;
+    // The data of a pseudo terminal can arrive a moment after the process has exited.
+    await term.until("Nothing was changed.");
+    expect(exitCode, term.seen()).toBe(1);
+    expect(term.seen()).toContain(
+      'The title as it will be sent, "Add subject 03 (v2020.1.1)", has an author and a year in it ("v2020")',
+    );
+    expect(term.seen()).not.toContain("Create update PR");
+    expect(git(work, "branch", "--list", "update/*")).toBe("");
+    expect(ghArgs()).toBeNull();
   });
 
   test("does not ask what the command line already said", async () => {

@@ -4,7 +4,7 @@
 **Date:** 2026-10-08
 **Owner:** Seyed Yahya Shirazi
 
-Partially superseded by [ADR 0107](0107-dataset-pull-requests-are-screened-on-content-owners-and-administrators-are-exempt-and-the-review-check-is-required.md) (proposed with epic #1813; the exemption of owners and administrators and the removal of the caps, the pool and the automatic pause are built so far),
+Partially superseded by [ADR 0107](0107-dataset-pull-requests-are-screened-on-content-owners-and-administrators-are-exempt-and-the-review-check-is-required.md) (proposed with epic #1813; phases P1 to P6 are built on the epic branch, so the exemption of owners and administrators, the removal of the caps, the pool and the automatic pause, the two stages and the tooling for the required check all exist, and the required check is not switched on),
 which removes the caps and the tally pause, exempts owners and administrators, makes the review two stages at effort `max`, and makes the check required on reviewable datasets.
 Its "What this supersedes" section lists what it replaces here.
 

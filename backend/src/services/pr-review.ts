@@ -181,6 +181,12 @@ const EDIT_RESTART_TRIES = 3;
 /** How long the dispatch may wait for GitHub before the Worker answers the webhook. */
 const DISPATCH_TIMEOUT_MS = 10_000;
 
+/**
+ * How long a restart waits before it publishes the running check a second time, after the first
+ * publish failed. Short, because the publish runs inside the webhook's own request.
+ */
+export const RUNNING_PUBLISH_RETRY_WAIT_MS = 1_000;
+
 /** A review may only use a dataset that is currently a named public publication (ADR 0092). */
 const REVIEWABLE_DATASET_PREDICATE = `d.status = 'active' AND d.visibility = 'public'
   AND d.anonymous = 0 AND d.first_published_at IS NOT NULL`;
@@ -1429,7 +1435,15 @@ async function restartReview(
   }
 }
 
-/** Show the review as running, hand it to GitHub, and record a failure to do so. */
+/**
+ * Show the review as running, hand it to GitHub, and record a failure to do so.
+ *
+ * A restart takes a completed result off the required check by updating that check run back to
+ * `in_progress`. GitHub's documentation neither allows nor forbids that transition (ADR 0107 lists
+ * it as unverified), so the publish can be refused, and a refused or timed-out publish must not be
+ * silent: the old result would keep standing on the check until the callback or the watchdog. It is
+ * tried a second time after a short wait, and a second failure is logged once, naming the review.
+ */
 async function startReview(
   env: Bindings,
   row: ReviewRow,
@@ -1437,7 +1451,14 @@ async function startReview(
   secret: string,
 ): Promise<PrReviewResponse> {
   const db = env.DB;
-  await publishOutcome(env, row, "running");
+  if (!(await publishOutcome(env, row, "running"))) {
+    await new Promise((resolve) => setTimeout(resolve, RUNNING_PUBLISH_RETRY_WAIT_MS));
+    if (!(await publishOutcome(env, row, "running"))) {
+      console.error(
+        `[pr-review] review ${row.id} (${row.datasetId}#${row.prNumber}): the running check was not published after a retry; the old result may still stand on the check until the callback or the watchdog`,
+      );
+    }
+  }
   try {
     const token = await signPrReviewCallbackToken(
       { datasetId: row.datasetId, reviewId: row.id, nonce },
