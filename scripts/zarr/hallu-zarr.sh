@@ -392,8 +392,12 @@ sys.exit(code)
 # `Recording.from_file`. The streaming export still raises a bare `ValueError` for
 # a truncated FIF (biosigio#161) and for a truncated KIT `.sqd` or 4D/BTi `config`
 # or `hs_file` (biosigio#168), and an uncoded failure is retried until
-# `retry_exhausted`. The engine stamp did not move for any of them, and this pin
-# does not move it (see requirements.txt).
+# `retry_exhausted`. The converter opts in to `allow_partial_frame` for one case,
+# a MULTIPLEXED BrainVision file that ends in a partial frame and declares no
+# positive `DataPoints` count: it reads the whole frames, as 1.2.12 did, and
+# records the dropped bytes (`brainvision_dropped_bytes`). Vectorized data with a
+# partial frame is still refused. The engine stamp did not move for any of them,
+# and this pin does not move it (see requirements.txt).
 # The `<1.2.14` half is a CAP, not a floor, raised deliberately per release; raise
 # it everywhere at once (requirements.txt, this default and
 # BIOSIGIO_FLOOR/BIOSIGIO_CAP, SUBJECT_INFO_FLOOR in generate_zarr.py when the
