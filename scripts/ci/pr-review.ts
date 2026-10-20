@@ -109,8 +109,22 @@ export interface StageBudget {
 }
 
 /**
+ * The review model's output ceiling: the most a single answer can be (128K tokens on
+ * `claude-sonnet-5-5`), thinking included. At effort `max` the model's thinking, not its small JSON
+ * answer, is what fills the budget: on 2026-10-20 seven of nine reviews on real pull requests hit
+ * 32,000 tokens after about five minutes (some 100 tokens a second) and ended `model_truncated`.
+ * The review is given all the room there is; a pull request that still does not fit is too large
+ * for one review, and its check tells the author to split it.
+ */
+export const REVIEW_MAX_TOKENS = 128_000;
+
+/**
  * Each stage's {@link StageBudget}. The workflow test keeps the worst case, both deadlines, the
- * evidence budget and the callback's retries, inside the job's `timeout-minutes`.
+ * evidence budget and the callback's retries, inside the job's `timeout-minutes`. The review's
+ * deadline lets the model decode as slowly as about 71 tokens a second and still reach its ceiling
+ * (128,000 tokens in 30 minutes); the one rate observed was about 100, so 128,000 tokens take about
+ * 21 minutes. A stage that runs out of time first ends `model_unavailable`, which names no size and
+ * advises no split, so a test keeps the deadline well past the ceiling.
  */
 export const STAGE_BUDGETS = {
   screen: {
@@ -122,9 +136,9 @@ export const STAGE_BUDGETS = {
   },
   review: {
     model: REVIEW_MODEL,
-    maxTokens: 32_000,
+    maxTokens: REVIEW_MAX_TOKENS,
     timeoutMs: 120_000,
-    deadlineMs: 11 * 60_000,
+    deadlineMs: 30 * 60_000,
     maxRetries: 1,
   },
 } as const satisfies Record<Stage, StageBudget>;
