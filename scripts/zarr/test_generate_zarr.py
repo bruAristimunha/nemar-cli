@@ -28,9 +28,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import unittest
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar, cast
 
@@ -11395,15 +11397,18 @@ class TestConvertOneFifSidecarOvercount(unittest.TestCase):
         # other way the header count goes missing, a FIF MNE cannot parse:
         # with a sidecar over-declaring it, it must be refused before any
         # store exists, never reach the gate's "header unknown" path and publish.
+        # biosigIO 1.2.13 types a FIF cut short in its data `corrupt_or_truncated`
+        # through `Recording.from_file`; the other two cases keep the probe's codes.
+        header_codes = ("maxshield_probe_failed", "file_read_error")
         cases = {
-            "garbage header": lambda data: b"not a fif header at all",
-            "header cut short": lambda data: data[:600],
-            "data cut short": lambda data: data[: len(data) // 2],
+            "garbage header": (lambda data: b"not a fif header at all", header_codes),
+            "header cut short": (lambda data: data[:600], header_codes),
+            "data cut short": (lambda data: data[: len(data) // 2], ("corrupt_or_truncated",)),
         }
         path = os.path.join(self.repo, self.PRIMARY)
         with open(path, "rb") as fh:
             original = fh.read()
-        for name, corrupt in cases.items():
+        for name, (corrupt, codes) in cases.items():
             with self.subTest(name):
                 with open(path, "wb") as fh:
                     fh.write(corrupt(original))
@@ -11411,7 +11416,7 @@ class TestConvertOneFifSidecarOvercount(unittest.TestCase):
                 with contextlib.redirect_stdout(out):
                     result = self.convert(len(FIF_CHANNELS) + 9)
                 self.assertFalse(result["ok"])
-                self.assertIn(result["code"], ("maxshield_probe_failed", "file_read_error"))
+                self.assertIn(result["code"], codes)
                 self.assertNotIn("entry", result)
                 self.assertFalse(self.synced())
 
@@ -11476,9 +11481,15 @@ class TestConvertOneEeglabSidecarOvercount(unittest.TestCase):
             )
         work = os.path.join(self._tmp.name, "work")
         os.makedirs(work, exist_ok=True)
+        # The tree tracks what is on disk: a `.set` that keeps its samples in a
+        # `.fdt` has that `.fdt` in the dataset (`require_companions` asks the tree).
+        fdt = os.path.splitext(self.PRIMARY)[0] + ".fdt"
+        tracked = {self.PRIMARY, self.TSV}
+        if os.path.exists(os.path.join(self.repo, fdt)):
+            tracked.add(fdt)
         generate_zarr._init_worker({
             "repo": self.repo, "bucket": "nemar-test", "dataset_id": "on003645",
-            "head": "b" * 40, "head_files": {self.PRIMARY, self.TSV}, "local": True,
+            "head": "b" * 40, "head_files": tracked, "local": True,
             "tmp": work, "updated": "2026-09-29T00:00:00Z",
             "contract_base": "https://zarr.nemar.org", "engine_version": "3",
             "dataset_row": None, "provenance_fetch_failed": False,
@@ -12566,10 +12577,15 @@ class TestMainRetryPendingRound(unittest.TestCase):
     index and the exit status all run for real.
 
     Recording B is committed the way git-annex commits it, as a symlink into
-    `.git/annex/objects`. Its content is absent on the first run, so B fails and
-    is listed as pending while A converts; the tests then decide whether the
-    content is there for the retry. HEAD never moves, which is exactly the
-    situation a retry round is in.
+    `.git/annex/objects`. Its object exists but this user cannot read it on the
+    first run (mode 0): the host's condition and not the file's, which no reader
+    types, so B fails uncoded and is listed as pending while A converts. The
+    tests then decide whether the content is readable for the retry. HEAD never
+    moves, which is exactly the situation a retry round is in.
+
+    An ABSENT object would not do. Since biosigIO 1.2.12 its streaming source
+    types a missing file `file_read_error`, as its in-memory path always did
+    (`TestAbsentAnnexObjectThroughConvertOne`).
     """
 
     A = "sub-01/eeg/sub-01_task-rest_eeg.edf"
@@ -12603,8 +12619,13 @@ class TestMainRetryPendingRound(unittest.TestCase):
             json.dump({"Name": "retry fixture", "BIDSVersion": "1.8.0"}, fh)
         build_real_edf(os.path.join(self.repo, "sub-01", "eeg"), "sub-01_task-rest_eeg", seconds=10)
         # B as git-annex leaves it before `get`: a committed symlink to an object
-        # that is not there.
+        # this user cannot read yet.
         self.b_object = os.path.join(self.repo, ".git", "annex", "objects", "B.edf")
+        os.makedirs(os.path.dirname(self.b_object))
+        build_real_edf(os.path.dirname(self.b_object), "B", seconds=10)
+        os.chmod(self.b_object, 0)
+        if os.access(self.b_object, os.R_OK):
+            self.skipTest("file modes do not bind this user (root), so B would convert")
         os.symlink(
             os.path.relpath(self.b_object, os.path.join(self.repo, "sub-02", "eeg")),
             os.path.join(self.repo, self.B),
@@ -12661,9 +12682,8 @@ class TestMainRetryPendingRound(unittest.TestCase):
         return f"http://127.0.0.1:{server.server_port}"
 
     def materialize_b(self):
-        """`git annex get` for B: the content appears, HEAD does not move."""
-        os.makedirs(os.path.dirname(self.b_object), exist_ok=True)
-        build_real_edf(os.path.dirname(self.b_object), "B", seconds=10)
+        """`git annex get` for B: the content becomes readable, HEAD does not move."""
+        os.chmod(self.b_object, 0o644)
 
     def run_main(self, *extra, clean: bool = True) -> tuple[int, str, dict]:
         argv = [
@@ -13940,10 +13960,15 @@ class TestDeclaredFdtConvertOne(unittest.TestCase):
         self.assertEqual(group["n_channels"], self.NBCHAN)
         self.assertEqual(group["n_samples"], self.PNTS)
 
-    def test_an_undeclared_dataset_fails_exactly_as_before(self):
+    def test_an_undeclared_dataset_is_refused_for_the_fdt_its_tree_lacks(self):
+        # No declaration, and the tree has no .fdt beside the .set nor under the
+        # name the header embeds: `companion_missing` (it was `file_read_error`,
+        # "none was found"), naming the file by its BIDS path. It is the
+        # declaration that supplies this .fdt, so it is not a declaration refusal.
         result = self.convert({})
         self.assertFalse(result["ok"])
-        self.assertIn("none was found", result["error"])
+        self.assertEqual(result["code"], "companion_missing")
+        self.assertIn("sub-01/eeg/sub-01_task-x_eeg.fdt", result["error"])
         self.assertNotEqual(result["code"], "fdt_declaration_refused")
 
     def test_a_declared_fdt_converts_in_local_mode(self):
@@ -14353,7 +14378,7 @@ class TestMainConvertsADeclaredFdt(unittest.TestCase):
         self.declare({})
         _, log, _ = self.run_main(1)
         self.assertNotIn(f"converted {self.SET}", log)
-        self.assertIn("none was found", log)
+        self.assertIn("sub-01/eeg/sub-01_task-x_eeg.fdt is not in the dataset tree", log)
 
 
 # A stand-in `aws` that serves a local directory laid out EXACTLY like the bucket:
@@ -15010,20 +15035,31 @@ class TestMainAnnexMissingVerdict(unittest.TestCase):
         git("config", "user.name", "t")
         keys = {}
         for i, (rec, how) in enumerate(stored.items()):
-            # Distinct labels per recording: identical files would share one
-            # annex key, and storing one would store the other.
-            content = build_labeled_edf(os.path.join(self.dir, os.path.basename(rec)),
-                                        [f"R{i}C{n}" for n in (1, 2, 3)])
+            if how == "refused_bdf":
+                # A real BDF+ cut to half its length: pyedflib refuses it
+                # ("Filesize"), and biosigIO's tolerant read cannot recover it
+                # (unlike a late first onset). Stored plain with a key that
+                # vouches for exactly these bytes.
+                content = build_truncated_bdfplus(
+                    os.path.join(self.dir, os.path.basename(rec))
+                )
+                ext = ".bdf"
+            else:
+                # Distinct labels per recording: identical files would share one
+                # annex key, and storing one would store the other.
+                content = build_labeled_edf(os.path.join(self.dir, os.path.basename(rec)),
+                                            [f"R{i}C{n}" for n in (1, 2, 3)])
+                ext = ".edf"
             with open(content, "rb") as fh:
                 data = fh.read()
             if how == "truncated":
                 # Same length, garbage after the fixed header: a file the key
                 # vouches for and no reader can decode.
                 data = data[:256] + b"\xff" * (len(data) - 256)
-            key = sha256e(data, ".edf")
+            key = sha256e(data, ext)
             if how == "chunked":
                 self.s3.put_chunked(key, data, self.CHUNK)
-            elif how == "truncated":
+            elif how in ("truncated", "refused_bdf"):
                 self.s3.put_plain(key, data)
             link = os.path.join(self.repo, rec)
             os.makedirs(os.path.dirname(link), exist_ok=True)
@@ -15098,6 +15134,2474 @@ class TestMainAnnexMissingVerdict(unittest.TestCase):
         (failure,) = index["failures"]
         self.assertEqual((failure["path"], failure["code"]), (self.RECS[1], "annex_object_missing"))
         self.assertEqual(index["pending"], [], "typed, so not pending")
+
+    BDF = "sub-02/ieeg/sub-02_task-rest_ieeg.bdf"
+
+    def test_a_streamed_refusal_is_a_data_failure_and_never_pending(self):
+        # The recording pyedflib refuses, through the STREAMING exporter: it used
+        # to reach the callback as an uncoded failure, so the run was not
+        # `deterministic`, the recording was `pending`, and it was retried five
+        # times before the index called it `retry_exhausted`.
+        self.build({self.BDF: "refused_bdf"})
+        StreamEdfThreshold.use(self, 1)
+        rc, log, cb = self.run_main()
+        self.assertEqual(rc, 1, log)
+        self.assertEqual(cb["status"], "failed")
+        (entry,) = cb["data_failures"]
+        self.assertEqual((entry["path"], entry["code"]), (self.BDF, "corrupt_or_truncated"))
+        self.assertTrue(cb["deterministic"], log)
+        self.assertEqual(cb["pending_count"], 0, "typed, so not pending")
+        self.assertIsNone(self.published_index(), "a total failure publishes nothing")
+
+    def test_a_streamed_refusal_beside_a_converting_recording_is_listed_as_a_failure(self):
+        self.build({self.RECS[0]: "chunked", self.BDF: "refused_bdf"})
+        StreamEdfThreshold.use(self, 1)
+        rc, log, cb = self.run_main()
+        self.assertEqual(rc, 0, log)
+        self.assertEqual(cb["status"], "ready")
+        self.assertEqual(cb["converted"], [store_rel_for(self.RECS[0])])
+        index = self.published_index()
+        if index is None:
+            self.fail("a partial run publishes its index")
+        (failure,) = index["failures"]
+        self.assertEqual((failure["path"], failure["code"]), (self.BDF, "corrupt_or_truncated"))
+        self.assertEqual(index["pending"], [], "typed, so not pending")
+
+
+# --- Typed verdicts for missing companion data (#1801) --------------------------
+
+
+class TestTypedVerdictCodes(unittest.TestCase):
+    """The three NEMAR-side codes #1801 adds, and where they sit in the retry
+    rules. Pure: no library is read."""
+
+    NEW = ("companion_missing", "split_part_missing", "epoched_recording")
+
+    @staticmethod
+    def verdict(*codes: str | None) -> bool:
+        paths = [f"sub-{i:02d}/eeg/r.edf" for i in range(len(codes))]
+        entries = [_failure_entry(p, c, f"{c} detail") for p, c in zip(paths, codes) if c]
+        return generate_zarr.dataset_failure_is_deterministic(paths, entries)
+
+    def test_the_constants_spell_the_published_codes(self):
+        self.assertEqual(
+            {
+                generate_zarr.CompanionMissing.code,
+                generate_zarr.SPLIT_PART_MISSING,
+                generate_zarr.EPOCHED_RECORDING,
+            },
+            set(self.NEW),
+        )
+
+    def test_each_new_code_has_its_own_reason(self):
+        generic = reason_for_code(None)
+        reasons = {code: reason_for_code(code) for code in self.NEW}
+        for code, reason in reasons.items():
+            with self.subTest(code):
+                self.assertNotEqual(reason, generic)
+        self.assertEqual(len(set(reasons.values())), len(self.NEW), "one sentence per code")
+        # And the sentence says the thing: the viewer shows it to a person.
+        self.assertIn("not in the dataset", reasons["companion_missing"])
+        self.assertIn("split", reasons["split_part_missing"])
+        self.assertIn("epoched", reasons["epoched_recording"])
+        # `not_continuous` calls its file a derivative; this code does not.
+        self.assertNotIn("derivative", reasons["epoched_recording"])
+
+    def test_the_schema_description_lists_each_new_code(self):
+        with open(INDEX_SCHEMA_PATH, encoding="utf-8") as fh:
+            schema = json.load(fh)
+        description = schema["$defs"]["failure"]["properties"]["code"]["description"]
+        for code in self.NEW:
+            with self.subTest(code):
+                self.assertIn(code, description)
+
+    def test_a_run_of_only_new_codes_is_deterministic(self):
+        # They are data failures, so a run that converts nothing and fails only
+        # with them is terminal, exactly as for corrupt_or_truncated.
+        for code in self.NEW:
+            with self.subTest(code):
+                self.assertTrue(self.verdict(code))
+                self.assertTrue(self.verdict(code, code))
+                # Alongside a storage-state code the run is still deterministic,
+                # because the new code is the genuine data failure in the mix.
+                self.assertTrue(self.verdict("annex_object_missing", code))
+                # An infrastructure failure (uncoded) keeps the run retryable.
+                self.assertFalse(self.verdict(code, None))
+
+    def test_the_new_codes_join_neither_code_set(self):
+        # Both sets are pinned: a new code added to either would change what a
+        # whole dataset's verdict means.
+        self.assertEqual(RETRYABLE_CODES, frozenset({"recording_memory_exceeded"}))
+        self.assertEqual(generate_zarr.STORAGE_STATE_CODES, frozenset({"annex_object_missing"}))
+        for code in self.NEW:
+            with self.subTest(code):
+                self.assertNotIn(code, RETRYABLE_CODES)
+                self.assertNotIn(code, generate_zarr.STORAGE_STATE_CODES)
+
+
+class TestVhdrDataFile(unittest.TestCase):
+    """`_vhdr_data_file`: the `DataFile=` a BrainVision header names, read the way
+    the channel-count rule reads `NumberOfChannels=` (the `[Common Infos]`
+    section, the key without regard to case). None when the header names no
+    data file or cannot be read: the reader decides then, not this rule."""
+
+    def parse(self, content: str | bytes) -> str | None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "sub-01_task-x_eeg.vhdr")
+            with open(path, "wb") as fh:
+                fh.write(content if isinstance(content, bytes) else content.encode("utf-8"))
+            return generate_zarr._vhdr_data_file(path)
+
+    def test_the_file_name(self):
+        self.assertEqual(
+            self.parse("Brain Vision Data Exchange Header File Version 1.0\n"
+                       "[Common Infos]\nCodepage=UTF-8\nDataFile=x.eeg\nMarkerFile=x.vmrk\n"),
+            "x.eeg",
+        )
+        # Spaces around the sign and after the value are not part of the name;
+        # one inside it is.
+        self.assertEqual(self.parse("[Common Infos]\nDataFile = my data.eeg  \n"), "my data.eeg")
+
+    def test_only_the_common_infos_section_counts(self):
+        # A DataFile line in another section, ahead of or behind [Common Infos],
+        # names nothing: MNE reads the key from that section alone.
+        self.assertIsNone(self.parse("[Marker Infos]\nDataFile=wrong.eeg\n[Common Infos]\nCodepage=UTF-8\n"))
+        self.assertIsNone(self.parse("[Common Infos]\nCodepage=UTF-8\n[Binary Infos]\nDataFile=wrong.eeg\n"))
+        self.assertEqual(
+            self.parse("[Marker Infos]\nDataFile=wrong.eeg\n[Common Infos]\nDataFile=right.eeg\n[Binary Infos]\nDataFile=wrong.eeg\n"),
+            "right.eeg",
+        )
+        # The section name is matched exactly, as the channel count does.
+        self.assertIsNone(self.parse("[Common Infos 2]\nDataFile=wrong.eeg\n"))
+        # A commented-out line is not a key.
+        self.assertIsNone(self.parse("[Common Infos]\n; DataFile=wrong.eeg\n"))
+
+    def test_the_key_is_read_without_regard_to_case(self):
+        for key in ("datafile", "DATAFILE", "DataFile", "dataFile"):
+            with self.subTest(key):
+                self.assertEqual(self.parse(f"[Common Infos]\n{key}=x.eeg\n"), "x.eeg")
+        # A longer key that merely starts the same way is a different key.
+        self.assertIsNone(self.parse("[Common Infos]\nDataFileFormat=BINARY\n"))
+
+    def test_crlf_line_endings_leave_no_carriage_return_in_the_name(self):
+        self.assertEqual(
+            self.parse("[Common Infos]\r\nDataFile=x.eeg\r\nMarkerFile=x.vmrk\r\n"), "x.eeg"
+        )
+        self.assertEqual(self.parse("[Common Infos]\r\nDataFile=x.eeg"), "x.eeg")
+
+    def test_an_absent_or_empty_key_names_nothing(self):
+        self.assertIsNone(self.parse("[Common Infos]\nCodepage=UTF-8\n"))
+        self.assertIsNone(self.parse("[Common Infos]\nDataFile=\n"))
+        self.assertIsNone(self.parse("[Common Infos]\nDataFile=   \n"))
+        self.assertIsNone(self.parse(""))
+
+    def test_a_latin1_header_is_read(self):
+        # Written by a Windows tool in cp1252: not UTF-8, and `µV` is one byte.
+        header = (
+            "[Common Infos]\nCodepage=ANSI\nDataFile=é.eeg\n[Channel Infos]\nCh1=Fz,,0.1,µV\n"
+        ).encode("latin-1")
+        self.assertEqual(self.parse(header), "é.eeg")
+
+    def test_an_unreadable_header_names_nothing(self):
+        self.assertIsNone(generate_zarr._vhdr_data_file("/no/such/dir/sub-01_task-x_eeg.vhdr"))
+
+
+class TestRequireCompanionsVhdr(unittest.TestCase):
+    """`require_companions` for a BrainVision recording, judged against the git
+    tree: refuse only when the header's DataFile is untracked AND no same-stem
+    `.eeg` or `.dat` is, which is the question biosigIO's own stale-header
+    recovery (biosigio#132) answers before it gives up."""
+
+    PRIMARY = "sub-01/eeg/sub-01_task-rest_eeg.vhdr"
+    HEAD = "0123456789abcdef" * 2 + "01234567"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.local = os.path.join(self._tmp.name, "sub-01_task-rest_eeg.vhdr")
+
+    def check(
+        self,
+        tracked,
+        data_file="sub-01_task-rest_eeg.eeg",
+        *,
+        header=True,
+        primary=None,
+    ):
+        primary = primary or self.PRIMARY
+        if header:
+            with open(self.local, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "Brain Vision Data Exchange Header File Version 1.0\n"
+                    f"[Common Infos]\nDataFile={data_file}\nMarkerFile=x.vmrk\n"
+                )
+        generate_zarr.require_companions(
+            primary, self.local, {primary, *tracked}, self.HEAD, False
+        )
+
+    def test_a_header_whose_data_file_is_tracked_passes(self):
+        self.check({"sub-01/eeg/sub-01_task-rest_eeg.eeg"})
+
+    def test_an_untracked_data_file_is_refused_by_its_tree_path(self):
+        with self.assertRaises(generate_zarr.CompanionMissing) as cm:
+            self.check({"sub-01/eeg/sub-01_task-rest_eeg.vmrk"})
+        exc = cm.exception
+        self.assertEqual(exc.code, "companion_missing")
+        # The BIDS-relative path of the missing file, never a scratch path, and
+        # the commit it was judged against.
+        self.assertIn("sub-01/eeg/sub-01_task-rest_eeg.eeg", str(exc))
+        self.assertIn(self.HEAD[:8], str(exc))
+        # Survives `failure_detail` as written: a relative path is not stripped.
+        self.assertIn("sub-01/eeg/sub-01_task-rest_eeg.eeg", failure_detail(exc) or "")
+
+    def test_a_stale_header_with_a_same_stem_sibling_passes(self):
+        # BIDS renamed the .eeg on disk and not the name inside the header.
+        self.check({"sub-01/eeg/sub-01_task-rest_eeg.eeg"}, data_file="old_name.eeg")
+        self.check({"sub-01/eeg/sub-01_task-rest_eeg.dat"}, data_file="old_name.eeg")
+
+    def test_the_sibling_extension_is_matched_without_regard_to_case(self):
+        for ext in (".EEG", ".Eeg", ".DAT"):
+            with self.subTest(ext):
+                self.check({f"sub-01/eeg/sub-01_task-rest_eeg{ext}"}, data_file="old_name.eeg")
+
+    def test_a_same_stem_match_is_unicode_normalized(self):
+        # A name can reach the tree composed (one code point for the accented
+        # letter) or decomposed (the letter, then a combining accent), and the
+        # sibling search takes the two for one stem. The header's DataFile names
+        # neither, so only the sibling clause can satisfy the rule.
+        composed = "sub-01_task-caf\u00e9_eeg"
+        decomposed = "sub-01_task-cafe\u0301_eeg"
+        self.assertNotEqual(composed, decomposed)
+        self.assertEqual(unicodedata.normalize("NFC", decomposed), composed)
+        for label, header_stem, data_stem in (
+            ("decomposed header, composed data file", decomposed, composed),
+            ("composed header, decomposed data file", composed, decomposed),
+        ):
+            with self.subTest(label):
+                primary = f"sub-01/eeg/{header_stem}.vhdr"
+                data = f"sub-01/eeg/{data_stem}.eeg"
+                self.check({data}, data_file="old_name.eeg", primary=primary)
+                # The controls: no sibling at all, and a sibling whose stem
+                # differs by more than the spelling of its accent.
+                for tracked in (set(), {"sub-01/eeg/sub-01_task-cafe_eeg.eeg"}):
+                    with self.assertRaises(generate_zarr.CompanionMissing):
+                        self.check(tracked, data_file="old_name.eeg", primary=primary)
+
+    def test_a_stale_header_with_no_sibling_is_refused(self):
+        with self.assertRaises(generate_zarr.CompanionMissing) as cm:
+            self.check({"sub-01/eeg/sub-01_task-rest_eeg.vmrk"}, data_file="old_name.eeg")
+        self.assertIn("sub-01/eeg/old_name.eeg", str(cm.exception))
+
+    def test_only_the_stem_of_this_recording_counts(self):
+        for other in (
+            "sub-01/eeg/sub-01_task-other_eeg.eeg",   # another recording's data
+            "sub-02/eeg/sub-01_task-rest_eeg.eeg",    # the same name in another directory
+            "sub-01/eeg/sub-01_task-rest_eeg.eeg.bak",  # not an extension we read
+        ):
+            with self.subTest(other), self.assertRaises(generate_zarr.CompanionMissing):
+                self.check({other}, data_file="old_name.eeg")
+
+    def test_a_data_file_tracked_under_another_name_is_not_this_rules_to_refuse(self):
+        # The tree HAS the file the header names, so there is nothing missing to
+        # report; whether the reader gets it is a different question.
+        self.check({"sub-01/eeg/shared.eeg"}, data_file="shared.eeg")
+
+    def test_a_header_in_a_subdirectory_reference_is_resolved_from_its_directory(self):
+        self.check({"sub-01/eeg/data/run1.eeg"}, data_file="data/run1.eeg")
+        with self.assertRaises(generate_zarr.CompanionMissing) as cm:
+            self.check({"sub-01/eeg/run1.eeg"}, data_file="data/run1.eeg")
+        self.assertIn("sub-01/eeg/data/run1.eeg", str(cm.exception))
+
+    def test_a_data_file_path_is_normalized_before_the_tree_lookup(self):
+        # The tree lists normalized paths, and a header may spell its DataFile with
+        # `.` and `..` components. The tracked file shares no stem with the header,
+        # so only the normalized path can satisfy the rule.
+        wanted = "sub-01/eeg/shared.eeg"
+        # Paths that a spelling would reach if its `..` were dropped rather than
+        # resolved. The rule must not find them.
+        decoys = {"sub-01/eeg/data/shared.eeg", "sub-01/eeg/eeg/shared.eeg"}
+        for written in ("./shared.eeg", "data/../shared.eeg", "../eeg/shared.eeg"):
+            with self.subTest(written):
+                self.check({wanted}, data_file=written)
+                # The control: with that file untracked the same header is refused,
+                # and the refusal names the path the spelling means.
+                with self.assertRaises(generate_zarr.CompanionMissing) as cm:
+                    self.check(decoys, data_file=written)
+                self.assertIn(wanted, str(cm.exception))
+
+    def test_nothing_is_refused_that_the_rule_cannot_read(self):
+        # No such header, a header naming no data file: the reader decides.
+        self.check(set(), header=False)
+        self.check(set(), data_file="")
+
+    def test_other_formats_are_untouched(self):
+        for primary in (
+            "sub-01/eeg/sub-01_task-rest_eeg.edf",
+            "sub-01/eeg/sub-01_task-rest_eeg.bdf",
+            "sub-01/meg/sub-01_task-rest_meg.fif",
+            "sub-01/meg/sub-01_task-rest_meg.ds",
+        ):
+            with self.subTest(primary):
+                generate_zarr.require_companions(
+                    primary, "/no/such/file", {primary}, self.HEAD, False
+                )
+
+
+def write_fdt_backed_set(path: str, embedded: str = "orig_name.fdt", nbchan: int = 4) -> str:
+    """A classic EEGLAB `.set` whose `EEG.data` is a file NAME (the samples live in
+    a `.fdt`), written by the pure-Python `Mat5` writer so the fast tier can use
+    it. No `.fdt` is written: the tests decide what the tree holds."""
+    m = Mat5("<")
+    fields = [
+        ("setname", m.chars("", "fixture")),
+        ("nbchan", m.scalar("", nbchan)),
+        ("trials", m.scalar("", 1)),
+        ("pnts", m.scalar("", 100)),
+        ("srate", m.scalar("", 250.0)),
+        ("data", m.chars("", embedded)),
+    ]
+    return m.file(path, [m.struct("EEG", [fields])])
+
+
+def write_inline_set(path: str, nbchan: int = 2) -> str:
+    """A classic EEGLAB `.set` that carries its samples inline (a numeric
+    `EEG.data`), by the same writer."""
+    import struct
+
+    m = Mat5("<")
+    pnts = 5
+    count = nbchan * pnts
+    samples = m.matrix("", 6, [nbchan, pnts], m.elem(9, struct.pack(f"<{count}d", *range(count))))
+    fields = [
+        ("setname", m.chars("", "fixture")),
+        ("nbchan", m.scalar("", nbchan)),
+        ("trials", m.scalar("", 1)),
+        ("pnts", m.scalar("", pnts)),
+        ("srate", m.scalar("", 250.0)),
+        ("data", samples),
+    ]
+    return m.file(path, [m.struct("EEG", [fields])])
+
+
+class TestRequireCompanionsSet(unittest.TestCase):
+    """`require_companions` for an EEGLAB `.set` whose samples are in a `.fdt`:
+    refused only when the header says so (`EEG.data` is a file name), the
+    same-stem `.fdt` is untracked, no reviewed ADR 0073 declaration supplies one,
+    and the name the header embeds is not a tracked file beside it either (the
+    second place biosigIO's `_read_fdt` looks)."""
+
+    PRIMARY = "sub-01/eeg/sub-01_task-rest_eeg.set"
+    SIBLING = "sub-01/eeg/sub-01_task-rest_eeg.fdt"
+    HEAD = "89abcdef" * 5
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.local = os.path.join(self._tmp.name, "sub-01_task-rest_eeg.set")
+
+    def check(self, tracked, *, declared=False):
+        generate_zarr.require_companions(
+            self.PRIMARY, self.local, {self.PRIMARY, *tracked}, self.HEAD, declared
+        )
+
+    def test_a_tracked_same_stem_fdt_satisfies_a_set_in_any_matlab_format(self):
+        # The BIDS-rename shape: the .fdt was renamed with the .set, and the name
+        # stored inside the .set is the stale pre-rename one. The header is
+        # readable and names a file the tree lacks, so only the tracked
+        # <stem>.fdt can satisfy the rule, in every format a .set is saved in.
+        for label, v73, wrapped in (
+            ("classic", False, True),
+            ("v7.3 wrapped", True, True),
+            ("v7.3 flat", True, False),
+        ):
+            with self.subTest(label):
+                original = os.path.join(self._tmp.name, "pre_rename.set")
+                try:
+                    build_eeglab_set(original, 4, fdt=True, v73=v73, wrapped=wrapped)
+                except ImportError as exc:
+                    self.skipTest(
+                        f"{exc.name} not installed (the fast tier); the full tier runs this"
+                    )
+                os.replace(original, self.local)
+                self.check({self.SIBLING})
+                # The control: without that sibling the same header is refused, so
+                # the pass above is the sibling clause and not a header the rule
+                # could not read.
+                with self.assertRaises(generate_zarr.CompanionMissing):
+                    self.check(set())
+
+    def test_a_tracked_same_stem_fdt_passes_though_the_header_names_another(self):
+        # The common BIDS-rename shape: the .fdt was renamed with the .set, and
+        # the name inside the .set is the stale pre-rename one. The header IS
+        # readable, names a file the tree lacks, and only the tracked <stem>.fdt
+        # satisfies the rule. Written without scipy or h5py, so the fast tier
+        # runs it too.
+        write_fdt_backed_set(self.local, embedded="pre_rename.fdt")
+        self.check({self.SIBLING})
+        # The control: without that sibling the same header is refused.
+        with self.assertRaises(generate_zarr.CompanionMissing):
+            self.check(set())
+
+    def test_an_untracked_fdt_is_refused_by_its_tree_path(self):
+        write_fdt_backed_set(self.local, embedded="sub-01_task-rest_eeg.fdt")
+        with self.assertRaises(generate_zarr.CompanionMissing) as cm:
+            self.check(set())
+        exc = cm.exception
+        self.assertEqual(exc.code, "companion_missing")
+        self.assertIn(self.SIBLING, str(exc))
+        self.assertIn(self.HEAD[:8], str(exc))
+        self.assertIn(self.SIBLING, failure_detail(exc) or "")
+
+    def test_a_declared_fdt_is_not_this_rules_to_refuse(self):
+        # ADR 0073: a reviewed declaration supplies the .fdt, and
+        # `stage_declared_fdt` verifies it (and refuses, typed, if it is wrong).
+        write_fdt_backed_set(self.local)
+        self.check(set(), declared=True)
+
+    def test_a_set_with_inline_samples_needs_no_fdt(self):
+        write_inline_set(self.local)
+        self.check(set())
+
+    def test_an_unreadable_set_is_left_to_the_reader(self):
+        for content in (b"", b"not a MAT file", b"MATLAB 5.0 MAT-file" + b"\0" * 20):
+            with self.subTest(content=content[:12]):
+                with open(self.local, "wb") as fh:
+                    fh.write(content)
+                self.check(set())
+        os.remove(self.local)
+        self.check(set())
+
+    def test_a_tracked_sibling_of_another_recording_is_not_this_ones(self):
+        write_fdt_backed_set(self.local, embedded="sub-01_task-rest_eeg.fdt")
+        for other in ("sub-01/eeg/sub-01_task-other_eeg.fdt", "sub-02/eeg/sub-01_task-rest_eeg.fdt"):
+            with self.subTest(other), self.assertRaises(generate_zarr.CompanionMissing):
+                self.check({other})
+
+    def test_the_name_the_header_embeds_is_a_companion_when_it_is_tracked_beside_the_set(self):
+        # biosigIO reads <set stem>.fdt first and the embedded name second, so a
+        # .set whose own stem has no .fdt but whose embedded name is tracked
+        # beside it CONVERTS; refusing it would turn a served store into a failure.
+        try:
+            import scipy.io  # noqa: F401
+        except ImportError:
+            self.skipTest("scipy not installed (the fast tier); the full tier runs this")
+        write_fdt_backed_set(self.local, embedded="orig_name.fdt")
+        self.check({"sub-01/eeg/orig_name.fdt"})
+        # Beside the .set, not anywhere else, and by the name the header gives.
+        for tracked in ("sub-02/eeg/orig_name.fdt", "sub-01/eeg/other_name.fdt"):
+            with self.subTest(tracked), self.assertRaises(generate_zarr.CompanionMissing):
+                self.check({tracked})
+
+    def test_a_v73_set_with_its_samples_in_a_fdt(self):
+        for wrapped in (True, False):
+            with self.subTest(wrapped=wrapped):
+                try:
+                    build_eeglab_set(self.local, 4, v73=True, fdt=True, wrapped=wrapped)
+                except ImportError as exc:
+                    self.skipTest(f"{exc.name} not installed (the fast tier); the full tier runs this")
+                # build_eeglab_set wrote <stem>.fdt beside the .set on disk; the
+                # TREE is what is judged, and it tracks nothing.
+                with self.assertRaises(generate_zarr.CompanionMissing) as cm:
+                    self.check(set())
+                self.assertIn(self.SIBLING, str(cm.exception))
+                self.check({self.SIBLING})
+
+    def test_a_v73_sets_embedded_fdt_name_is_a_companion_when_tracked_beside_it(self):
+        # The .set was saved as orig_name_eeg.set (so it embeds orig_name_eeg.fdt)
+        # and renamed to the BIDS name; the .fdt kept its name.
+        for wrapped in (True, False):
+            with self.subTest(wrapped=wrapped):
+                original = os.path.join(self._tmp.name, "orig_name_eeg.set")
+                try:
+                    build_eeglab_set(original, 4, v73=True, fdt=True, wrapped=wrapped)
+                except ImportError as exc:
+                    self.skipTest(f"{exc.name} not installed (the fast tier); the full tier runs this")
+                os.replace(original, self.local)
+                self.check({"sub-01/eeg/orig_name_eeg.fdt"})
+                with self.assertRaises(generate_zarr.CompanionMissing):
+                    self.check({"sub-01/eeg/other_name_eeg.fdt"})
+
+    def test_an_epoched_v73_set_is_left_to_the_reader(self):
+        # biosigIO's v7.3 reader refuses a file with more than one epoch
+        # (`not_continuous`) before it asks for the .fdt, and that is the verdict
+        # on record for the file; this rule would otherwise pre-empt it.
+        for wrapped in (True, False):
+            with self.subTest(wrapped=wrapped):
+                try:
+                    build_eeglab_set(self.local, 4, v73=True, fdt=True, wrapped=wrapped, trials=4)
+                except ImportError as exc:
+                    self.skipTest(f"{exc.name} not installed (the fast tier); the full tier runs this")
+                self.check(set())
+                # The control: the same file with ONE epoch is refused, so the
+                # exemption is the epochs and nothing wider.
+                build_eeglab_set(self.local, 4, v73=True, fdt=True, wrapped=wrapped, trials=1)
+                with self.assertRaises(generate_zarr.CompanionMissing):
+                    self.check(set())
+
+    def test_a_classic_epoched_set_is_not_exempt(self):
+        # A classic file with several epochs and a .fdt converts (the epochs are
+        # flattened), so a missing .fdt is its problem like any other's.
+        try:
+            build_eeglab_set(self.local, 4, fdt=True, trials=4)
+        except ImportError as exc:
+            self.skipTest(f"{exc.name} not installed (the fast tier); the full tier runs this")
+        with self.assertRaises(generate_zarr.CompanionMissing):
+            self.check(set())
+
+    def test_other_formats_are_untouched(self):
+        generate_zarr.require_companions(
+            "sub-01/eeg/sub-01_task-rest_eeg.edf", "/no/such/file", set(), self.HEAD, False
+        )
+
+
+class TestGitTreeNamesAreNotQuoted(unittest.TestCase):
+    """Everything the converter judges by a recording's name (discovery, the
+    incremental worklist, `require_companions`) is read from `git ls-tree` and
+    `git diff`. Asked without `-z`, git wraps a name holding a byte above 0x7f in
+    double quotes and escapes the bytes, so `Müller_01.eeg` is listed as
+    `"M\\303\\274ller_01.eeg"`: a string no file has and no extension test matches.
+    Over a REAL repository, with the quoting pinned on in its config so the
+    result does not depend on the machine's global git settings."""
+
+    HEADER = "sub-01/eeg/sub-01_task-rest_eeg.vhdr"
+    DATA = "sub-01/eeg/Müller_01.eeg"
+    NAMED_RECORDING = "sub-01/eeg/sub-01_task-Müller_eeg.edf"
+    PLAIN_RECORDING = "sub-01/eeg/sub-01_task-rest_eeg.edf"
+    ADDED = "sub-01/eeg/sub-01_task-Ärger_eeg.edf"
+    HEAD = "0123456789abcdef" * 2 + "01234567"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = self._tmp.name
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "t@example.org")
+        self.git("config", "user.name", "t")
+        self.git("config", "core.quotePath", "true")
+        os.makedirs(os.path.join(self.repo, "sub-01/eeg"))
+        write_brainvision(
+            os.path.join(self.repo, self.HEADER), ["Fz", "Cz"], rate=10, seconds=1
+        )
+        os.replace(
+            os.path.join(self.repo, "sub-01/eeg/sub-01_task-rest_eeg.eeg"),
+            os.path.join(self.repo, self.DATA),
+        )
+        with open(os.path.join(self.repo, self.HEADER), encoding="utf-8") as fh:
+            header = fh.read().replace(
+                "DataFile=sub-01_task-rest_eeg.eeg", "DataFile=Müller_01.eeg"
+            )
+        with open(os.path.join(self.repo, self.HEADER), "w", encoding="utf-8") as fh:
+            fh.write(header)
+        for name in (self.NAMED_RECORDING, self.PLAIN_RECORDING):
+            with open(os.path.join(self.repo, name), "wb") as fh:
+                fh.write(b"x")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "one")
+        self.first = self.git("rev-parse", "HEAD").strip()
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", self.repo, *args], check=True, capture_output=True, text=True
+        ).stdout
+
+    def tree(self) -> set[str]:
+        return set(generate_zarr.git_ls_files(self.repo, "HEAD"))
+
+    def test_the_listing_holds_the_real_names(self):
+        tree = self.tree()
+        for name in (self.DATA, self.NAMED_RECORDING, self.PLAIN_RECORDING, self.HEADER):
+            with self.subTest(name):
+                self.assertIn(name, tree)
+        self.assertFalse([n for n in tree if n.startswith('"') or "\\" in n], tree)
+        # The control: git does quote them when asked the way the converter used to.
+        quoted = self.git("ls-tree", "-r", "--name-only", "HEAD")
+        self.assertIn('"sub-01/eeg/M\\303\\274ller_01.eeg"', quoted)
+
+    def test_discovery_finds_a_recording_with_a_non_ascii_name(self):
+        found = generate_zarr.discover_primaries(sorted(self.tree()))
+        self.assertIn(self.NAMED_RECORDING, found)
+        self.assertIn(self.PLAIN_RECORDING, found)
+
+    def test_the_incremental_worklist_sees_a_non_ascii_name_added_or_removed(self):
+        with open(os.path.join(self.repo, self.ADDED), "wb") as fh:
+            fh.write(b"x")
+        self.git("rm", "-q", self.NAMED_RECORDING)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "two")
+        diff = generate_zarr.git_diff_name_status(self.repo, self.first, "HEAD")
+        self.assertEqual(sorted(diff), sorted([("A", self.ADDED), ("D", self.NAMED_RECORDING)]))
+        convert, remove = generate_zarr.compute_worklist(sorted(self.tree()), diff, False)
+        self.assertEqual(convert, [self.ADDED])
+        self.assertEqual(remove, [store_rel_for(self.NAMED_RECORDING)])
+
+    def test_a_header_naming_a_tracked_non_ascii_data_file_is_not_refused(self):
+        # Not the recording's own stem, so only the name the header gives can
+        # satisfy the rule. It converted before the rule existed.
+        generate_zarr.require_companions(
+            self.HEADER, os.path.join(self.repo, self.HEADER), self.tree(), self.HEAD, False
+        )
+
+    def test_a_non_ascii_data_file_the_tree_lacks_is_refused_by_its_real_name(self):
+        self.git("rm", "-q", self.DATA)
+        self.git("commit", "-q", "-m", "drop the data file")
+        with self.assertRaises(generate_zarr.CompanionMissing) as cm:
+            generate_zarr.require_companions(
+                self.HEADER, os.path.join(self.repo, self.HEADER), self.tree(), self.HEAD, False
+            )
+        self.assertIn(self.DATA, str(cm.exception))
+
+    def test_an_eeglab_fdt_with_a_non_ascii_name_beside_the_set_is_a_companion(self):
+        # The `.set` embeds a non-ASCII `.fdt` name and the `.fdt` sits beside it
+        # under that name, with no same-stem `.fdt`. (Skips without scipy, like
+        # the writer: the fast tier runs the cases above.)
+        primary = "sub-01/eeg/sub-01_task-x_eeg.set"
+        write_eeglab_set(
+            os.path.join(self.repo, primary),
+            os.path.join(self.repo, "sub-01/eeg/Müller_01.fdt"),
+            embedded="Müller_01.fdt",
+        )
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "a set and its fdt")
+        generate_zarr.require_companions(
+            primary, os.path.join(self.repo, primary), self.tree(), self.HEAD, False
+        )
+
+
+class TestGitListingsAreByteExact(unittest.TestCase):
+    """`git_ls_files`, `git_diff_name_status` and `compute_worklist` over a REAL
+    repository whose tree holds names a text pipeline mangles: a space, a tab, a
+    newline, a quote, a backslash, leading and trailing whitespace, a byte
+    sequence that is not UTF-8, and a valid non-ASCII name.
+
+    What the listings promise is the bytes of every name, once each, and nothing
+    else: `-z` output ends in a NUL, and splitting on it leaves an empty last
+    field that is not a file. These tests fail if that empty field is kept, if a
+    name is stripped, split on whitespace or decoded lossily, if `-z` goes, or if
+    `--no-renames` goes (a rename then carries two paths and the pairs shift).
+
+    The tree is written with git's plumbing, never through a working tree: a file
+    system may refuse some of these names (APFS refuses a byte sequence that is
+    not UTF-8), and git does not care."""
+
+    DIR = b"sub-01/eeg/"
+    # Name tails; each ends `_eeg.edf` (a recording) unless the test says otherwise.
+    SPACE = b"sub-01_task-with space_eeg.edf"
+    TAB = b"sub-01_task-tab\there_eeg.edf"
+    NEWLINE = b"sub-01_task-new\nline_eeg.edf"
+    QUOTE = b'sub-01_task-say "hi"_eeg.edf'
+    BACKSLASH = b"sub-01_task-back\\slash_eeg.edf"
+    NOT_UTF8 = b"sub-01_task-\xff\xfe_eeg.edf"
+    RENAMED_NOT_UTF8 = b"sub-01_task-\xfe\xff_eeg.edf"
+    NON_ASCII = "sub-01_task-M\u00fcller_eeg.edf".encode()
+    EDGES = b" edges \n"  # not a recording: leading and trailing whitespace, a newline
+    ADDED = b"sub-01_task-added\ttab_eeg.edf"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = self._tmp.name
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "t@example.org")
+        self.git("config", "user.name", "t")
+        self.git("config", "core.quotePath", "true")
+        self.git("config", "diff.renames", "true")  # the default `git diff` would detect them
+        self.first = self.commit(
+            [(self.DIR + name, b"100644", name) for name in (
+                self.SPACE, self.TAB, self.NEWLINE, self.QUOTE, self.BACKSLASH,
+                self.NOT_UTF8, self.NON_ASCII, self.EDGES,
+            )]
+        )
+
+    def git(self, *args: str, stdin: bytes | None = None) -> bytes:
+        return subprocess.run(
+            ["git", "-C", self.repo, *args], check=True, capture_output=True, input=stdin
+        ).stdout
+
+    def commit(self, entries: list[tuple[bytes, bytes, bytes | None]]) -> str:
+        """Apply `(path, mode, content)` entries to the index and commit it on
+        `main`; `content` None removes the path."""
+        info = b""
+        for path, mode, content in entries:
+            if content is None:
+                info += b"0 " + b"0" * 40 + b"\t" + path + b"\0"
+            else:
+                blob = self.git("hash-object", "-w", "--stdin", stdin=content).strip()
+                info += mode + b" " + blob + b"\t" + path + b"\0"
+        self.git("update-index", "-z", "--index-info", stdin=info)
+        tree = self.git("write-tree").decode().strip()
+        parents = []
+        head = subprocess.run(
+            ["git", "-C", self.repo, "rev-parse", "-q", "--verify", "HEAD"],
+            capture_output=True, text=True, check=False,
+        )
+        if head.returncode == 0:
+            parents = ["-p", head.stdout.strip()]
+        commit = self.git("commit-tree", *parents, "-m", "x", tree).decode().strip()
+        self.git("update-ref", "HEAD", commit)
+        return commit
+
+    def paths(self, *tails: bytes) -> set[bytes]:
+        return {self.DIR + tail for tail in tails}
+
+    @staticmethod
+    def as_bytes(listing) -> list[bytes]:
+        return [os.fsencode(name) for name in listing]
+
+    def test_the_tree_listing_is_every_name_once_byte_for_byte(self):
+        listing = generate_zarr.git_ls_files(self.repo, "HEAD")
+        # The control: this really is the tree, so equality is not vacuous.
+        self.assertEqual(len(listing), 8)
+        self.assertNotIn("", listing, "the field after the last NUL is not a file")
+        self.assertEqual(
+            sorted(self.as_bytes(listing)),
+            sorted(self.paths(
+                self.SPACE, self.TAB, self.NEWLINE, self.QUOTE, self.BACKSLASH,
+                self.NOT_UTF8, self.NON_ASCII, self.EDGES,
+            )),
+        )
+        # The listing stays a path the file system can be asked for.
+        self.assertIn(os.fsdecode(self.DIR + self.NOT_UTF8), listing)
+
+    def test_discovery_finds_every_recording_among_those_names(self):
+        found = generate_zarr.discover_primaries(sorted(generate_zarr.git_ls_files(self.repo, "HEAD")))
+        self.assertEqual(
+            sorted(self.as_bytes(found)),
+            sorted(self.paths(
+                self.SPACE, self.TAB, self.NEWLINE, self.QUOTE, self.BACKSLASH,
+                self.NOT_UTF8, self.NON_ASCII,
+            )),
+        )
+
+    def second_commit(self) -> None:
+        """One of each status git reports with renames off, plus a rename."""
+        self.commit([
+            (self.DIR + self.ADDED, b"100644", b"added"),            # A
+            (self.DIR + self.NEWLINE, b"100644", None),               # D
+            (self.DIR + self.SPACE, b"100644", b"changed"),           # M
+            (self.DIR + self.QUOTE, b"120000", b"elsewhere"),         # T: file to symlink
+            (self.DIR + self.NOT_UTF8, b"100644", None),              # a rename ...
+            # ... with the content `setUp` gave the old name (its own name), so git
+            # sees a rename when asked to look for one
+            (self.DIR + self.RENAMED_NOT_UTF8, b"100644", self.NOT_UTF8),
+        ])
+
+    def test_the_diff_keeps_every_status_and_every_name(self):
+        self.second_commit()
+        diff = generate_zarr.git_diff_name_status(self.repo, self.first, "HEAD")
+        self.assertEqual(
+            sorted((status, os.fsencode(path)) for status, path in diff),
+            sorted([
+                ("A", self.DIR + self.ADDED),
+                ("D", self.DIR + self.NEWLINE),
+                ("M", self.DIR + self.SPACE),
+                ("T", self.DIR + self.QUOTE),
+                # `--no-renames`: a rename is a deletion and an addition, each with
+                # one path, not an `R100` entry carrying two.
+                ("D", self.DIR + self.NOT_UTF8),
+                ("A", self.DIR + self.RENAMED_NOT_UTF8),
+            ]),
+        )
+
+    def test_the_control_for_no_renames_git_would_detect_the_rename(self):
+        self.second_commit()
+        raw = self.git("diff", "--name-status", "-z", f"{self.first}..HEAD")
+        self.assertTrue(
+            any(field.startswith(b"R") for field in raw.split(b"\0")),
+            "without --no-renames git reports the rename as one entry with two paths",
+        )
+
+    def test_deleted_names_reach_remove_and_changed_ones_reach_convert(self):
+        self.second_commit()
+        tree = generate_zarr.git_ls_files(self.repo, "HEAD")
+        diff = generate_zarr.git_diff_name_status(self.repo, self.first, "HEAD")
+        convert, remove = generate_zarr.compute_worklist(sorted(tree), diff, False)
+        self.assertEqual(
+            sorted(self.as_bytes(convert)),
+            sorted(self.paths(self.ADDED, self.SPACE, self.QUOTE, self.RENAMED_NOT_UTF8)),
+        )
+        self.assertEqual(
+            sorted(self.as_bytes(remove)),
+            sorted(
+                os.fsencode(store_rel_for(os.fsdecode(self.DIR + tail)))
+                for tail in (self.NEWLINE, self.NOT_UTF8)
+            ),
+        )
+
+
+class TestNameStatusPairs(unittest.TestCase):
+    """`git diff --name-status -z` is `<status> NUL <path> NUL` per entry. Pairing
+    is by position, so a field list that does not pair up is an error: zipping it
+    would drop the tail silently and an incremental run would skip a change."""
+
+    def test_pairs_status_with_path_and_keeps_the_status_letter(self):
+        self.assertEqual(
+            generate_zarr._name_status_pairs(["A", "a.edf", "D", "b c.edf", "T", "d.edf"]),
+            [("A", "a.edf"), ("D", "b c.edf"), ("T", "d.edf")],
+        )
+        self.assertEqual(generate_zarr._name_status_pairs([]), [])
+
+    def test_an_odd_number_of_fields_is_an_error_not_a_shorter_list(self):
+        for fields in (["A"], ["A", "a.edf", "D"], ["R100", "old.edf", "new.edf"]):
+            with self.subTest(fields), self.assertRaises(RuntimeError) as cm:
+                generate_zarr._name_status_pairs(fields)
+            self.assertIn(str(len(fields)), str(cm.exception))
+
+
+class ConvertOneLocalCase(unittest.TestCase):
+    """Shared harness for the full-tier cases below: `convert_one` in LOCAL mode
+    (the Hallu path) over real files in a throwaway repository, up to the upload,
+    which a no-op `aws` absorbs. Nothing else is substituted. Subclasses say which
+    libraries they need through `REQUIRES`."""
+
+    REQUIRES: ClassVar[tuple[str, ...]] = ("zarr",)
+
+    @classmethod
+    def setUpClass(cls):
+        for name in cls.REQUIRES:
+            try:
+                __import__(name)
+            except Exception as exc:  # noqa: BLE001
+                raise unittest.SkipTest(f"conversion deps unavailable: {exc}") from exc
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = os.path.join(self._tmp.name, "repo")
+        os.makedirs(self.repo)
+        bindir = os.path.join(self._tmp.name, "bin")
+        os.makedirs(bindir)
+        with open(os.path.join(bindir, "aws"), "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(os.path.join(bindir, "aws"), 0o755)
+        path = os.environ["PATH"]
+        os.environ["PATH"] = bindir + os.pathsep + path
+        self.addCleanup(os.environ.__setitem__, "PATH", path)
+        saved_ctx = dict(generate_zarr._CTX)
+        self.addCleanup(lambda: (generate_zarr._CTX.clear(), generate_zarr._CTX.update(saved_ctx)))
+
+    def convert(self, primary: str, head_files, **ctx) -> dict:
+        work = os.path.join(self._tmp.name, "work")
+        os.makedirs(work, exist_ok=True)
+        generate_zarr._init_worker({
+            "repo": self.repo, "bucket": "nemar-test", "dataset_id": "nm099999",
+            "head": "d" * 40, "head_files": set(head_files), "local": True,
+            "tmp": work, "updated": "2026-10-15T00:00:00Z",
+            "contract_base": "https://zarr.nemar.org", "engine_version": ZARR_ENGINE_VERSION,
+            "dataset_row": None, "provenance_fetch_failed": False,
+            "mem_budget": None, "hard_ceiling": None, "projections": {},
+            **ctx,
+        })
+        with contextlib.redirect_stdout(io.StringIO()):
+            return convert_one(primary)
+
+    def assert_refused_as_data(self, result: dict, code: str) -> None:
+        """A typed data failure: not ok, the expected code, never retried, and
+        counted as a property of the data rather than of the node."""
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["code"], code, result.get("error"))
+        self.assertNotIn(code, RETRYABLE_CODES)
+        entry = _failure_entry(result["primary"], result["code"], result["detail"])
+        self.assertEqual(count_infra_failures([result["primary"]], [entry]), 0)
+        self.assertTrue(generate_zarr.dataset_failure_is_deterministic([result["primary"]], [entry]))
+
+
+class ConvertOneKeepingStoreCase(ConvertOneLocalCase):
+    """`ConvertOneLocalCase` whose `aws` keeps the store it is asked to upload, in
+    `synced_dir`, so a test can read what would have been published."""
+
+    def setUp(self):
+        super().setUp()
+        # `ConvertOneLocalCase`'s `aws` absorbs the upload; this one keeps the store.
+        self.synced_dir = os.path.join(self._tmp.name, "synced")
+        with open(os.path.join(self._tmp.name, "bin", "aws"), "w") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                'if [ "$1" = s3 ] && [ "$2" = sync ]; then\n'
+                f'  mkdir -p "{self.synced_dir}" && cp -R "$3" "{self.synced_dir}/"\n'
+                "fi\nexit 0\n"
+            )
+
+    def published_recording_metadata(self, entry: dict) -> dict:
+        with open(
+            os.path.join(self.synced_dir, os.path.basename(entry["zarr"]), "zarr.json"),
+            encoding="utf-8",
+        ) as fh:
+            return json.load(fh)["attributes"]["recording_metadata"]
+
+
+class TestCompanionMissingThroughConvertOne(ConvertOneLocalCase):
+    """A recording whose companion data the tree does not hold, through the real
+    `convert_one` and the real readers (MNE for BrainVision, scipy and biosigIO
+    for EEGLAB): a typed `companion_missing` that names the file, where it was an
+    opaque `file_read_error`; and the controls that prove the rule does not
+    refuse what converts."""
+
+    REQUIRES = ("zarr", "scipy.io", "mne", "biosigio")
+
+    SET = "sub-01/eeg/sub-01_task-x_eeg.set"
+    SET_FDT = "sub-01/eeg/sub-01_task-x_eeg.fdt"
+    VHDR = "sub-01/eeg/sub-01_task-rest_eeg.vhdr"
+    VMRK = "sub-01/eeg/sub-01_task-rest_eeg.vmrk"
+    EEG = "sub-01/eeg/sub-01_task-rest_eeg.eeg"
+
+    def write_set(self, fdt_rel: str | None, *, embedded: str = "orig_name.fdt") -> None:
+        write_eeglab_set(
+            os.path.join(self.repo, self.SET),
+            None if fdt_rel is None else os.path.join(self.repo, fdt_rel),
+            embedded=embedded,
+        )
+
+    def assert_converted(self, result: dict) -> None:
+        self.assertTrue(result["ok"], result.get("error"))
+        (group,) = result["entry"]["groups"]
+        self.assertEqual((group["n_channels"], group["n_samples"]), (4, 1000))
+
+    def test_an_eeglab_set_without_its_fdt_is_companion_missing(self):
+        self.write_set(self.SET_FDT, embedded="sub-01_task-x_eeg.fdt")
+        os.remove(os.path.join(self.repo, self.SET_FDT))  # the data is not in the dataset
+        result = self.convert(self.SET, {self.SET})
+        self.assert_refused_as_data(result, "companion_missing")
+        # Names the file the tree lacks, by its BIDS path, in the published detail.
+        self.assertIn(self.SET_FDT, result["error"])
+        self.assertIn(self.SET_FDT, result["detail"])
+        self.assertNotIn(self.repo, result["detail"])
+
+    def test_biosigio_refuses_the_same_file_so_the_rule_pre_empts_nothing(self):
+        # Without this the rule could be refusing a file the reader would have
+        # converted. The reader, handed the same bytes, fails: it reports the
+        # missing .fdt as a generic read error.
+        from biosigio import Recording
+        from biosigio.exceptions import FileReadError
+
+        self.write_set(self.SET_FDT, embedded="sub-01_task-x_eeg.fdt")
+        os.remove(os.path.join(self.repo, self.SET_FDT))
+        with self.assertRaises(FileReadError) as cm:
+            Recording.from_file(os.path.join(self.repo, self.SET))
+        self.assertIn("none was found", str(cm.exception))
+        self.assertEqual(cm.exception.code, "file_read_error")
+
+    def test_the_same_set_converts_once_its_fdt_is_in_the_tree(self):
+        self.write_set(self.SET_FDT, embedded="sub-01_task-x_eeg.fdt")
+        self.assert_converted(self.convert(self.SET, {self.SET, self.SET_FDT}))
+
+    def test_a_set_whose_embedded_fdt_name_is_tracked_beside_it_still_converts(self):
+        # The .set names orig_name.fdt, which sits beside it and is tracked; there
+        # is no <stem>.fdt. biosigIO reads the embedded name second, so this
+        # converts today and must keep converting.
+        fdt = "sub-01/eeg/orig_name.fdt"
+        self.write_set(fdt, embedded="orig_name.fdt")
+        self.assert_converted(self.convert(self.SET, {self.SET, fdt}))
+
+    def test_a_stale_embedded_fdt_name_with_a_tracked_same_stem_fdt_converts(self):
+        # BIDS renamed the .fdt with the .set and not the name inside it. biosigIO
+        # reads <set stem>.fdt first, so this converts on the base branch (the
+        # case this rule must not turn into a failure); the embedded name is
+        # untracked, so only the same-stem clause lets it through.
+        self.write_set(self.SET_FDT, embedded="pre_rename.fdt")
+        self.assert_converted(self.convert(self.SET, {self.SET, self.SET_FDT}))
+
+    def build_v73(self, trials: int) -> None:
+        os.makedirs(os.path.join(self.repo, os.path.dirname(self.SET)), exist_ok=True)
+        try:
+            build_eeglab_set(
+                os.path.join(self.repo, self.SET), 3, trials=trials, fdt=True, v73=True
+            )
+        except ImportError as exc:
+            self.skipTest(f"{exc.name} not installed")
+
+    def test_an_epoched_v73_set_without_its_fdt_keeps_the_epoched_verdict(self):
+        # biosigIO's v7.3 reader refuses an epoched file before it asks for the
+        # .fdt, so the verdict on record for this file is `not_continuous`. The
+        # absent .fdt is also true; it is not the better description, and the
+        # recording stays as typed as it was.
+        self.build_v73(trials=4)
+        os.remove(os.path.join(self.repo, self.SET_FDT))
+        result = self.convert(self.SET, {self.SET})
+        self.assert_refused_as_data(result, "not_continuous")
+        self.assertIn("4 epochs", result["detail"])
+
+    def test_an_epoched_v73_set_with_its_fdt_is_not_continuous_too(self):
+        self.build_v73(trials=4)
+        self.assert_refused_as_data(self.convert(self.SET, {self.SET, self.SET_FDT}), "not_continuous")
+
+    def test_a_continuous_v73_set_without_its_fdt_is_companion_missing(self):
+        # The control for the two above: the exemption is the epochs.
+        self.build_v73(trials=1)
+        os.remove(os.path.join(self.repo, self.SET_FDT))
+        self.assert_refused_as_data(self.convert(self.SET, {self.SET}), "companion_missing")
+
+    def test_a_brainvision_header_without_its_data_file_is_companion_missing(self):
+        write_brainvision(self.vhdr_path(), ["Fz", "Cz", "Pz", "Oz"])
+        os.remove(os.path.join(self.repo, self.EEG))
+        result = self.convert(self.VHDR, {self.VHDR, self.VMRK})
+        self.assert_refused_as_data(result, "companion_missing")
+        self.assertIn(self.EEG, result["error"])
+        self.assertIn(self.EEG, result["detail"])
+
+    def test_the_same_brainvision_recording_converts_with_its_data_file(self):
+        write_brainvision(self.vhdr_path(), ["Fz", "Cz", "Pz", "Oz"])
+        result = self.convert(self.VHDR, {self.VHDR, self.VMRK, self.EEG})
+        self.assertTrue(result["ok"], result.get("error"))
+
+    def test_a_stale_brainvision_header_with_a_same_stem_data_file_converts(self):
+        # BIDS renamed the .eeg and not the name in the header (biosigio#132).
+        # Measured: this converts, so it must not become companion_missing.
+        write_brainvision(self.vhdr_path(), ["Fz", "Cz", "Pz", "Oz"])
+        header = os.path.join(self.repo, self.VHDR)
+        with open(header, encoding="utf-8") as fh:
+            text = fh.read()
+        stem = "sub-01_task-rest_eeg"
+        with open(header, "w", encoding="utf-8") as fh:
+            fh.write(text.replace(f"DataFile={stem}.eeg", "DataFile=pre_rename.eeg"))
+        result = self.convert(self.VHDR, {self.VHDR, self.VMRK, self.EEG})
+        self.assertTrue(result["ok"], result.get("error"))
+
+    def vhdr_path(self) -> str:
+        path = os.path.join(self.repo, self.VHDR)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return path
+
+
+class Refusal(Exception):
+    """A stand-in for a reader's refusal, carrying a `.code` the way biosigIO's
+    typed errors do. For the pure `failure_verdict` tests only: every other test
+    here reaches a refusal by giving a real reader a real file."""
+
+    def __init__(self, message: str, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def chained(outer: BaseException, inner: BaseException) -> BaseException:
+    """`outer` raised `from` `inner`, without raising either."""
+    outer.__cause__ = inner
+    return outer
+
+
+EDF_REFUSAL = "the file is not EDF(+) or BDF(+) compliant"
+MNE_SPLIT_REFUSAL = (
+    "Split raw file detected but next file {path} does not exist. Ensure all files "
+    "were transferred properly and that split and original files were not manually "
+    "renamed on disk (split files should be recursively loaded)."
+)
+
+
+class TestFailureVerdict(unittest.TestCase):
+    """`failure_verdict(exc, primary, head_files) -> (code, detail)`: the one place
+    a reader's refusal becomes a code. Pure. The exceptions here are constructed
+    to prove refusals: a host condition is not one, nor is a typed failure of
+    another kind, nor is the same words from a different exception."""
+
+    SPLIT_HEAD = "sub-01/meg/sub-01_task-rest_split-01_meg.fif"
+    SPLIT_NEXT = "sub-01/meg/sub-01_task-rest_split-02_meg.fif"
+    SET = "sub-01/eeg/sub-01_task-x_eeg.set"
+
+    def verdict(self, exc, primary="sub-01/eeg/sub-01_task-x_eeg.edf", tracked=()):
+        return generate_zarr.failure_verdict(exc, primary, set(tracked) | {primary})
+
+    def probe_failure(self, path="/scratch/work/sub-01_task-rest_split-02_meg.fif"):
+        """MNE's split refusal as `is_maxshield_fif` surfaces it."""
+        return chained(
+            MaxShieldProbeFailed(
+                "could not read the FIF header to test for Internal Active Shielding: "
+                "ValueError: " + MNE_SPLIT_REFUSAL.format(path=path)
+            ),
+            ValueError(MNE_SPLIT_REFUSAL.format(path=path)),
+        )
+
+    # -- a bare OSError is the host's, whatever its words --------------------
+    #
+    # The former bare-OSError text match typed pyedflib's streaming refusal and
+    # biosigIO's tolerant fallback's truncation errors by their words. biosigIO
+    # 1.2.12 types both itself (`CorruptFileError`), so nothing reads an
+    # `OSError`'s words now.
+
+    def test_a_bare_oserror_is_not_typed_by_its_text(self):
+        # The words biosigIO's streaming source used to leave in a bare,
+        # errno-less OSError: pyedflib's refusal, and the tolerant fallback's
+        # truncation errors with the scratch path in front.
+        for message in (
+            f"/scratch/work/x.bdf: {EDF_REFUSAL} (Filesize)",
+            "/scratch/work/x.edf: EDF/BDF header is truncated (<256 bytes)",
+            "/scratch/work/x.edf: invalid number of signals in header (-1)",
+            "/scratch/work/x.edf: signal header is truncated",
+            (
+                "/scratch/work/x.edf: file is truncated (expected at least 3080 bytes "
+                "for 4 data record(s), found 1850)"
+            ),
+        ):
+            with self.subTest(message):
+                self.assertEqual(self.verdict(OSError(message)), (None, None))
+
+    def test_a_host_condition_is_not_a_refusal(self):
+        # An OSError that carries an errno is the HOST saying no (a failing
+        # disk, a permission, a full volume), and it keeps its retry, also when
+        # its words are a reader's refusal.
+        for exc in (
+            OSError(errno.EIO, f"x.bdf: {EDF_REFUSAL} (Filesize)"),
+            OSError(errno.ENOSPC, f"x.bdf: {EDF_REFUSAL} (Filesize)"),
+            PermissionError(errno.EACCES, f"x.bdf: {EDF_REFUSAL} (Filesize)"),
+            FileNotFoundError(errno.ENOENT, f"x.bdf: {EDF_REFUSAL} (Filesize)"),
+        ):
+            with self.subTest(type(exc).__name__, errno=exc.errno):
+                self.assertEqual(self.verdict(exc), (None, None))
+
+    def test_the_same_words_from_another_exception_are_not_a_refusal(self):
+        for exc in (
+            RuntimeError(f"x.bdf: {EDF_REFUSAL} (Filesize)"),
+            ValueError(f"x.bdf: {EDF_REFUSAL} (Filesize)"),
+            Refusal(f"x.bdf: {EDF_REFUSAL} (Filesize)"),
+            # Subclasses of OSError built without an errno.
+            PermissionError(f"x.bdf: {EDF_REFUSAL} (Filesize)"),
+            FileNotFoundError(f"x.bdf: {EDF_REFUSAL} (Filesize)"),
+        ):
+            with self.subTest(type(exc).__name__):
+                self.assertEqual(self.verdict(exc), (None, None))
+
+    def test_an_oserror_with_other_words_is_still_uncoded(self):
+        self.assertEqual(self.verdict(OSError("download failed after 4 attempts")), (None, None))
+
+    @staticmethod
+    def raised_while_handling(refusal: BaseException, make_next: Callable[[], BaseException]):
+        """The exception `make_next` builds, RAISED inside the `except` block that
+        caught `refusal`: Python links the refusal as its `__context__`, which is
+        how biosigIO's tolerant EDF read ends up holding a host error beside
+        pyedflib's refusal. Raised, not assembled by hand, so the link is the
+        interpreter's own."""
+        try:
+            try:
+                raise refusal
+            except Exception:  # noqa: BLE001 - any refusal, not only an OSError
+                raise make_next()
+        except Exception as raised:  # noqa: BLE001 - the exception is the product
+            return raised
+        raise AssertionError("make_next() was not raised")
+
+    def test_a_host_error_raised_while_recovering_from_a_refusal_keeps_its_retry(self):
+        # A reader's recovery can read the file again INSIDE the `except` block
+        # that caught its refusal (biosigIO's tolerant EDF read does). A host
+        # error raised by that second read (a failing disk, a full volume, a
+        # permission) therefore carries the refusal as its `__context__`. It is
+        # the host saying no, and keeps its retry: the refusal behind it is not
+        # what this exception is. The refusal here is one a rule reads (MNE's
+        # split refusal), so (None, None) can only mean the walk declined the
+        # context; behind a refusal no rule reads it would hold whatever the
+        # walk did.
+        text = MNE_SPLIT_REFUSAL.format(path="/w/sub-01_task-rest_split-02_meg.fif")
+        for label, make in (
+            ("EIO", lambda: OSError(errno.EIO, "Input/output error")),
+            ("ENOSPC", lambda: OSError(errno.ENOSPC, "No space left on device")),
+            ("EACCES", lambda: PermissionError(errno.EACCES, "Permission denied")),
+            ("no errno, other words", lambda: OSError("fallback read failed")),
+        ):
+            with self.subTest(label):
+                refusal = ValueError(text)
+                exc = self.raised_while_handling(refusal, make)
+                # The control: the refusal really is the context, so a verdict
+                # of (None, None) is the rule declining to read it.
+                self.assertIn(text, str(exc.__context__))
+                self.assertEqual(self.verdict(exc, self.SPLIT_HEAD), (None, None))
+                # And the walk does read this refusal as a cause: the same host
+                # error raised `from` it names the part the tree lacks.
+                self.assertEqual(
+                    self.verdict(chained(make(), refusal), self.SPLIT_HEAD)[0],
+                    "split_part_missing",
+                )
+
+    def test_a_split_refusal_is_read_through_five_causes_and_never_by_context(self):
+        # The walk reads the exception and five explicit `__cause__` links: a host
+        # error on top does not hide a refusal that close, and nothing further
+        # down is read. A context is not a link at any depth.
+        text = MNE_SPLIT_REFUSAL.format(path="/w/sub-01_task-rest_split-02_meg.fif")
+
+        def host_over(leaf, depth):
+            """A host error whose explicit causes reach `leaf` after `depth` links."""
+            host = OSError(errno.EIO, "Input/output error")
+            host.__cause__ = self.wrapper_chain(leaf, depth - 1)
+            return host
+
+        for depth in range(1, 6):
+            with self.subTest(cause_at=depth):
+                code, detail = self.verdict(
+                    host_over(ValueError(text), depth), self.SPLIT_HEAD
+                )
+                self.assertEqual(code, "split_part_missing")
+                self.assertIn(self.SPLIT_NEXT, detail or "")
+        # One link further is out of reach.
+        exc = host_over(ValueError(text), 6)
+        self.assertEqual(self.verdict(exc, self.SPLIT_HEAD), (None, None))
+        # The same distances with the last hop an implicit context instead of a
+        # cause: the host error nearest the refusal was raised while handling it.
+        for depth in range(1, 6):
+            with self.subTest(context_at=depth):
+                tail = self.raised_while_handling(
+                    ValueError(text), lambda: OSError(errno.EIO, "Input/output error")
+                )
+                self.assertIsNone(tail.__cause__)
+                self.assertIn(text, str(tail.__context__))
+                exc = host_over(tail, depth - 1) if depth > 1 else tail
+                self.assertEqual(self.verdict(exc, self.SPLIT_HEAD), (None, None))
+
+    # -- a code that is not generic passes through -------------------------
+
+    def test_a_specific_code_is_never_refined(self):
+        split = ValueError(MNE_SPLIT_REFUSAL.format(path="/w/sub-01_task-rest_split-02_meg.fif"))
+        for exc, code in (
+            (chained(RecordingMemoryExceeded("out of memory"), split), "recording_memory_exceeded"),
+            (chained(generate_zarr.AnnexObjectMissing("KEY", "chunk C2 is absent"), split),
+             "annex_object_missing"),
+            (chained(MaxShieldUncalibrated("no pair"), split), "maxshield_uncalibrated"),
+            (chained(generate_zarr.CompanionMissing("no fdt"), split), "companion_missing"),
+            (chained(Refusal("x", "channel_count_mismatch"), split), "channel_count_mismatch"),
+            (chained(Refusal("x", "not_continuous"), split), "not_continuous"),
+        ):
+            with self.subTest(code):
+                self.assertEqual(
+                    self.verdict(exc, primary=self.SPLIT_HEAD, tracked=()), (code, None)
+                )
+
+    def test_only_the_generic_codes_are_refined(self):
+        # The four a reader (or the probe) reports without saying why.
+        split = ValueError(MNE_SPLIT_REFUSAL.format(path="/w/sub-01_task-rest_split-02_meg.fif"))
+        for code in (None, "file_read_error", "corrupt_or_truncated", "maxshield_probe_failed"):
+            with self.subTest(code):
+                self.assertEqual(
+                    self.verdict(chained(Refusal("read failed", code), split), self.SPLIT_HEAD)[0],
+                    "split_part_missing",
+                )
+
+    # -- rule 1: a split chain missing its next part -----------------------
+
+    def test_a_missing_split_part_is_named_by_its_tree_path(self):
+        code, detail = self.verdict(self.probe_failure(), self.SPLIT_HEAD)
+        self.assertEqual(code, "split_part_missing")
+        self.assertIn(self.SPLIT_NEXT, detail or "")
+        # The scratch directory MNE quoted is nowhere in what is published.
+        self.assertNotIn("/scratch", detail or "")
+        self.assertIn(self.SPLIT_NEXT, failure_detail(detail) or "")
+
+    def test_the_split_message_alone_is_enough(self):
+        # biosigIO's typed error carries MNE's sentence in its own message.
+        exc = Refusal(
+            "Truncated, incomplete, or corrupt file (/w/x.fif): "
+            + MNE_SPLIT_REFUSAL.format(path="/w/sub-01_task-rest_split-02_meg.fif"),
+            "corrupt_or_truncated",
+        )
+        self.assertEqual(self.verdict(exc, self.SPLIT_HEAD)[0], "split_part_missing")
+
+    def test_a_tracked_next_part_is_not_relabeled(self):
+        # The tree HAS the part: the file is missing from the working tree or was
+        # not fetched, which is a fetch gap, not a property of the dataset.
+        for code_source in (self.probe_failure(),
+                            Refusal("corrupt", "corrupt_or_truncated"),
+                            Refusal("unreadable", "file_read_error")):
+            exc = chained(code_source, ValueError(
+                MNE_SPLIT_REFUSAL.format(path="/w/sub-01_task-rest_split-02_meg.fif")))
+            with self.subTest(exc.code):
+                self.assertEqual(
+                    self.verdict(exc, self.SPLIT_HEAD, tracked={self.SPLIT_NEXT}),
+                    (exc.code, None),
+                )
+
+    def test_the_part_is_judged_in_the_primarys_directory_by_basename(self):
+        # MNE quotes wherever the file was materialized; the tree path is the
+        # primary's directory plus that file's name.
+        elsewhere = "sub-01/meg/other/sub-01_task-rest_split-02_meg.fif"
+        _, detail = self.verdict(self.probe_failure("/deep/ly/nested/" + os.path.basename(self.SPLIT_NEXT)),
+                                 self.SPLIT_HEAD, tracked={elsewhere})
+        self.assertIn(self.SPLIT_NEXT, detail or "")
+
+    # -- rule 2: epoched EEGLAB ---------------------------------------------
+
+    def test_a_three_dimensional_set_is_an_epoched_recording(self):
+        exc = Refusal(
+            "Could not read recording (/w/x.set): Must pass 2-d input. shape=(4, 500, 3)",
+            "file_read_error",
+        )
+        self.assertEqual(self.verdict(exc, self.SET), ("epoched_recording", None))
+        self.assertEqual(self.verdict(exc, self.SET.replace(".set", ".SET"))[0], "epoched_recording")
+        # Through a cause, too.
+        wrapped = chained(Refusal("Could not read recording", "file_read_error"),
+                          ValueError("Must pass 2-d input. shape=(4, 500, 3)"))
+        self.assertEqual(self.verdict(wrapped, self.SET)[0], "epoched_recording")
+
+    def test_the_epoched_rule_is_for_eeglab_sets_only(self):
+        exc = Refusal("Could not read recording: Must pass 2-d input. shape=(4, 500, 3)", "file_read_error")
+        for primary in ("sub-01/eeg/x_eeg.edf", "sub-01/eeg/x_eeg.vhdr", "sub-01/meg/x_meg.fif"):
+            with self.subTest(primary):
+                self.assertEqual(self.verdict(exc, primary), ("file_read_error", None))
+
+    # -- rule 3: a .fdt whose size disagrees with the header ---------------
+
+    def test_a_fdt_that_disagrees_with_its_header_is_corrupt_or_truncated(self):
+        message = (
+            "/w/x.fdt holds 3999 float32 samples but the .set header implies 4000 "
+            "(nbchan 4 x pnts 1000 x trials 1)"
+        )
+        exc = Refusal(f"Could not read recording (/w/x.set): {message}", "file_read_error")
+        self.assertEqual(self.verdict(exc, self.SET), ("corrupt_or_truncated", None))
+        self.assertEqual(
+            self.verdict(chained(Refusal("unreadable", "file_read_error"), ValueError(message)),
+                         self.SET),
+            ("corrupt_or_truncated", None),
+        )
+
+    # -- the walk ------------------------------------------------------------
+
+    def wrapper_chain(self, leaf: BaseException, depth: int) -> BaseException:
+        """An uncoded exception whose `__cause__` chain reaches `leaf` after
+        `depth` links."""
+        links = [RuntimeError(f"wrapper {i}") for i in range(depth)]
+        for outer, inner in zip(links, [*links[1:], leaf]):
+            outer.__cause__ = inner
+        return links[0] if links else leaf
+
+    FDT_MISMATCH = (
+        "/w/x.fdt holds 3999 float32 samples but the .set header implies 4000 "
+        "(nbchan 4 x pnts 1000 x trials 1)"
+    )
+
+    def test_the_walk_follows_exactly_exc_plus_five_links(self):
+        # exc is link 0; the leaf is link `depth`. Five links is the last one
+        # read, by the rules that read the chain (1 to 3).
+        leaf = ValueError(self.FDT_MISMATCH)
+        self.assertEqual(
+            self.verdict(self.wrapper_chain(leaf, 5), self.SET), ("corrupt_or_truncated", None)
+        )
+        self.assertEqual(self.verdict(self.wrapper_chain(leaf, 6), self.SET), (None, None))
+        # The walk reads only what the rules above look for: the same chain
+        # around the EDF refusal, at any depth, is not a verdict.
+        refusal = OSError(f"x.bdf: {EDF_REFUSAL} (Filesize)")
+        for depth in range(1, 6):
+            with self.subTest(refusal_at=depth):
+                self.assertEqual(self.verdict(self.wrapper_chain(refusal, depth)), (None, None))
+
+    def test_the_walk_does_not_follow_the_implicit_context(self):
+        # The cause contract: a reader that types a failure raises `... from` the
+        # reader's own error (biosigIO's `classify_read_error(...) from e`, the
+        # probe's `MaxShieldProbeFailed ... from exc`), and that explicit link is
+        # the only one read. `__context__` is whatever was being handled when
+        # something else was raised, which is the HOST's error as often as the
+        # file's, so it is not a statement of cause.
+        try:
+            try:
+                raise ValueError(self.FDT_MISMATCH)
+            except ValueError:
+                raise RuntimeError("while handling that") from None
+        except RuntimeError as exc:
+            # The control: the link is there (`from None` only hides it from a
+            # traceback), so (None, None) is the walk declining to follow it.
+            self.assertIsNotNone(exc.__context__)
+            self.assertEqual(self.verdict(exc, self.SET), (None, None))
+        implicit = self.raised_while_handling(
+            ValueError(self.FDT_MISMATCH), lambda: RuntimeError("while handling that")
+        )
+        self.assertIsNotNone(implicit.__context__)
+        self.assertEqual(self.verdict(implicit, self.SET), (None, None))
+        # The same link, made explicit, is read.
+        try:
+            try:
+                raise ValueError(self.FDT_MISMATCH)
+            except ValueError as inner:
+                raise RuntimeError("wrapped on purpose") from inner
+        except RuntimeError as exc:
+            self.assertEqual(self.verdict(exc, self.SET), ("corrupt_or_truncated", None))
+
+    # -- rules 1 to 3 read causes, never contexts ----------------------------
+    #
+    # A host error raised while a handler was reading a file carries that file's
+    # refusal as its `__context__`. It is the host saying no, and keeps its retry:
+    # the refusal behind it is not what the exception is. Each exception below is
+    # RAISED inside the handler that caught the refusal, so the link is the
+    # interpreter's own.
+
+    HOSTS: ClassVar[tuple[tuple[str, Callable[[], BaseException]], ...]] = (
+        ("EIO", lambda: OSError(errno.EIO, "Input/output error")),
+        ("ENOSPC", lambda: OSError(errno.ENOSPC, "No space left on device")),
+        ("EACCES", lambda: PermissionError(errno.EACCES, "Permission denied")),
+        # A typed generic code is no more a statement of cause than an errno:
+        # it was raised without `from`, so it names no cause.
+        ("untied generic", lambda: Refusal("read failed", "file_read_error")),
+    )
+
+    def assert_context_is_not_a_cause(self, refusal, primary, tracked=()):
+        for label, make in self.HOSTS:
+            with self.subTest(label):
+                exc = self.raised_while_handling(refusal, make)
+                # The control: the refusal really is the context, and nothing is
+                # the cause, so the verdict is the rule declining to read it.
+                self.assertIsNone(exc.__cause__)
+                self.assertIn(str(refusal), str(exc.__context__))
+                self.assertEqual(self.verdict(exc, primary, tracked), (getattr(exc, "code", None), None))
+
+    def test_a_split_refusal_in_the_context_is_not_a_missing_part(self):
+        refusal = ValueError(MNE_SPLIT_REFUSAL.format(path="/w/sub-01_task-rest_split-02_meg.fif"))
+        self.assert_context_is_not_a_cause(refusal, self.SPLIT_HEAD)
+        # The control for the control: as the explicit cause, the same refusal
+        # is read, and the part the tree lacks is named.
+        code, detail = self.verdict(chained(OSError(errno.EIO, "Input/output error"), refusal),
+                                    self.SPLIT_HEAD)
+        self.assertEqual(code, "split_part_missing")
+        self.assertIn(self.SPLIT_NEXT, detail or "")
+
+    def test_an_epoched_refusal_in_the_context_is_not_an_epoched_recording(self):
+        refusal = ValueError("Must pass 2-d input. shape=(4, 500, 3)")
+        self.assert_context_is_not_a_cause(refusal, self.SET)
+        self.assertEqual(
+            self.verdict(chained(OSError(errno.EIO, "Input/output error"), refusal), self.SET),
+            ("epoched_recording", None),
+        )
+
+    def test_a_size_mismatch_in_the_context_is_not_a_truncated_fdt(self):
+        refusal = ValueError(self.FDT_MISMATCH)
+        self.assert_context_is_not_a_cause(refusal, self.SET)
+        self.assertEqual(
+            self.verdict(chained(OSError(errno.EIO, "Input/output error"), refusal), self.SET),
+            ("corrupt_or_truncated", None),
+        )
+
+    def test_a_cause_cycle_terminates(self):
+        a, b = RuntimeError("a"), RuntimeError("b")
+        a.__cause__, b.__cause__ = b, a
+        self.assertEqual(self.verdict(a), (None, None))
+
+    def test_an_unmatched_generic_code_is_returned_as_it_was(self):
+        for code in (None, "file_read_error", "corrupt_or_truncated", "maxshield_probe_failed"):
+            with self.subTest(code):
+                self.assertEqual(self.verdict(Refusal("something else entirely", code)), (code, None))
+
+    def test_a_code_that_is_not_a_nonempty_string_is_absent(self):
+        # The code is tested for membership in a frozenset, which raises TypeError
+        # for an unhashable value (a list, a dict, a set). That TypeError escaped
+        # `convert_one`'s `except` branch and turned a recording's failure into a
+        # crash of the worker. Any `.code` that is not a non-empty string is not a
+        # code: the exception is read as uncoded, which is also what gets its
+        # message refined and what keeps a stray value off the public index.
+        cases = (
+            ("plain", "read failed", "sub-01/eeg/sub-01_task-x_eeg.edf", None),
+            ("split", MNE_SPLIT_REFUSAL.format(path="/w/sub-01_task-rest_split-02_meg.fif"),
+             self.SPLIT_HEAD, "split_part_missing"),
+            ("epoched", "Must pass 2-d input. shape=(4, 500, 3)", self.SET, "epoched_recording"),
+            ("fdt", self.FDT_MISMATCH, self.SET, "corrupt_or_truncated"),
+        )
+        for label, message, primary, refined in cases:
+            uncoded = self.verdict(Refusal(message, None), primary)
+            # The control: an uncoded exception really is refined (or not) as
+            # expected, so equality below compares against a non-trivial verdict.
+            self.assertEqual(uncoded[0], refined, label)
+            for bad in (["file_read_error"], {"file_read_error"}, {"code": 1}, 7, b"x", "", object()):
+                with self.subTest(label, code=type(bad).__name__):
+                    odd = type("OddCoded", (Exception,), {"code": bad})(message)
+                    try:
+                        verdict = self.verdict(odd, primary)
+                    except TypeError as exc:  # pragma: no cover - the defect itself
+                        self.fail(f"failure_verdict raised {exc!r} for code {bad!r}")
+                    self.assertEqual(verdict, uncoded)
+
+
+def build_truncated_edfplus(path: str) -> str:
+    """A REAL EDF+ written by pyedflib and cut to half its length: the reader's
+    own "(Filesize)" refusal, not a hand-made file."""
+    directory, name = os.path.split(path)
+    written = build_real_edf(directory, os.path.splitext(name)[0], seconds=10)
+    with open(written, "rb") as fh:
+        data = fh.read()
+    with open(written, "wb") as fh:
+        fh.write(data[: len(data) // 2])
+    return written
+
+
+def build_truncated_bdfplus(path: str) -> str:
+    """A REAL BDF+ written by pyedflib and cut to half its length: the same
+    "(Filesize)" refusal as `build_truncated_edfplus`, for a `.bdf`."""
+    import pyedflib
+
+    build_edf_family(
+        path, [("Fz", 64), ("Cz", 64)], pyedflib.FILETYPE_BDFPLUS, annotations=True, seconds=10
+    )
+    with open(path, "rb") as fh:
+        data = fh.read()
+    with open(path, "wb") as fh:
+        fh.write(data[: len(data) // 2])
+    return path
+
+
+def build_onset_shifted_edf_family(path: str, file_type: int, first_onset: int = 40) -> str:
+    """A REAL EDF+ or BDF+ written by pyedflib whose time-keeping annotation
+    onsets start at +`first_onset` instead of +0: a session cut out of the middle
+    with its session-relative onsets kept. pyedflib refuses it with "(it contains
+    format errors)" and no errno. About 2 KB; only the onsets are rewritten, in
+    place, so every length in the header still holds."""
+    import pyedflib
+
+    build_edf_family(path, [("Fz", 64), ("Cz", 64)], file_type, seconds=2)
+    width = 3 if file_type in (pyedflib.FILETYPE_BDF, pyedflib.FILETYPE_BDFPLUS) else 2
+    with open(path, "rb") as fh:
+        raw = bytearray(fh.read())
+    n_signals = int(raw[252:256].decode().strip())
+    per_signal = 16 + 80 + 8 + 8 + 8 + 8 + 8 + 80  # label ... prefiltering, per signal
+    first_count = 256 + n_signals * per_signal
+    samples = [
+        int(raw[first_count + 8 * i: first_count + 8 * (i + 1)].decode().strip())
+        for i in range(n_signals)
+    ]
+    header_bytes = 256 * (n_signals + 1)
+    record_bytes = width * sum(samples)
+    annotation_bytes = width * samples[-1]  # the annotation signal is last
+    for record in range((len(raw) - header_bytes) // record_bytes):
+        start = header_bytes + record * record_bytes + (record_bytes - annotation_bytes)
+        new = f"+{first_onset + record}".encode() + b"\x14\x14\x00"
+        raw[start:start + len(new)] = new
+    with open(path, "wb") as fh:
+        fh.write(raw)
+    return path
+
+
+def build_late_onset_pair(compliant: str, late: str, file_type: int, first_onset: int = 40) -> None:
+    """A REAL compliant EDF+C or BDF+C with events (`compliant`) and its late-onset
+    twin (`late`): the same bytes with every time-stamped annotation list (TAL)
+    moved by `first_onset` seconds, the time-keeping ones and the events alike.
+    That is a session cut out of the middle with its onsets kept, and it is what
+    pyedflib refuses ("it contains format errors"). Only TAL bytes differ between
+    the two, so the samples are identical by construction, and the compliant file
+    is the reference both are read against."""
+    from decimal import Decimal
+
+    import pyedflib
+
+    # Events at 1.0 s ("stimulus", no duration) and 4.5 s ("response", 0.5 s) in a
+    # six-second file of one-second data records.
+    build_edf_family(compliant, [("Fz", 64), ("Cz", 64)], file_type, annotations=True, seconds=6)
+    width = 3 if file_type in (pyedflib.FILETYPE_BDF, pyedflib.FILETYPE_BDFPLUS) else 2
+    with open(compliant, "rb") as fh:
+        raw = bytearray(fh.read())
+    n_signals = int(raw[252:256].decode().strip())
+    per_signal = 16 + 80 + 8 + 8 + 8 + 8 + 8 + 80  # label ... prefiltering, per signal
+    first_count = 256 + n_signals * per_signal
+    samples = [
+        int(raw[first_count + 8 * i : first_count + 8 * (i + 1)].decode().strip())
+        for i in range(n_signals)
+    ]
+    header_bytes = 256 * (n_signals + 1)
+    record_bytes = width * sum(samples)
+    block_bytes = width * samples[-1]  # the annotation signal is last
+    for record in range((len(raw) - header_bytes) // record_bytes):
+        start = header_bytes + record * record_bytes + (record_bytes - block_bytes)
+        shifted = bytearray()
+        for tal in re.findall(rb"[^\x00]+", bytes(raw[start : start + block_bytes])):
+            onset = re.match(rb"([+-])(\d+(?:\.\d+)?)(.*)", tal, re.DOTALL)
+            assert onset is not None, tal
+            fraction = onset.group(2).partition(b".")[2]
+            value = Decimal(onset.group(2).decode()) * (-1 if onset.group(1) == b"-" else 1)
+            value += first_onset
+            sign = "-" if value < 0 else "+"
+            shifted += f"{sign}{abs(value):.{len(fraction)}f}".encode() + onset.group(3) + b"\x00"
+        assert len(shifted) <= block_bytes, "the shifted TALs no longer fit the block"
+        raw[start : start + block_bytes] = bytes(shifted).ljust(block_bytes, b"\x00")
+    with open(late, "wb") as fh:
+        fh.write(raw)
+
+
+class StreamEdfThreshold:
+    """Choose the exporter for the EDF and BDF files of one test, and see which
+    one ran. 1 sends every file down the streaming exporter, the existing
+    pattern for reaching it with a file small enough to build in a test; None
+    puts the threshold back to what production runs with."""
+
+    # Read at import, before any test lowers it. `use(test, None)` means THIS
+    # value, not "leave the current one alone": a test that streams one file
+    # and then asks for the in-memory exporter for the next must get it, and
+    # the value in force at that moment is the 1 the first file left behind.
+    DEFAULT: ClassVar[int] = generate_zarr.STREAM_EDF_MIN_BYTES
+
+    @staticmethod
+    def use(test: unittest.TestCase, threshold: int | None) -> None:
+        saved = generate_zarr.STREAM_EDF_MIN_BYTES
+        test.addCleanup(setattr, generate_zarr, "STREAM_EDF_MIN_BYTES", saved)
+        generate_zarr.STREAM_EDF_MIN_BYTES = (
+            StreamEdfThreshold.DEFAULT if threshold is None else threshold
+        )
+
+    @staticmethod
+    @contextlib.contextmanager
+    def watching_writers():
+        """Yield the names of the store writers `convert_recording` hands to
+        `write_store`, in call order, collected as they are called. The real
+        function still runs; this only watches, and puts it back on exit. A
+        refusal in memory never reaches a writer (the importer refuses first),
+        so an empty list means the in-memory exporter, and `stream_to_zarr` the
+        streaming one."""
+        seen: list[str] = []
+        real = generate_zarr.write_store
+
+        def watch(writer, *args, **kwargs):
+            seen.append(getattr(writer, "__name__", repr(writer)))
+            return real(writer, *args, **kwargs)
+
+        generate_zarr.write_store = watch
+        try:
+            yield seen
+        finally:
+            generate_zarr.write_store = real
+
+
+class TestStreamedEdfRefusalThroughConvertOne(ConvertOneLocalCase):
+    """A file pyedflib refuses is `corrupt_or_truncated` on BOTH exporters.
+
+    biosigIO types the refusal itself on both (`CorruptFileError`, since 1.2.12).
+    Streaming used to re-raise pyedflib's bare `OSError`, which `convert_one`
+    took for infrastructure and retried until `retry_exhausted`. Real files, the
+    real exporters, the real `convert_one`."""
+
+    REQUIRES = ("zarr", "pyedflib", "biosigio")
+
+    REFUSED: ClassVar[dict[str, tuple[str, Callable[[str], str]]]] = {
+        "truncated EDF+ (Filesize)": (
+            "sub-01/eeg/sub-01_task-rest_eeg.edf", build_truncated_edfplus,
+        ),
+        "truncated BDF+ (Filesize)": (
+            "sub-01/eeg/sub-01_task-rest_eeg.bdf", build_truncated_bdfplus,
+        ),
+    }
+
+    def test_both_exporters_type_the_refusal_alike(self):
+        for label, (primary, build) in self.REFUSED.items():
+            os.makedirs(os.path.join(self.repo, os.path.dirname(primary)), exist_ok=True)
+            build(os.path.join(self.repo, primary))
+            codes = {}
+            for path_name, threshold in (("in-memory", None), ("streaming", 1)):
+                with self.subTest(label, path=path_name):
+                    StreamEdfThreshold.use(self, threshold)
+                    with StreamEdfThreshold.watching_writers() as writers:
+                        result = self.convert(primary, {primary})
+                    # Which exporter ran, from what it was handed to write with:
+                    # the second fixture used to stream in both halves.
+                    self.assertEqual(
+                        "stream_to_zarr" in writers, path_name == "streaming", writers
+                    )
+                    self.assert_refused_as_data(result, "corrupt_or_truncated")
+                    self.assertNotIn("entry", result, "nothing is published for a refusal")
+                    self.assertIn("not EDF(+) or BDF(+) compliant", result["detail"])
+                    codes[path_name] = result["code"]
+            self.assertEqual(codes.get("in-memory"), codes.get("streaming"), label)
+
+    def test_a_streamed_file_that_pyedflib_reads_still_converts(self):
+        # The inverse: the rule keys on the refusal, not on the exporter.
+        import pyedflib
+
+        primary = "sub-01/eeg/sub-01_task-rest_eeg.bdf"
+        os.makedirs(os.path.join(self.repo, "sub-01/eeg"))
+        build_edf_family(
+            os.path.join(self.repo, primary), [("Fz", 64), ("Cz", 64)],
+            pyedflib.FILETYPE_BDFPLUS, seconds=2,
+        )
+        StreamEdfThreshold.use(self, 1)
+        result = self.convert(primary, {primary})
+        self.assertTrue(result["ok"], result.get("error"))
+
+
+class TestPinnedStreamingRefusal(unittest.TestCase):
+    """The pinned biosigIO types a streamed EDF/BDF refusal itself.
+
+    `stream_to_zarr` used to re-raise pyedflib's refusal, and the tolerant
+    fallback's truncation errors, as a bare `OSError` (errno None), where the
+    in-memory path raised a typed `corrupt_or_truncated`. The converter read
+    those by their text. biosigio#149 (fixed by #150, released in 1.2.12) types
+    them at the source, so the converter has nothing to infer, and this class
+    is the canary for that contract on the converter's own call
+    (`write_store(stream_to_zarr, ...)`). The day a release raises a bare
+    `OSError` again, or a different type, it FAILS, and the cap in
+    requirements.txt is not raised until a person has read why.
+
+    A bare `OSError` out of the streaming exporter is still read as the host's:
+    it carries no code, so it is retried (`TestFailureVerdict`)."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import pyedflib  # noqa: F401
+            import zarr  # noqa: F401
+            from biosigio import stream_to_zarr  # noqa: F401
+        except Exception as exc:
+            raise unittest.SkipTest(f"conversion deps unavailable: {exc}") from exc
+
+    def streamed_error(self, build, name: str) -> BaseException:
+        """What the converter's streaming write raises for the file `build` makes."""
+        from biosigio import stream_to_zarr
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = build(os.path.join(tmp, name))
+            store = os.path.join(tmp, "out.zarr")
+            with self.assertRaises(Exception) as raised:  # the exception IS the measurement
+                generate_zarr.write_store(
+                    stream_to_zarr, src, store, expected_path=store, bids_channels="off"
+                )
+        return raised.exception
+
+    def assert_typed(self, exc: BaseException, expected: type, code: str, text: str) -> None:
+        self.assertIs(
+            type(exc), expected,
+            f"biosigIO raised {type(exc).__name__} for a streamed refusal, not "
+            f"{expected.__name__}: {exc}",
+        )
+        self.assertNotIsInstance(exc, OSError)
+        self.assertEqual(exc.code, code)
+        self.assertIn(text, str(exc))
+
+    def test_a_streamed_pyedflib_refusal_is_a_corrupt_file_error(self):
+        from biosigio.exceptions import CorruptFileError
+
+        for label, build, name in (
+            ("truncated EDF+", build_truncated_edfplus, "sub-01_task-rest_eeg.edf"),
+            ("truncated BDF+", build_truncated_bdfplus, "sub-01_task-rest_eeg.bdf"),
+        ):
+            with self.subTest(label):
+                exc = self.streamed_error(build, name)
+                self.assert_typed(
+                    exc, CorruptFileError, "corrupt_or_truncated",
+                    "not EDF(+) or BDF(+) compliant",
+                )
+
+    def test_a_streamed_fallback_truncation_is_a_corrupt_file_error(self):
+        from biosigio.exceptions import CorruptFileError
+
+        exc = self.streamed_error(build_cut_degenerate_range_edf, "sub-01_task-rest_eeg.edf")
+        self.assert_typed(exc, CorruptFileError, "corrupt_or_truncated", "file is truncated")
+
+    def test_a_streamed_impossible_signal_count_is_a_file_read_error(self):
+        # The fallback's header probe. biosigIO types it generically, not as
+        # `corrupt_or_truncated`; the converter publishes the code it is given.
+        from biosigio.exceptions import FileReadError
+
+        exc = self.streamed_error(build_negative_signal_count_edf, "sub-01_task-rest_eeg.edf")
+        self.assert_typed(
+            exc, FileReadError, "file_read_error", "invalid number of signals in header (-1)"
+        )
+
+
+def build_degenerate_range_edf(path: str) -> str:
+    """A REAL EDF written by pyedflib whose first channel has
+    `physical_max == physical_min`, rewritten in place in the header. pyedflib
+    refuses to open it ("not EDF(+) or BDF(+) compliant") and biosigIO's tolerant
+    fallback reads it anyway (biosigio#109, #116): the one shape where the
+    refusal is caught and a SECOND read of the file follows inside the `except`
+    block that caught it."""
+    directory, name = os.path.split(path)
+    written = build_real_edf(directory, os.path.splitext(name)[0], n_channels=2, rate=100, seconds=4)
+    with open(written, "rb") as fh:
+        raw = bytearray(fh.read())
+    n_signals = int(raw[252:256].decode().strip())
+    physical_min = 256 + n_signals * (16 + 80 + 8)  # label, transducer, dimension
+    physical_max = physical_min + n_signals * 8
+    raw[physical_max:physical_max + 8] = raw[physical_min:physical_min + 8]
+    with open(written, "wb") as fh:
+        fh.write(raw)
+    return written
+
+
+def build_cut_degenerate_range_edf(path: str, keep: float = 0.6) -> str:
+    """`build_degenerate_range_edf`, then cut to `keep` of its length: pyedflib
+    refuses it for the degenerate range before it ever looks at the length, so
+    biosigIO's tolerant fallback is what finds the file short."""
+    written = build_degenerate_range_edf(path)
+    with open(written, "rb") as fh:
+        raw = fh.read()
+    with open(written, "wb") as fh:
+        fh.write(raw[: int(len(raw) * keep)])
+    return written
+
+
+def build_negative_signal_count_edf(path: str) -> str:
+    """`build_degenerate_range_edf` with the header's signal count rewritten to
+    -1, so pyedflib refuses it ("(Number of signals)") and the tolerant
+    fallback's header probe finds the count impossible."""
+    written = build_degenerate_range_edf(path)
+    with open(written, "rb") as fh:
+        raw = bytearray(fh.read())
+    raw[252:256] = b"-1  "
+    with open(written, "wb") as fh:
+        fh.write(raw)
+    return written
+
+
+class TestHostErrorWhileRecoveringARefusedEdf(ConvertOneLocalCase):
+    """A host error is the host's, also when it is raised while biosigIO is
+    recovering from pyedflib's refusal.
+
+    The tolerant fallback reads the file a second time inside the `except`
+    block that caught pyedflib's refusal, so an `OSError(EIO)` raised by the
+    second read has the refusal as its `__context__`. biosigIO leaves that EIO
+    uncoded (it re-raises a host condition instead of typing it), and the
+    converter must not read the context behind it: the failure stays a
+    `pending` retry, never a terminal `corrupt_or_truncated` verdict for what a
+    retry on a healthy disk would convert. The EIO is injected at
+    `mne.io.read_raw`, the fallback's one read of the samples: no portable file
+    permission reaches it, since pyedflib's own open fails first on an
+    unreadable file and raises the host error before any fallback."""
+
+    REQUIRES = ("zarr", "pyedflib", "biosigio", "mne")
+    PRIMARY = "sub-01/eeg/sub-01_task-rest_eeg.edf"
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(os.path.join(self.repo, os.path.dirname(self.PRIMARY)))
+        build_degenerate_range_edf(os.path.join(self.repo, self.PRIMARY))
+
+    @contextlib.contextmanager
+    def failing_disk(self):
+        """`mne.io.read_raw` raises `OSError(EIO)`; yields the list of calls."""
+        import mne.io
+
+        calls: list[str] = []
+        real = mne.io.read_raw
+
+        def read_raw(path, *args, **kwargs):
+            calls.append(os.path.basename(str(path)))
+            raise OSError(errno.EIO, "Input/output error", str(path))
+
+        mne.io.read_raw = read_raw
+        try:
+            yield calls
+        finally:
+            mne.io.read_raw = real
+
+    def test_the_fixture_is_refused_by_pyedflib_and_recovered_by_biosigio(self):
+        # The control for everything below: this file takes the fallback.
+        import pyedflib
+
+        with self.assertRaises(OSError) as refusal:
+            pyedflib.EdfReader(os.path.join(self.repo, self.PRIMARY))
+        self.assertIn("not EDF(+) or BDF(+) compliant", str(refusal.exception))
+        for path_name, threshold in (("in-memory", None), ("streaming", 1)):
+            with self.subTest(path_name):
+                StreamEdfThreshold.use(self, threshold)
+                with StreamEdfThreshold.watching_writers() as writers:
+                    result = self.convert(self.PRIMARY, {self.PRIMARY})
+                self.assertTrue(result["ok"], result.get("error"))
+                self.assertEqual("stream_to_zarr" in writers, path_name == "streaming", writers)
+
+    def test_a_host_error_during_the_fallback_read_keeps_its_retry(self):
+        for path_name, threshold in (("in-memory", None), ("streaming", 1)):
+            with self.subTest(path_name):
+                StreamEdfThreshold.use(self, threshold)
+                with StreamEdfThreshold.watching_writers() as writers, self.failing_disk() as calls:
+                    result = self.convert(self.PRIMARY, {self.PRIMARY})
+                # The fallback ran (the injected read was reached) on the
+                # exporter this subtest asked for.
+                self.assertEqual(calls, [os.path.basename(self.PRIMARY)] * len(calls))
+                self.assertTrue(calls, "the fallback read was never reached")
+                self.assertEqual("stream_to_zarr" in writers, path_name == "streaming", writers)
+                # Not a data verdict. Uncoded is how a host condition reaches the
+                # driver: it becomes a `pending` retry, never a `failures` entry.
+                self.assertFalse(result["ok"], result)
+                self.assertIsNone(result["code"], result.get("detail"))
+                self.assertIn("Input/output error", result["detail"])
+
+
+class TestFallbackTruncationThroughConvertOne(ConvertOneLocalCase):
+    """A file biosigIO's tolerant fallback finds cut short is `corrupt_or_truncated`
+    on BOTH exporters.
+
+    The fallback is for files pyedflib refuses and MNE can read, and it raises
+    an error when it finds the file shorter than its header says. biosigIO
+    types it on both exporters (`CorruptFileError`, since 1.2.12); streaming
+    used to raise it as a bare `OSError`, which reached `failure_verdict`
+    uncoded and was retried until `retry_exhausted`. Real files, the real
+    exporters, the real `convert_one`."""
+
+    REQUIRES = ("zarr", "pyedflib", "biosigio", "mne")
+    PRIMARY = "sub-01/eeg/sub-01_task-rest_eeg.edf"
+
+    def build(self, builder) -> None:
+        os.makedirs(os.path.join(self.repo, os.path.dirname(self.PRIMARY)), exist_ok=True)
+        builder(os.path.join(self.repo, self.PRIMARY))
+
+    def convert_on(self, path_name: str, threshold: int | None) -> dict:
+        StreamEdfThreshold.use(self, threshold)
+        with StreamEdfThreshold.watching_writers() as writers:
+            result = self.convert(self.PRIMARY, {self.PRIMARY})
+        self.assertEqual("stream_to_zarr" in writers, path_name == "streaming", writers)
+        return result
+
+    def test_the_uncut_file_converts_on_both_exporters(self):
+        # The control: this file takes the fallback and is whole, so the
+        # verdicts below are about the cut and nothing else.
+        self.build(build_degenerate_range_edf)
+        for path_name, threshold in (("in-memory", None), ("streaming", 1)):
+            with self.subTest(path_name):
+                result = self.convert_on(path_name, threshold)
+                self.assertTrue(result["ok"], result.get("error"))
+
+    def test_a_cut_file_is_corrupt_or_truncated_on_both_exporters(self):
+        self.build(build_cut_degenerate_range_edf)
+        codes = {}
+        for path_name, threshold in (("in-memory", None), ("streaming", 1)):
+            with self.subTest(path_name):
+                result = self.convert_on(path_name, threshold)
+                self.assert_refused_as_data(result, "corrupt_or_truncated")
+                self.assertNotIn("entry", result, "nothing is published for a refusal")
+                self.assertIn("file is truncated", result["detail"])
+                codes[path_name] = result["code"]
+        self.assertEqual(codes.get("in-memory"), codes.get("streaming"))
+
+    def test_an_impossible_signal_count_is_a_generic_data_failure_on_both_exporters(self):
+        # The fallback's header probe. biosigIO calls this one a generic
+        # `file_read_error` on both exporters, which is its call to make, and the
+        # converter publishes the code it is given: a typed failure that is
+        # never retried, where the bare `OSError` used to be typed
+        # `corrupt_or_truncated` here by its text.
+        self.build(build_negative_signal_count_edf)
+        codes = {}
+        for path_name, threshold in (("in-memory", None), ("streaming", 1)):
+            with self.subTest(path_name):
+                result = self.convert_on(path_name, threshold)
+                self.assert_refused_as_data(result, "file_read_error")
+                self.assertIn("invalid number of signals in header (-1)", result["detail"])
+                codes[path_name] = result["code"]
+        self.assertEqual(codes.get("in-memory"), codes.get("streaming"))
+
+
+class TestAbsentAnnexObjectThroughConvertOne(ConvertOneLocalCase):
+    """A git-annex pointer whose content was never fetched, in LOCAL mode.
+
+    The working tree holds a symlink to an object that is not there, so the
+    converter cannot stat the file, forces streaming, and a reader is asked to
+    open a path that does not exist. biosigIO 1.2.12 types that
+    `file_read_error` on the streaming source, as its in-memory source always
+    did; before, the streaming source raised a bare `FileNotFoundError`, which
+    reached `failure_verdict` uncoded and was retried as `pending`. Remote
+    mode never gets here: it types a missing object `annex_object_missing`
+    before any reader runs.
+
+    This pins what the pin does, so the change is visible; it is not a
+    statement that a typed, never-retried failure is the right verdict for
+    content that is merely unfetched."""
+
+    REQUIRES = ("zarr", "pyedflib", "biosigio")
+    PRIMARY = "sub-01/eeg/sub-01_task-rest_eeg.edf"
+    PRIMARY_BDF = "sub-01/eeg/sub-01_task-rest_eeg.bdf"
+
+    def assert_unfetched_is_a_typed_read_failure(self, primary: str) -> None:
+        link = os.path.join(self.repo, primary)
+        os.makedirs(os.path.dirname(link))
+        extension = os.path.splitext(primary)[1]
+        absent = os.path.join(self.repo, ".git", "annex", "objects", f"absent{extension}")
+        os.symlink(os.path.relpath(absent, os.path.dirname(link)), link)
+        self.assertFalse(os.path.exists(link), "the control: the link dangles")
+
+        result = self.convert(primary, {primary})
+
+        self.assert_refused_as_data(result, "file_read_error")
+        self.assertIn("no such file or directory", result["detail"])
+
+    def test_an_unfetched_object_is_a_typed_read_failure(self):
+        self.assert_unfetched_is_a_typed_read_failure(self.PRIMARY)
+
+    def test_an_unfetched_bdf_object_is_a_typed_read_failure(self):
+        self.assert_unfetched_is_a_typed_read_failure(self.PRIMARY_BDF)
+
+
+class TestLateOnsetThroughConvertOne(ConvertOneKeepingStoreCase):
+    """An EDF+C or BDF+C recording whose first time-keeping onset is late
+    converts on BOTH exporters (biosigio#145, fixed by #152, in 1.2.12).
+
+    pyedflib refuses such a file ("it contains format errors"); biosigIO's
+    tolerant read recovers it and says so in the store's recording metadata
+    (`edf_tolerant_read`). The fixture is a small real file this test writes,
+    with its onsets rewritten in place."""
+
+    REQUIRES = ("zarr", "pyedflib", "biosigio")
+
+    def test_a_late_first_onset_converts_in_memory_and_streamed(self):
+        import pyedflib
+
+        for label, primary, file_type in (
+            ("EDF+C", "sub-01/eeg/sub-01_task-rest_eeg.edf", pyedflib.FILETYPE_EDFPLUS),
+            ("BDF+C", "sub-01/eeg/sub-01_task-rest_eeg.bdf", pyedflib.FILETYPE_BDFPLUS),
+        ):
+            path = os.path.join(self.repo, primary)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            build_onset_shifted_edf_family(path, file_type, first_onset=40)
+            with self.subTest(label, check="the fixture is the shape pyedflib refuses"):
+                with self.assertRaises(OSError) as refusal:
+                    pyedflib.EdfReader(path)
+                self.assertIn("not EDF(+) or BDF(+) compliant", str(refusal.exception))
+            for path_name, threshold in (("in-memory", None), ("streaming", 1)):
+                with self.subTest(label, path=path_name):
+                    shutil.rmtree(self.synced_dir, ignore_errors=True)
+                    StreamEdfThreshold.use(self, threshold)
+                    with StreamEdfThreshold.watching_writers() as writers:
+                        result = self.convert(primary, {primary})
+                    self.assertEqual(
+                        "stream_to_zarr" in writers, path_name == "streaming", writers
+                    )
+                    self.assertTrue(result["ok"], result.get("error"))
+                    (group,) = result["entry"]["groups"]
+                    self.assertEqual((group["n_channels"], group["n_samples"]), (2, 128))
+                    metadata = self.published_recording_metadata(result["entry"])
+                    self.assertIs(metadata.get("edf_tolerant_read"), True, metadata)
+                    self.assertEqual(
+                        metadata.get("edf_tolerant_read_reason"), "late_timekeeping_onset"
+                    )
+
+    def published_group(self, entry: dict):
+        import zarr
+
+        return zarr.open_group(
+            os.path.join(self.synced_dir, os.path.basename(entry["zarr"])), mode="r"
+        )
+
+    def published_samples(self, entry: dict) -> list[tuple[Any, float]]:
+        """Each channel's samples as the store serves them, decoded by the
+        channel's own `scale` and `offset`, with that scale: the serving copy is
+        int16, so the scale is one quantization step."""
+        import numpy as np
+
+        root = self.published_group(entry)
+        (name,) = root.attrs["channel_groups"]
+        group = root[name]
+        level0 = np.asarray(group["0"][:, :], dtype=np.float64)
+        return [
+            (level0[ch["row_index"]] * ch["scale"] + ch["offset"], ch["scale"])
+            for ch in group.attrs["channels"]
+        ]
+
+    def published_events(self, entry: dict) -> tuple[list[float], list[str]]:
+        """The store's events as (onsets in seconds, descriptions)."""
+        events = self.published_group(entry)["events"]
+        if events.attrs["n_events"] == 0:
+            return [], []
+        labels = events.attrs["label_map"]
+        return (
+            [float(v) for v in events["onset"][:]],
+            [labels[str(int(code))] for code in events["code"][:]],
+        )
+
+    EVENTS = ([1.0, 4.5], ["stimulus", "response"])
+    # The `events.tsv` rows of the test below. They differ from the file's own
+    # annotations on purpose: `apply_events_tsv` replaces events, and a store that
+    # still held the annotations (a no-op apply) would otherwise pass.
+    TSV_EVENTS = ([2.0, 3.25], ["go", "stop"])
+    # The store writer `convert_recording` hands to `write_store` on each path.
+    WRITER: ClassVar[dict[str, str]] = {"in-memory": "to_zarr", "streaming": "stream_to_zarr"}
+
+    def late_onset_formats(self):
+        import pyedflib
+
+        return (
+            ("EDF+C", "edf", pyedflib.FILETYPE_EDFPLUS),
+            ("BDF+C", "bdf", pyedflib.FILETYPE_BDFPLUS),
+        )
+
+    def test_a_late_first_onset_keeps_the_samples_and_the_in_file_events(self):
+        """The late recording's store holds the samples its compliant twin holds,
+        read by pyedflib (the reference reader), and the in-file events at the
+        times the compliant file states, not shifted by the late onset. The
+        streaming exporter carries no in-file annotations at all, on a compliant
+        recording as on this one, so there both stores must publish none."""
+        import numpy as np
+        import pyedflib
+
+        for label, ext, file_type in self.late_onset_formats():
+            late = f"sub-01/eeg/sub-01_task-rest_eeg.{ext}"
+            twin = f"sub-02/eeg/sub-02_task-rest_eeg.{ext}"
+            compliant = os.path.join(self._tmp.name, f"compliant.{ext}")
+            for rel in (late, twin):
+                os.makedirs(os.path.dirname(os.path.join(self.repo, rel)), exist_ok=True)
+            build_late_onset_pair(compliant, os.path.join(self.repo, late), file_type)
+            shutil.copy(compliant, os.path.join(self.repo, twin))
+
+            reader = pyedflib.EdfReader(compliant)
+            try:
+                reference = [reader.readSignal(i) for i in range(reader.signals_in_file)]
+                onsets, _durations, descriptions = reader.readAnnotations()
+            finally:
+                reader.close()
+            with self.subTest(label, check="the reference reads what the fixture wrote"):
+                self.assertEqual((list(onsets), list(descriptions)), self.EVENTS)
+                self.assertEqual(len(reference), 2)
+
+            for path_name, threshold in (("in-memory", None), ("streaming", 1)):
+                with self.subTest(label, path=path_name):
+                    StreamEdfThreshold.use(self, threshold)
+                    shutil.rmtree(self.synced_dir, ignore_errors=True)
+                    with StreamEdfThreshold.watching_writers() as writers:
+                        results = {rel: self.convert(rel, {rel}) for rel in (late, twin)}
+                    # The exporter that ran, for the late file and its twin alike.
+                    self.assertEqual(writers, [self.WRITER[path_name]] * 2)
+                    for rel, result in results.items():
+                        self.assertTrue(result["ok"], (rel, result.get("error")))
+                    # The controls: only the late file went through the tolerant read.
+                    self.assertIs(
+                        self.published_recording_metadata(results[late]["entry"]).get(
+                            "edf_tolerant_read"
+                        ),
+                        True,
+                    )
+                    self.assertNotIn(
+                        "edf_tolerant_read",
+                        self.published_recording_metadata(results[twin]["entry"]),
+                    )
+
+                    published = self.published_samples(results[late]["entry"])
+                    twin_published = self.published_samples(results[twin]["entry"])
+                    self.assertEqual(len(published), len(reference))
+                    for (decoded, step), (twin_decoded, _), source in zip(
+                        published, twin_published, reference, strict=True
+                    ):
+                        self.assertEqual(decoded.shape, source.shape)
+                        np.testing.assert_array_equal(decoded, twin_decoded)
+                        self.assertLessEqual(float(np.abs(decoded - source).max()), step)
+
+                    events = self.published_events(results[late]["entry"])
+                    self.assertEqual(events, self.published_events(results[twin]["entry"]))
+                    if path_name == "in-memory":
+                        self.assertEqual(events, self.EVENTS)
+                    else:
+                        # The streaming exporter writes only the events table it is
+                        # handed (from events.tsv), never a file's own annotations,
+                        # so the compliant file and the late one both publish none
+                        # here. The events.tsv test below covers streamed events.
+                        self.assertEqual(events, ([], []))
+
+    def test_events_tsv_events_reach_the_store_of_a_late_first_onset_recording(self):
+        """On the streaming path the events come from the BIDS `events.tsv`, so
+        that is where a late recording's events are checked against expected
+        values on both exporters. The rows differ from the file's own
+        annotations, so only the sidecar's values can satisfy the test."""
+        self.assertNotEqual(self.TSV_EVENTS, self.EVENTS)
+        tsv = "sub-01/eeg/sub-01_task-rest_events.tsv"
+        os.makedirs(os.path.join(self.repo, "sub-01/eeg"), exist_ok=True)
+        with open(os.path.join(self.repo, tsv), "w", encoding="utf-8") as fh:
+            fh.write("onset\tduration\ttrial_type\n2.0\t0.5\tgo\n3.25\t0\tstop\n")
+
+        for label, ext, file_type in self.late_onset_formats():
+            primary = f"sub-01/eeg/sub-01_task-rest_eeg.{ext}"
+            build_late_onset_pair(
+                os.path.join(self._tmp.name, f"compliant.{ext}"),
+                os.path.join(self.repo, primary),
+                file_type,
+            )
+            for path_name, threshold in (("in-memory", None), ("streaming", 1)):
+                with self.subTest(label, path=path_name):
+                    StreamEdfThreshold.use(self, threshold)
+                    shutil.rmtree(self.synced_dir, ignore_errors=True)
+                    with StreamEdfThreshold.watching_writers() as writers:
+                        result = self.convert(primary, {primary, tsv})
+                    self.assertEqual(writers, [self.WRITER[path_name]])
+                    self.assertTrue(result["ok"], result.get("error"))
+                    self.assertEqual(self.published_events(result["entry"]), self.TSV_EVENTS)
+                    self.assertEqual(result["entry"]["n_events"], 2)
+                    self.assertEqual(result["entry"]["trial_types"], {"go": 1, "stop": 1})
+
+
+class TestCutShortBrainVisionThroughConvertOne(ConvertOneKeepingStoreCase):
+    """A BrainVision data file that ends in a partial frame, through `convert_one`.
+
+    Before biosigIO 1.2.13 the reader dropped the partial trailing frame, and any
+    marker in it, without a word. 1.2.13 refuses it, and the converter opts back
+    in (`allow_partial_frame`) for ONE case: a multiplexed file that ends in a
+    partial frame and whose header declares no positive `DataPoints` count.
+    Without a count, a partial frame cannot be told from a complete recording
+    that ends in stray bytes, so the whole frames convert and the dropped byte
+    count is recorded in the store's `recording_metadata` as
+    `brainvision_dropped_bytes`, where it used to vanish. Every other refusal
+    stays a terminal `corrupt_or_truncated`: a file that holds fewer frames than
+    the positive `DataPoints` count its header declares, vectorized data with a
+    partial frame (a cut there moves every channel after the first), and a file
+    that holds no whole frame.
+
+    A frame is one sample of every channel: channels times bytes per sample, read
+    from the header. The files are a real BrainVision triplet written by
+    `write_brainvision`, converted through the real `convert_one` on both
+    exporters. The streaming exporter is selected by lowering `STREAM_MIN_BYTES`,
+    which is path selection and not a substitute for any logic."""
+
+    REQUIRES = ("zarr", "mne", "biosigio")
+    PRIMARY = "sub-01/eeg/sub-01_task-rest_eeg.vhdr"
+    LABELS = ("Fp1", "Fp2", "Cz", "Pz")
+    PATHS: ClassVar[tuple[str, ...]] = ("in-memory", "streaming")
+    DROPPED = "brainvision_dropped_bytes"
+    # Bytes per sample of the binary formats MNE reads.
+    SAMPLE_BYTES: ClassVar[dict[str, int]] = {"INT_16": 2, "INT_32": 4, "IEEE_FLOAT_32": 4}
+
+    def write_recording(self) -> tuple[set[str], str, str]:
+        """A complete triplet in the repository: the files the tree tracks, the
+        header and the data file."""
+        os.makedirs(os.path.join(self.repo, "sub-01/eeg"))
+        paths = write_brainvision(os.path.join(self.repo, self.PRIMARY), list(self.LABELS))
+        self.assertEqual(os.path.splitext(paths[2])[1], ".eeg")
+        return {os.path.relpath(path, self.repo) for path in paths}, paths[0], paths[2]
+
+    def frame_bytes(self, vhdr: str) -> int:
+        """One frame of the data file a header describes: a sample of every
+        channel, so its channel count times its bytes per sample."""
+        with open(vhdr, encoding="utf-8") as fh:
+            declared = dict(re.findall(r"^(\w+)=(.*)$", fh.read(), re.MULTILINE))
+        return int(declared["NumberOfChannels"]) * self.SAMPLE_BYTES[declared["BinaryFormat"]]
+
+    def convert_on(self, path_name: str, head_files: set[str]) -> dict:
+        """Convert the recording down one exporter, and check it was that one."""
+        import warnings
+
+        self.addCleanup(setattr, generate_zarr, "STREAM_MIN_BYTES", generate_zarr.STREAM_MIN_BYTES)
+        generate_zarr.STREAM_MIN_BYTES = 1 if path_name == "streaming" else STREAM_MIN_BYTES
+        shutil.rmtree(self.synced_dir, ignore_errors=True)
+        with StreamEdfThreshold.watching_writers() as writers, warnings.catch_warnings():
+            # biosigIO also warns about the bytes it drops; the store records them.
+            warnings.filterwarnings(
+                "ignore", message="BrainVision data file .* ends in a partial frame"
+            )
+            result = self.convert(self.PRIMARY, head_files)
+        # Which exporter ran, from what it was handed to write with.
+        self.assertEqual("stream_to_zarr" in writers, path_name == "streaming", writers)
+        return result
+
+    def n_samples(self, result: dict) -> int:
+        """The samples per channel the converted store holds."""
+        (group,) = result["entry"]["groups"]
+        return group["n_samples"]
+
+    def edit_header(self, vhdr: str, old: str, new: str) -> None:
+        """Rewrite part of the header the fixture wrote. The part must be there
+        exactly once: an edit that matched nothing would leave the unedited file
+        under test."""
+        with open(vhdr, encoding="utf-8") as fh:
+            header = fh.read()
+        self.assertEqual(header.count(old), 1, old)
+        with open(vhdr, "w", encoding="utf-8") as fh:
+            fh.write(header.replace(old, new))
+
+    def assert_converts(self, head_files: set[str], samples: int) -> None:
+        """The control of a test: the recording converts on both exporters, with
+        every frame and nothing dropped, so what the test does to it next is what
+        is being judged and not the fixture."""
+        for path_name in self.PATHS:
+            with self.subTest("complete", path=path_name):
+                result = self.convert_on(path_name, head_files)
+                self.assertTrue(result["ok"], result.get("error"))
+                self.assertEqual(self.n_samples(result), samples)
+                self.assertNotIn(self.DROPPED, self.published_recording_metadata(result["entry"]))
+
+    def assert_refused(self, head_files: set[str], data: str, reason: str) -> None:
+        """Both exporters refuse the recording, typed and never retried, naming its
+        data file, and publish no store for it. `reason` is the part of biosigIO's
+        message that says why, so a refusal for another cause does not pass. It is
+        read from `error`: `detail` is capped at 300 characters, and the longest
+        refusal runs past that."""
+        for path_name in self.PATHS:
+            with self.subTest("refused", path=path_name):
+                result = self.convert_on(path_name, head_files)
+                self.assert_refused_as_data(result, "corrupt_or_truncated")
+                self.assertIn(os.path.basename(data), result["detail"])
+                self.assertIn(reason, result["error"])
+                self.assertNotIn("entry", result)
+
+    def test_a_data_file_cut_inside_its_last_frame_converts_the_whole_frames(self):
+        head_files, vhdr, data = self.write_recording()
+        frame = self.frame_bytes(vhdr)
+        size = os.path.getsize(data)
+        self.assertEqual(size % frame, 0)
+
+        self.assert_converts(head_files, size // frame)
+
+        with open(data, "r+b") as fh:
+            fh.truncate(size - 1)
+        # The cut lands inside the last frame: every frame before it is whole, and
+        # what is left of the last one is a partial frame.
+        frames, dropped = divmod(size - 1, frame)
+        self.assertEqual((frames, dropped), (size // frame - 1, frame - 1))
+
+        # The same expected values on both exporters.
+        for path_name in self.PATHS:
+            with self.subTest("cut by one byte", path=path_name):
+                result = self.convert_on(path_name, head_files)
+                self.assertTrue(result["ok"], result.get("error"))
+                self.assertEqual(self.n_samples(result), frames)
+                self.assertEqual(
+                    self.published_recording_metadata(result["entry"]).get(self.DROPPED), dropped
+                )
+
+    def test_a_data_file_cut_below_its_declared_data_points_is_terminal_corrupt_or_truncated(self):
+        head_files, vhdr, data = self.write_recording()
+        frame = self.frame_bytes(vhdr)
+        size = os.path.getsize(data)
+        # The header now declares the complete recording's frame count. The same
+        # one-byte cut as above then leaves fewer frames than the file promises, and
+        # the opt-in, which covers a file that declares no count, does not touch it.
+        self.edit_header(
+            vhdr,
+            "DataOrientation=MULTIPLEXED\n",
+            f"DataOrientation=MULTIPLEXED\nDataPoints={size // frame}\n",
+        )
+        self.assert_converts(head_files, size // frame)
+
+        with open(data, "r+b") as fh:
+            fh.truncate(size - 1)
+        # biosigIO's refusal for a file smaller than the frames its header declares.
+        declared = size // frame * frame
+        self.assert_refused(
+            head_files, data, f"is smaller than the {declared} bytes its header declares"
+        )
+
+    def test_a_vectorized_data_file_with_a_partial_frame_is_terminal_corrupt_or_truncated(self):
+        head_files, vhdr, data = self.write_recording()
+        frame = self.frame_bytes(vhdr)
+        size = os.path.getsize(data)
+        # The same bytes, declared as channel after channel instead of sample after
+        # sample. A cut there moves every channel boundary after the first, so the
+        # whole frames are not a shorter recording and the opt-in does not apply.
+        self.edit_header(vhdr, "DataOrientation=MULTIPLEXED", "DataOrientation=VECTORIZED")
+        self.assert_converts(head_files, size // frame)
+
+        with open(data, "r+b") as fh:
+            fh.truncate(size - 1)
+        # biosigIO says the flag does not apply only when the flag was passed, so
+        # this also fails if the converter stops passing it.
+        self.assert_refused(head_files, data, "does not apply to vectorized data")
+
+    def test_a_data_file_smaller_than_one_frame_is_terminal_corrupt_or_truncated(self):
+        head_files, vhdr, data = self.write_recording()
+        frame = self.frame_bytes(vhdr)
+        self.assert_converts(head_files, os.path.getsize(data) // frame)
+
+        # One byte short of a single frame: no whole frame is left to read.
+        with open(data, "r+b") as fh:
+            fh.truncate(frame - 1)
+        self.assert_refused(head_files, data, "so the file holds no whole frame")
+
+
+class TestStreamedTruncatedFifThroughConvertOne(ConvertOneLocalCase):
+    """A FIF cut short in its data, converted down the STREAMING path.
+
+    Through `Recording.from_file` biosigIO 1.2.13 types such a file
+    `corrupt_or_truncated`, and the in-memory path ends there (see
+    `TestConvertOneFifSidecarOvercount`). The streaming export still raises MNE's
+    bare `ValueError` ("buffer size must be a multiple of element size",
+    biosigio#161), which reaches `failure_verdict` uncoded, so the converter
+    retries the recording until `retry_exhausted`. One defect, two verdicts.
+
+    The streaming branch is selected by lowering `STREAM_MIN_BYTES`, which is path
+    selection and not a substitute for any logic: the file, the reader and the
+    converter are real. A KIT `.sqd` and a 4D/BTi `config` or `hs_file` have the
+    same gap on the streaming path (biosigio#168), but this repository carries no
+    such fixture, so they are not covered here.
+
+    The first test pins today's verdict, so a biosigIO that fixes #161 breaks it
+    and says why; the second is the verdict we want, an expected failure that
+    turns into a failing run the day it passes. Remove both xfail and companion
+    together when #161 is fixed."""
+
+    REQUIRES = ("zarr", "mne", "biosigio")
+    PRIMARY = "sub-01/meg/sub-01_task-rest_meg.fif"
+
+    def convert_streamed(self) -> tuple[dict, list[str]]:
+        os.makedirs(os.path.join(self.repo, "sub-01/meg"))
+        path = build_real_fif(os.path.join(self.repo, self.PRIMARY))
+        with open(path, "rb") as fh:
+            data = fh.read()
+        with open(path, "wb") as fh:
+            fh.write(data[: len(data) // 2])
+        saved = generate_zarr.STREAM_MIN_BYTES
+        self.addCleanup(setattr, generate_zarr, "STREAM_MIN_BYTES", saved)
+        generate_zarr.STREAM_MIN_BYTES = 1
+        with StreamEdfThreshold.watching_writers() as writers:
+            result = self.convert(self.PRIMARY, {self.PRIMARY})
+        return result, writers
+
+    def test_a_streamed_truncated_fif_is_uncoded_until_biosigio_161_is_fixed(self):
+        result, writers = self.convert_streamed()
+        self.assertEqual(writers, ["stream_to_zarr"], "the streaming branch ran")
+        self.assertFalse(result["ok"])
+        self.assertIsNone(result["code"], "uncoded, so retried as infrastructure")
+        self.assertIn("buffer size must be a multiple of element size", result["error"])
+
+    @unittest.expectedFailure
+    def test_a_streamed_truncated_fif_is_corrupt_or_truncated(self):
+        """xfail (strict): biosigio#161."""
+        result, writers = self.convert_streamed()
+        self.assertEqual(writers, ["stream_to_zarr"], "the streaming branch ran")
+        self.assert_refused_as_data(result, "corrupt_or_truncated")
+
+
+class TestReaderRefusalsThroughConvertOne(ConvertOneLocalCase):
+    """The readers' refusals that `failure_verdict` types, each reached by giving
+    the real reader a real broken file, and the controls that keep the rules
+    from turning a conversion that works into a failure."""
+
+    REQUIRES = ("zarr", "scipy.io", "mne", "biosigio")
+
+    SET = "sub-01/eeg/sub-01_task-x_eeg.set"
+    FDT = "sub-01/eeg/sub-01_task-x_eeg.fdt"
+    SPLITS = tuple(f"sub-01/meg/sub-01_task-rest_split-0{n}_meg.fif" for n in (1, 2, 3))
+
+    def write_fdt_set(self, **kwargs) -> None:
+        write_eeglab_set(
+            os.path.join(self.repo, self.SET), os.path.join(self.repo, self.FDT),
+            embedded="sub-01_task-x_eeg.fdt", **kwargs,
+        )
+
+    def test_a_fdt_of_the_wrong_size_is_corrupt_or_truncated(self):
+        self.write_fdt_set()
+        with open(os.path.join(self.repo, self.FDT), "r+b") as fh:
+            fh.truncate(4 * 1000 * 4 - 4)
+        result = self.convert(self.SET, {self.SET, self.FDT})
+        self.assert_refused_as_data(result, "corrupt_or_truncated")
+        self.assertIn("float32 samples but the .set header implies", result["detail"])
+
+    def test_a_fdt_of_the_right_size_converts(self):
+        self.write_fdt_set()
+        result = self.convert(self.SET, {self.SET, self.FDT})
+        self.assertTrue(result["ok"], result.get("error"))
+
+    def test_an_embedded_epoched_set_is_an_epoched_recording(self):
+        build_eeglab_set(os.path.join(self.repo, self.SET), 3, trials=4)
+        result = self.convert(self.SET, {self.SET})
+        self.assert_refused_as_data(result, "epoched_recording")
+        self.assertIn("Must pass 2-d input", result["detail"])
+
+    def test_an_epoched_set_with_a_fdt_still_converts(self):
+        # Measured: the reader flattens its four epochs into one run. This is why
+        # the rule keys on the reader's refusal and not on `trials > 1`.
+        os.makedirs(os.path.join(self.repo, "sub-01/eeg"))
+        build_eeglab_set(os.path.join(self.repo, self.SET), 3, trials=4, fdt=True)
+        result = self.convert(self.SET, {self.SET, self.FDT})
+        self.assertTrue(result["ok"], result.get("error"))
+        (group,) = result["entry"]["groups"]
+        self.assertEqual((group["n_channels"], group["n_samples"]), (3, 500 * 4))
+
+    def build_split_chain(self) -> None:
+        os.makedirs(os.path.join(self.repo, "sub-01/meg"))
+        build_real_fif(
+            os.path.join(self.repo, "sub-01/meg/sub-01_task-rest_meg.fif"),
+            rate=1000.0, seconds=120, split_size="2MB", split_naming="bids",
+        )
+        for part in self.SPLITS:
+            self.assertTrue(os.path.exists(os.path.join(self.repo, part)), part)
+
+    def test_a_split_chain_without_its_next_part_is_split_part_missing(self):
+        self.build_split_chain()
+        os.remove(os.path.join(self.repo, self.SPLITS[1]))
+        result = self.convert(self.SPLITS[0], {self.SPLITS[0], self.SPLITS[2]})
+        self.assert_refused_as_data(result, "split_part_missing")
+        self.assertIn(self.SPLITS[1], result["detail"])
+        self.assertNotIn(self.repo, result["detail"])
+        # And it is not the MaxShield verdict it used to be reported as.
+        self.assertNotEqual(result["code"], "maxshield_probe_failed")
+
+    def test_a_tracked_next_part_that_is_absent_keeps_the_probe_failure(self):
+        # The tree lists split-02, the working tree lacks it: not a property of
+        # the dataset, so no relabel.
+        self.build_split_chain()
+        os.remove(os.path.join(self.repo, self.SPLITS[1]))
+        result = self.convert(self.SPLITS[0], set(self.SPLITS))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "maxshield_probe_failed")
+
+    def test_the_whole_split_chain_converts(self):
+        self.build_split_chain()
+        result = self.convert(self.SPLITS[0], set(self.SPLITS))
+        self.assertTrue(result["ok"], result.get("error"))
 
 
 # --- Subject information never reaches a store (#1626) -------------------------
@@ -15229,7 +17733,7 @@ class TestSubjectInfoProblems(unittest.TestCase):
     writers that do or do not name the option. This tests the check itself:
     no conversion logic is replaced."""
 
-    def problems(self, installed="1.2.11", imported="1.2.11", strip=_strip_nothing, **writers):
+    def problems(self, installed="1.2.13", imported="1.2.13", strip=_strip_nothing, **writers):
         return generate_zarr.subject_info_problems(
             installed_version=installed, imported_version=imported,
             writers={**CAPABLE_WRITERS, **writers}, strip=strip,
@@ -15237,37 +17741,38 @@ class TestSubjectInfoProblems(unittest.TestCase):
 
     def test_a_capable_biosigio_passes(self):
         # "1.10.0" is the case a string comparison gets wrong: as strings it
-        # sorts below "1.2.11".
-        for version in ("1.2.11", "1.2.11.0", "1.2.11.post1", "1.2.11+local.1",
-                        "1.2.12", "1.3", "1.10.0", "2.0.0"):
+        # sorts below "1.2.13".
+        for version in ("1.2.13", "1.2.13.0", "1.2.13.post1", "1.2.13+local.1",
+                        "1.2.14", "1.3", "1.10.0", "2.0.0"):
             with self.subTest(version):
                 self.assertEqual(self.problems(version, version), [])
 
     def test_a_release_below_the_floor_is_refused(self):
-        for version in ("1.2.10", "1.2.10.post1", "1.2.9", "1.1.99", "0.9.9"):
+        for version in ("1.2.12", "1.2.12.post1", "1.2.11", "1.2.11.post1", "1.2.10",
+                        "1.2.10.post1", "1.2.9", "1.1.99", "0.9.9"):
             with self.subTest(version):
                 problems = self.problems(version, version)
                 self.assertEqual(problems, [
-                    f"the installed biosigIO is {version}, below 1.2.11",
-                    f"the imported biosigIO is {version}, below 1.2.11",
+                    f"the installed biosigIO is {version}, below 1.2.13",
+                    f"the imported biosigIO is {version}, below 1.2.13",
                 ])
 
     def test_a_pre_release_or_unreadable_version_is_refused(self):
-        # `1.2.11rc1` sorts BELOW 1.2.11; read by its leading digits it would pass.
-        for version in ("1.2.11rc1", "1.2.11.dev0", "1.2.11a1", "1.2.12.dev0",
-                        "1.2.11.post1.dev0", "not-a-version", "", None):
+        # `1.2.13rc1` sorts BELOW 1.2.13; read by its leading digits it would pass.
+        for version in ("1.2.13rc1", "1.2.13.dev0", "1.2.13a1", "1.2.14.dev0",
+                        "1.2.13.post1.dev0", "not-a-version", "", None):
             with self.subTest(version):
                 self.assertEqual(len(self.problems(version, version)), 2)
 
     def test_an_import_older_than_the_installed_release_is_refused(self):
         # An older copy shadowing the installed one, or imported before an
-        # upgrade: the distribution says 1.2.11, the code that runs is 1.2.10.
-        self.assertEqual(self.problems("1.2.11", "1.2.10"),
-                         ["the imported biosigIO is 1.2.10, below 1.2.11"])
+        # upgrade: the distribution says 1.2.13, the code that runs is 1.2.12.
+        self.assertEqual(self.problems("1.2.13", "1.2.12"),
+                         ["the imported biosigIO is 1.2.12, below 1.2.13"])
 
     def test_an_installed_release_older_than_the_import_is_refused(self):
-        self.assertEqual(self.problems("1.2.10", "1.2.11"),
-                         ["the installed biosigIO is 1.2.10, below 1.2.11"])
+        self.assertEqual(self.problems("1.2.12", "1.2.13"),
+                         ["the installed biosigIO is 1.2.12, below 1.2.13"])
 
     def test_every_writer_must_name_the_option(self):
         for name in generate_zarr.BIOSIGIO_STORE_WRITERS:
@@ -15293,8 +17798,8 @@ class TestSubjectInfoProblems(unittest.TestCase):
         self.assertFalse(generate_zarr.names_keyword(_writer_without_option, "exclude_subject_info"))
         self.assertFalse(generate_zarr.names_keyword(None, "exclude_subject_info"))
 
-    def test_the_floor_is_the_release_that_added_the_option(self):
-        self.assertEqual(generate_zarr.final_release(generate_zarr.SUBJECT_INFO_FLOOR), (1, 2, 11))
+    def test_the_floor_is_the_pinned_release(self):
+        self.assertEqual(generate_zarr.final_release(generate_zarr.SUBJECT_INFO_FLOOR), (1, 2, 13))
 
     def test_the_refusal_exit_is_ex_config(self):
         self.assertEqual(generate_zarr.EXIT_SUBJECT_INFO_UNAVAILABLE, 78)
@@ -16193,7 +18698,7 @@ class TestMainRefusesWithoutSubjectInfoExclusion(unittest.TestCase):
         git("add", "-A")
         git("commit", "-q", "-m", "init")
 
-    def standin(self, version: str = "1.2.11", dist_version: str | None = None,
+    def standin(self, version: str = "1.2.13", dist_version: str | None = None,
                 lacking: str | None = None, exporter_imports: bool = True,
                 mode: str = "read_nothing") -> str:
         """Write the stand-in package; `lacking` names the one writer that does
@@ -16258,7 +18763,7 @@ class TestMainRefusesWithoutSubjectInfoExclusion(unittest.TestCase):
         self.assertEqual(body["status"], "failed")
         self.assertEqual(body["converted"], [])
         self.assertFalse(body["deterministic"], "the node, not the dataset, is at fault")
-        self.assertIn("cannot leave subject information out", body["error"])
+        self.assertIn("does not meet the converter's floor", body["error"])
         self.assertEqual(body["discovered_count"], 1)
         self.assertEqual(body["pending_count"], 0, "nothing was attempted")
         # The prior index was read first, and nothing in the bucket was synced,
@@ -16293,21 +18798,21 @@ class TestMainRefusesWithoutSubjectInfoExclusion(unittest.TestCase):
 
     def test_a_release_below_the_floor_is_refused(self):
         self.commit(with_recording=True)
-        rc, log = self.run_main(self.standin(version="1.2.10"), "--wipe")
-        self.assert_refused(rc, log, "the installed biosigIO is 1.2.10, below 1.2.11")
+        rc, log = self.run_main(self.standin(version="1.2.12"), "--wipe")
+        self.assert_refused(rc, log, "the installed biosigIO is 1.2.12, below 1.2.13")
 
     def test_a_stale_import_is_refused_although_the_installed_release_is_current(self):
-        # The distribution record says 1.2.11; the module imported says 1.2.10.
+        # The distribution record says 1.2.13; the module imported says 1.2.12.
         self.commit(with_recording=True)
-        rc, log = self.run_main(self.standin(version="1.2.10", dist_version="1.2.11"), "--wipe")
-        self.assert_refused(rc, log, "the imported biosigIO is 1.2.10, below 1.2.11")
+        rc, log = self.run_main(self.standin(version="1.2.12", dist_version="1.2.13"), "--wipe")
+        self.assert_refused(rc, log, "the imported biosigIO is 1.2.12, below 1.2.13")
 
     def test_an_installed_release_older_than_the_import_is_refused(self):
-        # The other way round: the module says 1.2.11, but what the environment
-        # records as installed is 1.2.10.
+        # The other way round: the module says 1.2.13, but what the environment
+        # records as installed is 1.2.12.
         self.commit(with_recording=True)
-        rc, log = self.run_main(self.standin(version="1.2.11", dist_version="1.2.10"), "--wipe")
-        self.assert_refused(rc, log, "the installed biosigIO is 1.2.10, below 1.2.11")
+        rc, log = self.run_main(self.standin(version="1.2.13", dist_version="1.2.12"), "--wipe")
+        self.assert_refused(rc, log, "the installed biosigIO is 1.2.12, below 1.2.13")
 
     def test_a_biosigio_whose_exporter_cannot_be_imported_is_refused(self):
         # Fail closed: a check that cannot look must refuse, not wave through.
@@ -16321,7 +18826,7 @@ class TestMainRefusesWithoutSubjectInfoExclusion(unittest.TestCase):
         self.commit(with_recording=True)
         rc, log = self.run_main(self.standin())
         self.assertEqual(rc, 1, log)
-        self.assertNotIn("cannot leave subject information out", log)
+        self.assertNotIn("does not meet the converter's floor", log)
         self.assertIn(f"conversion failed for {self.PRIMARY}", log)
         body = self.callback_body()
         self.assertNotIn("error", body)
@@ -16364,7 +18869,7 @@ class TestMainRefusesWithoutSubjectInfoExclusion(unittest.TestCase):
         self.commit(with_recording=False)
         rc, log = self.run_main(self.standin(lacking="stream_to_zarr"))
         self.assertEqual(rc, 0, log)
-        self.assertNotIn("cannot leave subject information out", log)
+        self.assertNotIn("does not meet the converter's floor", log)
 
 
 class TestFailedCallbackBody(unittest.TestCase):

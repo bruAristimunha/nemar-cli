@@ -243,7 +243,30 @@ export interface Bindings {
   // pull requests by itself. The callback token reuses PRESCREEN_CALLBACK_SECRET under its own
   // domain tag. Set on the PRODUCTION Worker only unless a staging test is deliberate: the dev
   // Worker answers only for repositories it owns (see the ownership fence in the webhook).
+  //
+  // Not a casual switch: once any repository carries the review ruleset (ADR 0107), an unset or 0
+  // value leaves every pull request on that repository waiting for a check that nothing posts, so
+  // the merges stop. The rulesets come off before the review does, in this order, and a removal is
+  // allowed whatever the switches say: (a) while PR_REVIEW_AUTO_REQUIRE is still on, run
+  // `nemar admin fleet require-review --all --remove --apply` and repeat it with `--after` set to
+  // the last id of each page (it does ONE page, 25 datasets by default and 50 at most, and prints
+  // `Next page:` instead of looping) until the output has no `Next page:` line; (b) dry run the
+  // same pages and expect no row that would remove; (c) turn PR_REVIEW_AUTO_REQUIRE off through a
+  // release, because the next deploy drops what was changed only in the dashboard; (d) repeat (a)
+  // and (b) once more, for the datasets that changed in between. Only then switch the review off.
   PR_REVIEW_ENABLED?: string; // "1" enables the review
+
+  // Automatic requirement of the pull-request review (ADR 0107). Only when this is exactly "1" (and
+  // PR_REVIEW_ENABLED is too) do publishing, a visibility change and the enforce routes put the
+  // review ruleset ON a repository; unset, they leave a reviewed dataset's ruleset as it is. It
+  // gates the addition only: a dataset that is not reviewed has its ruleset taken off whatever
+  // this says. The explicit tools (the review-ruleset routes and `nemar admin fleet
+  // require-review`) do not read it. The owner turns it on when the fleet step of the rollout
+  // starts, after the canary and the calibration gate; it is never on before. It is set in the
+  // configuration file, but a Worker secret of the same name would also turn it on, survives a
+  // deploy and does not show in the file, so the review-ruleset routes report what the Worker
+  // reads as `auto_require`.
+  PR_REVIEW_AUTO_REQUIRE?: string; // "1" lets the automatic paths put the review ruleset on
 
   // Publication review (ADR 0102). When PUBLICATION_REVIEW_ENABLED is exactly "1", a stored
   // identifier-screen result whose gate is clear or acknowledge starts a model review of the

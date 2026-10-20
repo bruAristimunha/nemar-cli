@@ -137,6 +137,50 @@ export function checkedDatasetId(raw: string, json?: boolean): string | null {
 }
 
 /**
+ * Whether `raw` is a dataset id PREFIX the review-ruleset page takes: two lowercase letters, then up
+ * to six digits (`nm`, `nm0001`). The Worker's own rule (`reviewRulesetBulkSchema` in
+ * backend/src/routes/admin/fleet.ts), written here because the CLI does not import the backend; a
+ * test sends the same table to the real route and fails if the two ever disagree.
+ */
+export function isDatasetIdPrefix(raw: string): boolean {
+  return /^[a-z]{2}\d{0,6}$/.test(raw);
+}
+
+/**
+ * Whether `raw` is a dataset id as the Worker's `isValidDatasetId` takes it: `nm`, `on` or `xx`
+ * and six digits whose number is at most 99999, which is to say the first digit is a zero. (The
+ * publication commands' `PUBLICATION_DATASET_ID_RE` leaves that bound out; `--after` goes to a
+ * route that does not.) A test checks this against the real function.
+ */
+export function isBoundedDatasetId(raw: string): boolean {
+  return /^(nm|on|xx)0\d{5}$/.test(raw);
+}
+
+/**
+ * A `--prefix` typed on the command line, checked before anything is sent; null (after saying so,
+ * with exit 1) when it is not one. Without this the Worker's refusal comes back as an object and
+ * prints as "[object Object]". A mistyped prefix is an answer, not a crash.
+ */
+export function checkedDatasetIdPrefix(raw: string, json?: boolean): string | null {
+  if (isDatasetIdPrefix(raw)) return raw;
+  failMessage(
+    `"${raw}" is not a dataset id prefix: use two lowercase letters, then up to six digits (like nm or nm0001).`,
+    { json, answered: true },
+  );
+  return null;
+}
+
+/** An `--after` typed on the command line: a dataset id, checked as {@link checkedDatasetIdPrefix} is. */
+export function checkedAfterDatasetId(raw: string, json?: boolean): string | null {
+  if (isBoundedDatasetId(raw)) return raw;
+  failMessage(
+    `"${raw}" is not a dataset id (like nm000312). --after takes the last id of the previous page.`,
+    { json, answered: true },
+  );
+  return null;
+}
+
+/**
  * Check authentication: when nobody is signed in, say so (on standard error under `--json`), set
  * the exit code to 1 and return false so the caller can `return`. A command that is not signed in
  * has done nothing, and a script has to be able to tell. The message already says what to do, so

@@ -446,6 +446,10 @@ jobs:
               skip = case.find("skipped")
               if skip is None:
                   continue
+              # An expected failure is a test that asserts a known gap, not a skip; a
+              # strict one still fails the run itself the day the gap closes.
+              if skip.get("type") == "pytest.xfail":
+                  continue
               reason = skip.get("message") or (skip.text or "")
               if reason.startswith("real-data test skipped") or "is not bash 3.x" in reason:
                   expected += 1

@@ -9,6 +9,7 @@
  */
 
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { buildBranchRulesetPayload } from "../backend/src/services/github";
 import {
   adminGitHubToken,
   approvalGate,
@@ -231,9 +232,33 @@ describe("what the review's verdict allows", () => {
     expect(approvalGate({ verdict: "pass", staleVerdict: null })).toEqual({ kind: "proceed" });
     expect(approvalGate({ verdict: "fail", staleVerdict: null }).kind).toBe("needs_force");
     expect(approvalGate({ verdict: "in_progress", staleVerdict: null }).kind).toBe("needs_force");
-    for (const v of ["uncertain", "could_not_decide", "not_reviewed"] as const) {
+    for (const v of ["uncertain", "could_not_decide", "not_reviewed", "exempt"] as const) {
       expect(approvalGate({ verdict: v, staleVerdict: null }).kind).toBe("confirm");
     }
+  });
+
+  test("an exempt pull request asks first and says why: it is neither a pass nor a block", () => {
+    const gate = approvalGate({ verdict: "exempt", staleVerdict: null });
+    expect(gate.kind).toBe("confirm");
+    if (gate.kind === "confirm") {
+      expect(gate.warning).toContain("did not run");
+      expect(gate.warning).toContain("owner or administrator");
+    }
+    // An unreadable answer still beats it: nothing is assumed about a review that cannot be read.
+    expect(approvalGate({ verdict: "exempt", staleVerdict: null, unread: "down" }).kind).toBe(
+      "needs_force",
+    );
+  });
+
+  test("an exempt pull request says what an earlier commit's review concluded, because that change is still in it", () => {
+    const gate = approvalGate({ verdict: "exempt", staleVerdict: "fail" });
+    expect(gate.kind).toBe("confirm");
+    if (gate.kind === "confirm") {
+      expect(gate.warning).toContain("did not run on this commit");
+      expect(gate.warning).toContain("An earlier commit of it was reviewed and read fail");
+    }
+    const none = approvalGate({ verdict: "exempt", staleVerdict: null });
+    if (none.kind === "confirm") expect(none.warning).not.toContain("earlier commit");
   });
 
   test("a review of a different commit says what it concluded, so its pass is not read as this one's", () => {
@@ -297,7 +322,26 @@ describe("reading the review the API sent", () => {
       SHA_A,
     );
     expect(r).toMatchObject({ ok: true, detail: "contributor_paused" });
-    if (r.ok) expect(r.contributorNote).toContain("paused by a maintainer");
+    if (r.ok) expect(r.contributorNote).toContain("paused by an administrator's block");
+  });
+
+  test("a pause whose cause this CLI does not know is a plain pause, not a block", () => {
+    const r = reviewForApproval(
+      {
+        ...good,
+        verdict: "not_reviewed",
+        detail: "contributor_paused",
+        review_current: null,
+        author: { standing: { paused: true, because: "tally" } },
+      },
+      SHA_A,
+    );
+    expect(r).toMatchObject({ ok: true });
+    if (r.ok) {
+      expect(r.contributorNote).toBe(
+        "The contributor's pull requests are not reviewed automatically (paused).",
+      );
+    }
   });
 
   test("anything that cannot be read as an answer about THIS commit is unread, which needs --force", () => {
@@ -772,6 +816,42 @@ describe("what GitHub's mergeable state allows, asked before anything is written
       expect(said, state).toContain(`'${state}'`);
       expect(said, state).toContain(why);
       expect(said, state).toContain("so a merge would not be attempted");
+    }
+  });
+
+  test("a blocked state names what can block, and names the review check, and no other, as the one to override in the GitHub UI, where its ruleset is in force", () => {
+    // GitHub says `blocked` for any required check or review that is not satisfied. The review is
+    // one of them where a dataset's ruleset requires it (ADR 0107), and it is the one check this
+    // tool names as overridable in the GitHub UI by an owner or administrator: the tool never uses
+    // the bypass they hold there. Saying so of every blocked pull request would send an
+    // administrator to override a block that is not the review's.
+    const why = refusal("blocked") ?? "";
+    expect(why).toContain("a required check or review is not satisfied");
+    // The other blocks are named, not left to be read as the review.
+    expect(why).toContain("the BIDS validation, the version check");
+    expect(why).toContain("where its ruleset is in force, the NEMAR PR Review");
+    // What the tool names as overridable is the review check alone, and only where its ruleset is
+    // in force. It is what the tool names, and not a claim about what GitHub allows.
+    expect(why).toContain(
+      "this tool names the NEMAR PR Review check, and no other, as one an owner or administrator can override in the GitHub UI, and only where its ruleset is in force",
+    );
+    expect(why).toContain("never uses the bypass");
+    // It must not say that the review is the only check anyone can override. An organization owner
+    // bypasses the NEMAR branch protection ruleset too, and that is the ruleset that carries the
+    // BIDS validation and the version check.
+    expect(
+      buildBranchRulesetPayload({ checks: [] }).bypass_actors.map((a) => a.actor_type),
+    ).toContain("OrganizationAdmin");
+    expect(why).not.toContain("can override only");
+    expect(why).not.toContain("override only");
+    // The old sentence told them to merge "such a pull request", whichever check was blocking it.
+    expect(why).not.toContain("such a pull request");
+    expect(why).not.toContain("merges");
+    // The same sentence reaches the card `next` shows, and no other state says it.
+    const check = mergeCheckOf("blocked");
+    if (!check.ok) expect(check.card).toContain("in the GitHub UI");
+    for (const state of ["behind", "dirty", "unstable", "draft", "unknown"]) {
+      expect(refusal(state), state).not.toContain("GitHub UI");
     }
   });
 

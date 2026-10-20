@@ -75,7 +75,12 @@ def read_duration(
         primary_local, _events, _key = generate_zarr.materialize_recording(
             repo_dir, bucket, dataset_id, relpath, head_files, tag, work
         )
-        rec = Recording.from_file(primary_local)
+        # The Zarr converter's BrainVision policy (generate_zarr.convert_recording): a
+        # multiplexed file that ends in a partial frame and declares no positive
+        # `DataPoints` count is read as its whole frames, so the duration counts the
+        # same frames the converter stores. biosigIO ignores the flag for every other
+        # format, and still refuses a cut vectorized file.
+        rec = Recording.from_file(primary_local, allow_partial_frame=True)
         dur = float(rec.get_duration())
         nsamp = int(rec.get_n_samples())
         if not math.isfinite(dur) or dur <= 0:

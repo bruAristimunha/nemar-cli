@@ -19,6 +19,9 @@
 /** The default length of a note. Equal to the pull-request review's `NOTE_MAX`; a test pins it. */
 export const DEFAULT_NOTE_MAX = 200;
 
+/** What {@link sanitizeNote} leaves where it removed a link. It is not a word of the note. */
+export const LINK_REMOVED = "(link removed)";
+
 /**
  * Free text from a model or a pull request, made safe to put in a check-run.
  *
@@ -51,8 +54,8 @@ export function sanitizeNote(input: unknown, max: number = DEFAULT_NOTE_MAX): st
     if (s === before) break;
   }
   s = s
-    .replace(/\b(?:https?|ftp|file|data|javascript):\/*\S*/gi, "(link removed)")
-    .replace(/\bwww\.\S+/gi, "(link removed)")
+    .replace(/\b(?:https?|ftp|file|data|javascript):\/*\S*/gi, LINK_REMOVED)
+    .replace(/\bwww\.\S+/gi, LINK_REMOVED)
     .replace(/\s+/g, " ")
     .trim();
   const chars = Array.from(s);

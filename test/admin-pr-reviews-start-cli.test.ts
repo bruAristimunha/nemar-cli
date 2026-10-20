@@ -26,12 +26,12 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "bun";
+import { PR_REVIEW_DEADLINE_MINUTES } from "../backend/src/services/pr-review";
 import { hashApiKey } from "../backend/src/services/token";
 import type { Bindings } from "../backend/src/types/bindings";
 import { freshDb, realD1 } from "../backend/test/helpers/d1";
 import { makePrQueueApp } from "../backend/test/helpers/pr-queue-app";
 import { type PrSpec, SHA_A, prNode, seedReview } from "../backend/test/helpers/pr-queue-fixtures";
-import { DAILY_REVIEW_CAP } from "../shared/pr-review";
 import { type GitHubStandin, WORKER_TOKEN, startGitHubStandin } from "./helpers/github-standin";
 
 setDefaultTimeout(30_000);
@@ -207,7 +207,7 @@ describe("nemar admin pr-reviews start <dataset> <pr>", () => {
     expect(dispatches()).toHaveLength(1);
   });
 
-  test("a paused contributor is named, with the command that lifts the pause", async () => {
+  test("a blocked contributor is named, with the command that lifts the block", async () => {
     db.run(
       "INSERT INTO pr_review_overrides (author_id, author_login, mode) VALUES (42, 'alice', 'block')",
     );
@@ -216,10 +216,105 @@ describe("nemar admin pr-reviews start <dataset> <pr>", () => {
     const r = await cli([...START, "nm000201", "12"]);
 
     expect(r.exitCode).toBe(0);
-    expect(r.stdout).toContain("not started");
-    expect(r.stdout).toContain("paused");
-    expect(r.stdout).toContain("nemar admin pr-reviews allow alice");
+    expect(r.stdout).toContain(
+      "not started: the contributor is blocked by an administrator (lift it with: nemar admin pr-reviews allow alice)",
+    );
     expect(dispatches()).toHaveLength(0);
+  });
+
+  test("an owner's or administrator's pull request is not started, and the sentence says why", async () => {
+    openPr({ ds: "nm000201", n: 12, author: "startadmin-gh", authorId: 4001 });
+
+    const r = await cli([...START, "nm000201", "12"]);
+
+    // An answer about a pull request, not a fault in the command.
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain(
+      "not started: its author is a NEMAR owner or administrator, so it is not reviewed",
+    );
+    expect(dispatches()).toHaveLength(0);
+    expect(rows()).toHaveLength(0);
+    // Its check was posted, as skipped, by the Worker.
+    const checks = gh.seen.filter((s) => s.method === "POST" && s.path.endsWith("/check-runs"));
+    expect(checks).toHaveLength(1);
+    expect(checks[0].body).toMatchObject({ status: "completed", conclusion: "skipped" });
+  });
+
+  test("an administrator's pull request whose title breaks the naming rule is not started, and its check fails", async () => {
+    openPr({ ds: "nm000201", n: 12, author: "startadmin-gh", authorId: 4001 });
+    const pull = gh.pulls["nm000201#12"];
+    if (!pull) throw new Error("no pull request");
+    pull.title = "Lee2019 EEG rename";
+
+    const r = await cli([...START, "nm000201", "12"]);
+
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain(
+      "not started: its author is a NEMAR owner or administrator, and the naming rule refused its title or its new dataset name, so its check failed",
+    );
+    expect(dispatches()).toHaveLength(0);
+    const checks = gh.seen.filter((s) => s.method === "POST" && s.path.endsWith("/check-runs"));
+    expect(checks).toHaveLength(1);
+    expect(checks[0].body).toMatchObject({ status: "completed", conclusion: "failure" });
+  });
+
+  test("an administrator's pull request whose dataset name GitHub would not show is a fault: exit 1, and how to retry", async () => {
+    openPr({ ds: "nm000201", n: 12, author: "startadmin-gh", authorId: 4001 });
+    gh.naming.nm000201 = {
+      files: ["dataset_description.json"],
+      names: { [SHA_A]: 502 },
+    };
+
+    const r = await cli([...START, "nm000201", "12"]);
+
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toContain(
+      "not started: its author is a NEMAR owner or administrator, and its dataset name could not be read to check the naming rule, so its check needs a person",
+    );
+    // Either GitHub did not answer or the file is unreadable: one more try, then the file, and
+    // never a bare "again in a moment", which a file that cannot be read answers the same way.
+    expect(r.stdout).toContain(
+      "GitHub may not have answered, or dataset_description.json has no readable Name",
+    );
+    expect(r.stdout).toContain("run the same command once more");
+    expect(r.stdout).toContain("fix dataset_description.json and push");
+    expect(r.stdout).not.toContain("in a moment");
+    expect(r.stdout).not.toContain("naming_unchecked");
+    const checks = gh.seen.filter((s) => s.method === "POST" && s.path.endsWith("/check-runs"));
+    expect(checks[0]?.body).toMatchObject({ conclusion: "action_required" });
+  });
+
+  test("an administrator's pull request whose naming problem was waived for this commit says so, exit 0", async () => {
+    openPr({ ds: "nm000201", n: 12, author: "startadmin-gh", authorId: 4001 });
+    const pull = gh.pulls["nm000201#12"];
+    if (!pull) throw new Error("no pull request");
+    pull.title = "Lee2019 EEG rename";
+    db.run(
+      `INSERT INTO audit_log (user_id, action, resource_type, resource_id, details)
+       VALUES (1, 'pr_review_naming_waived', 'pr_review', 'nm000201#12', ?)`,
+      [JSON.stringify({ head_sha: SHA_A, title: "author_year", name: null })],
+    );
+
+    const r = await cli([...START, "nm000201", "12"]);
+
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain(
+      "not started: its author is a NEMAR owner or administrator, and the naming rule was waived for this commit",
+    );
+    expect(dispatches()).toHaveLength(0);
+  });
+
+  test("the help says when a review that never came back may be started again, in the Worker's minutes", async () => {
+    const r = await cli([...START, "--help-all"]);
+    expect(r.exitCode).toBe(0);
+    const help = r.stdout.replace(/\s+/g, " ");
+    expect(help).toContain(
+      `more than ${PR_REVIEW_DEADLINE_MINUTES} minutes ago that never came back`,
+    );
+    expect(help).toContain("up to two model calls");
+    expect(help).not.toContain("one or two model calls");
+    // A run the naming rule ends asked no model, so it is not a call either.
+    expect(help).toContain("a run the naming rule ends makes none");
   });
 
   test("a pull request GitHub does not have is an error with a word", async () => {
@@ -341,7 +436,7 @@ describe("nemar admin pr-reviews start --all", () => {
     expect(dispatches()).toHaveLength(0);
   });
 
-  test("a paused contributor is asked about and declined by the Worker, with the way out", async () => {
+  test("a blocked contributor is asked about and declined by the Worker, with the way out", async () => {
     queue();
     db.run(
       "INSERT INTO pr_review_overrides (author_id, author_login, mode) VALUES (42, 'alice', 'block')",
@@ -351,7 +446,7 @@ describe("nemar admin pr-reviews start --all", () => {
 
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("nm000201 #1");
-    expect(r.stdout).toContain("not started: the contributor is paused");
+    expect(r.stdout).toContain("not started: the contributor is blocked by an administrator");
     expect(r.stdout).toContain("nemar admin pr-reviews allow alice");
     expect(dispatches()).toHaveLength(2);
     expect(rows().find((x) => x.pr_number === 1)).toMatchObject({
@@ -360,7 +455,7 @@ describe("nemar admin pr-reviews start --all", () => {
     });
   });
 
-  test("after the pause is lifted, the stored decline is started by --all", async () => {
+  test("after the block is lifted, the stored decline is started by --all", async () => {
     queue();
     seedReview(db, {
       ds: "nm000201",
@@ -383,7 +478,7 @@ describe("nemar admin pr-reviews start --all", () => {
     expect(rows().find((x) => x.pr_number === 1)).toMatchObject({ state: "dispatched" });
   });
 
-  test("a contributor held back by an allowance is started: the administrator chose it", async () => {
+  test("a decline from a limit that no longer exists is started", async () => {
     for (let i = 0; i < 3; i++) {
       seedReview(db, {
         ds: "nm000203",
@@ -412,9 +507,9 @@ describe("nemar admin pr-reviews start --all", () => {
     expect(rows().find((x) => x.pr_number === 1)).toMatchObject({ state: "dispatched" });
   });
 
-  test("stops when the platform's daily pool is spent", async () => {
+  test("does not stop for the old daily pool: 400 reviews today change nothing", async () => {
     queue();
-    for (let i = 0; i < DAILY_REVIEW_CAP; i++) {
+    for (let i = 0; i < 400; i++) {
       seedReview(db, {
         ds: "nm000203",
         n: 1000 + i,
@@ -422,20 +517,19 @@ describe("nemar admin pr-reviews start --all", () => {
         authorId: 20_000 + i,
         state: "reported",
         verdict: "pass",
-        // Inside the day the pool is counted over (a result seeded without a date is old).
+        // Inside the day the pool used to be counted over (a result seeded without a date is old).
         createdAt: new Date().toISOString().slice(0, 19).replace("T", " "),
       });
     }
 
     const r = await cli([...START, "--all", "--yes"]);
 
-    // Some were not reviewed, so the exit code says so (`next` does the same when it stops).
-    expect(r.exitCode).toBe(1);
-    expect(r.stdout).toContain("daily");
-    expect(r.stdout).toMatch(/2 were not tried/);
-    expect(dispatches()).toHaveLength(0);
-    // The first decline says the pool is spent; the rest are not tried.
-    expect(gh.seen.filter((s) => s.method === "GET" && s.path.includes("/pulls/"))).toHaveLength(1);
+    // Every one of the three is started, and nothing says some were not tried.
+    expect(r.exitCode).toBe(0);
+    expect(dispatches()).toHaveLength(3);
+    expect(r.stdout).toMatch(/3 started/);
+    expect(r.stdout).not.toContain("not tried");
+    expect(r.stdout).not.toContain("daily");
   });
 
   test("a pull request that cannot be read is counted and the run goes on", async () => {
@@ -506,7 +600,8 @@ describe("nemar admin pr-reviews start --all", () => {
     expect(r.exitCode).toBe(0);
     const out = JSON.parse(r.stdout);
     expect(out.results).toHaveLength(3);
-    expect(out.not_tried).toBe(0);
+    // The pool stop is gone, and so is the count of what it left untried.
+    expect(out).not.toHaveProperty("not_tried");
     expect(out.results.every((x: { dispatched: boolean }) => x.dispatched)).toBe(true);
     expect(out.results.map((x: { reason: string }) => x.reason).sort()).toEqual([
       "dispatched",
@@ -514,6 +609,96 @@ describe("nemar admin pr-reviews start --all", () => {
       "redispatched",
     ]);
     expect(out.failed).toBe(0);
+  });
+});
+
+describe("a commit capped by too many edits is started by name, never by --all", () => {
+  /** One pull request whose review was refused at the cap, and an ordinary one waiting to be started. */
+  function cappedAndOrdinary() {
+    openPr({ ds: "nm000201", n: 1, author: "alice", authorId: 42 });
+    seedReview(db, {
+      ds: "nm000201",
+      n: 1,
+      sha: SHA_A,
+      authorId: 42,
+      state: "errored",
+      detail: "edit_limit",
+    });
+    db.run("UPDATE pr_reviews SET edit_restarts = 5");
+    openPr({ ds: "nm000202", n: 2, author: "bob", authorId: 43 });
+  }
+
+  test("--all leaves the capped commit out, says how to start it, and does not touch its row", async () => {
+    cappedAndOrdinary();
+    const before = rows().find((x) => x.pr_number === 1);
+
+    const r = await cli([...START, "--all", "--yes"]);
+
+    expect(r.exitCode).toBe(0);
+    // Only the ordinary one was started, and the capped row is exactly as it was: still capped,
+    // with its count, so a bulk start did not lift the cap.
+    expect(dispatches()).toHaveLength(1);
+    expect(rows().find((x) => x.pr_number === 1)).toEqual(before);
+    expect(rows().find((x) => x.pr_number === 1)).toMatchObject({
+      state: "errored",
+      detail: "edit_limit",
+      edit_restarts: 5,
+    });
+    expect(r.stdout).toMatch(/1 started/);
+    // The list says which one is capped, why it is not started, and how to start it.
+    expect(r.stdout).toContain("1 left out, capped by too many edits");
+    expect(r.stdout).toContain("nm000201 #1");
+    expect(r.stdout).toContain(
+      "nm000201 #1  alice  capped: nemar admin pr-reviews start nm000201 1",
+    );
+    expect(r.stdout).toContain("lifts the cap");
+  });
+
+  test("--all with only a capped commit has nothing to start, and --json names it", async () => {
+    openPr({ ds: "nm000201", n: 1, author: "alice", authorId: 42 });
+    seedReview(db, {
+      ds: "nm000201",
+      n: 1,
+      sha: SHA_A,
+      authorId: 42,
+      state: "errored",
+      detail: "edit_limit",
+    });
+
+    const text = await cli([...START, "--all", "--yes"]);
+    expect(text.exitCode).toBe(0);
+    expect(text.stdout).toContain("Nothing to start");
+    expect(text.stdout).toContain("capped: nemar admin pr-reviews start nm000201 1");
+    expect(dispatches()).toHaveLength(0);
+
+    const json = await cli([...START, "--all", "--dry-run", "--json"]);
+    expect(json.exitCode).toBe(0);
+    const out = JSON.parse(json.stdout);
+    // Nothing is waiting, so the document is the empty result, and it still names what was left out.
+    expect(out.results).toEqual([]);
+    expect(out.capped).toEqual([{ dataset_id: "nm000201", pr_number: 1, author_login: "alice" }]);
+  });
+
+  test("started by name, it starts the review again and begins the count again", async () => {
+    cappedAndOrdinary();
+
+    const r = await cli([...START, "nm000201", "1"]);
+
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("started again");
+    expect(rows().find((x) => x.pr_number === 1)).toMatchObject({
+      state: "dispatched",
+      detail: null,
+      edit_restarts: 0,
+    });
+    expect(dispatches()).toHaveLength(1);
+  });
+
+  test("the help says so", async () => {
+    const r = await cli([...START, "--help-all"]);
+    expect(r.stdout).toContain("left out of --all");
+    expect(r.stdout).toContain("start it");
+    expect(r.stdout).toContain("by name, which starts its review and lifts the cap");
   });
 });
 
@@ -669,25 +854,5 @@ describe("what must not start anything, and what a refused dispatch is", () => {
     expect(overdue.stdout).toMatch(/1 started/);
     expect(overdue.stdout).not.toContain("already has a review");
     expect(dispatches()).toHaveLength(1);
-  });
-
-  test("the daily stop says how many were not tried", async () => {
-    queue();
-    for (let i = 0; i < DAILY_REVIEW_CAP; i++) {
-      seedReview(db, {
-        ds: "nm000203",
-        n: 1000 + i,
-        sha: `${i}`.padStart(40, "b"),
-        authorId: 20_000 + i,
-        state: "reported",
-        verdict: "pass",
-        createdAt: new Date().toISOString().slice(0, 19).replace("T", " "),
-      });
-    }
-
-    const r = await cli([...START, "--all", "--yes"]);
-
-    expect(r.exitCode).toBe(1);
-    expect(r.stdout).toMatch(/Stopped: .*2 were not tried/);
   });
 });

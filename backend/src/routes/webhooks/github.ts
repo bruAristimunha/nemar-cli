@@ -544,9 +544,12 @@ export function registerGithubWebhookRoutes(webhooks: WebhookRouter): void {
     //
     // Unlike a push, an unexpected failure here (the database, say) answers 500. GitHub does not
     // retry a failed delivery, but it lists it as failed in the App's delivery log, where it can
-    // be redelivered; answering 200 would leave a pull request with no check and no trace.
-    // Redelivering is safe because (dataset, pull request, commit) is unique. A review that fails
-    // AFTER it was recorded is a check that needs a person, not a failure of the delivery.
+    // be redelivered; answering 200 would leave a pull request with no check and no trace. That
+    // includes an exempt pull request's `skipped` check that GitHub would not take: it has no row
+    // for the watchdog to retry from. Redelivering is safe because (dataset, pull request, commit)
+    // is unique for a reviewed commit, and a second `skipped` check on an exempt commit is
+    // harmless. A review that fails AFTER it was recorded is a check that needs a person, not a
+    // failure of the delivery.
     if (eventType === "pull_request") {
       const where = describePullRequest(payload);
       try {

@@ -1,12 +1,15 @@
 /**
  * The wire shapes of the pull-request review queue's admin routes (ADR 0093, following ADR 0092):
  *
- *   GET    /admin/pr-reviews                      every open pull request to `main`, with its review
+ *   GET    /admin/pr-reviews                      every open pull request to `main`, with its review,
+ *                                                 and the volume of reviews over the last day and week
  *   GET    /admin/pr-reviews/:dataset/:pr         one pull request: the stored report, its history
- *   GET    /admin/pr-review-authors/:login        a contributor's tally, override and standing
- *   PUT    /admin/pr-review-authors/:login        allow or block a contributor
- *   DELETE /admin/pr-review-authors/:login        remove that decision, so the tally decides again
+ *   GET    /admin/pr-review-authors/:login        a contributor's record, override and standing
+ *   PUT    /admin/pr-review-authors/:login        block a contributor, or lift a block (allow)
+ *   DELETE /admin/pr-review-authors/:login        remove that decision
  *   POST   /admin/pr-reviews/:dataset/:pr/start   review a pull request that is already open
+ *   POST   /admin/pr-reviews/:dataset/:pr/allow   waive the naming rule for an owner's or an
+ *                                                 administrator's pull request, at its current commit
  *
  * Types, the closed vocabularies, and nothing else, so the Worker that answers and the CLI that
  * prints read ONE definition. Every string a pull request's author controls (title, branch) arrives
@@ -17,11 +20,13 @@
 import type {
   AuthorTally,
   DeclineReason,
+  NamingFacts,
   OverrideMode,
-  ReviewOutcome,
   ReviewState,
   RunError,
   Standing,
+  StoredOutcome,
+  TokenTotals,
 } from "../pr-review.js";
 
 // The review's own vocabulary (ADR 0092) is declared once, in `shared/pr-review.ts`.
@@ -32,12 +37,19 @@ export type { OverrideMode, ReviewState };
  *
  *  - `pass`, `fail`, `uncertain`: the derived verdict of a review OF THE CURRENT COMMIT.
  *  - `not_reviewed`: no review of the current commit is on record. That is also the answer when the
- *    review is off, when the contributor was paused or rate limited (`detail` says which), and when
- *    the review on record is of another commit (`review_current` is false and `stale_verdict` says
- *    what that one concluded). A verdict is never carried over to a commit it did not read.
+ *    review is off, when the contributor was paused (`detail` says so; a row from before the
+ *    limits were removed may say rate limited or daily limit), and when the review on record is of
+ *    another commit (`review_current` is false and `stale_verdict` says what that one concluded). A
+ *    verdict is never carried over to a commit it did not read.
  *  - `in_progress`: the review was handed to GitHub and has not reported.
  *  - `could_not_decide`: the review ran and ended without a verdict (an error, or it never
  *    reported). `detail` says why.
+ *  - `exempt`: the pull request's author is a NEMAR owner or administrator, who are not reviewed
+ *    (ADR 0107), so no review of the current commit is on record and none is wanted. Its review
+ *    check is posted when the commit arrives, as `skipped` unless the naming rule fails it or
+ *    cannot check it; this list does not verify that. A review of the current commit still wins
+ *    over this word, because a push by someone who is not exempt IS reviewed, and a review of
+ *    another commit is never carried over to this one.
  */
 export const QUEUE_VERDICTS = [
   "pass",
@@ -46,8 +58,21 @@ export const QUEUE_VERDICTS = [
   "not_reviewed",
   "in_progress",
   "could_not_decide",
+  "exempt",
 ] as const;
 export type QueueVerdict = (typeof QUEUE_VERDICTS)[number];
+
+/**
+ * A verdict a STORED review can have: every word but `exempt`, which is about a pull request with
+ * no review of its current commit and is never what a row says. The queue and the detail view may
+ * say `exempt`; a review record and a history item may not.
+ */
+export type StoredVerdict = Exclude<QueueVerdict, "exempt">;
+
+/** Every {@link StoredVerdict}: the queue's own words but `exempt`, so a word added there is counted too. */
+export const STORED_VERDICTS: readonly StoredVerdict[] = QUEUE_VERDICTS.filter(
+  (v): v is StoredVerdict => v !== "exempt",
+);
 
 /** A verdict that means the review READ a commit and concluded something about it. */
 export type ReadVerdict = "pass" | "fail" | "uncertain";
@@ -58,8 +83,21 @@ export type CheckState = (typeof CHECK_STATES)[number];
 
 export type QueueEnvironment = "production" | "non-production";
 
-/** The closed reason behind a `not_reviewed` (a decline) or `could_not_decide` (a run error). */
-export type VerdictDetail = DeclineReason | RunError | "unreported";
+/**
+ * The closed reason behind a `not_reviewed` (a decline) or `could_not_decide` (a run error), or, for
+ * an `exempt` row in the list, why the naming rule holds it: `naming_rule` (the review's check on
+ * the current commit failed, so the author fixes the title or the dataset name, or an administrator
+ * waives the rule for the commit with `allow --admin`) and `naming_unchecked` (that check asks for a
+ * person, because the dataset's name could not be read, whatever the title says: there is nothing
+ * to waive until a start reads it, or, when the file has no readable `Name`, until the file is fixed
+ * and pushed). An exempt row the rule does not hold has no detail.
+ */
+export type VerdictDetail =
+  | DeclineReason
+  | RunError
+  | "unreported"
+  | "naming_rule"
+  | "naming_unchecked";
 
 /**
  * Every error word these routes answer with, in the body's `code` field. (The body's `error` field
@@ -70,12 +108,14 @@ export const QUEUE_ERROR_CODES = [
   "bad_dataset",
   "bad_pr",
   "bad_head",
+  "bad_reason",
   "bad_login",
   "not_owned_here",
   "no_such_pull_request",
   "no_such_user",
   "not_a_user",
   "ambiguous_login",
+  "head_moved",
   "github_unavailable",
   "github_timeout",
   "github_rate_limited",
@@ -134,6 +174,46 @@ export interface QueueFilters {
   needs_me: boolean;
 }
 
+/**
+ * What the review did over one window of time. Information for the administrator who reads the
+ * list, and never an input to a decision: no count here, or anywhere, decides whether a pull
+ * request is reviewed (ADR 0107).
+ */
+export interface VolumeWindow {
+  /** Review records created in the window. A commit started again counts as a new record. */
+  reviews: number;
+  /**
+   * Runs of the review those records cost, or may yet cost: the sum of their attempts, leaving out
+   * a decline and a run that never reached the model (a dispatch GitHub did not run, a commit a
+   * newer one superseded) or asked none (a run the naming rule ended at the facts stage). Each run
+   * makes up to two model calls: the screen, and then the review unless the screen stopped the pull
+   * request.
+   */
+  review_runs: number;
+  /** The records by what they came to, in the words the list uses. Every word is there, zero if unseen. */
+  by_verdict: Record<StoredVerdict, number>;
+  /** The declined records by their reason word. Every stored word is there, zero if unseen. */
+  declines: Record<DeclineReason, number>;
+  /**
+   * The tokens the window's reported reviews used, by stage, summed from their reports. Only a
+   * version 2 report carries its usage, so `reviews_counted` says how many reports were summed: a
+   * report from before the screen, and a run that ended without a report (an error, a refusal, a
+   * truncation), cost tokens that are not here. Absent from an older Worker's answer.
+   */
+  tokens?: TokenTotals & { reviews_counted: number };
+  /**
+   * What `tokens` cost at the list prices in `shared/pr-review.ts`, in US dollars to the cent: an
+   * estimate for orientation, never a bill. Absent from an older Worker's answer.
+   */
+  estimated_cost_usd?: number;
+}
+
+/** The volume of the last day and of the last week, counted from when each record was created. */
+export interface QueueVolume {
+  last_24_hours: VolumeWindow;
+  last_7_days: VolumeWindow;
+}
+
 export interface QueueResponse {
   environment: QueueEnvironment;
   /** The review itself is switched on in this environment (`PR_REVIEW_ENABLED`). */
@@ -146,15 +226,28 @@ export interface QueueResponse {
   truncated: boolean;
   skipped: QueueSkipped;
   filters: QueueFilters;
+  /**
+   * What the review has done lately across the whole platform, whatever the filters are. Null when
+   * it could not be read this time: informing never holds up the list, and an unread count is not
+   * a count of zero.
+   */
+  volume: QueueVolume | null;
 }
 
 /**
  * What starting the review of one open pull request came to. `reason` is one of the review's own
- * fixed words (ADR 0092): `dispatched`, `redispatched` (a commit started again) or `dispatch_claimed`
- * (GitHub's answer was lost but the workflow had already claimed it) when it was handed to GitHub,
- * otherwise why not (`duplicate`, `contributor_paused`, `daily_limit`, `draft`, `not_open`, `not_main`,
- * `bot_author`, `dataset_not_reviewable`, `pr_review_disabled`, ...). `review_id` is null when no
- * review row exists for it.
+ * fixed words (ADR 0092): `dispatched`, `redispatched` (a commit started again),
+ * `redispatched_after_edit` (a commit started again because its title, body or base was edited,
+ * ADR 0107; only a delivery says it, an administrator's start never edits anything) or
+ * `dispatch_claimed` (GitHub's answer was lost but the workflow had already claimed it) when it was
+ * handed to GitHub,
+ * otherwise why not (`duplicate`, `contributor_paused`, `exempt_author` (its author is an owner or
+ * administrator, so it is not reviewed and its check was posted as skipped), `naming_rule` (its
+ * author is exempt, and the naming rule refused its title or its new dataset name, so its check was
+ * posted as failed), `naming_unchecked` (exempt, and the dataset name could not be read, whatever
+ * the title says, so the check needs a person), `exempt_naming_waived` (exempt, and an administrator waived the naming rule
+ * for this commit), `draft`, `not_open`, `not_main`, `bot_author`, `dataset_not_reviewable`,
+ * `pr_review_disabled`, ...). `review_id` is null when no review row exists for it.
  */
 export interface StartReviewResponse {
   environment: QueueEnvironment;
@@ -165,11 +258,72 @@ export interface StartReviewResponse {
   author_login: string | null;
 }
 
+/**
+ * The words a waiver of the naming rule can come to (`POST /admin/pr-reviews/:dataset/:pr/allow`):
+ *  - `waived`: the rule refused the commit, the waiver is recorded, and its check is now skipped;
+ *  - `already_waived`: a waiver for this commit covers what the rule finds; its check was posted
+ *    again;
+ *  - `nothing_to_waive`: the rule finds nothing on the commit; its check was posted as skipped;
+ *  - `naming_unchecked`: the dataset's name could not be read, so there is nothing definite to
+ *    waive and nothing was recorded or posted. GitHub may not have answered, which asking again
+ *    settles, or the file at the head has no readable `Name` (not JSON, no text `Name`, or one that
+ *    shows nothing), which asking again finds again: that file has to be fixed and pushed;
+ *  - `not_exempt`: the author is not a NEMAR owner or administrator, whose review it would bypass;
+ *  - `reviewed`: the commit was reviewed (someone who is not exempt pushed it), and its review stands;
+ *  - or why the pull request was not looked at, in the start's words (`pr_review_disabled`,
+ *    `unknown_dataset`, `dataset_not_reviewable`, `not_open`, `not_main`, `draft`, `bot_author`,
+ *    `malformed`, ...).
+ */
+export type WaiveNamingReason =
+  | "waived"
+  | "already_waived"
+  | "nothing_to_waive"
+  | "naming_unchecked"
+  | "not_exempt"
+  | "reviewed"
+  | (string & {});
+
+export interface WaiveNamingResponse {
+  environment: QueueEnvironment;
+  /** True when the commit's check is skipped by a waiver, recorded now or before. */
+  waived: boolean;
+  reason: WaiveNamingReason;
+  /**
+   * The commit the answer is about, in full, when the pull request was read that far. When
+   * `waived` is true it is the commit that was waived, whether or not the request named one.
+   */
+  head_sha: string | null;
+  /** What the naming rule found on that commit, when it was waived now or could not be read. */
+  facts: NamingFacts | null;
+}
+
+/**
+ * The body of `POST /admin/pr-reviews/:dataset/:pr/allow`. A pull request that has moved on from
+ * `head_sha` is not waived: the answer is a 409 with the code `head_moved`, and nothing is recorded
+ * or posted. A body with no reason, or one with no plain words in it, is a 400 with the code
+ * `bad_reason`: a waiver is recorded with the reason it was given. A reason has plain words in it
+ * when a letter or a digit remains once links, mentions and markup are removed, so a link alone,
+ * or punctuation alone, is no reason.
+ */
+export interface WaiveNamingRequest {
+  /**
+   * Why, in plain words; required, kept to 200 characters, and a link in it is removed before it
+   * is recorded.
+   */
+  reason: string;
+  /**
+   * The commit the caller means: the first seven to forty characters of its id (hexadecimal). The
+   * pull request's current commit is waived only if its id starts with this. Without it the current
+   * commit is waived whatever it is, and the answer's `head_sha` says which one that was.
+   */
+  head_sha?: string;
+}
+
 export interface ReviewHistoryItem {
   id: number;
   head_sha: string;
   state: ReviewState;
-  verdict: QueueVerdict;
+  verdict: StoredVerdict;
   created_at: string;
   decided_at: string | null;
 }
@@ -178,7 +332,7 @@ export interface ReviewRecord {
   id: number;
   head_sha: string;
   /** What this review concluded of ITS OWN commit, re-derived from the stored report. */
-  verdict: QueueVerdict;
+  verdict: StoredVerdict;
   detail: VerdictDetail | null;
   author_login: string;
   author_id: number;
@@ -186,7 +340,7 @@ export interface ReviewRecord {
   created_at: string;
   decided_at: string | null;
   /** The stored outcome, re-validated on the way out; null while the review is in progress. */
-  outcome: ReviewOutcome | null;
+  outcome: StoredOutcome | null;
 }
 
 /** What GitHub says about the pull request right now. Best effort: null when GitHub could not be read. */
@@ -206,6 +360,7 @@ export interface LivePullRequest {
 export interface ContributorStanding {
   login: string;
   author_id: number;
+  /** The record of rejected pull requests: information, and never a reason to pause anyone. */
   tally: AuthorTally;
   override: null | {
     mode: OverrideMode;
@@ -213,12 +368,8 @@ export interface ContributorStanding {
     set_at: string;
     set_by: string | null;
   };
-  /** The standing the review gate applies today: the override if there is one, else the record. */
+  /** The standing the review gate applies today. Only a block pauses a contributor; the tally never does. */
   standing: Standing;
-  /** The standing the RECORD alone would give, ignoring any override. */
-  by_record: Standing;
-  /** The tally rule, so a reader can see how far from a pause a contributor is. */
-  thresholds: { rejected_more_than: number; percent_more_than: number };
   /** The latest decided review of each of the contributor's most recent pull requests. */
   recent: Array<{
     dataset_id: string;

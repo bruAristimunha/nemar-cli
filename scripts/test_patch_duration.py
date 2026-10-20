@@ -8,11 +8,13 @@ are absent (local dev without the zarr deps); CI installs scripts/zarr/requireme
 
 from __future__ import annotations
 
+import math
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -32,6 +34,13 @@ try:
 except ImportError:
     HAVE_BIOSIGIO = False
 
+try:
+    import mne  # noqa: F401
+
+    HAVE_MNE = True
+except ImportError:
+    HAVE_MNE = False
+
 NEEDS_DEPS = unittest.skipUnless(
     HAVE_PYEDFLIB and HAVE_BIOSIGIO,
     "needs pyedflib + biosigio (CI installs scripts/zarr/requirements.txt)",
@@ -41,6 +50,13 @@ EDF_REL = "sub-01/eeg/sub-01_task-rest_eeg.edf"
 FS, SECS, N_CH = 256, 10, 2
 EXPECTED_DURATION = float(SECS)  # 10.0 s
 EXPECTED_NTIMES = FS * SECS  # 2560
+
+# A BrainVision triplet: multiplexed INT_16, so a frame (one sample of every channel)
+# is the channel count times two bytes.
+BV_REL = "sub-01/eeg/sub-01_task-rest_eeg.vhdr"
+BV_LABELS = ("Fp1", "Fp2", "Cz", "Pz")
+BV_FS, BV_SECS = 250, 4
+BV_FRAME_BYTES = len(BV_LABELS) * 2
 
 
 def write_edf(path: Path, *, fs: int = FS, secs: int = SECS, n_ch: int = N_CH) -> None:
@@ -69,6 +85,39 @@ def write_edf(path: Path, *, fs: int = FS, secs: int = SECS, n_ch: int = N_CH) -
     w.close()
 
 
+def write_brainvision(vhdr: Path, *, cut: int = 0) -> Path:
+    """Write a real BrainVision triplet beside `vhdr`: multiplexed INT_16 and no
+    `DataPoints` count in the header, as the format specifies it. `cut` bytes are
+    then dropped from the end of the data file; a `cut` of less than one frame
+    leaves a partial frame. Returns the data file."""
+    stem = vhdr.with_suffix("")
+    vhdr.write_text(
+        "Brain Vision Data Exchange Header File Version 1.0\n"
+        "[Common Infos]\nCodepage=UTF-8\n"
+        f"DataFile={stem.name}.eeg\nMarkerFile={stem.name}.vmrk\n"
+        "DataFormat=BINARY\nDataOrientation=MULTIPLEXED\n"
+        f"NumberOfChannels={len(BV_LABELS)}\nSamplingInterval={1_000_000 // BV_FS}\n"
+        "[Binary Infos]\nBinaryFormat=INT_16\n[Channel Infos]\n"
+        + "".join(f"Ch{i + 1}={label},,0.1,\u00b5V\n" for i, label in enumerate(BV_LABELS)),
+        encoding="utf-8",
+    )
+    stem.with_suffix(".vmrk").write_text(
+        "Brain Vision Data Exchange Marker File, Version 1.0\n"
+        f"[Common Infos]\nCodepage=UTF-8\nDataFile={stem.name}.eeg\n"
+        "[Marker Infos]\nMk1=New Segment,,1,1,0\nMk2=Stimulus,S  1,250,1,0\n",
+        encoding="utf-8",
+    )
+    t = np.arange(BV_FS * BV_SECS) / BV_FS
+    # (samples, channels) in C order is sample after sample: the multiplexed layout.
+    samples = np.stack(
+        [np.sin(2 * np.pi * (5 + i) * t) * 1000 for i in range(len(BV_LABELS))], axis=1
+    )
+    payload = samples.astype("<i2").tobytes()
+    data = stem.with_suffix(".eeg")
+    data.write_bytes(payload[: len(payload) - cut])
+    return data
+
+
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -78,23 +127,42 @@ def _git(repo: Path, *args: str) -> None:
     )
 
 
-def setup_repo(repo: Path, *, primary_bytes: bytes | None = None) -> None:
-    """Real git repo with the primary committed as a plain git blob, tagged
-    v1.0.0. No git-annex, so materialize_recording writes the blob directly
-    (no S3)."""
+def _init_repo(repo: Path) -> None:
     repo.mkdir(parents=True, exist_ok=True)
     _git(repo, "init", "-q")
     _git(repo, "config", "user.email", "t@t")
     _git(repo, "config", "user.name", "t")
+
+
+def _commit_and_tag(repo: Path) -> None:
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+    _git(repo, "tag", "v1.0.0")
+
+
+def setup_repo(repo: Path, *, primary_bytes: bytes | None = None) -> None:
+    """Real git repo with the primary committed as a plain git blob, tagged
+    v1.0.0. No git-annex, so materialize_recording writes the blob directly
+    (no S3)."""
+    _init_repo(repo)
     edf = repo / EDF_REL
     edf.parent.mkdir(parents=True, exist_ok=True)
     if primary_bytes is None:
         write_edf(edf)
     else:
         edf.write_bytes(primary_bytes)
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "init")
-    _git(repo, "tag", "v1.0.0")
+    _commit_and_tag(repo)
+
+
+def setup_brainvision_repo(repo: Path, *, cut: int = 0) -> Path:
+    """The same, for a BrainVision triplet whose data file loses its last `cut`
+    bytes. Returns the data file."""
+    _init_repo(repo)
+    vhdr = repo / BV_REL
+    vhdr.parent.mkdir(parents=True, exist_ok=True)
+    data = write_brainvision(vhdr, cut=cut)
+    _commit_and_tag(repo)
+    return data
 
 
 def import_patch():
@@ -104,7 +172,7 @@ def import_patch():
     return patch_duration
 
 
-def base_record(**ss) -> dict:
+def base_record(relpath: str = EDF_REL, **ss) -> dict:
     summary = {
         "nchans": 2,
         "ntimes": None,
@@ -116,7 +184,7 @@ def base_record(**ss) -> dict:
         "schema_version": "0.3.0",
         "doc_type": "record",
         "dataset": "nm099999",
-        "bids_relpath": EDF_REL,
+        "bids_relpath": relpath,
         "modality": "EEG",
         "signal_summary": summary,
     }
@@ -177,6 +245,39 @@ class PatchDurationTests(unittest.TestCase):
         filled, gaps = self._patch(records)
         self.assertEqual((filled, gaps), (0, 0))
         self.assertEqual(records[0]["signal_summary"]["recording_duration"], first)
+
+    @unittest.skipUnless(HAVE_MNE, "needs mne (CI installs scripts/zarr/requirements.txt)")
+    def test_brainvision_ending_in_a_partial_frame_counts_the_whole_frames(self):
+        # The header declares no positive DataPoints count, so a data file that ends
+        # in a partial frame cannot be told from a complete recording with stray
+        # bytes. biosigIO 1.2.13 refuses it unless asked for the whole frames, which
+        # is the Zarr converter's policy, so the duration must count the same frames
+        # the converter stores instead of staying null. The control is the whole file.
+        for label, cut in (("whole file", 0), ("cut inside the last frame", 1)):
+            with self.subTest(label):
+                shutil.rmtree(self.repo, ignore_errors=True)
+                data = setup_brainvision_repo(self.repo, cut=cut)
+                size = data.stat().st_size
+                self.assertEqual(size % BV_FRAME_BYTES == 0, cut == 0)
+                frames = size // BV_FRAME_BYTES  # the whole frames, whatever is left over
+                records = [
+                    base_record(
+                        BV_REL, nchans=len(BV_LABELS), channel_type_counts={"EEG": len(BV_LABELS)}
+                    )
+                ]
+                with warnings.catch_warnings():
+                    # biosigIO also warns about the bytes it drops.
+                    warnings.filterwarnings(
+                        "ignore", message="BrainVision data file .* ends in a partial frame"
+                    )
+                    filled, gaps = self._patch(records)
+                self.assertEqual((filled, gaps), (1, 1))
+                ss = records[0]["signal_summary"]
+                self.assertTrue(math.isfinite(ss["recording_duration"]))
+                self.assertGreater(ss["recording_duration"], 0)
+                # Whole frames times the sample interval (1 / sampling rate).
+                self.assertAlmostEqual(ss["recording_duration"], frames / BV_FS, places=6)
+                self.assertEqual(ss["ntimes"], frames)
 
     def test_preserves_existing_tier1_ntimes(self):
         # ntimes set by Tier-1 (sidecar SF*RD) but duration null is impossible by

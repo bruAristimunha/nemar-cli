@@ -43,6 +43,7 @@ import type {
   QueueResponse,
   SetOverrideResponse,
   StartReviewResponse,
+  WaiveNamingResponse,
 } from "../../../shared/contract/pr-review-admin.js";
 import type { BackfillNameOutcome } from "../../../shared/contract/publication.js";
 import type { NeurobagelWeekly } from "../../../shared/contract/weekly-attention.js";
@@ -1359,6 +1360,134 @@ export async function enforceBulk(opts: {
   );
 }
 
+// ----------------------------------------------------------------------------
+// The required pull-request review (ADR 0107)
+// ----------------------------------------------------------------------------
+
+/** The body the Worker sends GitHub for the "NEMAR PR review required" ruleset. */
+export interface ReviewRulesetPayload {
+  name: string;
+  target: string;
+  enforcement: string;
+  conditions: { ref_name: { include: string[]; exclude: string[] } };
+  bypass_actors: Array<{ actor_id: number; actor_type: string; bypass_mode: string }>;
+  rules: Array<Record<string, unknown>>;
+}
+
+/** Why the Worker does not review a dataset's pull requests: the first condition it fails. */
+export type NotReviewableReason = "inactive" | "private" | "anonymous" | "unpublished";
+
+/**
+ * What a review-ruleset request came to for one dataset. `intent` is what the dataset's row
+ * called for (or `--remove` asked for) and `action` is what was done, or with a dry run would be:
+ * `create`, `update`, `remove`, `none` (nothing to take off), `skip` (required here but not
+ * written, see `reason`), or null when the attempt failed (`error` says how, and `code` is its
+ * word when it has one: `review_disabled` is a requirement refused because the review is off,
+ * `review_app_mismatch` one refused because the Worker posts the check as another GitHub App,
+ * `review_app_not_configured` one refused because the Worker has no way to sign in as the right
+ * App for nemarDatasets, and `github_request_failed` a request GitHub refused or did not complete,
+ * whose `error` is a sentence that carries GitHub's status code and never GitHub's own words).
+ */
+export interface ReviewRulesetOutcome {
+  dataset_id: string;
+  reviewable: boolean;
+  not_reviewable_because: NotReviewableReason | null;
+  intent: "require" | "remove";
+  action: "create" | "update" | "remove" | "none" | "skip" | null;
+  applied: boolean;
+  reason?: string;
+  default_branch?: string;
+  payload?: ReviewRulesetPayload;
+  error?: string;
+  code?:
+    | "review_disabled"
+    | "review_app_mismatch"
+    | "review_app_not_configured"
+    | "github_request_failed";
+}
+
+/**
+ * The GitHub App ids that decide whether a requirement can ever be met: the ruleset requires the
+ * check from `ruleset_app_id`, and the Worker posts it as `github_app_id`, which is null both when
+ * the binding is unset and when it holds something that is not an id, so `github_app_id_state`
+ * says which: `unset`, `not_a_number` or `id`. A requirement is refused (`review_app_mismatch`)
+ * unless they are the same App. The right id is not enough: the check is posted with an
+ * installation token for nemarDatasets, and a Worker without the App's private key or that
+ * installation id (`installation_configured` false) falls back to a personal access token, which
+ * cannot post a check run, so a requirement is refused then too (`review_app_not_configured`).
+ */
+export interface ReviewAppIds {
+  github_app_id: string | null;
+  github_app_id_state: "unset" | "not_a_number" | "id";
+  ruleset_app_id: number;
+  app_id_matches: boolean;
+  installation_configured: boolean;
+}
+
+export interface ReviewRulesetResponse extends ReviewRulesetOutcome, ReviewAppIds {
+  dry_run: boolean;
+  /** The automated review is switched on in this environment (PR_REVIEW_ENABLED). */
+  review_enabled: boolean;
+  /**
+   * The owner's switch for the automatic requirement (PR_REVIEW_AUTO_REQUIRE) is exactly "1" on
+   * this Worker, however it was set: in its configuration file or as a Worker secret.
+   */
+  auto_require: boolean;
+}
+
+export interface ReviewRulesetBulkResponse extends ReviewAppIds {
+  dry_run: boolean;
+  review_enabled: boolean;
+  auto_require: boolean;
+  remove: boolean;
+  limit: number;
+  count: number;
+  /** The last id of a full page, to send as `after` for the next one; null on the last page. */
+  next_after: string | null;
+  /** The body every create and update row sends; null with `remove`. */
+  payload: ReviewRulesetPayload | null;
+  results: ReviewRulesetOutcome[];
+}
+
+/**
+ * Put the review ruleset on one dataset's repository, or take it off. A dry run unless `dryRun`
+ * is false; with `remove` it is taken off whatever the dataset's row says.
+ */
+export async function reviewRuleset(
+  datasetId: string,
+  opts: { dryRun: boolean; remove: boolean },
+): Promise<ReviewRulesetResponse> {
+  return request<ReviewRulesetResponse>(
+    `/admin/datasets/${datasetId}/review-ruleset`,
+    { method: "POST", body: JSON.stringify({ dry_run: opts.dryRun, remove: opts.remove }) },
+    true,
+  );
+}
+
+/** The same across a page of datasets, in id order (owner-only, at most 50 a page). */
+export async function reviewRulesetBulk(opts: {
+  prefix?: string;
+  after?: string;
+  limit?: number;
+  dryRun: boolean;
+  remove: boolean;
+}): Promise<ReviewRulesetBulkResponse> {
+  return request<ReviewRulesetBulkResponse>(
+    "/admin/datasets/review-ruleset/bulk",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        prefix: opts.prefix,
+        after: opts.after,
+        limit: opts.limit,
+        dry_run: opts.dryRun,
+        remove: opts.remove,
+      }),
+    },
+    true,
+  );
+}
+
 export interface RevalidateResponse {
   dataset_id: string;
   head_sha: string | null;
@@ -2238,6 +2367,7 @@ export type {
   QueueVerdict,
   SetOverrideResponse,
   StartReviewResponse,
+  WaiveNamingResponse,
 } from "../../../shared/contract/pr-review-admin.js";
 
 /** Every open pull request to `main` in `nemarDatasets`, with the automated review of its current commit. */
@@ -2300,7 +2430,7 @@ export async function getPrReviewAuthor(login: string): Promise<ContributorStand
   );
 }
 
-/** Allow or block a contributor; the tally no longer decides the pause until it is cleared (rate limits still apply). */
+/** Block a contributor, or lift a block (allow). Only an administrator's block pauses anyone's reviews. */
 export async function setPrReviewAuthor(
   login: string,
   mode: "allow" | "block",
@@ -2317,6 +2447,30 @@ export async function clearPrReviewAuthor(login: string): Promise<ClearOverrideR
   return request<ClearOverrideResponse>(
     `/admin/pr-review-authors/${encodeURIComponent(login)}`,
     { method: "DELETE" },
+    true,
+  );
+}
+
+/**
+ * Waive the naming rule for an owner's or an administrator's pull request, at its current commit:
+ * the explicit override that replaces their exemption for that rule (ADR 0107). The Worker reads
+ * the pull request from GitHub itself, records the waiver with `reason` (required: the Worker
+ * answers 400 `bad_reason` without one), and posts the check; the answer's `reason` is a fixed word (`waived`, `nothing_to_waive`, `not_exempt`, ...). With `commit`
+ * (the first seven or more characters of a commit id) a pull request that has moved on is not
+ * waived: the Worker answers 409 `head_moved`.
+ */
+export async function waivePrReviewNaming(
+  datasetId: string,
+  prNumber: number,
+  reason: string,
+  commit?: string,
+): Promise<WaiveNamingResponse> {
+  return request<WaiveNamingResponse>(
+    `/admin/pr-reviews/${encodeURIComponent(datasetId)}/${prNumber}/allow`,
+    {
+      method: "POST",
+      body: JSON.stringify({ reason, ...(commit ? { head_sha: commit } : {}) }),
+    },
     true,
   );
 }

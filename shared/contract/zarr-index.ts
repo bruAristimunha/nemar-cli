@@ -182,7 +182,7 @@ export const zarrStoreSchema = z
   .superRefine(assertSssIffDerived);
 export type ZarrStore = z.infer<typeof zarrStoreSchema>;
 
-/** A recording that has no store for a reason retrying will not change. */
+/** A recording that has no store for a reason that retrying in the same state will not change. */
 export const zarrFailureSchema = z
   .object({
     path: z.string(),

@@ -13,6 +13,70 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
+## 0.10.20 - 2026-10-19
+
+The Zarr conversion that runs on `hallu` now pins biosigIO 1.2.13 and types the failures caused by missing companion data.
+This release requeues nothing and leaves `ZARR_ENGINE_VERSION` at `3`. A dataset's stores are rebuilt when that dataset next runs: the drain rebuilds every recording with `--clean`, and a biosigIO change makes a published index non-current, so a pending retry round also rebuilds. A recording that converts again gets the new verdicts.
+There is one migration, 0099 (`0099_pr_review_edit_limit.sql`), which rebuilds the `pr_reviews` table, adds the `edit_restarts` count (default 0) and the `edit_limit` word for the review gate below (#1846).
+This release sets no new Worker secret or variable; it adds one optional switch, `PR_REVIEW_AUTO_REQUIRE`, which is left unset.
+The Worker serves the index schema from one route, so the descriptions that route returns change on deploy.
+The conversion changes run on `hallu` from this repository's `main` branch, not from the npm package.
+
+### Changed
+
+- **Zarr conversion pins biosigIO 1.2.13 (`>=1.2.13,<1.2.14`).**
+  A BrainVision data file shorter than its header's `DataPoints` count is refused as `corrupt_or_truncated`.
+  A BrainVision data file with no `DataPoints` count that ends in a partial frame now converts: the converter reads the whole frames, as 1.2.12 did, and records the dropped byte count in the store's recording metadata (`brainvision_dropped_bytes`). A cut inside the last frame of such a file is therefore read rather than refused. Vectorized data with a partial frame, and a file with no whole frame, are still refused.
+  An EDF+C or BDF+C recording whose first time-keeping onset is not zero now converts, where it was refused as not EDF(+) or BDF(+) compliant.
+  A truncated FIF read through `Recording.from_file` is typed `corrupt_or_truncated`, where it was `file_read_error`.
+  A BrainVision cut that falls exactly on a frame boundary of a file with no `DataPoints` count is not detected; that is a known limit of the reader.
+- **The duration backfill counts the same BrainVision frames as the converter (#1837).**
+  `scripts/patch_duration.py` passes `allow_partial_frame=True`, as the converter does, so a file the converter stores gets the same duration.
+  biosigIO ignores the flag for every other format.
+- **Missing companion data gets a typed, terminal verdict (#1808).**
+  A BrainVision header that names a data file the tree does not hold is `companion_missing`; a FIF file whose next split part is not in the tree is `split_part_missing`; an EEGLAB `.set` that stores epoched data is `epoched_recording`.
+  These replace the `retry_exhausted`, `maxshield_probe_failed` and `file_read_error` verdicts that the same recordings used to receive, and none of them is retried.
+  A host error raised while the reader recovers from a refusal keeps its retry: a refusal's code is read from the exception and its direct causes, never from its context.
+  Discovery now lists tree paths with `-z`, so a recording whose name has non-ASCII bytes matches the header that names it.
+  That widens discovery for those datasets. A dataset takes the new discovery when it next runs; the engine stamp, which this release leaves at `3`, governs requeues only.
+- **The source copy of the dataset pull-request review workflow now matches the copy that dataset repositories run (#1820).**
+  The review workflow runs the checkout, the Bun setup and the install after it mints the dataset token, and before it writes the token to the clone's configuration.
+  The install uses `--ignore-scripts`, and the job timeout is 28 minutes, below the 40-minute watchdog deadline.
+  The shared workflow repository already runs this body; this release brings the source copy in this repository to the same content.
+- **The index contract says what a retry can change.**
+  The `failure` description in `shared/zarr-index.schema.json` says that retrying in the same state will not change the outcome.
+  The `failure_count` description excludes content that is not yet fetched locally from the failures that need a change to the data or the converter.
+  The code list names `companion_missing`, `split_part_missing` and `epoched_recording`.
+  This is a description-only change.
+- **The unexpected-skip guard in `test.yml` exempts pytest expected failures (epic #1800).**
+  A pinned known gap no longer fails the run as a skip; a real skip still does.
+- **Dataset pull requests are screened on their content, and NEMAR owners and administrators are exempt from the model review by identity (epic #1813, merged as #1846; Architecture Decision Record (ADR) 0107).**
+  The hourly, daily and platform caps and the automatic tally pause are removed, and the admin list shows a volume line in their place (#1815).
+  The exemption also needs the login to hold admin on the dataset's repository, as GitHub reports it, and an exempt pull request shows its own queue verdict (#1814); the naming rule still applies to it (#1816).
+  A title or a changed dataset name that cites an author and year, a Digital Object Identifier (DOI) or a naming-template token ends the review at the facts, before any model is asked (`shared/naming-rule.ts`; #1816, #1826, #1830).
+  A pull request is reviewed again when its title or body changes, when its base moves onto `main`, or when it is reopened or marked ready; each head commit allows five such restarts, counted in `edit_restarts`, and a sixth is refused as an errored row with `detail = 'edit_limit'` (#1817, #1845).
+- **The required review check has its switch in place, and the switch is off unless it is set to `1` (#1819).**
+  The Worker reads `PR_REVIEW_AUTO_REQUIRE` as on only when it is `1`, and the repository does not set it.
+  The switch gates publishing, visibility changes and `nemar admin fleet enforce`; `nemar admin fleet require-review`, for one dataset or a page, does not wait for it.
+- **The command-line interface (CLI) no longer writes a placeholder pull request title or body (#1818, #1823; `src/lib/pr-text.ts`).**
+  `nemar dataset push --pr` used to write "Update from branch X" and an empty body when given none, and `nemar dataset update` wrote a stock title and a file list that dropped the first letter of its first path.
+  The CLI refuses text that cannot be read as a description of the change.
+  In a script, `nemar dataset update` fails unless both `--message` and `--description` are given, and `nemar dataset push --pr` fails unless both `--title` and `--body` are given.
+- **`nemar dataset update` writes its title into the dataset's change log as the new version's entry (#1823).**
+  The entry goes into the change log the dataset already has (`CHANGES`, `CHANGES.md` and the like), or into a new `CHANGES` file if it has none; an entry the author wrote first is left alone.
+
+### Known limitations
+
+- This release requeues nothing; a dataset's stores change only when that dataset next runs (see the first paragraph above).
+- Streamed export still raises an uncoded error for a truncated FIF (biosigIO #161) and for truncated KIT and 4D/BTi files (biosigIO #168), so those are retried until the retry budget runs out.
+- In a local run, a git-annex pointer whose content was never fetched is a typed `file_read_error` that is never retried; whether it should stay retryable is open (#1812).
+- A BrainVision marker that falls inside a dropped partial frame is not kept; the dropped byte count is in the store's metadata, not in the public index.
+- A store whose recording metadata carries `brainvision_dropped_bytes` is refused by the scrub zarr stage until an operator names the member with `--allow-member`, as for the converter's other technical flags.
+- A host read error during the MaxShield header probe is still recorded as `maxshield_probe_failed`, which is terminal (#1833).
+- A short read of an EEGLAB `.fdt` caused by an I/O error is reported as a sample-count mismatch, which is typed `corrupt_or_truncated` (biosigIO #169).
+- The review check is not required on any dataset yet, so a dataset pull request still merges without it until the owner applies the ruleset.
+- Once a repository carries the review ruleset, an unset or `0` value of `PR_REVIEW_ENABLED` leaves its pull requests waiting for a check that nothing posts, and its merges stop; remove the rulesets before the review is switched off.
+
 ## 0.10.19 - 2026-10-16
 
 A publication request now gets one derived verdict that is built by the Worker from the mechanical gates and a no-tools model review of the submission, and approving over anything that is not a clear pass is the administrator's recorded act (epic #1726, #1782; Architecture Decision Record (ADR) 0102 and ADR 0105).

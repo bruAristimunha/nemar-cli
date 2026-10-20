@@ -79,10 +79,10 @@ export const EDF_MIRROR_MEMBERS: ReadonlySet<string> = new Set([
  * wrote for nm000186 and nm000348 (census of 2026-10-05, names only): `startdate` (an
  * acquisition date does not gate, ADR 0085), `filetype`, `number_of_signals`, `file_duration`,
  * `datarecord_duration`, `source_file`, `source_format`, `streamed`, and `channels_tsv_units`
- * with whatever it holds (a units report). The converter's own notes name four more technical
+ * with whatever it holds (a units report). The converter's own notes name five more technical
  * flags a store can carry (`channel_labels_deduplicated`, `brainvision_header_recovered`,
- * `eeglab_fdt_recovered`, `edf_tolerant_read`); they are NOT listed here, so a store that has
- * one is refused until `--allow-member` names it after a look.
+ * `brainvision_dropped_bytes`, `eeglab_fdt_recovered`, `edf_tolerant_read`); they are NOT listed
+ * here, so a store that has one is refused until `--allow-member` names it after a look.
  */
 export const KNOWN_BENIGN: ReadonlySet<string> = new Set([
   "startdate",

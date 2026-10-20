@@ -52,7 +52,11 @@ export interface CheckRunInput {
   headSha: string;
   /** The existing check-run to update, or null to create one. */
   checkRunId: number | null;
-  /** `in_progress` for a review that is running; `completed` carries a conclusion. */
+  /**
+   * `null` publishes an `in_progress` check for a review that is running; any other value is a
+   * `completed` check carrying that conclusion. `skipped` is sent for an exempt pull request
+   * (ADR 0107) and for nothing else: `conclusionOf` is the only thing that chooses it.
+   */
   conclusion: CheckConclusion | null;
   title: string;
   summary: string;
