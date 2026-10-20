@@ -1247,7 +1247,7 @@ describe("the refusal at the edit cap (ADR 0107, decision 4)", () => {
   });
 
   test("no other error has that title, and its summary is its own", () => {
-    for (const error of RUN_ERRORS.filter((w) => w !== "edit_limit")) {
+    for (const error of RUN_ERRORS.filter((w) => w !== "edit_limit" && w !== "model_truncated")) {
       const r = renderCheck({ kind: "error", error });
       expect(r.title, error).toBe("Could not decide");
       expect(r.summary, error).not.toContain("the most one commit gets");
@@ -2200,6 +2200,17 @@ describe("the check text of version 2", () => {
         "No verdict was reached, so this check does not pass. A NEMAR administrator needs to look at this pull request.",
       );
     }
+  });
+
+  test("a review that used all its room does not pass and tells the author to split the pull request", () => {
+    const outcome = { kind: "error", error: "model_truncated" } as const;
+    expect(conclusionOf(outcome)).toBe("action_required");
+    const r = renderCheck(outcome);
+    expect(r.title).toBe("Could not decide: split this pull request");
+    expect(r.summary).toContain("used all the room it is given");
+    expect(r.summary).toContain("Split it into smaller pull requests");
+    // The other errors keep the plain title.
+    expect(renderCheck({ kind: "error", error: "model_refused" }).title).toBe("Could not decide");
   });
 
   test("conclusionOf is never skipped for a reported review, at any stage", () => {

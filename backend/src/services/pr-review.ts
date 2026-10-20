@@ -151,13 +151,13 @@ export const PR_REVIEW_BASE_BRANCH = "main";
 
 /**
  * How long a dispatched review may take, counted from when its row was recorded, before the
- * watchdog gives up on it. The review workflow's `timeout-minutes` (28) is kept below this, and the
+ * watchdog gives up on it. The review workflow's `timeout-minutes` (50) is kept below this, and the
  * job's worst case (the setup steps, both model stages at their deadlines, the callback's retries)
  * below that; a test in `test/pr-review-workflow.test.ts` checks both. The deadline runs from when
  * the row was recorded and the job's limit from when it starts, so the gap between them is the time
  * a dispatch may wait in GitHub's queue.
  */
-export const PR_REVIEW_DEADLINE_MINUTES = 40;
+export const PR_REVIEW_DEADLINE_MINUTES = 60;
 
 /**
  * A result that did not reach GitHub is eligible to be tried again this long after it was decided,

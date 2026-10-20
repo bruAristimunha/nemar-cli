@@ -48,6 +48,7 @@ import {
   EVIDENCE_BUDGET_MS,
   EVIDENCE_ERRORS,
   EvidenceError,
+  MAX_DIFFS_EXAMINED,
   MAX_GROUPS,
   MAX_MODEL_FILES,
   MAX_PATCH_FILES,
@@ -57,6 +58,7 @@ import {
   buildEvidence,
   childEnv,
   classifyPath,
+  diffSignature,
   gatherContent,
   gatherGitFacts,
   gatherListing,
@@ -909,11 +911,11 @@ describe("runReview: the job around the model call", () => {
     expect(user).toContain("# Edited");
   });
 
-  test("stage 2 is Sonnet 5.5 at max effort, streamed, 32000 tokens, the review schema and the review prompt", async () => {
+  test("stage 2 is Sonnet 5.5 at max effort, streamed, 128000 tokens, the review schema and the review prompt", async () => {
     const { review: req } = await bothRequests("run-stage2-request");
     expect(req.body.model).toBe("claude-sonnet-5-5");
     expect(req.body.stream).toBe(true);
-    expect(req.body.max_tokens).toBe(32_000);
+    expect(req.body.max_tokens).toBe(128_000);
     const config = req.body.output_config as { effort: string; format: Record<string, unknown> };
     expect(config.effort).toBe("max");
     expect(config.format.schema).toEqual(REVIEW_OUTPUT_SCHEMA);
@@ -933,9 +935,9 @@ describe("runReview: the job around the model call", () => {
       },
       review: {
         model: "claude-sonnet-5-5",
-        maxTokens: 32_000,
+        maxTokens: 128_000,
         timeoutMs: 120_000,
-        deadlineMs: 11 * 60_000,
+        deadlineMs: 30 * 60_000,
         maxRetries: 1,
       },
     });
@@ -1706,11 +1708,16 @@ describe("what the reviewer was not shown is a fact", () => {
     // must not be green.
     const dir = newBigDataset("unread-damage", 30);
     const r = branch(dir, () => {
+      // Each file is emptied differently, so no two diffs are the same change.
       for (let i = 0; i < 30; i++) {
-        write(dir, `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_events.tsv`, "onset\tduration\n");
+        write(
+          dir,
+          `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_events.tsv`,
+          `onset\tduration\n${i}\n`,
+        );
       }
       for (let i = 0; i < 18; i++) {
-        write(dir, `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_eeg.json`, "{}");
+        write(dir, `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_eeg.json`, `{"n":${i}}`);
       }
       release(dir);
     });
@@ -1747,7 +1754,7 @@ describe("what the reviewer was not shown is a fact", () => {
     const dir = newBigDataset("many-added", 5);
     const r = branch(dir, () => {
       for (let i = 100; i < 200; i++) {
-        write(dir, `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_eeg.json`, "{}");
+        write(dir, `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_eeg.json`, `{"n":${i}}`);
       }
       write(dir, "dataset_description.json", desc("1.1.0"));
     });
@@ -1775,7 +1782,7 @@ describe("what the reviewer was not shown is a fact", () => {
     const r = branch(dir, () => {
       const bulk = "x".repeat(9000);
       for (let i = 0; i < 14; i++) {
-        write(dir, `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_events.tsv`, `onset\n${bulk}\n`);
+        write(dir, `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_events.tsv`, `onset\n${bulk}${i}\n`);
       }
       write(dir, "sub-900/eeg/sub-900_task-rest_eeg.json", "{}");
     });
@@ -1832,8 +1839,8 @@ describe("what the reviewer was not shown is a fact", () => {
     const dir = newBigDataset("prompt-flag", 30);
     const r = branch(dir, () => {
       for (let i = 0; i < 30; i++) {
-        write(dir, `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_events.tsv`, "onset\n");
-        write(dir, `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_channels.tsv`, "name\n");
+        write(dir, `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_events.tsv`, `onset\n${i}\n`);
+        write(dir, `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_channels.tsv`, `name\n${i}\n`);
       }
     });
     const facts = gatherGitFacts(r.dir, r.base, r.head);
@@ -2140,7 +2147,7 @@ describe("cosmetic changes are proven from the blobs, never assumed", () => {
     const dir = newBigDataset("n2-many-real", 60);
     const r = branch(dir, () => {
       for (let i = 0; i < 60; i++) {
-        write(dir, sidecar(i), JSON.stringify({ ...base, SamplingFrequency: 512 }, null, 4));
+        write(dir, sidecar(i), JSON.stringify({ ...base, SamplingFrequency: 512 + i }, null, 4));
       }
     });
     const facts = gatherGitFacts(r.dir, r.base, r.head);
@@ -2292,7 +2299,7 @@ describe("a bulk edit reads as groups, and the cut says what it cut", () => {
   test("one shape, how many were shown, and the totals add up", () => {
     const dir = newBigDataset("n2-groups", 50);
     const r = branch(dir, () => {
-      for (let i = 0; i < 50; i++) write(dir, channels(i), "name\ttype\nCz\tMISC\n");
+      for (let i = 0; i < 50; i++) write(dir, channels(i), `name\ttype\nCz\tMISC${i}\n`);
     });
     const facts = gatherGitFacts(r.dir, r.base, r.head);
     const g = facts.groups.find((x) => x.pattern === "sub-*/eeg/sub-*_task-rest_channels.tsv");
@@ -2351,6 +2358,234 @@ describe("a bulk edit reads as groups, and the cut says what it cut", () => {
     expect(pathPattern("sub-01.5/x.tsv")).toBe("sub-*.5/x.tsv");
     expect(pathPattern("sub-/x.tsv")).toBe("sub-/x.tsv");
     expect(pathPattern("sub-(a|b)+/[x].tsv")).toBe("sub-*/[x].tsv");
+  });
+});
+
+describe("one change repeated across files is read once", () => {
+  const sidecar = (i: number) => `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_eeg.json`;
+  const channels = (i: number) => `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_channels.tsv`;
+  const fixed = JSON.stringify({ TaskName: "rest", SamplingFrequency: 512 });
+  const SHAPE = "sub-*/eeg/sub-*_task-rest_eeg.json";
+
+  test("the same edit in 60 sidecars is one diff that covers all of them, and nothing is unread", () => {
+    const dir = newBigDataset("fold-same", 60);
+    const r = branch(dir, () => {
+      for (let i = 0; i < 60; i++) write(dir, sidecar(i), fixed);
+      release(dir);
+    });
+    const facts = gatherGitFacts(r.dir, r.base, r.head);
+    const shown = facts.patches.find((p) => p.path === sidecar(0));
+    expect(shown?.same).toHaveLength(59);
+    expect(shown?.same).toContain(sidecar(59));
+    expect(facts.patches.filter((p) => p.path.endsWith("_eeg.json"))).toHaveLength(1);
+    expect(facts.readIncomplete).toBe(false);
+    expect(facts.groups.find((g) => g.pattern === SHAPE)).toMatchObject({
+      status: "modified",
+      files: 60,
+      shown: 60,
+    });
+    // 60 sidecars, the dataset description and the change log: every one of the 62 counts as read.
+    const e = buildEvidence(facts, NO_TEXT_PROBLEMS);
+    expect(e.files_changed).toBe(62);
+    expect(e.files_read).toBe(62);
+    expect(e.truncated).toBe(false);
+    expect(verdictOf(full(allPass, e))).toBe("pass");
+  });
+
+  test("a file that differs in one byte is shown on its own, among any number that repeat", () => {
+    const dir = newBigDataset("fold-odd", 60);
+    const r = branch(dir, () => {
+      for (let i = 0; i < 60; i++) write(dir, sidecar(i), i === 41 ? "{}" : fixed);
+      release(dir);
+    });
+    const facts = gatherGitFacts(r.dir, r.base, r.head);
+    const odd = facts.patches.find((p) => p.path === sidecar(41));
+    expect(odd?.same).toEqual([]);
+    expect(odd?.text).toContain("+{}");
+    const shown = facts.patches.find((p) => p.path === sidecar(0));
+    expect(shown?.same).toHaveLength(58);
+    expect(shown?.same).not.toContain(sidecar(41));
+  });
+
+  test("a change that names its own subject is a different change in every file", () => {
+    const dir = newBigDataset("fold-label", 50);
+    const r = branch(dir, () => {
+      for (let i = 0; i < 50; i++) {
+        write(dir, channels(i), `name\ttype\nCz\tMISC\nsub-${pad(i)}\tn/a\n`);
+      }
+    });
+    const facts = gatherGitFacts(r.dir, r.base, r.head);
+    expect(facts.patches.filter((p) => p.path.endsWith("_channels.tsv"))).toHaveLength(
+      MAX_PATCH_FILES,
+    );
+    expect(facts.patches.every((p) => p.same.length === 0)).toBe(true);
+    expect(facts.readIncomplete).toBe(true);
+  });
+
+  test("a repeated change whose diff was cut covers none of the files it repeats in", () => {
+    const dir = newBigDataset("fold-cut", 6);
+    const rows = Array.from({ length: 3000 }, (_, k) => `Ch${k}\tEEG`).join("\n");
+    const r = branch(dir, () => {
+      for (let i = 0; i < 5; i++) write(dir, channels(i), `name\ttype\n${rows}\n`);
+    });
+    const facts = gatherGitFacts(r.dir, r.base, r.head);
+    const shown = facts.patches.find((p) => p.path === channels(0));
+    expect(shown?.truncated).toBe(true);
+    expect(shown?.same).toHaveLength(4);
+    expect(facts.readIncomplete).toBe(true);
+    // A cut diff stands for no other file: one of the five was read, and the evidence says so.
+    const evidence = buildEvidence(facts, NO_TEXT_PROBLEMS);
+    expect(evidence.files_changed).toBe(5);
+    expect(evidence.files_read).toBe(1);
+    expect(evidence.truncated).toBe(true);
+    expect(
+      facts.groups.find((g) => g.pattern === "sub-*/eeg/sub-*_task-rest_channels.tsv")?.shown,
+    ).toBe(0);
+  });
+
+  test("a symlink, an executable and a regular file with the same lines changed are three changes", () => {
+    const dir = join(root, "fold-modes");
+    mkdirSync(dir, { recursive: true });
+    git(dir, "init", "-q", "-b", "main");
+    write(dir, "dataset_description.json", desc("1.0.0"));
+    const paths = ["a", "b", "c"].map((k) => `sub-${k}/eeg/sub-${k}_task-rest_eeg.json`);
+    write(dir, paths[0] ?? "", "x");
+    write(dir, paths[2] ?? "", "x");
+    mkdirSync(join(dir, "sub-b/eeg"), { recursive: true });
+    symlinkSync("x", join(dir, paths[1] ?? ""));
+    chmodSync(join(dir, paths[2] ?? ""), 0o755);
+    git(dir, "add", "-A");
+    git(dir, "commit", "-q", "-m", "initial");
+    const r = branch(dir, () => {
+      write(dir, paths[0] ?? "", "target");
+      unlinkSync(join(dir, paths[1] ?? ""));
+      symlinkSync("target", join(dir, paths[1] ?? ""));
+      write(dir, paths[2] ?? "", "target");
+      chmodSync(join(dir, paths[2] ?? ""), 0o755);
+    });
+    const facts = gatherGitFacts(r.dir, r.base, r.head);
+    for (const path of paths) {
+      expect(facts.patches.find((p) => p.path === path)?.same, path).toEqual([]);
+    }
+  });
+
+  test("bytes that are not valid UTF-8 are different changes, not one", () => {
+    const dir = newBigDataset("fold-bytes", 3);
+    const r = branch(dir, () => {
+      writeFileSync(join(dir, sidecar(0)), Buffer.from([0x63, 0x61, 0x66, 0xe9]));
+      writeFileSync(join(dir, sidecar(1)), Buffer.from([0x63, 0x61, 0x66, 0xe8]));
+    });
+    const facts = gatherGitFacts(r.dir, r.base, r.head);
+    expect(facts.patches.find((p) => p.path === sidecar(0))?.same).toEqual([]);
+    expect(facts.patches.find((p) => p.path === sidecar(1))).toBeDefined();
+  });
+
+  test("a CRLF edit and an LF edit of the same line are different changes", () => {
+    const dir = newBigDataset("fold-crlf", 3);
+    const r = branch(dir, () => {
+      write(dir, channels(0), "name\ttype\nCz\tMISC\n");
+      write(dir, channels(1), "name\ttype\r\nCz\tMISC\r\n");
+    });
+    const facts = gatherGitFacts(r.dir, r.base, r.head);
+    expect(facts.patches.find((p) => p.path === channels(0))?.same).toEqual([]);
+    expect(facts.patches.find((p) => p.path === channels(1))).toBeDefined();
+  });
+
+  test("a repeat is found after the patch cap is reached, and the cap still holds", () => {
+    // File 0 and file 99 are the same change; files 1 to 98 are 98 different ones. The 40-patch cap
+    // is full long before file 99, which still rides on file 0 and costs nothing.
+    const dir = newBigDataset("fold-after-cap", 100);
+    const r = branch(dir, () => {
+      for (let i = 0; i < 100; i++) {
+        write(dir, sidecar(i), i === 0 || i === 99 ? fixed : JSON.stringify({ n: i }));
+      }
+    });
+    const facts = gatherGitFacts(r.dir, r.base, r.head);
+    expect(facts.patches).toHaveLength(MAX_PATCH_FILES);
+    expect(facts.patches.find((p) => p.path === sidecar(0))?.same).toEqual([sidecar(99)]);
+    expect(facts.readIncomplete).toBe(true);
+  });
+
+  test("when the pass is nearly out of time the first diffs are still read, the search for repeats stops, and nothing throws", () => {
+    // Files 0 and 49 are the same change; files 1 to 48 are 48 different ones, so the 40 patches
+    // are full before file 49 is reached.
+    const dir = newBigDataset("fold-late", 50);
+    const r = branch(dir, () => {
+      for (let i = 0; i < 50; i++) {
+        write(dir, sidecar(i), i === 0 || i === 49 ? fixed : JSON.stringify({ n: i }));
+      }
+    });
+    const listing = gatherListing(r.dir, r.base, r.head);
+    // Less time than the search keeps in reserve.
+    __setEvidenceBudgetForTests({ content: 19_000 });
+    try {
+      const content = gatherContent(r.dir, listing);
+      expect(content.patches).toHaveLength(MAX_PATCH_FILES);
+      // File 49 would have ridden on file 0; with the search stopped it is unread, which fails closed.
+      expect(content.patches.find((p) => p.path === sidecar(0))?.same).toEqual([]);
+      expect(content.readIncomplete).toBe(true);
+    } finally {
+      __setEvidenceBudgetForTests(null);
+    }
+  });
+
+  test("the folding reads no more than MAX_DIFFS_EXAMINED files; the rest stay unread", () => {
+    const n = MAX_DIFFS_EXAMINED + 10;
+    const dir = newBigDataset("fold-cap", n);
+    const r = branch(dir, () => {
+      for (let i = 0; i < n; i++) write(dir, sidecar(i), fixed);
+    });
+    const facts = gatherGitFacts(r.dir, r.base, r.head);
+    const shown = facts.patches.find((p) => p.path === sidecar(0));
+    expect(shown?.same).toHaveLength(MAX_DIFFS_EXAMINED - 1);
+    expect(facts.readIncomplete).toBe(true);
+  }, 120_000);
+
+  test("the review is told which change repeats and in how many files", () => {
+    const dir = newBigDataset("fold-prompt", 60);
+    const r = branch(dir, () => {
+      for (let i = 0; i < 60; i++) write(dir, sidecar(i), fixed);
+      release(dir);
+    });
+    const facts = gatherGitFacts(r.dir, r.base, r.head);
+    const { user, system } = buildReviewMessages({
+      facts,
+      evidence: buildEvidence(facts, NO_TEXT_PROBLEMS),
+      pr: { title: "t", body: "b" },
+      fromFork: false,
+      nonce: "abc123def456",
+    });
+    expect(user).toContain("(the same change, line for line, in 59 other files: ");
+    expect(user).toContain(sidecar(1));
+    expect(user).toContain(", and others)");
+    expect(user).toContain('"changed_metadata_not_shown_in_full": false');
+    expect(system).toContain("the same change, line for line, in N other files");
+  });
+
+  test("diffSignature takes out the file's name and nothing else", () => {
+    const a =
+      "diff --git a/x.json b/x.json\nindex 111..222 100644\n--- a/x.json\n+++ b/x.json\n@@ -1 +1 @@\n-a\n+b\n";
+    const other = a.replaceAll("x.json", "y/z.json").replace("111..222", "333..444");
+    expect(diffSignature(a)).toBe(diffSignature(other));
+    // A line of the body that looks like a header is a line of the body.
+    const lookalike = a.replace("-a\n", "--- a\n");
+    expect(diffSignature(lookalike)).not.toBe(diffSignature(a));
+    expect(diffSignature(lookalike)).toContain("--- a");
+    // A mode change is part of the change.
+    const mode = a.replace(
+      "index 111..222 100644",
+      "old mode 100644\nnew mode 100755\nindex 111..222",
+    );
+    expect(diffSignature(mode)).not.toBe(diffSignature(a));
+    // The mode printed on the index line is part of the change; the object ids are not.
+    const exec = a.replace("index 111..222 100644", "index 111..222 100755");
+    expect(diffSignature(exec)).not.toBe(diffSignature(a));
+    expect(diffSignature(exec)).toBe(diffSignature(other.replace("100644", "100755")));
+    // A different hunk, a different line number, a different byte.
+    expect(diffSignature(a.replace("+b", "+c"))).not.toBe(diffSignature(a));
+    expect(diffSignature(a.replace("@@ -1 +1 @@", "@@ -2 +2 @@"))).not.toBe(diffSignature(a));
+    // No hunk, no signature: a binary file is never folded.
+    expect(diffSignature("diff --git a/x b/x\nBinary files a/x and b/x differ\n")).toBeNull();
   });
 });
 
@@ -3340,6 +3575,8 @@ describe("the worst case fits", () => {
         path: `${long(195)}${i}`,
         text: long(i < 6 ? 12_000 : MAX_PATCH_TOTAL_CHARS - 6 * 12_000),
         truncated: i === 6,
+        // The note names the first few of the files a change repeats in, at the longest path.
+        same: Array.from({ length: 50 }, (_, k) => `${long(195)}${i}-${k}`),
       })),
       readIncomplete: true,
       cosmeticOnlyFiles: 0,

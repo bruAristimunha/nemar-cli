@@ -1213,7 +1213,7 @@ skipped when the rule finds nothing (or an administrator waived it for this comm
 refuses the title or the new dataset name, and one that needs a person when the name could not be
 read. No count of reviews, and no record of rejected pull requests, holds a start back. A commit
 whose review was declined, ended in an error or never reported is started again, and so is one
-handed to GitHub more than 40 minutes ago that never came back; one that is running or has a
+handed to GitHub more than 60 minutes ago that never came back; one that is running or has a
 result is not started again. A start that restarts a review that already ran costs a second run.
 A commit whose review was refused for too many edits (five restarts by edits, reopenings and
 markings as ready) is left out of --all, so that a bulk start never lifts the cap unasked; start it
