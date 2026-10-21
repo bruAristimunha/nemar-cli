@@ -1236,8 +1236,7 @@ Ordered steps (one commit each, tests in the same commit):
 5. `pr-review-prompt.ts`: the facts block, the fenced block, the groups column, the system-prompt paragraph, `platformFindings`, `assembleReport`'s new parameters.
    Tests: fence and forged-line tests; platform findings first and surviving; every existing prompt pin unchanged.
 6. `pr-review.ts`: pass platform findings; `observeEvidence`.
-7. `shared/pr-review.ts`: the three codes, labels, exclusion from `REVIEW_FINDING_CODES`.
-   Tests: `test/pr-review.test.ts` code test.
+7. (Moved out of the epic: the three codes, labels and the exclusion from `REVIEW_FINDING_CODES` shipped first as S0, nemarOrg/nemar-cli#1863, so the Worker accepts them one release before anything emits them. Nothing remains to do here.)
 8. `pr-review-calibrate.ts`: `--evidence-only` and the columns.
    Tests: `test/pr-review-calibrate.test.ts`.
 9. Hostile fixture builder `test/fixtures/pr-review-hostile/` and its test (set B).
