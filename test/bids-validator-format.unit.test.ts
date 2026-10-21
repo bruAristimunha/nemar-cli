@@ -53,6 +53,7 @@ function resultWithSize(size: number): BidsValidationResult {
     },
     errorCount: 0,
     warningCount: 0,
+    validatorVersion: "3.0.2",
   };
 }
 
