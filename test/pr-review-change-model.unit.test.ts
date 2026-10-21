@@ -17,10 +17,12 @@ import {
   type ClassKind,
   type FileDiff,
   type JsonCounts,
+  type JsonLeaf,
   type JsonValue,
   type PoolFile,
   ROLE_OF,
   type RelabelRule,
+  SUMMARY_LIMITS,
   type Table,
   type TableCounts,
   buildPools,
@@ -480,6 +482,134 @@ describe("relabelRule: numbers and nothing-to-say pairs never get a rule", () =>
     expect(relabelRule("A01 Hz", "A1 Hz", { chars: false })).toEqual(rule("repad", [], "", true));
   });
 
+  test("a digit run joined to another by separators alone compares as text: 1 000 to 1 0 is not a padding", () => {
+    // One number written with a separator: a space, an apostrophe, an underscore, a middle dot,
+    // the Arabic decimal separator. Each pair is a change of magnitude, never "zero padding".
+    for (const [a, b] of [
+      ["5 000", "5 0"],
+      ["1 000 Hz", "1 0 Hz"],
+      ["1'000", "1'0000"],
+      ["1_000", "1_0000"],
+      ["1 000", "1 0000"],
+      ["0\u{B7}05 Hz", "0\u{B7}5 Hz"],
+      ["1\u{66B}05", "1\u{66B}5"],
+    ] as const) {
+      for (const chars of [false, true]) {
+        const forward = relabelRule(a, b, { chars });
+        const backward = relabelRule(b, a, { chars });
+        expect(forward?.kind, `${a} -> ${b}`).not.toBe("repad");
+        expect(backward?.kind, `${b} -> ${a}`).not.toBe("repad");
+        expect(forward?.repadded ?? false, `${a} -> ${b}`).toBe(false);
+        expect(backward?.repadded ?? false, `${b} -> ${a}`).toBe(false);
+      }
+    }
+    // Several separators in a row still join, and so does a run at either end of the string.
+    expect(relabelRule("x1 - 05", "x1 - 5", { chars: false })).toBeNull();
+    expect(relabelRule("05 1", "5 1", { chars: false })).toBeNull();
+  });
+
+  test("a decimal mark in either string makes the pair compare every digit as text, even when the mark is in the added text", () => {
+    for (const [a, b] of [
+      ["05 Hz", ".5 Hz"],
+      ["A05", "A.5"],
+      ["x 05 Hz", "x .5 Hz"],
+      ["0050 Hz", "50, Hz"],
+      // The other number of the string holds the mark: the pair is still compared as text.
+      ["05 a 1.5", "5 a 1.5"],
+      ["05 a 1 2", "5 a 1 2"],
+    ] as const) {
+      for (const chars of [false, true]) {
+        expect(relabelRule(a, b, { chars }), `${a} -> ${b}`).toBeNull();
+        expect(relabelRule(b, a, { chars }), `${b} -> ${a}`).toBeNull();
+      }
+    }
+    // Compared as text, a rule that rebuilds the string exactly is still found, and it never says
+    // a padding changed: `07 Hz` gained the prefix `.`, which the class line says.
+    expect(relabelRule("07 Hz", ".07 Hz", { chars: false })).toEqual(rule("wrap", [".", ""]));
+    // Neither string holds a mark or a join: the digits are compared by value, as before.
+    expect(relabelRule("05 a 1", "5 a 1", { chars: false })).toEqual(rule("repad", [], "", true));
+  });
+
+  test("digits are read by value only among the allowed neighbors: no other mark, wherever it stands, lets a pair claim a padding", () => {
+    const hidden: (readonly [string, string])[] = [
+      // A mark at the edge of both strings.
+      ["\u{66B}05 Hz", "\u{66B}5 Hz"],
+      ["\u{FF0E}05 Hz", "\u{FF0E}5 Hz"],
+      // A mark only in the text a rule would add, alone or with an invisible or a space after it.
+      ["05 Hz", "\u{FF0E}5 Hz"],
+      ["005", "\u{B7}5"],
+      ["05 Hz", ".\u{2060}5 Hz"],
+      ["05 Hz", ".\u{200B}5 Hz"],
+      ["05 Hz", ".\u{AD}5 Hz"],
+      ["05 Hz", ".\u{301}5 Hz"],
+      ["05 Hz", ". 5 Hz"],
+      // A letter, or a letter-like mark, inside one number.
+      ["0\u{A78F}05 Hz", "0\u{A78F}5 Hz"],
+      ["1\u{2BC}000 Hz", "1\u{2BC}0000 Hz"],
+      ["1\u{2CC}000", "1\u{2CC}0000"],
+      ["res-0p05mm", "res-0p5mm"],
+      ["1e05", "1e5"],
+      ["1x000 Hz", "1x0000 Hz"],
+      ["1E0100", "1E100"],
+      // A digit with no value this module vouches for anywhere in the string, around a plain one.
+      ["Fp\u{663} EEG05", "Fp\u{663} EEG5"],
+      ["Fp\u{B2} EEG05", "Fp\u{B2} EEG5"],
+    ];
+    for (const [a, b] of hidden) {
+      for (const chars of [false, true]) {
+        for (const [x, y] of [
+          [a, b],
+          [b, a],
+        ] as const) {
+          const found = relabelRule(x, y, { chars });
+          const label = JSON.stringify([x, y, chars, found]);
+          expect(found?.kind === "repad" || found?.repadded === true, label).toBe(false);
+        }
+      }
+    }
+  });
+
+  test("the allowed neighbors keep every real padding: an edge, a separator, or letters that are not one letter between numbers", () => {
+    for (const [a, b] of [
+      ["sub-01", "sub-1"],
+      ["sub-01_ses-02", "sub-1_ses-2"],
+      ["0100 Hz", "100 Hz"],
+      ["EEG 001", "EEG 1"],
+      ["x_02_y", "x_2_y"],
+      ["E001", "E1"],
+      ["ECOG1", "ECOG01"],
+      ["Fp1", "Fp01"],
+    ] as const) {
+      for (const chars of [false, true]) {
+        expect(relabelRule(a, b, { chars }), `${a} -> ${b}`).toEqual(rule("repad", [], "", true));
+        expect(relabelRule(b, a, { chars }), `${b} -> ${a}`).toEqual(rule("repad", [], "", true));
+      }
+    }
+  });
+
+  test("a letter between two digit runs breaks the join: legitimate repads keep their rule", () => {
+    for (const [a, b] of [
+      ["sub-01", "sub-1"],
+      ["0100 Hz", "100 Hz"],
+      ["EEG 001", "EEG 1"],
+      ["x_02_y", "x_2_y"],
+      ["sub-01_ses-02", "sub-1_ses-2"],
+      ["1 x 05", "1 x 5"],
+    ] as const) {
+      expect(relabelRule(a, b, { chars: false }), `${a} -> ${b}`).toEqual(
+        rule("repad", [], "", true),
+      );
+      expect(relabelRule(b, a, { chars: false }), `${b} -> ${a}`).toEqual(
+        rule("repad", [], "", true),
+      );
+    }
+    // The join is a property of each string, so it holds inside a wrap too.
+    expect(relabelRule("A01", "POL A1", { chars: false })).toEqual(
+      rule("wrap", ["POL ", ""], "", true),
+    );
+    expect(relabelRule("1-01", "POL 1-1", { chars: false })).toBeNull();
+  });
+
   test("digits compare by value only as ASCII digits: a superscript is the text it is", () => {
     // The superscript two is a number character but has no value this module vouches for.
     expect(relabelRule("A\u{B2}", "POL A\u{B2}", { chars: false })).toEqual(
@@ -768,10 +898,280 @@ describe("relabelRule: every rule it returns rebuilds the other string from one 
     }
     // The generator reaches every kind of rule, so the property is not vacuous.
     expect([...kinds].sort()).toEqual(["case", "delete", "insert", "repad", "strip", "wrap"]);
-    // 1,535 of the 6,000 tries find a rule (3,437 before digits were barred from inserted text,
-    // which this generator, with four digits in a twelve-character alphabet, hits often).
-    expect(withRule).toBeGreaterThan(1500);
+    // 1,403 of the 6,000 tries find a rule (3,437 before digits were barred from inserted text,
+    // which this generator, with four digits in a twelve-character alphabet, hits often). It was
+    // 1,535 before a pair compared its digits by value only when every digit run of both strings
+    // stands among the neighbors the allowlist names: 140 tries lost a rule then, each a padding
+    // change in a string whose digits are now read as text (beside a `.`, a single letter with
+    // digits beyond it, or another number), and 8 found an exact one by text that the old
+    // reading, digit run by digit run, did not (`07` to `..07` is the prefix `..`).
+    expect(withRule).toBeGreaterThan(1350);
   });
+});
+
+/**
+ * An independent reading of the allowlist, written over characters rather than the module's runs:
+ * a string is read as text when it holds a digit that is not ASCII, or when a maximal run of ASCII
+ * digits has a side that is none of: the edge; a maximal run of letters that are all ASCII and are
+ * not one letter with a digit beyond it; one space, hyphen or underscore with the edge or such
+ * letters beyond it. When either string of a pair is read as text, every digit of the pair must
+ * be compared as text.
+ */
+function readAsText(s: string): boolean {
+  const chars = Array.from(s);
+  const asciiDigit = (c: string | undefined) => c !== undefined && c >= "0" && c <= "9";
+  const digit = (c: string | undefined) => c !== undefined && /^\p{N}$/u.test(c);
+  const letter = (c: string | undefined) => c !== undefined && /^\p{L}$/u.test(c);
+  if (chars.some((c) => digit(c) && !asciiDigit(c))) return true;
+  // The letters from `at` outward (`step`): all ASCII, and more than one or no digit beyond.
+  const lettersOk = (at: number, step: number): boolean => {
+    let end = at;
+    while (letter(chars[end])) end += step;
+    const run = chars.slice(Math.min(at, end - step), Math.max(at, end - step) + 1);
+    return run.every((c) => /^[A-Za-z]$/.test(c)) && (run.length > 1 || !digit(chars[end]));
+  };
+  const sideOk = (at: number, step: number): boolean => {
+    const c = chars[at];
+    if (c === undefined) return true;
+    if (letter(c)) return lettersOk(at, step);
+    if (c !== " " && c !== "-" && c !== "_") return false;
+    const beyond = chars[at + step];
+    return beyond === undefined || (letter(beyond) && lettersOk(at + step, step));
+  };
+  for (let i = 0; i < chars.length; ) {
+    if (!asciiDigit(chars[i])) {
+      i++;
+      continue;
+    }
+    let end = i;
+    while (asciiDigit(chars[end])) end++;
+    if (!sideOk(i - 1, -1) || !sideOk(end, 1)) return true;
+    i = end;
+  }
+  return false;
+}
+
+/**
+ * An independent reading of when only the zero padding of numbers differs: neither string holds a
+ * number written with a separator, the strings split into the same maximal letter runs and
+ * letter-free stretches, letters are equal exactly, and each stretch is equal once its one digit
+ * run is read by value.
+ */
+function onlyPaddingDiffers(before: string, after: string): boolean {
+  const numeric = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+  if (before === after || before === "" || after === "") return false;
+  if (numeric.test(before) && numeric.test(after)) return false;
+  // A case change is the rule that comes first; it is not a padding.
+  if (before.toLowerCase() === after.toLowerCase()) return false;
+  if (readAsText(before) || readAsText(after)) return false;
+  const pieces = (s: string): string[] => s.match(/\p{L}+|[^\p{L}]+/gu) ?? [];
+  const byValue = (piece: string): string =>
+    piece.replace(/[0-9]+/g, (digits) => digits.replace(/^0+(?=[0-9])/, ""));
+  const b = pieces(before);
+  const a = pieces(after);
+  return b.length === a.length && b.every((piece, i) => byValue(piece) === byValue(a[i] as string));
+}
+
+/** Whether a rule rebuilds the longer string from the shorter one by TEXT alone, digits included. */
+function rebuildsByText(found: RelabelRule, before: string, after: string): boolean {
+  switch (found.kind) {
+    case "case":
+      return before.toLowerCase() === after.toLowerCase();
+    case "repad":
+      return false;
+    case "wrap":
+      return after === `${found.gaps[0]}${before}${found.gaps[1]}`;
+    case "strip":
+      return before === `${found.gaps[0]}${after}${found.gaps[1]}`;
+    case "insert":
+    case "delete": {
+      const kept = found.kind === "insert" ? before : after;
+      const whole = found.kind === "insert" ? after : before;
+      const pieces = found.shape.startsWith("c") ? Array.from(kept) : partsOf(kept);
+      if (found.gaps.length !== pieces.length + 1) return false;
+      const interleaved = pieces.map((piece, i) => `${found.gaps[i]}${piece}`).join("");
+      return `${interleaved}${found.gaps[pieces.length]}` === whole;
+    }
+  }
+}
+
+/**
+ * The alphabet of the padding property tests: digits and zeros, the three allowed separators,
+ * letters, and the marks a number can be written with (the two decimal marks, an apostrophe, the
+ * middle dot, the Arabic decimal separator, the fullwidth full stop, letter-like marks, a word
+ * joiner, and `p`, a decimal in BIDS-style names), and an Arabic-Indic digit, which has no value
+ * this module vouches for.
+ */
+const SEPARATOR_ALPHABET = [
+  "0",
+  "0",
+  "0",
+  "1",
+  "5",
+  " ",
+  ".",
+  ",",
+  "'",
+  "_",
+  "-",
+  "\u{B7}",
+  "\u{66B}",
+  "\u{FF0E}",
+  "\u{A78F}",
+  "\u{2BC}",
+  "\u{2CC}",
+  "\u{2060}",
+  "\u{663}",
+  "p",
+  "a",
+  "B",
+  "Hz",
+];
+
+describe("relabelRule: a repad is exactly what an independent reading of the two strings allows", () => {
+  /** A word over the separator alphabet, and its pick. */
+  const wordFrom = (random: () => number) => (): string =>
+    Array.from(
+      { length: 1 + Math.floor(random() * 8) },
+      () => SEPARATOR_ALPHABET[Math.floor(random() * SEPARATOR_ALPHABET.length)],
+    ).join("");
+  /** Every number's padding changed or kept, at random. */
+  const repad = (random: () => number, s: string): string =>
+    s.replace(/[0-9]+/g, (d) =>
+      random() < 0.5 ? (random() < 0.5 ? `0${d}` : d.replace(/^0/, "")) : d,
+    );
+  const byValue = (s: string): string => s.replace(/[0-9]+/g, (d) => d.replace(/^0+(?=[0-9])/, ""));
+
+  test("4,000 generated pairs over digits, zeros, separators and letters", () => {
+    const random = seeded(1868);
+    // Half the characters from the plain ones, so pairs that may repad stay common beside the marks.
+    const plain = ["0", "01", "5", " ", "-", "_", "a", "Hz", "EEG", "Fp", "sub"];
+    const marked = wordFrom(random);
+    const word = (): string =>
+      random() < 0.5
+        ? Array.from(
+            { length: 1 + Math.floor(random() * 8) },
+            () => plain[Math.floor(random() * plain.length)],
+          ).join("")
+        : marked();
+    // Mostly the padding of one or every number changed, so repads and near-repads are common.
+    const mutate = (s: string): string => {
+      const choice = random();
+      if (choice < 0.7) return repad(random, s);
+      if (choice < 0.85) {
+        const at = Math.floor(random() * (s.length + 1));
+        return `${s.slice(0, at)}0${s.slice(at)}`;
+      }
+      return word();
+    };
+
+    let repads = 0;
+    let refused = 0;
+    for (let n = 0; n < 4000; n++) {
+      const before = word();
+      const after = mutate(before);
+      const expected = onlyPaddingDiffers(before, after);
+      for (const chars of [false, true]) {
+        const found = relabelRule(before, after, { chars });
+        expect(found?.kind === "repad", JSON.stringify([before, after, chars])).toBe(expected);
+      }
+      if (expected) repads++;
+      // A pair equal once every number is read by value, that is still no repad: a join or a
+      // decimal mark decided it, which is what this test is about.
+      const sameByValue = byValue(before) === byValue(after);
+      if (!expected && sameByValue && before.toLowerCase() !== after.toLowerCase()) refused++;
+    }
+    // Not vacuous: the generator reaches both sides of the rule many times.
+    expect(repads).toBeGreaterThan(300);
+    expect(refused).toBeGreaterThan(300);
+  });
+
+  test("4,000 generated pairs with a decimal mark put anywhere: no rule says a number kept its value when either string holds one", () => {
+    const random = seeded(18683);
+    const word = wordFrom(random);
+    // The padding changed or not, then one or two marks put anywhere, so a mark is often in the
+    // text a rule would add (`05 Hz` to `.5 Hz`).
+    const mutate = (s: string): string => {
+      let out = random() < 0.8 ? repad(random, s) : s;
+      for (let k = 1 + Math.floor(random() * 2); k > 0; k--) {
+        const at = Math.floor(random() * (out.length + 1));
+        out = `${out.slice(0, at)}${random() < 0.5 ? "." : ","}${out.slice(at)}`;
+      }
+      return out;
+    };
+
+    let separated = 0;
+    let ruled = 0;
+    let wouldHaveRepadded = 0;
+    for (let n = 0; n < 4000; n++) {
+      const before = word();
+      const after = mutate(before);
+      for (const [b, a] of [
+        [before, after],
+        [after, before],
+      ] as const) {
+        const expected = onlyPaddingDiffers(b, a);
+        const strict = readAsText(b) || readAsText(a);
+        if (strict) separated++;
+        for (const chars of [false, true]) {
+          const found = relabelRule(b, a, { chars });
+          const label = JSON.stringify([b, a, chars, found]);
+          expect(found?.kind === "repad", label).toBe(expected);
+          if (!strict || found === null) continue;
+          ruled++;
+          expect(found.repadded, label).toBe(false);
+          expect(rebuildsByText(found, b, a), label).toBe(true);
+        }
+        // The pairs this rule exists for: one string is the other with a number repadded and a
+        // mark put beside it, so a comparison by value would have found a rule.
+        if (strict && byValue(b.replace(/[.,]/g, "")) === byValue(a.replace(/[.,]/g, ""))) {
+          wouldHaveRepadded++;
+        }
+      }
+    }
+    expect(separated).toBeGreaterThan(4000);
+    expect(ruled).toBeGreaterThan(300);
+    expect(wouldHaveRepadded).toBeGreaterThan(300);
+  });
+});
+
+describe("relabelRule: the allowlist over every code point", () => {
+  test("c05 Hz to c5 Hz claims a padding exactly for an ASCII letter, a space, a hyphen or an underscore; 0c05 never; 05 to c5 only as a real repad", () => {
+    // A digit c is part of the number itself (`105`), so it is left out; every other code point,
+    // the surrogates excepted, is tried in all three places.
+    const allowed = (c: string) => /^[A-Za-z _-]$/.test(c);
+    const claims = (found: RelabelRule | null) =>
+      found?.kind === "repad" || found?.repadded === true;
+    let tried = 0;
+    let claimed = 0;
+    const wrong: string[] = [];
+    for (let cp = 0; cp <= 0x10ffff; cp++) {
+      if (cp >= 0xd800 && cp <= 0xdfff) continue;
+      if (cp >= 0x30 && cp <= 0x39) continue;
+      const c = String.fromCodePoint(cp);
+      tried++;
+      const edge = relabelRule(`${c}05 Hz`, `${c}5 Hz`, { chars: false });
+      if (claims(edge) !== allowed(c)) wrong.push(`edge U+${cp.toString(16)}`);
+      if (claims(relabelRule(`0${c}05 Hz`, `0${c}5 Hz`, { chars: false }))) {
+        wrong.push(`joined U+${cp.toString(16)}`);
+      }
+      const added = relabelRule("05 Hz", `${c}5 Hz`, { chars: false });
+      if (claims(added) !== allowed(c)) wrong.push(`added U+${cp.toString(16)}`);
+      if (claims(added)) {
+        claimed++;
+        // A real repad: the text added holds no digit, and with it the number keeps its value.
+        const gaps = added?.gaps ?? [];
+        const rebuilt = `${gaps[0] ?? ""}05 Hz${gaps[1] ?? ""}`;
+        const value = (s: string) => s.replace(/[0-9]+/g, (d) => d.replace(/^0+(?=[0-9])/, ""));
+        if (gaps.some((gap) => /\p{N}/u.test(gap)) || value(rebuilt) !== value(`${c}5 Hz`)) {
+          wrong.push(`added, not a repad: U+${cp.toString(16)}`);
+        }
+      }
+    }
+    expect(wrong.slice(0, 10)).toEqual([]);
+    expect(tried).toBe(0x110000 - 0x800 - 10);
+    expect(claimed).toBe(52 + 3);
+  }, 30_000);
 });
 
 /** A pool file from text; `before` is null for an added file. */
@@ -779,9 +1179,16 @@ function pooled(path: string, before: string | null, after: string): PoolFile {
   return { path, before: before === null ? null : enc(before), after: enc(after) };
 }
 
+/** The leaves of a document no test here expects to be refused for a long path. */
+function leavesOf(value: JsonValue): JsonLeaf[] {
+  const found = flattenJson(value);
+  if (found === null) throw new Error("a path over maxNameChars in a test document");
+  return found;
+}
+
 describe("flattenJson: the leaves of a document", () => {
   const leaves = (text: string) =>
-    flattenJson(json(text)).map((leaf) => [leaf.path, leaf.value] as const);
+    leavesOf(json(text)).map((leaf) => [leaf.path, leaf.value] as const);
 
   test("objects recurse, scalars are leaves, and a list of scalars is one leaf", () => {
     expect(
@@ -842,7 +1249,7 @@ describe("flattenJson: the leaves of a document", () => {
   });
 
   test("a leaf knows its parent, its name and whether it is a key", () => {
-    const found = flattenJson(json('{"a": {"b": 1}, "c": [{"d": 2}, 3]}'));
+    const found = leavesOf(json('{"a": {"b": 1}, "c": [{"d": 2}, 3]}'));
     expect(found.map((l) => [l.path, l.parent, l.name, l.isKey])).toEqual([
       [".a.b", ".a", "b", true],
       [".c[0].d", ".c[0]", "d", true],
@@ -858,6 +1265,29 @@ describe("flattenJson: the leaves of a document", () => {
       [".e", "1e400"],
       [".z", "-0"],
     ]);
+  });
+
+  test("a path of 1,024 code units is a leaf; one longer, built of short keys, leaves the document with none", () => {
+    const max = SUMMARY_LIMITS.maxNameChars;
+    // 64 nested objects (the deepest a document may be), each key 15 characters: a path of 64
+    // segments of 16. The last key one character longer makes it 1,025.
+    const deep = (last: number): string => {
+      const keys = Array.from({ length: 63 }, (_, i) => `k${String(i).padStart(14, "0")}`);
+      keys.push("z".repeat(last));
+      return `${keys.map((k) => `{"${k}":`).join("")}1${"}".repeat(keys.length)}`;
+    };
+    const exact = leavesOf(json(deep(15)));
+    expect(exact.length).toBe(1);
+    expect(exact[0]?.path.length).toBe(max);
+    expect(flattenJson(json(deep(16)))).toBeNull();
+    // A key written in brackets counts as written, its quotes and brackets included.
+    const bracketed = (n: number) => `{"${"x ".repeat(n / 2)}":1}`;
+    expect(leavesOf(json(bracketed(max - 4)))[0]?.path.length).toBe(max);
+    expect(flattenJson(json(bracketed(max - 2)))).toBeNull();
+    // An index is a segment too, but a list of scalars is one leaf and adds none.
+    const key = "y".repeat(max - 3);
+    expect(flattenJson(json(`{"${key}":[[1],[2]]}`))).toBeNull();
+    expect(leavesOf(json(`{"${key}":[1,2]}`))[0]?.path.length).toBe(max - 2);
   });
 });
 
@@ -1022,6 +1452,28 @@ describe("buildPools: the rows and leaves a pull request adds", () => {
     ]);
   });
 
+  test("a name or path over maxNameChars leaves a file out as a parse failure does, keeping its top-level keys", () => {
+    const max = SUMMARY_LIMITS.maxNameChars;
+    const long = "k".repeat(max);
+    const pool = buildPools([
+      // A path of 1,025 on the after side, then on the before side: no leaf is a home.
+      pooled("task-x_eeg.json", null, `{"A":{"${long}":1}}`),
+      pooled("sub-01/sub-01_task-x_eeg.json", `{"B":{"${long}":1}}`, '{"B":{"x":1}}'),
+      // A key of 1,025 does not parse: the file is unreadable.
+      pooled("sub-02/sub-02_task-x_eeg.json", null, `{"${long}k":1}`),
+      // A column name of 1,025 does not parse either: no row of it is a copy.
+      pooled("sourcedata/old/x.tsv", null, `a\t${long}k\n1\t2\n`),
+    ]);
+    expect(pool.json.files.size).toBe(0);
+    expect(pool.json.byLeaf.size).toBe(0);
+    expect(Object.fromEntries(pool.json.byTopKey)).toEqual({
+      A: ["task-x_eeg.json"],
+      B: ["sub-01/sub-01_task-x_eeg.json"],
+    });
+    expect([...pool.json.unreadable]).toEqual(["sub-02/sub-02_task-x_eeg.json"]);
+    expect(pool.rows.files.size).toBe(0);
+  });
+
   test("a JSON file contributes the leaves it has now and did not have, by path and value", () => {
     const pool = buildPools([
       pooled(
@@ -1059,9 +1511,26 @@ describe("buildPools: the rows and leaves a pull request adds", () => {
     expect(pool.json.byLeaf.get(leafKey(".K", "1"))).toEqual(["b.json", "a.json"]);
   });
 
-  test("a path listed twice uses the first entry", () => {
-    const pool = buildPools([pooled("a.tsv", null, "x\n1\n"), pooled("a.tsv", null, "x\n2\n")]);
-    expect(rowsOf(pool, "a.tsv")).toEqual({ header: "x", rows: { "1": 1 } });
+  test("a path listed twice contributes nothing, whichever entry comes first; a JSON one is unreadable", () => {
+    const one = pooled("a.tsv", null, "x\n1\n");
+    const two = pooled("a.tsv", null, "x\n2\n");
+    const json = (value: string) => pooled("task-x_eeg.json", null, `{"K": ${value}}`);
+    for (const files of [
+      [one, two, json("1"), json("2")],
+      [two, one, json("2"), json("1")],
+    ]) {
+      const pool = buildPools(files);
+      expect(rowsOf(pool, "a.tsv")).toBeUndefined();
+      expect(pool.rows.files.size).toBe(0);
+      expect(pool.json.files.size).toBe(0);
+      expect(pool.json.byLeaf.size).toBe(0);
+      expect(pool.json.byTopKey.size).toBe(0);
+      // Not left out: it may hold any key, so it blocks a move past it as an unreadable file does.
+      expect([...pool.json.unreadable]).toEqual(["task-x_eeg.json"]);
+    }
+    // A path listed once beside them is pooled as usual.
+    const pool = buildPools([one, two, pooled("b.tsv", null, "x\n3\n")]);
+    expect(rowsOf(pool, "b.tsv")).toEqual({ header: "x", rows: { "3": 1 } });
   });
 
   test("nothing in the pool depends on the bytes being shared: a pool is its own copy", () => {
@@ -1917,6 +2386,17 @@ describe("diffTable: the lookup passes find relabels the positional walk cannot"
     expect(relabels(diff)).toEqual(["A1 -> POL A1", "A2 -> POL A2", "A3 -> POL A3"]);
   });
 
+  test("the lookup reads digits by value: a wrap that also repads is found in reversed order", () => {
+    // The positional walk cannot pair a reversed list; only the lookup can, and only when it
+    // indexes `A1` and the `A01` inside `POL A01` as one form.
+    const diff = diffText(
+      path,
+      tsv(header, ["A1", "EEG", "x"], ["A2", "EEG", "y"], ["A3", "EEG", "z"]),
+      tsv(header, ["POL A03", "EEG", "z"], ["POL A02", "EEG", "y"], ["POL A01", "EEG", "x"]),
+    );
+    expect(relabels(diff)).toEqual(["A1 -> POL A01", "A2 -> POL A02", "A3 -> POL A03"]);
+  });
+
   test("each gone key's parts are looked up among the added keys: a strip in reversed order", () => {
     const diff = diffText(
       path,
@@ -2469,7 +2949,7 @@ describe("diffTable: relocation is exact and corresponding", () => {
       );
     };
     // Both paths end in participants.tsv, but the copy is at sourcedata/x/<phenotype/participants.tsv>.
-    const expected = {
+    const expected: Record<string, false | ClassKind[]> = {
       "participants.tsv": ["row_removed"],
       "phenotype/participants.tsv": ["row_relocated"],
     };
@@ -3177,6 +3657,27 @@ const jsonLines = (before: string, after: string, files: PoolFile[] = []): strin
   diffJsonText("sub-01/eeg/sub-01_task-x_eeg.json", before, after, files).atoms.map(line);
 
 describe("diffJson: leaves at the same path", () => {
+  test("a path over maxNameChars on either side refuses the file too_large; one at the bound is diffed", () => {
+    const max = SUMMARY_LIMITS.maxNameChars;
+    const at = (key: string, value: number) => json(`{"a":{"${key}":${value}}}`);
+    // `.a.` and the key: 3 + (max - 3) is exactly the bound.
+    const fits = "k".repeat(max - 3);
+    const over = "k".repeat(max - 2);
+    const pool = buildPools([]).json;
+    const diff = diffJson("x.json", at(fits, 1), at(fits, 2), pool);
+    expect(diff.ok && diff.value.atoms.map((a) => [a.kind, a.field?.length])).toEqual([
+      ["json_value_changed", max],
+    ]);
+    expect(diffJson("x.json", at(over, 1), at(fits, 1), pool)).toEqual({
+      ok: false,
+      refusal: "too_large",
+    });
+    expect(diffJson("x.json", at(fits, 1), at(over, 1), pool)).toEqual({
+      ok: false,
+      refusal: "too_large",
+    });
+  });
+
   test("a document that did not change has no atoms, whatever its layout", () => {
     const diff = diffJsonText(
       "a.json",
@@ -4264,8 +4765,8 @@ describe("diffJson on generated documents", () => {
       for (const atom of atoms) seen.add(atom.kind);
 
       expect(verifyJsonCounts(result.value), `case ${n}`).toBe(true);
-      const beforeLeaves = flattenJson(b.value.value);
-      const afterLeaves = flattenJson(a.value.value);
+      const beforeLeaves = leavesOf(b.value.value);
+      const afterLeaves = leavesOf(a.value.value);
       expect(counts.beforeLeaves).toBe(beforeLeaves.length);
       expect(counts.afterLeaves).toBe(afterLeaves.length);
 

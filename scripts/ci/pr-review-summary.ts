@@ -2,12 +2,13 @@
  * The mechanical change summary of a dataset pull request: strict parsers, value rendering and the
  * closed vocabulary they share (ADR 0092, ADR 0107; design `.context/plans/pr-review-change-summary.md`).
  *
- * **This module is pure.** No git, no file system, no clock, and no import from the other
- * `pr-review-*` modules, so everything here can be tested on bytes and strings alone and cannot
- * reach the pull request's repository. The model is shown a summary of a change instead of every
- * diff, and that is only safe if the summary loses nothing; the coverage argument (design section
- * 6.2) therefore starts from two promises made here, and every function below is written to keep
- * one of them.
+ * **This module is pure.** No git, no file system, and no import at all; it reads the clock only
+ * through the `now` the caller passes to {@link summarizeChanges}, which defaults to `Date.now`, and
+ * only to check the summary's deadline. So everything here can be tested on bytes and strings
+ * alone and cannot reach the pull request's repository. The model is shown a summary of a change
+ * instead of every diff, and that is only safe if the summary loses nothing; the coverage argument
+ * (design section 6.2) therefore starts from two promises made here, and every function below is
+ * written to keep one of them.
  *
  * 1. **A parse loses nothing a reader could tell apart.** A table is accepted only when
  *    serializing the parse gives the input back byte for byte ({@link parseTsv}). A JSON document is
@@ -31,6 +32,13 @@
  * evidence for a pairing is doubtful, the pairing is not made: a doubtful pair is a removal and an
  * addition, shown as such and counted as a loss, and never a quiet match. That direction is the
  * rule of every choice in it.
+ *
+ * The third part groups the atoms of every file into change classes ({@link classify}): one class
+ * per kind, path shape, field, rule and detail, so one edit repeated over 125 subjects is one
+ * class with a count. It renders them within fixed bounds ({@link renderClasses}), decides which
+ * files the summary accounts for ({@link accountedFiles}: only those whose every non-additive
+ * class was shown completely) and counts the loss facts ({@link lossFactsOf}).
+ * {@link summarizeChanges} runs all of it over a pull request's candidate files.
  */
 
 /**
@@ -41,14 +49,26 @@
 export const SUMMARY_LIMITS = {
   maxBlobBytes: 8 * 1024 * 1024, // per file side
   maxRows: 200_000, // per table
+  // Columns per table; a wider header refuses the file `too_large` before its names are split, so
+  // the cost of a table is not its width times its rows of changed cells.
+  maxColumns: 10_000,
   maxJsonDepth: 64,
   maxJsonNodes: 200_000,
   maxKeyChars: 128, // longer keys get no relabel rule
+  // A column name, a JSON key or a JSON path longer than this, in UTF-16 code units (`.length`),
+  // refuses its file `too_large`. Every atom of a file can carry one, so an unbounded name would
+  // make the cost of a file its row count times the name. Above `maxValueChars` on purpose: a
+  // name between 301 and 1024 is still summarized, and its class line is cut and incomplete.
+  maxNameChars: 1024,
   maxRuns: 24,
   maxPairingSteps: 12_000_000, // per file: the pairing passes' work, in steps of about one lookup
   maxTotalBytes: 256 * 1024 * 1024, // all blobs the summary reads in one run
   maxSummaryChars: 30_000, // the fenced block
   maxClasses: 120, // classes rendered
+  // Distinct classes a run may hold. A file whose atoms would make more is refused `too_large`
+  // whole, and the run goes on with the next file, so what a run holds is bounded by its classes,
+  // not its atoms, and one file with thousands of distinct changes costs only that file.
+  maxTrackedClasses: 5_000,
   maxPairsPerClass: 12, // distinct value pairs rendered per class
   maxValueChars: 300, // per rendered value
   samplesPerClass: 2,
@@ -60,6 +80,7 @@ export const SUMMARY_LIMITS = {
  * about the bytes, the next six about a table's shape, the next four about a JSON document, and the
  * last two about the platform's own reading (`blob_missing` is a git object that
  * could not be read, `internal_mismatch` is the bucket count of design section 6.2 not adding up).
+ * `too_large` is also the word for a column name, a JSON key or a JSON path over `maxNameChars`.
  */
 export const SUMMARY_REFUSALS = [
   "too_large",
@@ -285,12 +306,16 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
  * `invalid_utf8`; 4. a leading BOM is removed and recorded; 5. the text is split on LF, an empty
  * last piece meaning a final newline; 6. one CR ending a TERMINATED line is the line's CRLF and is
  * recorded per line, any other CR (inside a line, or ending an unterminated last line) is
- * `bare_cr`; 7. no line at all: `empty`; 8. the first line is the header, and an empty column name
- * is `empty_column_name`, a repeated one `duplicate_column`; 9. every other line must have exactly
- * the header's number of cells (`ragged_row`), and there may be at most `maxRows` of them
- * (`too_many_rows`, reported only when no row was ragged); 10. a header name or a cell that STARTS
- * with a double quote is `quoted_cell`, because BIDS tables do not quote but pandas does at the
- * start of a field, so a file two readers would split differently is refused instead of guessed;
+ * `bare_cr`; 7. no line at all: `empty`; 8. the first line is the header: more than `maxColumns`
+ * columns is `too_large` (counted before the line is split into names, and before any row is
+ * split into cells), an empty column name `empty_column_name`, a repeated one `duplicate_column`,
+ * one longer than `maxNameChars` code units `too_large` (so no atom or class key is ever built
+ * from such a name); 9. every other line
+ * must have exactly the header's number of cells (`ragged_row`), and there may be at most
+ * `maxRows` of them (`too_many_rows`, reported only when no row was ragged); 10. a header name or
+ * a cell that STARTS with a double quote is `quoted_cell`, because BIDS tables do not quote but
+ * pandas does at the start of a field, so a file two readers would split differently is refused
+ * instead of guessed;
  * 11. the round trip: the serialization of what was read must equal the input byte for byte.
  *
  * Step 11 is the precondition of the coverage argument (design section 6.2): a parse that loses no
@@ -351,10 +376,18 @@ export function parseTsvWith(
   // Step 7.
   if (lines.length === 0) return { ok: false, refusal: "empty" };
 
-  // Step 8.
-  const header = (lines[0] as string).split("\t");
+  // Step 8. The width first, by counting tabs, so a header too wide is never split.
+  const first = lines[0] as string;
+  let tabs = 0;
+  for (let at = first.indexOf("\t"); at !== -1; at = first.indexOf("\t", at + 1)) {
+    if (++tabs >= SUMMARY_LIMITS.maxColumns) return { ok: false, refusal: "too_large" };
+  }
+  const header = first.split("\t");
   if (header.includes("")) return { ok: false, refusal: "empty_column_name" };
   if (new Set(header).size !== header.length) return { ok: false, refusal: "duplicate_column" };
+  if (header.some((name) => name.length > SUMMARY_LIMITS.maxNameChars)) {
+    return { ok: false, refusal: "too_large" };
+  }
 
   // A one-column table with an empty or all-space line: see the doc above.
   if (header.length === 1 && lines.some((line) => /^ *$/.test(line))) {
@@ -571,6 +604,8 @@ class JsonReader {
     for (;;) {
       if (this.text.charCodeAt(this.pos) !== 0x22) throw new JsonRefusal("not_json");
       const key = this.string();
+      // Before the key is stored, so no path or atom is ever built from it.
+      if (key.length > SUMMARY_LIMITS.maxNameChars) throw new JsonRefusal("too_large");
       if (members.has(key)) throw new JsonRefusal("duplicate_key");
       this.skipSpace();
       if (this.text.charCodeAt(this.pos) !== 0x3a) throw new JsonRefusal("not_json");
@@ -621,9 +656,9 @@ function jsonFormat(bom: boolean, text: string): TextFormat {
  * trailing commas, single quotes, leading zeros, a raw control character in a string and anything
  * after the value are `not_json`; a key repeated within one object, at any depth, is
  * `duplicate_key` (keys are compared decoded, so `"a"` and the six-character escape of `a` are the
- * same key); nesting past `maxJsonDepth` is `too_deep` and more than `maxJsonNodes` values
- * `too_many_nodes`. Where a document has several faults the word is the first one met in reading
- * order.
+ * same key); a key longer than `maxNameChars` code units once decoded is `too_large`; nesting past
+ * `maxJsonDepth` is `too_deep` and more than `maxJsonNodes` values `too_many_nodes`. Where a
+ * document has several faults the word is the first one met in reading order.
  *
  * Numbers stay as the text the file wrote and strings are decoded, so the six-character escape of
  * `A` and a plain `A` are one value, while `1.0`, `1` and `1e400` are three. Equal trees therefore
@@ -833,30 +868,72 @@ interface Run {
   cls: RunClass;
   text: string;
   /**
-   * What two runs are compared by. Letters and other characters: exactly their text. Digits:
-   * their value, so `01` and `1` are one number, but only for ASCII digits that stand alone; any
-   * other digit (Arabic-Indic, a superscript, a fraction) is compared as the text it is, because it
-   * has no value this module can vouch for, and so is a run directly before or after a `.` or a
-   * `,`. There the digits are part of a decimal number, where a zero after the point is not
-   * padding: `0.05` to `0.5` is a tenfold change, and by value it would read as "only the zero
-   * padding changed".
+   * What the run is compared by when the digits of a pair are compared by value, which they are
+   * only when every digit run of both strings stands among the neighbors {@link plainSide} allows
+   * (see {@link Name.numbersAsText}). Letters and other characters: exactly their text. Digits:
+   * their value, so `01` and `1` are one number, but only for ASCII digits; any other digit
+   * (Arabic-Indic, a superscript, a fraction) is the text it is, because it has no value this
+   * module can vouch for, and a string that holds one is compared as text whole.
    */
   norm: string;
 }
 
-/** The characters that make the digits next to them part of a decimal number. */
-const DECIMAL_MARKS: ReadonlySet<string> = new Set([".", ","]);
+/**
+ * The separators a run of ASCII digits may have beside it, one character each, and still be read
+ * as a number with padding: a space, a hyphen and an underscore, as in `0100 Hz`, `sub-01` and
+ * `x_02_y`. An ALLOWLIST: every other character beside a digit (a dot, a comma, an apostrophe, a
+ * middle dot, any other mark, symbol or space, a format or combining character) may be part of
+ * the number, and no list of such marks could be complete, so it compares the pair as text.
+ */
+const DIGIT_SEPARATORS: ReadonlySet<string> = new Set([" ", "-", "_"]);
+const ASCII_LETTERS = /^[A-Za-z]+$/;
 
-function normalizeRun(
-  run: { cls: RunClass; text: string },
-  previous: { text: string } | undefined,
-  next: { text: string } | undefined,
-): string {
+function normalizeRun(run: { cls: RunClass; text: string }): string {
   if (run.cls !== "D" || !ASCII_DIGITS.test(run.text)) return run.text;
-  if (DECIMAL_MARKS.has(previous?.text ?? "") || DECIMAL_MARKS.has(next?.text ?? "")) {
-    return run.text;
-  }
   return run.text.replace(/^0+(?=[0-9])/, "");
+}
+
+/**
+ * Whether a string compares its pair as text (see {@link Name.numbersAsText}): it holds a digit
+ * run with a non-ASCII digit, or an ASCII digit run with a side {@link plainSide} does not allow.
+ */
+function holdsNumberText(runs: readonly Run[]): boolean {
+  for (let i = 0; i < runs.length; i++) {
+    const run = runs[i] as Run;
+    if (run.cls !== "D") continue;
+    if (!ASCII_DIGITS.test(run.text)) return true;
+    if (!plainSide(runs, i, -1) || !plainSide(runs, i, 1)) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether one side (`step` -1 or 1) of the digit run at `i` lets its digits be read by value. The
+ * allowlist, and nothing else:
+ *
+ * - the edge of the string;
+ * - a run of ASCII letters that is not ONE letter with a digit run beyond it ({@link plainLetters}):
+ *   `E001`, `Fp1` and `ECOG1` are plain, the `p` of `0p05`, the `e` of `1e05` and the `x` of
+ *   `1x000` are each part of one number;
+ * - ONE separator of {@link DIGIT_SEPARATORS} with the edge or such a letter run beyond it, as in
+ *   `0100 Hz`, `sub-01` and `x_02_y`. A digit run beyond it JOINS the two (`5 000`, `1-05`, `1_000`
+ *   are one number), and anything else beyond it is not on the list (`. 5`, two separators).
+ */
+function plainSide(runs: readonly Run[], i: number, step: number): boolean {
+  const next = runs[i + step];
+  if (next === undefined) return true;
+  if (next.cls === "L") return plainLetters(runs, i + step, step);
+  if (next.cls !== "O" || !DIGIT_SEPARATORS.has(next.text)) return false;
+  const beyond = runs[i + 2 * step];
+  if (beyond === undefined) return true;
+  return beyond.cls === "L" && plainLetters(runs, i + 2 * step, step);
+}
+
+/** Whether the letter run at `j`, beside a digit run on its other side, is plain: see {@link plainSide}. */
+function plainLetters(runs: readonly Run[], j: number, step: number): boolean {
+  const letters = (runs[j] as Run).text;
+  if (!ASCII_LETTERS.test(letters)) return false;
+  return letters.length > 1 || runs[j + step]?.cls !== "D";
 }
 
 /**
@@ -888,8 +965,7 @@ function exceedsKeyChars(s: string): boolean {
 
 /**
  * Split a name into runs, or null when it has more than `maxRuns` of them. The caller has already
- * bounded the length in code points. A digit run's `norm` depends on its neighbors (see
- * {@link Run}), so the norms are set once every run is known.
+ * bounded the length in code points.
  */
 function splitRuns(s: string): Run[] | null {
   const parts: { cls: RunClass; text: string }[] = [];
@@ -908,11 +984,7 @@ function splitRuns(s: string): Run[] | null {
     text = ch;
   }
   if (cls !== null) parts.push({ cls, text });
-  return parts.map((part, i) => ({
-    cls: part.cls,
-    text: part.text,
-    norm: normalizeRun(part, parts[i - 1], parts[i + 1]),
-  }));
+  return parts.map((part) => ({ cls: part.cls, text: part.text, norm: normalizeRun(part) }));
 }
 
 /**
@@ -925,23 +997,45 @@ interface Name {
   long: boolean;
   /** Its runs, or null when it is long or has more than `maxRuns` of them. */
   runs: readonly Run[] | null;
+  /**
+   * The string has a digit run whose zeros may be part of a number rather than its padding, so its
+   * pair is compared as text. The digits of a pair are read by VALUE only when every digit run of
+   * both strings is ASCII and stands among neighbors an allowlist names ({@link plainSide}): the
+   * edge of the string, an ASCII letter run that is not one letter with digits beyond it, or one
+   * space, hyphen or underscore with the edge or such a letter run beyond it. So `sub-01_ses-02`,
+   * `0100 Hz`, `EEG 001`, `x_02_y`, `E001`, `ECOG1` and `Fp1` are plain; `0.05`, `5 000`, `1'000`,
+   * `0·05`, `1٫05`, `0ꞏ05`, `1ʼ000`, `0p05`, `1e05`, `．05` and `.⁠5` (a word joiner after the dot)
+   * are not, and no mark has to be known for that.
+   *
+   * It is decided for each string alone, and it decides the PAIR: when either string of a pair
+   * holds such a run, every digit run of both is compared by its text, so no rule between them
+   * can say a number kept its value. Deciding it run by run is not enough, because the mark can be
+   * in the text a rule adds: `05 Hz` to `.5 Hz` would otherwise read as a prefix `.` added and the
+   * zero padding changed, which is a tenfold change.
+   */
+  numbersAsText: boolean;
 }
 
 function nameOf(text: string): Name {
   const long = exceedsKeyChars(text);
-  return { text, long, runs: long ? null : splitRuns(text) };
+  const runs = long ? null : splitRuns(text);
+  return { text, long, runs, numbersAsText: runs !== null && holdsNumberText(runs) };
 }
 
-function sameRun(a: Run, b: Run): boolean {
-  return a.cls === b.cls && a.norm === b.norm;
+/**
+ * Whether two runs are the same part: the same class and, for digits, the same text when the pair
+ * compares numbers as text (`byText`), the same {@link Run.norm} otherwise.
+ */
+function sameRun(a: Run, b: Run, byText: boolean): boolean {
+  return a.cls === b.cls && (byText ? a.text === b.text : a.norm === b.norm);
 }
 
 /** The leftmost offset at which all of `short` appears among the runs of `long`, or -1. */
-function findContiguous(short: readonly Run[], long: readonly Run[]): number {
+function findContiguous(short: readonly Run[], long: readonly Run[], byText: boolean): number {
   for (let k = 0; k + short.length <= long.length; k++) {
     let all = true;
     for (let i = 0; i < short.length && all; i++) {
-      all = sameRun(short[i] as Run, long[k + i] as Run);
+      all = sameRun(short[i] as Run, long[k + i] as Run, byText);
     }
     if (all) return k;
   }
@@ -952,7 +1046,8 @@ function findContiguous(short: readonly Run[], long: readonly Run[]): number {
  * Match the runs of `short` against the TEXT of `long`, in order, and return the text left over
  * between the matches (one more gap than there are runs), or null when they do not all match.
  *
- * A digit run matches only a whole digit run of the same value. A letter run or another character
+ * A digit run matches only a whole digit run of the same value (the same text, when `byText`).
+ * A letter run or another character
  * matches an occurrence of its text, preferably one that starts and ends where a run of `long`
  * does, else the first occurrence after the previous match: `GA` is in `EEGGA` only as its tail, and
  * that is how `GA01` becomes `EEGGA_01REF`. The choice is greedy and never backs up, so a name that
@@ -963,6 +1058,7 @@ function findContiguous(short: readonly Run[], long: readonly Run[]): number {
 function matchInOrder(
   short: readonly Run[],
   long: readonly Run[],
+  byText: boolean,
 ): { gaps: string[]; repadded: boolean } | null {
   const text = long.map((run) => run.text).join("");
   const starts: number[] = [];
@@ -981,11 +1077,7 @@ function matchInOrder(
     if (run.cls === "D") {
       for (let i = 0; i < long.length; i++) {
         const candidate = long[i] as Run;
-        if (
-          (starts[i] as number) >= position &&
-          candidate.cls === "D" &&
-          candidate.norm === run.norm
-        ) {
+        if ((starts[i] as number) >= position && sameRun(candidate, run, byText)) {
           at = starts[i] as number;
           length = candidate.text.length;
           if (candidate.text !== run.text) repadded = true;
@@ -1026,13 +1118,18 @@ function matchInOrder(
  * unrelated new one. A number is what makes `GA01` and `EEGGA_01REF` the same channel; a name with
  * no number has no part that the insertion could not have changed the meaning of.
  */
-function runRule(before: readonly Run[], after: readonly Run[]): RelabelRule | null {
+function runRule(
+  before: readonly Run[],
+  after: readonly Run[],
+  byText: boolean,
+): RelabelRule | null {
   if (before.length === after.length) {
     // Same number of parts: only a number's padding can be the whole difference. Letters and other
     // characters compare by their exact text and the two strings differ (the caller returned on
     // equal strings), so when every run is the same by `norm`, some digit run changed its padding.
+    // Compared by text, every run the same would be two equal strings: no repad is ever found.
     for (let i = 0; i < before.length; i++) {
-      if (!sameRun(before[i] as Run, after[i] as Run)) return null;
+      if (!sameRun(before[i] as Run, after[i] as Run, byText)) return null;
     }
     return { kind: "repad", gaps: [], shape: "", repadded: true };
   }
@@ -1041,7 +1138,7 @@ function runRule(before: readonly Run[], after: readonly Run[]): RelabelRule | n
   const short = beforeShorter ? before : after;
   const long = beforeShorter ? after : before;
 
-  const k = findContiguous(short, long);
+  const k = findContiguous(short, long, byText);
   if (k >= 0) {
     const prefix = long
       .slice(0, k)
@@ -1059,7 +1156,7 @@ function runRule(before: readonly Run[], after: readonly Run[]): RelabelRule | n
   // Every gap is never empty here: if the runs of `short` sat in `long` with nothing between them,
   // `long` would split into the same runs (a matched letter run is followed by a digit or another
   // character, so it is a whole run of `long`), and the two would have the same number of runs.
-  const matched = matchInOrder(short, long);
+  const matched = matchInOrder(short, long, byText);
   if (matched === null) return null;
   return {
     kind: beforeShorter ? "insert" : "delete",
@@ -1140,12 +1237,14 @@ function characterRule(before: Name, after: Name): RelabelRule | null {
 /**
  * The first rule that says how `before` became `after`, or null. In order: `case` (equal once both
  * are lower-cased); then, over the runs of each string (a maximal run of letters, a maximal run of
- * digits, or one other character; digits compared by value, so `01` is `1`, except next to a `.`
- * or `,`), `repad`, `wrap` or `strip` (the shorter string's runs sit contiguously in the longer
- * one), and `insert` or `delete` (they sit in order, with text between them, and the one with
- * fewer runs holds a digit run: see `runRule`); and only when `opts.chars` is set, the character
- * rule, whose inserted text must be whole runs (see `characterRule`). Cells never ask for
- * characters: a changed character in a cell is a replaced value.
+ * digits, or one other character; digits compared by value, so `01` is `1`, only when every digit
+ * run of both strings stands among the neighbors an allowlist names, and otherwise every digit of
+ * both is compared as text: see {@link Name.numbersAsText}), `repad`, `wrap` or `strip` (the
+ * shorter string's runs sit contiguously in the longer one), and `insert` or `delete` (they sit in
+ * order, with text between them, and the one with fewer runs holds a digit run: see `runRule`);
+ * and only when `opts.chars` is set, the character rule, whose inserted text must be whole runs
+ * (see `characterRule`). Cells never ask for characters: a changed character in a cell is a
+ * replaced value.
  *
  * A pair gets no rule when the strings are equal, either is empty, either is longer than
  * `maxKeyChars` code points or has more than `maxRuns` runs (a long text is not a name, and an
@@ -1176,7 +1275,8 @@ function relabelNames(before: Name, after: Name, opts: { chars: boolean }): Rela
     return { kind: "case", gaps: [], shape: "", repadded: false };
   }
   if (before.runs === null || after.runs === null) return null;
-  const byRuns = runRule(before.runs, after.runs);
+  // One mode for the whole pair: see `Name.numbersAsText`.
+  const byRuns = runRule(before.runs, after.runs, before.numbersAsText || after.numbersAsText);
   const found = byRuns ?? (opts.chars ? characterRule(before, after) : null);
   // A number put in or taken out is never a respelling: `A1` to `A1-A2` adds a channel to the name
   // and `A1-A2` to `A2` drops one, and either can be a removed row and an unrelated new one that
@@ -1278,9 +1378,16 @@ export interface JsonLeaf {
  * canonical text, and an empty array is a leaf; an array with any object or array element recurses
  * with index paths; a scalar is a leaf. Treating a list of scalars as one value keeps a list that
  * lost an element a CHANGED value, shown whole, instead of a removed index with a shifted tail.
+ *
+ * Null when a path would be longer than `maxNameChars` code units: every atom of a leaf carries its
+ * path or its parent's, so a long path repeated over many leaves would make the cost of a document
+ * its leaf count times the path. The length is checked before a path is joined, so no path over
+ * the bound is ever built, and the caller refuses the file (`too_large`).
  */
-export function flattenJson(root: JsonValue): JsonLeaf[] {
+export function flattenJson(root: JsonValue): JsonLeaf[] | null {
   const out: JsonLeaf[] = [];
+  const max = SUMMARY_LIMITS.maxNameChars;
+  let tooLong = false;
   const walk = (
     v: JsonValue,
     path: string,
@@ -1291,21 +1398,40 @@ export function flattenJson(root: JsonValue): JsonLeaf[] {
   ): void => {
     if (v.t === "obj" && v.keys.length > 0) {
       for (const key of v.keys) {
+        // A segment is at least the key and one character, so a key that cannot fit is never
+        // escaped either.
+        if (path.length + key.length + 1 > max) {
+          tooLong = true;
+          return;
+        }
         const segment = BARE_KEY.test(key) ? `.${key}` : `[${JSON.stringify(key)}]`;
+        if (path.length + segment.length > max) {
+          tooLong = true;
+          return;
+        }
         // The root (the one place whose path is empty) holds the top-level keys; below them the
         // top-level key is inherited.
         walk(v.v.get(key) as JsonValue, path + segment, path, key, true, path === "" ? key : top);
+        if (tooLong) return;
       }
       return;
     }
     if (v.t === "arr" && v.v.some((item) => item.t === "arr" || item.t === "obj")) {
-      v.v.forEach((item, i) => walk(item, `${path}[${i}]`, path, `[${i}]`, false, top));
+      for (let i = 0; i < v.v.length; i++) {
+        const segment = `[${i}]`;
+        if (path.length + segment.length > max) {
+          tooLong = true;
+          return;
+        }
+        walk(v.v[i] as JsonValue, path + segment, path, segment, false, top);
+        if (tooLong) return;
+      }
       return;
     }
     out.push({ path, parent, name, isKey, top, value: canonicalJson(v), json: v });
   };
   walk(root, "", "", "", false, null);
-  return out;
+  return tooLong ? null : out;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1370,8 +1496,9 @@ export interface JsonPool {
    */
   readonly byTopKey: ReadonlyMap<string, readonly string[]>;
   /**
-   * The JSON files of the pull request whose after document could not be read. Such a file may hold
-   * any key, so where it applies to a file nothing can be said to have moved past it.
+   * The JSON files of the pull request whose after document could not be read, or whose path was
+   * listed more than once. Such a file may hold any key, so where it applies to a file nothing can
+   * be said to have moved past it.
    */
   readonly unreadable: ReadonlySet<string>;
 }
@@ -1409,6 +1536,14 @@ function sameCells(a: readonly string[], b: readonly string[]): boolean {
  * pool, so a copy cannot be found in it: the removal it would have explained is shown as a removal,
  * which is more change shown, never less. Nothing is thrown, because the pool is built before any
  * file is diffed and one contributor's bad file must not stop the diffs of the others.
+ *
+ * **A path listed more than once contributes nothing**: git lists a path once, so two entries are
+ * a caller's mistake, and which of them is the file cannot be decided. Keeping one would make the
+ * pool depend on the order of `files`; keeping neither means no row or leaf of either can be shown
+ * relocated or moved, so the removals they would have explained stay removals. A JSON path listed
+ * twice is named `unreadable`, never simply left out: left out, a nearer sidecar that sets a key
+ * would no longer stop a move past it, and a removed key would read as moved. Nothing else about
+ * the pool depends on the order of `files`.
  */
 export function buildPools(files: readonly PoolFile[]): { rows: RowPool; json: JsonPool } {
   const rows = new Map<string, RowPoolFile>();
@@ -1418,12 +1553,15 @@ export function buildPools(files: readonly PoolFile[]): { rows: RowPool; json: J
   const byTopKey = new Map<string, string[]>();
   const unreadable = new Set<string>();
 
-  const seen = new Set<string>();
+  const listed = new Map<string, number>();
+  for (const file of files) listed.set(file.path, (listed.get(file.path) ?? 0) + 1);
   for (const file of files) {
-    // A path is listed once by git; if a caller lists one twice, the first entry is the one used.
-    // That is the only thing about a pool that depends on the order of `files`.
-    if (seen.has(file.path)) continue;
-    seen.add(file.path);
+    if ((listed.get(file.path) ?? 0) > 1) {
+      // Which entry is the document cannot be decided, so it is read as one that could not be
+      // read at all: it may hold any key, blocks every move past it, and is never a home.
+      if (file.path.endsWith(".json")) unreadable.add(file.path);
+      continue;
+    }
     if (file.path.endsWith(".tsv")) {
       const after = parseTsv(file.after);
       const before = file.before === null ? null : parseTsv(file.before);
@@ -1468,11 +1606,15 @@ export function buildPools(files: readonly PoolFile[]): { rows: RowPool; json: J
         }
       }
       if (before !== null && !before.ok) continue;
+      // A path over `maxNameChars` on either side leaves the file's leaves out, as a side that
+      // does not parse does: it keeps its top-level keys above, and is never a home.
+      const beforeLeaves = before?.ok ? flattenJson(before.value.value) : [];
+      const afterLeaves = flattenJson(after.value.value);
+      if (beforeLeaves === null || afterLeaves === null) continue;
       const had = new Map<string, string>();
-      if (before?.ok)
-        for (const leaf of flattenJson(before.value.value)) had.set(leaf.path, leaf.value);
+      for (const leaf of beforeLeaves) had.set(leaf.path, leaf.value);
       const fresh = new Map<string, string>();
-      for (const leaf of flattenJson(after.value.value)) {
+      for (const leaf of afterLeaves) {
         if (had.get(leaf.path) !== leaf.value) fresh.set(leaf.path, leaf.value);
       }
       if (fresh.size === 0) continue;
@@ -1545,11 +1687,17 @@ export interface Atom {
  * The words a `format` atom's `detail` is one of. The state strings in `before` and `after` are
  * `present`/`absent` for a byte order mark and a final newline, the file-level word
  * (`lf`, `crlf`, `mixed`, `none`) for line endings, and the per-line pattern for a mixed table.
- * The design's `json_respelled` (a document whose tree is equal but whose escapes are spelled
- * differently) is not one of them yet: the JSON parser keeps no token text to compare, and the
- * renderer that would show it is phase 3's (design section 3.2).
+ * `json_respelled` is a JSON document whose tree is equal and whose text differs beyond the
+ * whitespace between tokens: a string escape spelled another way (`\u0041` for `A`). It carries
+ * no states (`before` and `after` are null), and only {@link summarizeChanges} adds it, because
+ * the diff reads trees and the parser keeps no token text (design section 3.2).
  */
-export type FormatDetail = "bom" | "line_endings" | "line_ending_pattern" | "final_newline";
+export type FormatDetail =
+  | "bom"
+  | "line_endings"
+  | "line_ending_pattern"
+  | "final_newline"
+  | "json_respelled";
 
 /**
  * The tallies a table diff proves itself total with (design section 6.2). The totals
@@ -2597,10 +2745,11 @@ export function verifyJsonCounts(diff: FileDiff<JsonCounts>): boolean {
 
 /**
  * The difference between two versions of a JSON document, as atoms, or `internal_mismatch` when the
- * diff is not total. Both documents are flattened to leaves ({@link flattenJson}); every before leaf
- * ends in exactly one of: unchanged, changed (value or type), emptied, filled, renamed, moved,
- * removed (with a value, or without one); every after leaf in one of: unchanged, changed, emptied,
- * filled, renamed, added. The tallies and the atoms are checked against each other
+ * diff is not total, or `too_large` when a path of either is longer than `maxNameChars` (checked
+ * before the path is built). Both documents are flattened to leaves ({@link flattenJson}); every
+ * before leaf ends in exactly one of: unchanged, changed (value or type), emptied, filled, renamed,
+ * moved, removed (with a value, or without one); every after leaf in one of: unchanged, changed,
+ * emptied, filled, renamed, added. The tallies and the atoms are checked against each other
  * ({@link verifyJsonCounts}).
  *
  * Leaves at the same path are compared first. A before leaf whose path is gone is then, in order:
@@ -2650,6 +2799,7 @@ export function diffJsonWith(
 ): Parsed<FileDiff<JsonCounts>> {
   const bl = flattenJson(before);
   const al = flattenJson(after);
+  if (bl === null || al === null) return { ok: false, refusal: "too_large" };
   const bFate = new Uint8Array(bl.length);
   const aFate = new Uint8Array(al.length);
   const pairOfBefore = new Int32Array(bl.length).fill(-1);
@@ -2853,4 +3003,1200 @@ export function diffJsonWith(
   const diff: FileDiff<JsonCounts> = { family: "json", keyColumn: null, atoms, counts };
   if (!verify(diff)) return { ok: false, refusal: "internal_mismatch" };
   return { ok: true, value: diff };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Change classes (design sections 4.2 and 5.1)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The words a class of each kind is called by, in the class table of the facts block and on the
+ * class line of the fenced block. Closed phrases written by the platform, one per kind and no two
+ * alike, so a class line names its kind exactly and no author text is ever in the facts. A
+ * `Record` over {@link ClassKind}, so a kind added without words does not compile.
+ */
+export const KIND_WORDS: Readonly<Record<ClassKind, string>> = {
+  column_removed: "columns removed",
+  row_removed: "rows removed",
+  json_key_removed: "keys removed",
+  row_relocated: "rows removed and found verbatim in a row this pull request adds",
+  json_key_moved: "keys moved to a sidecar that applies by inheritance",
+  key_relabeled: "rows relabeled",
+  cell_templated: "cells changed by a rule",
+  cell_replaced: "cells replaced",
+  cell_emptied: "cells emptied",
+  json_value_changed: "values changed",
+  json_type_changed: "value types changed",
+  json_emptied: "values emptied",
+  json_key_renamed: "keys renamed",
+  json_empty_key_removed: "keys without a value removed",
+  rows_reordered: "row order changed",
+  columns_reordered: "column order changed",
+  json_keys_reordered: "key order changed",
+  format: "file layout changed",
+  column_added: "columns added",
+  row_added: "rows added",
+  cell_filled: "cells filled",
+  json_key_added: "keys added",
+  json_filled: "values filled",
+};
+
+/**
+ * What showing a class of a kind COMPLETELY takes (design section 5.3).
+ *
+ * - `pairs`: every distinct before and after value, with its count, and no value cut. The kinds
+ *   whose atoms say "this value became that one", where only the values say what was lost.
+ * - `removals`: the same for kinds with one side only (a removed row's key or row text, a removed
+ *   key's `name = value`).
+ * - `rule`: the class line, whose rule is the full description (a relabel rule, the place a row
+ *   was found, a rename, the fact of a reorder or a layout change); examples only illustrate.
+ * - `additive`: nothing. New content removes nothing, so coverage never needs it shown.
+ *
+ * A `Record` over {@link ClassKind}: a kind added without saying how it is shown does not compile,
+ * because a kind that defaulted to `rule` or `additive` would let a class be called complete
+ * without its values.
+ */
+export type ClassDisplay = "pairs" | "removals" | "rule" | "additive";
+export const DISPLAY_OF: Readonly<Record<ClassKind, ClassDisplay>> = {
+  column_removed: "rule",
+  row_removed: "removals",
+  json_key_removed: "removals",
+  row_relocated: "rule",
+  json_key_moved: "rule",
+  key_relabeled: "rule",
+  cell_templated: "rule",
+  cell_replaced: "pairs",
+  cell_emptied: "pairs",
+  json_value_changed: "pairs",
+  json_type_changed: "pairs",
+  json_emptied: "pairs",
+  json_key_renamed: "rule",
+  json_empty_key_removed: "removals",
+  rows_reordered: "rule",
+  columns_reordered: "rule",
+  json_keys_reordered: "rule",
+  format: "rule",
+  column_added: "additive",
+  row_added: "additive",
+  cell_filled: "additive",
+  json_key_added: "additive",
+  json_filled: "additive",
+};
+
+/**
+ * One change, repeated: every atom of every file that has the same kind, path shape, field, rule
+ * and detail (design section 4.2). One edit made to 125 subjects is one class with a count, and an
+ * edit that differs in any of those is another class.
+ */
+export interface ChangeClass {
+  /** The JSON text of `[kind, shape, field, rule, detail]`: unique per class, stable within a run. */
+  key: string;
+  kind: ClassKind;
+  /** The path with every BIDS entity value written `*` ({@link entityPattern}). */
+  shape: string;
+  /**
+   * The column for a table kind; for a JSON kind the leaf path (value kinds) or the parent path
+   * (key kinds), with every array index written `[*]` ({@link foldIndices}); null for the kinds
+   * that have none (the reorders, `format`, and a row kind of a keyless table).
+   */
+  field: string | null;
+  /** The relabel rule, for `key_relabeled` and `cell_templated`; null otherwise. */
+  rule: RelabelRule | null;
+  /**
+   * Part of the key for three kinds only: the {@link FormatDetail} word of `format`, the target
+   * shape of `row_relocated`, and the `old -> new` names of `json_key_renamed`. Null otherwise:
+   * a removed column's count, a key's name and every value are what a class is made OF, not what
+   * it is.
+   */
+  detail: string | null;
+  /** The files that have an atom of the class, in review order. */
+  files: ReadonlySet<string>;
+  /** How many atoms the class holds. */
+  items: number;
+  /**
+   * For the `pairs` and `removals` kinds ({@link DISPLAY_OF}), each distinct value pair as the
+   * text `before + U+0000 + after` with how many atoms have it; empty for every other kind. The
+   * before side of a removal is the removed key or row text, or `name = value` for a JSON key, and
+   * its after side is empty. No after side can hold U+0000 (a table refuses a NUL byte, and
+   * canonical JSON escapes it), so the LAST U+0000 is always the separator, while a JSON key name
+   * on the before side may hold one.
+   */
+  pairs: ReadonlyMap<string, number>;
+  /**
+   * Up to `samplesPerClass` examples, each a file path and what in it changed (a row's key, a key's
+   * name, a cell's two values), already rendered for the prompt: the first atom of each of the
+   * first files in review order, or, when the class is in one file only, its first atoms there.
+   * Rendered only for the first `maxClasses` classes in render order, the only ones that can be
+   * shown; every later class has none, and is never shown.
+   */
+  examples: readonly string[];
+  /**
+   * The path of one of the examples was cut at `maxValueChars` code points. The examples only
+   * illustrate, but a path is a token of the block's grammar like the shape (design section 8.2),
+   * so a cut one cuts the class line and the class is incomplete. False when there are no examples.
+   */
+  examplePathCut: boolean;
+}
+
+/** One file's atoms, as {@link classify} groups them. */
+export interface FileAtoms {
+  path: string;
+  atoms: readonly Atom[];
+}
+
+/** The kinds whose `detail` is part of the class key: see {@link ChangeClass.detail}. */
+const DETAIL_IN_KEY: ReadonlySet<ClassKind> = new Set([
+  "format",
+  "row_relocated",
+  "json_key_renamed",
+]);
+
+/**
+ * A JSON path with every array index written `[*]`, so the same edit in every element of a list is
+ * one class. A key in brackets (`["a b"]`, JSON-escaped) is passed over whole, so a key that reads
+ * `[0]` is never taken for an index: only a bracket of digits is one.
+ */
+export function foldIndices(path: string): string {
+  return path.replace(/(\["(?:[^"\\]|\\.)*"\])|\[[0-9]+\]/g, (match, key: string | undefined) =>
+    key === undefined ? "[*]" : match,
+  );
+}
+
+/** What names a class: see {@link ChangeClass}. */
+type ClassIdentity = Pick<ChangeClass, "key" | "kind" | "shape" | "field" | "rule" | "detail">;
+
+/** The identity of the class an atom of a file belongs to: see {@link ChangeClass}. */
+export function classKeyOf(path: string, atom: Atom): ClassIdentity {
+  return classIdentity(entityPattern(path), atom);
+}
+
+/** {@link classKeyOf} with the file's shape already known: it is the same for all its atoms. */
+function classIdentity(shape: string, atom: Atom): ClassIdentity {
+  // A table's column name is the author's text and is never folded; a JSON path is the module's.
+  const field =
+    atom.field === null
+      ? null
+      : atom.kind.startsWith("json_")
+        ? foldIndices(atom.field)
+        : atom.field;
+  const rule = atom.kind === "key_relabeled" || atom.kind === "cell_templated" ? atom.rule : null;
+  const detail = DETAIL_IN_KEY.has(atom.kind) ? atom.detail : null;
+  // The rule by its fields in a fixed order, so two equal rules are one key however they were built.
+  const ruleKey = rule === null ? null : [rule.kind, rule.gaps, rule.shape, rule.repadded];
+  const key = JSON.stringify([atom.kind, shape, field, ruleKey, detail]);
+  return { key, kind: atom.kind, shape, field, rule, detail };
+}
+
+/** The before side of a removal as its pair shows it: see {@link ChangeClass.pairs}. */
+function removedText(atom: Atom): string {
+  return atom.kind === "row_removed"
+    ? (atom.before ?? "")
+    : `${atom.detail ?? ""} = ${atom.before ?? ""}`;
+}
+
+/** The pair an atom adds to its class, or null for a kind that is not shown by its values. */
+function pairOf(atom: Atom): string | null {
+  switch (DISPLAY_OF[atom.kind]) {
+    case "pairs":
+      return `${atom.before ?? ""}\u{0}${atom.after ?? ""}`;
+    case "removals":
+      return `${removedText(atom)}\u{0}`;
+    default:
+      return null;
+  }
+}
+
+/**
+ * A path as the summary prints it: one quoted token, rendered exactly as a value is
+ * ({@link renderValue}: escaped, and cut at `maxValueChars` code points with the marker after the
+ * closing quote). A path may hold ` | `, quotes, a line break, an invisible character or the
+ * platform's own words, and still cannot add a field or a line, or read as another path. A cut
+ * path cuts the class line it is on (see {@link renderClass}).
+ */
+function renderPath(path: string): { text: string; cut: boolean } {
+  return renderValue(path);
+}
+
+/**
+ * What one example of an atom says, after its file's path as {@link renderPath} gave it: see
+ * {@link ChangeClass.examples}.
+ */
+function exampleOf(where: string, atom: Atom): string {
+  const value = (v: string | null): string => renderValue(v ?? "").text;
+  switch (atom.kind) {
+    case "key_relabeled":
+      return `${where} row ${value(atom.before)} -> ${value(atom.after)}`;
+    case "row_removed":
+    case "row_relocated":
+      return `${where} row ${value(atom.before)}`;
+    case "row_added":
+      return `${where} row ${value(atom.after)}`;
+    case "cell_templated":
+    case "cell_replaced":
+    case "cell_emptied":
+    case "cell_filled":
+      return `${where} ${value(atom.before)} -> ${value(atom.after)}`;
+    case "json_value_changed":
+    case "json_type_changed":
+    case "json_emptied":
+    case "json_filled":
+      // A document that is one scalar changed at its root, which has no path to name.
+      return atom.field === "" ? where : `${where} key ${value(atom.field)}`;
+    case "json_key_removed":
+    case "json_empty_key_removed":
+    case "json_key_added":
+    case "json_key_moved":
+    case "json_key_renamed":
+      return `${where} key ${value(atom.detail)}`;
+    case "column_removed": {
+      // The count as the diff wrote it, or `unknown` for one it could not have written, never a 0
+      // that is not there: a missing or unreadable count is a loss (see `heldValues`).
+      const count = atom.detail !== null && /^[0-9]+$/.test(atom.detail) ? atom.detail : "unknown";
+      return `${where} (${count} non-missing values)`;
+    }
+    case "format":
+      // The states are the platform's own words, except a mixed file's per-line pattern.
+      return atom.detail === "line_ending_pattern" || atom.before === null || atom.after === null
+        ? where
+        : `${where} (${atom.before} to ${atom.after})`;
+    case "column_added":
+    case "columns_reordered":
+    case "rows_reordered":
+    case "json_keys_reordered":
+      return where;
+  }
+}
+
+/** The order of the roles in the summary: what a reader most needs to see comes first. */
+const ROLE_RANK: Readonly<Record<ClassRole, number>> = {
+  loss: 0,
+  relocated: 1,
+  modification: 2,
+  additive: 3,
+};
+
+/** Where an example comes from: rendered only if its class is among the ones that can be shown. */
+interface ExampleSource {
+  path: string;
+  atom: Atom;
+}
+
+/** A class while its files are folded in. */
+interface Building {
+  identity: ClassIdentity;
+  files: Set<string>;
+  items: number;
+  pairs: Map<string, number>;
+  examples: ExampleSource[];
+  /** The second atom of the first file, used when no second file has the class. */
+  spare: ExampleSource | null;
+}
+
+/** Render order (design section 5.1): see {@link classify}. */
+function renderOrder(a: Building, b: Building): number {
+  return (
+    ROLE_RANK[ROLE_OF[a.identity.kind]] - ROLE_RANK[ROLE_OF[b.identity.kind]] ||
+    b.files.size - a.files.size ||
+    b.items - a.items ||
+    byCodeUnits(a.identity.key, b.identity.key)
+  );
+}
+
+/**
+ * The classes of a run, built one file at a time, so a file's atoms can be dropped once they are
+ * folded in: what a run holds is its classes (their counts, pairs and at most three atoms each, for
+ * the examples), never every atom of every file.
+ *
+ * `fold` takes a file whole or not at all. It first computes each atom's class key, once, and
+ * counts the classes the file would add; when the run would then hold more than `limit` classes it
+ * returns null and the builder is exactly as it was, so the summary can refuse that one file and
+ * go on. Otherwise it folds the atoms in, with the keys it already computed, and hands the file's
+ * keys back. `finish` sorts the classes into render order and renders the examples of the first
+ * `maxClasses` only, since no later class can be shown.
+ */
+class ClassBuilder {
+  private readonly byKey = new Map<string, Building>();
+
+  constructor(private readonly limit: number) {}
+
+  fold(path: string, atoms: readonly Atom[]): Set<string> | null {
+    // First the file's classes, without touching the builder: one identity per distinct key, and
+    // how many of them the run does not hold yet.
+    const shape = entityPattern(path);
+    const ofFile = new Map<string, ClassIdentity>();
+    const identities: ClassIdentity[] = [];
+    let added = 0;
+    for (const atom of atoms) {
+      const computed = classIdentity(shape, atom);
+      let identity = ofFile.get(computed.key);
+      if (identity === undefined) {
+        identity = computed;
+        ofFile.set(computed.key, computed);
+        if (!this.byKey.has(computed.key) && this.byKey.size + ++added > this.limit) return null;
+      }
+      identities.push(identity);
+    }
+    // Then the fold, with the keys computed above.
+    for (const [i, atom] of atoms.entries()) {
+      const identity = identities[i] as ClassIdentity;
+      let entry = this.byKey.get(identity.key);
+      if (entry === undefined) {
+        entry = {
+          identity,
+          files: new Set(),
+          items: 0,
+          pairs: new Map(),
+          examples: [],
+          spare: null,
+        };
+        this.byKey.set(identity.key, entry);
+      }
+      const newFile = !entry.files.has(path);
+      entry.files.add(path);
+      entry.items++;
+      const pair = pairOf(atom);
+      if (pair !== null) entry.pairs.set(pair, (entry.pairs.get(pair) ?? 0) + 1);
+      if (newFile && entry.examples.length < SUMMARY_LIMITS.samplesPerClass) {
+        entry.examples.push({ path, atom });
+      } else if (!newFile && entry.files.size === 1 && entry.spare === null) {
+        entry.spare = { path, atom };
+      }
+    }
+    return new Set(ofFile.keys());
+  }
+
+  finish(): ChangeClass[] {
+    return [...this.byKey.values()].sort(renderOrder).map((entry, i) => {
+      const sources = i < SUMMARY_LIMITS.maxClasses ? [...entry.examples] : [];
+      if (
+        i < SUMMARY_LIMITS.maxClasses &&
+        sources.length < SUMMARY_LIMITS.samplesPerClass &&
+        entry.spare !== null
+      ) {
+        sources.push(entry.spare);
+      }
+      const shown = sources.map((source) => ({
+        where: renderPath(source.path),
+        atom: source.atom,
+      }));
+      return {
+        ...entry.identity,
+        files: entry.files,
+        items: entry.items,
+        pairs: entry.pairs,
+        examples: shown.map((example) => exampleOf(example.where.text, example.atom)),
+        examplePathCut: shown.some((example) => example.where.cut),
+      };
+    });
+  }
+}
+
+/**
+ * Group the atoms of every file into classes (design section 4.2), in render order (section 5.1):
+ * loss, then relocated, then modification, then additive; within a role the class in more files
+ * first, then the one with more items, then the class key in code-unit order, so the order is a
+ * function of the classes alone.
+ *
+ * `files` must be in review order (the summary passes them sorted by path); the examples are taken
+ * in that order, so they too depend only on the input. Only the first `maxClasses` classes have
+ * their examples rendered (see {@link ChangeClass.examples}). This is {@link ClassBuilder} with no
+ * bound on the classes; the summary folds its files one at a time under `maxTrackedClasses`.
+ */
+export function classify(files: readonly FileAtoms[]): ChangeClass[] {
+  const builder = new ClassBuilder(Number.POSITIVE_INFINITY);
+  for (const file of files) builder.fold(file.path, file.atoms);
+  return builder.finish();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rendering, bounds and completeness (design sections 5.2 to 5.4 and 8.2)
+// ---------------------------------------------------------------------------------------------
+
+/** What a `format` class says changed, in the platform's words. */
+const FORMAT_WORDS: Readonly<Record<FormatDetail, string>> = {
+  bom: "byte order mark added or removed",
+  line_endings: "line endings changed",
+  line_ending_pattern: "which lines end in CRLF changed",
+  final_newline: "final newline added or removed",
+  json_respelled: "same values, string escapes spelled differently",
+};
+
+/** The JSON kinds whose field is a leaf path; every other JSON kind with a field names its parent. */
+const JSON_VALUE_KINDS: ReadonlySet<ClassKind> = new Set([
+  "json_value_changed",
+  "json_type_changed",
+  "json_emptied",
+  "json_filled",
+]);
+
+/** The last line of a summary that could not show every class; never written for none. */
+function moreClassesLine(n: number): string {
+  return n === 1 ? "(1 more change class not shown)" : `(${n} more change classes not shown)`;
+}
+
+/** The line under a class whose distinct pairs were not all shown; never written for none. */
+function morePairsLine(n: number): string {
+  return n === 1
+    ? "    (1 more distinct value not shown)"
+    : `    (${n} more distinct values not shown)`;
+}
+
+/** A value with every character {@link renderValue} would escape removed, spaces kept. */
+function withoutUnseen(v: string): string {
+  return v.replace(UNSEEN, (ch) => (ch === " " ? ch : ""));
+}
+
+/**
+ * The note a pair needs when its two sides may LOOK alike (design section 8.2), or null. A pair
+ * gets one when its two rendered texts are equal (two values cut at the same place), when they
+ * differ only in characters the renderer escapes (a zero-width space, a bidirectional mark, a
+ * control character), when the raw values are equal after NFC normalization but not byte for byte
+ * (a precomposed letter against the letter and a combining mark), or when they first differ at a
+ * character outside ASCII (a Latin `a` against a Cyrillic one, U+0430). The last is wider than it
+ * must be, and deliberately: a note on a pair that did not need one costs a few words, while a
+ * look-alike without one is a change the reader cannot see. The note is computed on the raw
+ * values, never on the rendered ones.
+ */
+function differenceNote(
+  before: string,
+  after: string,
+  b: { text: string },
+  a: { text: string },
+): string | null {
+  const note = firstDifference(before, after);
+  if (note === null) return null;
+  // The NFC condition is the design's own, kept as it is written, though the last condition covers
+  // it: two values equal after NFC that differ first at an ASCII character on both sides cannot
+  // exist (an ASCII character is a starter that decomposes to itself, so the decompositions would
+  // differ there too), so such a pair always differs first at a character outside ASCII. Checked,
+  // not only argued: a brute force over 400,000 strings in the phase 3 review found no pair this
+  // condition annotates that the last one would not.
+  if (
+    b.text === a.text ||
+    withoutUnseen(before) === withoutUnseen(after) ||
+    before.normalize("NFC") === after.normalize("NFC")
+  ) {
+    return note;
+  }
+  const points = [...note.matchAll(/U\+([0-9A-F]+)/g)].map((m) =>
+    Number.parseInt(m[1] as string, 16),
+  );
+  return points.some((p) => p >= 0x80) ? note : null;
+}
+
+/**
+ * One class as the fenced block shows it, numbered `n` (design section 8.2), and whether that
+ * showing is COMPLETE (section 5.3):
+ *
+ * ```text
+ * C<n> | "<shape>" | <column "x" | key "path" | under "parent"> | <kind words>[: <rule>]
+ *     "<before>" -> "<after>" x<count>        (pairs; a removal shows one side)
+ *     (<k> more distinct values not shown)        (`1 more distinct value` for one)
+ *     e.g. "<path>" <what changed>
+ * ```
+ *
+ * Every author text is rendered so that nothing from the pull request can start a line, add a
+ * field or imitate the platform's words: values, column names, JSON paths, a rule's added text and
+ * every file path (the shape, a relocation's target, an example's file) go through
+ * {@link renderValue} (quoted, escaped, cut with a marker after the closing quote), so each is one
+ * quoted token.
+ *
+ * A class is complete when nothing on its class line was cut (the shape, the field, a rename's
+ * names, a relocation's target, and the path of any of its examples, which is a token of the same
+ * grammar) and, for the `pairs` and `removals` kinds, every distinct pair is shown and no shown
+ * value was cut. A cut anywhere a reader needs is a reason not to account for the class's files,
+ * whatever the kind: the rule of a rule kind describes its members only if the reader can read
+ * which column or key it applies to. The examples only illustrate, so a value cut in an example
+ * changes nothing.
+ */
+function renderClass(n: number, c: ChangeClass): { text: string; complete: boolean } {
+  let lineCut = c.examplePathCut;
+  const quoted = (v: string): string => {
+    const r = renderValue(v);
+    if (r.cut) lineCut = true;
+    return r.text;
+  };
+  const path = (p: string): string => {
+    const r = renderPath(p);
+    if (r.cut) lineCut = true;
+    return r.text;
+  };
+  const parts = [`C${n}`, path(c.shape)];
+  if (c.field !== null) {
+    if (!c.kind.startsWith("json_")) parts.push(`column ${quoted(c.field)}`);
+    else if (JSON_VALUE_KINDS.has(c.kind)) {
+      parts.push(c.field === "" ? "the whole document" : `key ${quoted(c.field)}`);
+    } else parts.push(c.field === "" ? "top level" : `under ${quoted(c.field)}`);
+  }
+  let rule: string | null = null;
+  if (c.rule !== null) {
+    // The rule's added or removed text is the author's: each gap is rendered like a value and
+    // put where `ruleWords` puts its quotes, so the words are the module's and the text is escaped.
+    // No gap can be cut today: a rule is found only between names of at most `maxKeyChars` (128)
+    // code points, so a gap never reaches the 300 of a cut. `quoted` would still mark the line
+    // cut if one did; that is kept as the guard that fails closed, not as a case that happens.
+    const gaps = c.rule.gaps.map((gap) => {
+      const text = quoted(gap);
+      return text.slice(1, text.lastIndexOf('"'));
+    });
+    rule = ruleWords({ ...c.rule, gaps });
+  } else if (c.kind === "row_relocated" && c.detail !== null) {
+    // The shape of the path the rows were found at, a path like the class's own.
+    rule = `to ${path(c.detail)}`;
+  } else if (c.kind === "json_key_renamed" && c.detail !== null) {
+    rule = quoted(c.detail);
+  } else if (c.kind === "format" && c.detail !== null) {
+    rule = FORMAT_WORDS[c.detail as FormatDetail] ?? quoted(c.detail);
+  }
+  parts.push(rule === null ? KIND_WORDS[c.kind] : `${KIND_WORDS[c.kind]}: ${rule}`);
+  const lines = [parts.join(" | ")];
+
+  const display = DISPLAY_OF[c.kind];
+  let pairsComplete = true;
+  if (display === "pairs" || display === "removals") {
+    // Most frequent first, then by text, so which pairs fit is a function of the class alone.
+    const ordered = [...c.pairs].sort((x, y) => y[1] - x[1] || byCodeUnits(x[0], y[0]));
+    const shown = ordered.slice(0, SUMMARY_LIMITS.maxPairsPerClass);
+    for (const [pair, count] of shown) {
+      const at = pair.lastIndexOf("\u{0}");
+      const before = pair.slice(0, at);
+      const b = renderValue(before);
+      if (b.cut) pairsComplete = false;
+      if (display === "removals") {
+        lines.push(`    ${b.text} x${count}`);
+        continue;
+      }
+      const after = pair.slice(at + 1);
+      const a = renderValue(after);
+      if (a.cut) pairsComplete = false;
+      const note = differenceNote(before, after, b, a);
+      lines.push(`    ${b.text} -> ${a.text} x${count}${note === null ? "" : ` (${note})`}`);
+    }
+    if (ordered.length > shown.length) {
+      lines.push(morePairsLine(ordered.length - shown.length));
+      pairsComplete = false;
+    }
+  }
+  for (const example of c.examples) lines.push(`    e.g. ${example}`);
+  return { text: lines.join("\n"), complete: !lineCut && pairsComplete };
+}
+
+/** The fenced block of a summary, and which classes it shows and shows completely. */
+export interface RenderedClasses {
+  /** The block's text: every shown class, then the line that counts the others; "" for no class. */
+  text: string;
+  /** The keys of the classes shown, in render order: always a prefix of the classes given. */
+  shown: ReadonlySet<string>;
+  /** The keys of the classes shown completely (design section 5.3); a subset of `shown`. */
+  complete: ReadonlySet<string>;
+  /** How many classes were not shown. */
+  cut: number;
+}
+
+/**
+ * Render classes, in the order given, within `maxClasses` and `maxSummaryChars` (design sections
+ * 5.2 to 5.4). A class renders whole or not at all, and rendering STOPS at the first class that
+ * does not fit: the classes shown are always a prefix of the order, so a loss class can never be
+ * left out while a later class is shown, and no class's showing depends on the size of the ones
+ * after it. When any class is left out, the block ends with `(N more change classes not shown)`
+ * (`(1 more change class not shown)` for one);
+ * room for that line is kept from the start, so the text never exceeds `maxSummaryChars`.
+ */
+export function renderClasses(classes: readonly ChangeClass[]): RenderedClasses {
+  const blocks: string[] = [];
+  const shown = new Set<string>();
+  const complete = new Set<string>();
+  let length = 0;
+  for (const [i, c] of classes.entries()) {
+    if (shown.size >= SUMMARY_LIMITS.maxClasses) break;
+    const block = renderClass(shown.size + 1, c);
+    const after = classes.length - i - 1;
+    const reserve = after > 0 ? 1 + moreClassesLine(after).length : 0;
+    const separator = blocks.length > 0 ? 1 : 0;
+    if (length + separator + block.text.length + reserve > SUMMARY_LIMITS.maxSummaryChars) break;
+    blocks.push(block.text);
+    length += separator + block.text.length;
+    shown.add(c.key);
+    if (block.complete) complete.add(c.key);
+  }
+  const cut = classes.length - shown.size;
+  if (cut > 0) blocks.push(moreClassesLine(cut));
+  return { text: blocks.join("\n"), shown, complete, cut };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Coverage and loss facts (design sections 6.1, 7.1 and 8.1)
+// ---------------------------------------------------------------------------------------------
+
+/** What became of one summary candidate. */
+export interface FileOutcome {
+  path: string;
+  family: "tsv" | "json";
+  /** Why the file was not summarized, or null when both sides parsed and its diff was total. */
+  refusal: SummaryRefusal | null;
+  /** The key column its rows were paired by (tables only), or null. */
+  keyColumn: string | null;
+  /** The keys of the classes its atoms are in; empty for a refused file. */
+  classKeys: ReadonlySet<string>;
+}
+
+/**
+ * The loss and relocation facts of a run (design section 7.1), counted over EVERY summarized file,
+ * whether the summary accounted for it or not: a pull request is held to the same rule at 3 files
+ * and at 3,000, and a file that is also shown as a raw diff still counts.
+ */
+export interface LossFacts {
+  /** `row_removed` atoms, and the number of files they are in. */
+  rowsRemoved: number;
+  rowsRemovedFiles: number;
+  /** `row_relocated` atoms. */
+  rowsRelocated: number;
+  /** `column_removed` atoms whose column held at least one non-missing value. */
+  columnsRemoved: number;
+  /** `json_key_removed` atoms, and the number of files they are in. */
+  keysRemoved: number;
+  keysRemovedFiles: number;
+  /** `json_key_moved` atoms. */
+  keysMoved: number;
+  /** `cell_emptied` and `json_emptied` atoms. */
+  valuesEmptied: number;
+  /**
+   * The first path in code-unit order with a blocking atom (`row_removed`, `json_key_removed`, or
+   * a `column_removed` that held a value), for the platform finding's `path`; null when none.
+   */
+  firstBlockingPath: string | null;
+}
+
+/** The facts of a run with nothing lost. */
+export const NO_LOSS: Readonly<LossFacts> = Object.freeze({
+  rowsRemoved: 0,
+  rowsRemovedFiles: 0,
+  rowsRelocated: 0,
+  columnsRemoved: 0,
+  keysRemoved: 0,
+  keysRemovedFiles: 0,
+  keysMoved: 0,
+  valuesEmptied: 0,
+  firstBlockingPath: null,
+});
+
+/**
+ * A removed column held a value unless its count is exactly the text `0`. A missing count, an empty
+ * one or one that is not a number cannot come from the diff; if one ever did, it would be counted
+ * as a loss, never as nothing lost. (Comparing as a number would not do: `Number(null)`,
+ * `Number("")` and `Number(" ")` are all 0.)
+ */
+function heldValues(atom: Atom): boolean {
+  return atom.detail !== "0";
+}
+
+/**
+ * The loss facts of the summarized files: see {@link LossFacts}. The summary counts the same facts
+ * one file at a time as it folds the file in ({@link addLossFacts}), so the two always agree.
+ */
+export function lossFactsOf(files: readonly FileAtoms[]): LossFacts {
+  const facts: LossFacts = { ...NO_LOSS };
+  for (const file of files) addLossFacts(facts, file);
+  return facts;
+}
+
+/** Add one summarized file's loss facts to a run's: the one place a loss fact is counted. */
+function addLossFacts(facts: LossFacts, file: FileAtoms): void {
+  let rows = 0;
+  let keys = 0;
+  let blocking = false;
+  for (const atom of file.atoms) {
+    switch (atom.kind) {
+      case "row_removed":
+        rows++;
+        blocking = true;
+        break;
+      case "row_relocated":
+        facts.rowsRelocated++;
+        break;
+      case "column_removed":
+        if (heldValues(atom)) {
+          facts.columnsRemoved++;
+          blocking = true;
+        }
+        break;
+      case "json_key_removed":
+        keys++;
+        blocking = true;
+        break;
+      case "json_key_moved":
+        facts.keysMoved++;
+        break;
+      case "cell_emptied":
+      case "json_emptied":
+        facts.valuesEmptied++;
+        break;
+      // No loss fact: every other kind, named, so a kind added to `CLASS_KINDS` without being
+      // placed here or above does not compile.
+      case "key_relabeled":
+      case "cell_templated":
+      case "cell_replaced":
+      case "json_value_changed":
+      case "json_type_changed":
+      case "json_key_renamed":
+      case "json_empty_key_removed":
+      case "rows_reordered":
+      case "columns_reordered":
+      case "json_keys_reordered":
+      case "format":
+      case "column_added":
+      case "row_added":
+      case "cell_filled":
+      case "json_key_added":
+      case "json_filled":
+        break;
+      default: {
+        const unclassified: never = atom.kind;
+        throw new Error(`addLossFacts: a kind with no case: ${String(unclassified)}`);
+      }
+    }
+  }
+  facts.rowsRemoved += rows;
+  if (rows > 0) facts.rowsRemovedFiles++;
+  facts.keysRemoved += keys;
+  if (keys > 0) facts.keysRemovedFiles++;
+  if (
+    blocking &&
+    (facts.firstBlockingPath === null || byCodeUnits(file.path, facts.firstBlockingPath) < 0)
+  ) {
+    facts.firstBlockingPath = file.path;
+  }
+}
+
+/**
+ * The files the summary accounts for (design section 6.1): a file is accounted for when it parsed
+ * on both sides with no refusal (so its table round-tripped and its diff was total) and EVERY class
+ * that holds one of its atoms and is not additive was shown completely. Additive classes are never
+ * needed: new content removes nothing. A class this function does not know, or a path that appears
+ * twice with different fates, accounts for nothing: every doubt here falls toward the raw-diff
+ * path. An abandoned run never gets here: {@link summarizeChanges} returns the abandoned summary,
+ * which accounts for nothing, before anything is accounted for.
+ */
+export function accountedFiles(
+  outcomes: readonly FileOutcome[],
+  classes: readonly ChangeClass[],
+  complete: ReadonlySet<string>,
+): Set<string> {
+  const accounted = new Set<string>();
+  const kindOf = new Map(classes.map((c) => [c.key, c.kind]));
+  const refused = new Set<string>();
+  for (const outcome of outcomes) {
+    const covered =
+      outcome.refusal === null &&
+      [...outcome.classKeys].every((key) => {
+        const kind = kindOf.get(key);
+        if (kind === undefined) return false;
+        return ROLE_OF[kind] === "additive" || complete.has(key);
+      });
+    if (covered) accounted.add(outcome.path);
+    else refused.add(outcome.path);
+  }
+  for (const path of refused) accounted.delete(path);
+  return accounted;
+}
+
+/**
+ * The summary's numbers for the facts block (design section 8.1), outside every fence. Only
+ * counts and the platform's own words: no path, value or name from the pull request.
+ */
+export interface SummaryFacts {
+  /** The run reached its deadline: every other number is then zero and nothing is accounted for. */
+  abandoned: boolean;
+  /** Candidates that parsed on both sides with a total diff. */
+  files_summarized: number;
+  /** Candidates refused, for any reason; the reasons are not given here. */
+  files_not_summarized: number;
+  files_accounted_for: number;
+  classes_shown: number;
+  classes_cut: number;
+  rows_removed_not_found_elsewhere: number;
+  rows_removed_found_verbatim_in_sourcedata: number;
+  columns_with_values_removed: number;
+  keys_removed_not_found_elsewhere: number;
+  keys_moved_to_an_inherited_sidecar: number;
+  values_emptied: number;
+}
+
+/** `1 item`, `2 items`. */
+function counted(n: number, word: string): string {
+  return `${n} ${word}${n === 1 ? "" : "s"}`;
+}
+
+/**
+ * The class table of the facts block: one line per SHOWN class, `C<n> <kind words> | <items> in
+ * <files> | in full` or `not shown in full`, numbered as the fenced block numbers them. Only the
+ * platform's words and counts, so a value cannot forge or change it. `not shown in full` is said of
+ * every incomplete class, whatever made it so: a pair not shown, a value cut, or a token of its
+ * class line cut (its shape, field or target, or an example's path), so the words never name a
+ * cause the block does not have.
+ */
+export function classTable(
+  classes: readonly ChangeClass[],
+  shown: ReadonlySet<string>,
+  complete: ReadonlySet<string>,
+): string[] {
+  return classes
+    .filter((c) => shown.has(c.key))
+    .map(
+      (c, i) =>
+        `C${i + 1} ${KIND_WORDS[c.kind]} | ${counted(c.items, "item")} in ${counted(c.files.size, "file")} | ${complete.has(c.key) ? "in full" : "not shown in full"}`,
+    );
+}
+
+/** The facts of a run: see {@link SummaryFacts}. */
+export function summaryFacts(input: {
+  abandoned: boolean;
+  outcomes: readonly FileOutcome[];
+  accounted: ReadonlySet<string>;
+  shown: number;
+  cut: number;
+  loss: LossFacts;
+}): SummaryFacts {
+  const summarized = input.outcomes.filter((o) => o.refusal === null).length;
+  return {
+    abandoned: input.abandoned,
+    files_summarized: summarized,
+    files_not_summarized: input.outcomes.length - summarized,
+    files_accounted_for: input.accounted.size,
+    classes_shown: input.shown,
+    classes_cut: input.cut,
+    rows_removed_not_found_elsewhere: input.loss.rowsRemoved,
+    rows_removed_found_verbatim_in_sourcedata: input.loss.rowsRelocated,
+    columns_with_values_removed: input.loss.columnsRemoved,
+    keys_removed_not_found_elsewhere: input.loss.keysRemoved,
+    keys_moved_to_an_inherited_sidecar: input.loss.keysMoved,
+    values_emptied: input.loss.valuesEmptied,
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// The summary of a pull request (design sections 5.4, 6.1 and 10.1)
+// ---------------------------------------------------------------------------------------------
+
+/** A modified `.tsv` or `.json` file the summary is asked to account for (design section 2.1). */
+export interface SummaryCandidate {
+  path: string;
+  before: Uint8Array;
+  after: Uint8Array;
+}
+
+/**
+ * Everything the summary of a pull request decided, for the evidence and the prompt. Read-only
+ * throughout: {@link EMPTY_SUMMARY} is one shared object, and no reader may change a summary.
+ */
+export interface ChangeSummary {
+  /** The deadline was reached: nothing below is used, and nothing is accounted for. */
+  abandoned: boolean;
+  /** One outcome per `.tsv` and `.json` candidate, in the order the candidates were processed. */
+  files: readonly FileOutcome[];
+  /** Every class, in render order (the shown ones are a prefix). */
+  classes: readonly ChangeClass[];
+  /** The keys of the classes rendered, and of those rendered completely. */
+  shown: ReadonlySet<string>;
+  complete: ReadonlySet<string>;
+  /** The paths the summary accounts for (design section 6.1). */
+  accounted: ReadonlySet<string>;
+  loss: Readonly<LossFacts>;
+  facts: Readonly<SummaryFacts> & { readonly classes: readonly string[] };
+  /** The fenced block's text: author text inside it, escaped; "" when there is no class. */
+  text: string;
+}
+
+/** A summary with nothing in it: no candidate, or (abandoned) a pass that ran out of time. */
+function emptySummary(
+  abandoned: boolean,
+  emptySet: () => ReadonlySet<string> = () => new Set<string>(),
+): ChangeSummary {
+  const outcomes: readonly FileOutcome[] = Object.freeze([]);
+  return Object.freeze({
+    abandoned,
+    files: outcomes,
+    classes: Object.freeze([]),
+    shown: emptySet(),
+    complete: emptySet(),
+    accounted: emptySet(),
+    loss: NO_LOSS,
+    facts: Object.freeze({
+      ...summaryFacts({
+        abandoned,
+        outcomes,
+        accounted: new Set(),
+        shown: 0,
+        cut: 0,
+        loss: NO_LOSS,
+      }),
+      classes: Object.freeze([]),
+    }),
+    text: "",
+  });
+}
+
+/**
+ * An empty set that stays empty: its `add`, `delete` and `clear` throw. `Object.freeze` does not
+ * reach a set's entries, so without this a caller could fill the shared summary's sets through a
+ * cast and change them for every later reader.
+ */
+function frozenSet(): ReadonlySet<string> {
+  const set = new Set<string>();
+  const refuse = (): never => {
+    throw new TypeError("the shared empty summary cannot change");
+  };
+  for (const name of ["add", "delete", "clear"] as const) {
+    Object.defineProperty(set, name, { value: refuse });
+  }
+  return Object.freeze(set);
+}
+
+/**
+ * The summary of a pull request with no candidate: not abandoned, and nothing in it. One object
+ * shared by every caller, so it is frozen, its facts too, and its sets refuse every change
+ * ({@link frozenSet}). The summaries a run returns are its own and keep ordinary sets.
+ */
+export const EMPTY_SUMMARY: ChangeSummary = emptySummary(false, frozenSet);
+
+/**
+ * JSON text with the whitespace between its tokens removed (space, tab, LF and CR outside a
+ * string; a string is copied exactly, escapes and all). Two documents whose trees are equal and
+ * whose texts differ after this differ only in how a string was spelled, which is the
+ * `json_respelled` format class. The text must be one the parser accepted, so every string ends.
+ */
+export function stripJsonSpace(text: string): string {
+  let out = "";
+  let start = 0;
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (inString) {
+      if (c === 0x5c) i++;
+      else if (c === 0x22) inString = false;
+    } else if (c === 0x22) {
+      inString = true;
+    } else if (c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d) {
+      out += text.slice(start, i);
+      start = i + 1;
+    }
+  }
+  return out + text.slice(start);
+}
+
+/** The text of bytes the JSON parser accepted, without its byte order mark. */
+function jsonText(bytes: Uint8Array): string {
+  const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  return text.startsWith(BOM) ? text.slice(BOM.length) : text;
+}
+
+/** The checks a summary proves each diff total with: the real ones, unless a test passes others. */
+export interface SummaryChecks {
+  table: (diff: FileDiff<TableCounts>) => boolean;
+  json: (diff: FileDiff<JsonCounts>) => boolean;
+}
+
+/** Both sides of a candidate parsed, or the first refusal: the before side's, then the after side's. */
+function parseBoth<T>(
+  parse: (bytes: Uint8Array) => Parsed<T>,
+  candidate: SummaryCandidate,
+): Parsed<{ before: T; after: T }> {
+  const before = parse(candidate.before);
+  if (!before.ok) return before;
+  const after = parse(candidate.after);
+  if (!after.ok) return after;
+  return { ok: true, value: { before: before.value, after: after.value } };
+}
+
+/**
+ * One candidate summarized, or why it was refused (steps 5 and 6 of {@link summarizeChangesWith}):
+ * both sides parsed, diffed against the pools, and the atoms folded into the run's classes. A
+ * table's layout atoms come from its diff; a JSON document's come from {@link formatAtoms} here,
+ * plus `json_respelled` when the trees are equal and the texts differ beyond whitespace. A file
+ * whose atoms would make the run hold more than `maxTrackedClasses` classes is `too_large`, and
+ * nothing of it is folded.
+ */
+function summarizeFile(
+  candidate: SummaryCandidate,
+  family: "tsv" | "json",
+  pools: { rows: RowPool; json: JsonPool },
+  checks: SummaryChecks,
+  builder: ClassBuilder,
+): Parsed<{ atoms: Atom[]; keyColumn: string | null; classKeys: ReadonlySet<string> }> {
+  const file = fileAtoms(candidate, family, pools, checks);
+  if (!file.ok) return file;
+  const classKeys = builder.fold(candidate.path, file.value.atoms);
+  if (classKeys === null) return { ok: false, refusal: "too_large" };
+  return { ok: true, value: { ...file.value, classKeys } };
+}
+
+/** The atoms of one candidate, or why it was refused: see {@link summarizeFile}. */
+function fileAtoms(
+  candidate: SummaryCandidate,
+  family: "tsv" | "json",
+  pools: { rows: RowPool; json: JsonPool },
+  checks: SummaryChecks,
+): Parsed<{ atoms: Atom[]; keyColumn: string | null }> {
+  const { path } = candidate;
+  if (family === "tsv") {
+    const sides = parseBoth(parseTsv, candidate);
+    if (!sides.ok) return sides;
+    const diff = diffTableWith(
+      path,
+      sides.value.before,
+      sides.value.after,
+      pools.rows,
+      checks.table,
+    );
+    if (!diff.ok) return diff;
+    return { ok: true, value: { atoms: diff.value.atoms, keyColumn: diff.value.keyColumn } };
+  }
+  const sides = parseBoth(parseJson, candidate);
+  if (!sides.ok) return sides;
+  const { before, after } = sides.value;
+  const diff = diffJsonWith(path, before.value, after.value, pools.json, checks.json);
+  if (!diff.ok) return diff;
+  const atoms = [...diff.value.atoms, ...formatAtoms(before.format, after.format)];
+  if (
+    canonicalJson(before.value) === canonicalJson(after.value) &&
+    stripJsonSpace(jsonText(candidate.before)) !== stripJsonSpace(jsonText(candidate.after))
+  ) {
+    atoms.push({
+      kind: "format",
+      field: null,
+      rule: null,
+      detail: "json_respelled",
+      before: null,
+      after: null,
+    });
+  }
+  return { ok: true, value: { atoms, keyColumn: null } };
+}
+
+/**
+ * Summarize the modified candidates of a pull request against its pools (design sections 4 to 7).
+ * Past the deadline the result is `abandoned` and accounts for nothing; see
+ * {@link summarizeChangesWith} for how a run proceeds.
+ */
+export function summarizeChanges(input: {
+  candidates: readonly SummaryCandidate[];
+  pool: readonly PoolFile[];
+  deadline: number | null;
+  now?: () => number;
+}): ChangeSummary {
+  return summarizeChangesWith(input, { table: verifyTableCounts, json: verifyJsonCounts });
+}
+
+/**
+ * {@link summarizeChanges} with the totality checks passed in, so a test can prove that a diff the
+ * check rejects is refused (`internal_mismatch`) and accounts for nothing. A run:
+ *
+ * 1. **Sorts the candidates by path, in code-unit order**, and processes them in that order. So
+ *    nothing about a run depends on the order git listed the files in: not the outcomes, not the
+ *    examples, and not which file takes a relocated row's copy. (A copy can serve only the file at
+ *    its corresponding path, so two different files never compete for one; the only order that
+ *    could matter is two candidates with ONE path, and a path given twice is refused, every time
+ *    it appears, as `internal_mismatch`, the word for the platform's own reading not adding up.)
+ * 2. Builds the pools once, from `pool`. {@link buildPools} gives the same pools for the files in
+ *    any order (it sorts the copies of one file itself, and a path listed twice contributes
+ *    nothing, whichever entry comes first), so the pool needs no sorting here.
+ * 3. Checks the deadline BEFORE each file, AFTER each file it folds in (a diff can be long), and
+ *    once more after the last file, before anything is rendered. When `now()` has reached it at
+ *    any of the three, the WHOLE summary is abandoned: no file is accounted for, no class or text
+ *    is kept, and the loss facts are zero. All or nothing is simpler to prove than a partial
+ *    account, and an abandoned summary leaves the review where it was without one (design section
+ *    5.4). A null deadline never abandons, and the clock is then never read.
+ * 4. Reads each file whose path ends in `.tsv` or `.json`; any other path is not a candidate and is
+ *    left out. Once the bytes read (both sides of every file so far) would pass `maxTotalBytes`,
+ *    that file and EVERY later one is refused `too_large`, so what the summary holds is bounded.
+ * 5. Parses both sides (the before side's refusal first) and diffs them against the pools
+ *    ({@link summarizeFile}). Any refusal, `internal_mismatch` included, is recorded on the file's
+ *    outcome, and such a file has no atoms, no class and no loss fact: it stays on the raw-diff
+ *    path.
+ * 6. Folds each summarized file into the classes ({@link ClassBuilder}) and adds its loss facts as
+ *    it goes, then drops its atoms, so a run never holds every atom of every file. A file whose
+ *    atoms would make the run hold more than `maxTrackedClasses` classes is refused `too_large`
+ *    whole (no atom, no class, no loss fact) and the run goes on, so which file is refused is
+ *    decided by the sorted order alone.
+ * 7. Renders the classes, and accounts for files.
+ */
+export function summarizeChangesWith(
+  input: {
+    candidates: readonly SummaryCandidate[];
+    pool: readonly PoolFile[];
+    deadline: number | null;
+    now?: () => number;
+  },
+  checks: SummaryChecks,
+): ChangeSummary {
+  const now = input.now ?? Date.now;
+  const expired = (): boolean => input.deadline !== null && now() >= input.deadline;
+  const candidates = [...input.candidates].sort((a, b) => byCodeUnits(a.path, b.path));
+  const listed = new Map<string, number>();
+  for (const candidate of candidates) {
+    listed.set(candidate.path, (listed.get(candidate.path) ?? 0) + 1);
+  }
+  const pools = buildPools(input.pool);
+
+  const outcomes: FileOutcome[] = [];
+  const builder = new ClassBuilder(SUMMARY_LIMITS.maxTrackedClasses);
+  const loss: LossFacts = { ...NO_LOSS };
+  let read = 0;
+  let exhausted = false;
+  for (const candidate of candidates) {
+    if (expired()) return emptySummary(true);
+    const { path } = candidate;
+    const family = path.endsWith(".tsv") ? "tsv" : path.endsWith(".json") ? "json" : null;
+    if (family === null) continue;
+    const refuse = (refusal: SummaryRefusal): void => {
+      outcomes.push({ path, family, refusal, keyColumn: null, classKeys: new Set() });
+    };
+    if ((listed.get(path) ?? 0) > 1) {
+      refuse("internal_mismatch");
+      continue;
+    }
+    const bytes = candidate.before.length + candidate.after.length;
+    if (exhausted || read + bytes > SUMMARY_LIMITS.maxTotalBytes) {
+      exhausted = true;
+      refuse("too_large");
+      continue;
+    }
+    read += bytes;
+
+    const file = summarizeFile(candidate, family, pools, checks, builder);
+    if (!file.ok) {
+      refuse(file.refusal);
+      continue;
+    }
+    const { atoms, keyColumn, classKeys } = file.value;
+    outcomes.push({ path, family, refusal: null, keyColumn, classKeys });
+    addLossFacts(loss, { path, atoms });
+    if (expired()) return emptySummary(true);
+  }
+  if (expired()) return emptySummary(true);
+
+  const classes = builder.finish();
+  const rendered = renderClasses(classes);
+  const accounted = accountedFiles(outcomes, classes, rendered.complete);
+  return {
+    abandoned: false,
+    files: outcomes,
+    classes,
+    shown: rendered.shown,
+    complete: rendered.complete,
+    accounted,
+    loss,
+    facts: {
+      ...summaryFacts({
+        abandoned: false,
+        outcomes,
+        accounted,
+        shown: rendered.shown.size,
+        cut: rendered.cut,
+        loss,
+      }),
+      classes: classTable(classes, rendered.shown, rendered.complete),
+    },
+    text: rendered.text,
+  };
 }

@@ -30,14 +30,17 @@ describe("the limits and the refusal words", () => {
     expect(SUMMARY_LIMITS).toEqual({
       maxBlobBytes: 8 * 1024 * 1024,
       maxRows: 200_000,
+      maxColumns: 10_000,
       maxJsonDepth: 64,
       maxJsonNodes: 200_000,
       maxKeyChars: 128,
+      maxNameChars: 1024,
       maxRuns: 24,
       maxPairingSteps: 12_000_000,
       maxTotalBytes: 256 * 1024 * 1024,
       maxSummaryChars: 30_000,
       maxClasses: 120,
+      maxTrackedClasses: 5_000,
       maxPairsPerClass: 12,
       maxValueChars: 300,
       samplesPerClass: 2,
@@ -534,6 +537,34 @@ describe("parseTsv refuses, with one closed word per fault", () => {
     expect(tsvRefusal("a\tA\ta \n")).toBeNull();
   });
 
+  test("too_large: a header of 10,001 columns is refused, and 10,000 are read", () => {
+    const max = SUMMARY_LIMITS.maxColumns;
+    const table = (n: number) => {
+      const names = Array.from({ length: n }, (_, i) => `c${i}`);
+      return `${names.join("\t")}\n${names.map(() => "1").join("\t")}\n`;
+    };
+    expect(tsvRefusal(table(max))).toBeNull();
+    expect(tsvRefusal(table(max + 1))).toBe("too_large");
+    // The width is the first thing read of the header: before an empty or a repeated name.
+    const wide = Array.from({ length: max + 1 }, () => "").join("\t");
+    expect(tsvRefusal(`${wide}\n`)).toBe("too_large");
+    expect(tsvRefusal(`${Array.from({ length: max + 1 }, () => "a").join("\t")}\n`)).toBe(
+      "too_large",
+    );
+  });
+
+  test("too_large: a column name of 1,025 code units is refused, and 1,024 is read", () => {
+    const max = SUMMARY_LIMITS.maxNameChars;
+    const table = (name: string) => `a\t${name}\n1\t2\n`;
+    expect(tsvRefusal(table("n".repeat(max)))).toBeNull();
+    expect(tsvRefusal(table("n".repeat(max + 1)))).toBe("too_large");
+    // Code units, not code points: 512 astral characters are 1,024 units, 513 are 1,026.
+    expect(tsvRefusal(table("\u{1F600}".repeat(max / 2)))).toBeNull();
+    expect(tsvRefusal(table("\u{1F600}".repeat(max / 2 + 1)))).toBe("too_large");
+    // The first column and a header with no rows are names like any other.
+    expect(tsvRefusal(`${"n".repeat(max + 1)}\n`)).toBe("too_large");
+  });
+
   test("ragged_row: too few cells, too many, a blank line, and a trailing blank line", () => {
     expect(tsvRefusal("a\tb\n1\n")).toBe("ragged_row");
     expect(tsvRefusal("a\tb\n1\t2\t3\n")).toBe("ragged_row");
@@ -619,6 +650,11 @@ describe("parseTsv refuses, with one closed word per fault", () => {
     expect(tsvRefusal('"a"\tb\r1\n')).toBe("bare_cr");
     expect(tsvRefusal('\ta\ta\n"1"\n')).toBe("empty_column_name");
     expect(tsvRefusal('a\ta\n"1"\n')).toBe("duplicate_column");
+    // A long name is checked after the empty and repeated ones, and before any row.
+    const long = "n".repeat(SUMMARY_LIMITS.maxNameChars + 1);
+    expect(tsvRefusal(`\t${long}\n`)).toBe("empty_column_name");
+    expect(tsvRefusal(`${long}\t${long}\n`)).toBe("duplicate_column");
+    expect(tsvRefusal(`a\t${long}\n1\n`)).toBe("too_large");
     expect(tsvRefusal('a\tb\n"1"\n')).toBe("ragged_row");
     expect(tsvRefusal(`a\n${"x\n".repeat(SUMMARY_LIMITS.maxRows)}"y\ty\n`)).toBe("ragged_row");
     expect(tsvRefusal(`a\n${"x\n".repeat(SUMMARY_LIMITS.maxRows + 1)}"y\n`)).toBe("too_many_rows");
@@ -1131,6 +1167,21 @@ describe("parseJson refuses, with one closed word per fault", () => {
     expect(jsonRefusal('{"a":1,"A":2,"a ":3}')).toBeNull();
   });
 
+  test("too_large: a key of 1,025 code units once decoded is refused, and 1,024 is read", () => {
+    const max = SUMMARY_LIMITS.maxNameChars;
+    expect(jsonRefusal(`{"${"k".repeat(max)}":1}`)).toBeNull();
+    expect(jsonRefusal(`{"${"k".repeat(max + 1)}":1}`)).toBe("too_large");
+    // At any depth, and in an array element.
+    expect(jsonRefusal(`{"a":{"${"k".repeat(max + 1)}":1}}`)).toBe("too_large");
+    expect(jsonRefusal(`[1,{"${"k".repeat(max + 1)}":1}]`)).toBe("too_large");
+    // Decoded: 1,024 six-character escapes are a key of 1,024 units, read; an astral character
+    // is two units.
+    expect(jsonRefusal(`{"${uesc("006b").repeat(max)}":1}`)).toBeNull();
+    expect(jsonRefusal(`{"${"\u{1F600}".repeat(max / 2 + 1)}":1}`)).toBe("too_large");
+    // A string VALUE of any length is a value, not a key.
+    expect(jsonRefusal(`{"a":"${"v".repeat(4 * max)}"}`)).toBeNull();
+  });
+
   test("too_deep: 64 nested arrays are read, 65 are refused", () => {
     const nested = (n: number) => "[".repeat(n) + "]".repeat(n);
     expect(jsonRefusal(nested(SUMMARY_LIMITS.maxJsonDepth))).toBeNull();
@@ -1181,6 +1232,10 @@ describe("parseJson refuses, with one closed word per fault", () => {
     expect(jsonRefusal('{"a":1,}"a"')).toBe("not_json");
     expect(jsonRefusal(`${"[".repeat(65)}x`)).toBe("too_deep");
     expect(jsonRefusal(`[x${"[".repeat(65)}`)).toBe("not_json");
+    // A long key is refused when it is read: before a later repeat of it, after an earlier fault.
+    const long = "k".repeat(SUMMARY_LIMITS.maxNameChars + 1);
+    expect(jsonRefusal(`{"${long}":1,"${long}":2}`)).toBe("too_large");
+    expect(jsonRefusal(`{"a":1,"a":2,"${long}":3}`)).toBe("duplicate_key");
   });
 });
 

@@ -40,7 +40,7 @@ Every decision has a recommendation and a reason; the policy choices that belong
 11. Part B shares Part A's blob reader, budget, value renderer, facts block and platform-finding mechanism; it needs three new finding codes, which ship accept-only in slice 1 so that slice 2 has no deploy skew.
 
 **Measured on the 86 open dataset pull requests** (section 1): the prototype accounts for 5,495 of 5,907 summarizable files; pull requests whose content is incompletely read drop from 31 to 14, and 7 of those 14 are over the 400-file name cut that this design deliberately leaves for slice 3.
-`nemarDatasets/on004551` #1 is fully accounted for in 5 classes and 2,385 characters, and its numbers match its author's own README claims exactly.
+`nemarDatasets/on004551` #1 is fully accounted for in 5 classes and 2,385 characters (a design-time figure, measured with the prototype's rendering; section 8.3 has the as-built text and sizes), and its numbers match its author's own README claims exactly.
 
 ---
 
@@ -78,7 +78,7 @@ All numbers in this document come from a throwaway prototype run on real data, n
 | --- | --- | --- |
 | Files whose content counts as read | 9 | 127 (125 accounted for, 2 raw diffs) |
 | `readIncomplete` | true | false |
-| Prompt text for the 125 tables | 80,000 characters of 9 diffs | 2,385 characters (768 facts, 1,617 fenced) |
+| Prompt text for the 125 tables | 80,000 characters of 9 diffs | 2,385 characters (768 facts, 1,617 fenced; design-time, see section 8.3 for the as-built sizes) |
 | Classes | | 5 |
 | Parse, diff and classify | | 66 to 106 ms |
 
@@ -212,6 +212,10 @@ Whitespace is not a JSON difference (the cosmetic proof handles a reindent).
 A file whose tree is equal but whose token text differs beyond whitespace (a respelled escape) gets the format class `json_respelled`.
 (Phase 2 note: `json_respelled` is deferred to phase 3.
 The parser keeps no token text to compare, so the change model's format words are `bom`, `line_endings`, `line_ending_pattern` and `final_newline`, declared as the type `FormatDetail`; phase 3 adds the fifth word with the renderer that shows it.)
+(Phase 3: `summarizeChanges` adds `json_respelled` when `canonicalJson` of the two trees is equal and the two texts, without their byte order mark and with the whitespace between tokens removed by `stripJsonSpace`, differ.
+It is information only, with no before or after state.
+It is decided only on equal trees: a respelled escape in a document that also changed a value is not reported, since the respelled value is equal for every reader.
+A JSON document's other layout atoms (`bom`, `line_endings`, `final_newline`) come from `formatAtoms` in `summarizeChanges`, outside the JSON diff's totality check; a table's come from its diff, once.)
 
 ### 3.3 Encodings
 
@@ -264,6 +268,21 @@ A **class key** is the tuple `(kind, shape, field, rule)`:
 A class holds the multiset of its distinct `(before, after)` value pairs with counts (for `row_removed`, the removed key or row text; for `json_key_removed`, `name = value`).
 So two files with the same logical change land in the same class whatever their line offsets, unrelated rows, row counts or subject labels, and an edit that differs gets its own pair or its own class.
 
+**The key as built (phase 3).**
+The class key is the JSON text of `[kind, shape, field, rule, detail]`, built by `classKeyOf`:
+
+- `shape` is `entityPattern` of the file's own path for every kind; a `row_relocated` atom's target shape is already its `detail`.
+- `field` is the column for a table kind (never folded: a column name is the author's text) and, for a JSON kind, the atom's path with every array index written `[*]` by `foldIndices`, which passes a bracketed key (`["[0]"]`) over whole: the leaf path for the value kinds, the parent path for the key kinds (the phase 2 atom conventions).
+- `rule` is the relabel rule for `key_relabeled` and `cell_templated` only, compared by its fields in a fixed order.
+- `detail` is in the key for `format` (the word), `row_relocated` (the target shape) and `json_key_renamed` (`old -> new`) only.
+  A removed column's count of non-missing values, a JSON key's name and every value are what a class is made of, so they are not in the key.
+
+A pair is the text `before + U+0000 + after` for the kinds shown by pairs (`cell_replaced`, `cell_emptied`, `json_value_changed`, `json_type_changed`, `json_emptied`) and `text + U+0000` for the removals (`row_removed`: the key or the row's cells joined with a tab; `json_key_removed` and `json_empty_key_removed`: `name = value`).
+No after side can hold U+0000 (a table refuses a NUL byte and canonical JSON escapes it), so the last U+0000 is the separator, while a JSON key name may hold one.
+`DISPLAY_OF` records, per kind, whether it is shown by `pairs`, `removals`, `rule` or is `additive`; like `ROLE_OF` it is a `Record`, so a new kind does not compile without it.
+Examples are the first atom of each of the first two files in review order, or the first two atoms when the class is in one file.
+`classify` orders classes by section 5.1.
+
 ### 4.3 Relabel rules
 
 `relabelRule(before, after, { chars })` returns the first rule that holds, or null; every rule is a function from the before string, so a class of one rule describes every member exactly.
@@ -275,6 +294,14 @@ So two files with the same logical change land in the same class whatever their 
    With empty prefix and suffix and `repadded`, the rule is `repad` ("only the zero padding of numbers changed").
    **Decimals** (phase 2 review, decision D4): a digit run directly before or after a `.` or `,` is compared by its text, not its value, wherever runs are compared.
    So `0.05` to `0.5`, `A1.05` to `A1.5` and `0.05 Hz` to `0.5 Hz` get no `repad`: a tenfold change must never read as formatting.
+   **Joined numbers** (phase 3 review): a digit run joined to another digit run (scanning from it in either direction over runs that are one other character each, the first run that is not one is a digit run) is part of one number written with a separator, so `5 000` to `5 0`, `1'000` to `1'0000`, `1_000` to `1_0000`, `0·05 Hz` to `0·5 Hz` and `1٫05` to `1٫5` get no `repad` either; no list of separators is kept.
+   A letter anywhere between two digit runs breaks the join, so `sub-01_ses-02`, `0100 Hz`, `EEG 001` and `x_02_y` still repad.
+   **The pair decides, by an allowlist** (phase 3 review, replacing the run-by-run reading of D4 and the two-character list of decimal marks): a pair compares its digit runs by VALUE only when, in BOTH strings, every digit run is ASCII and each of its two sides is one of: the edge of the string; a run of ASCII letters that is not one letter with a digit run beyond it; or one space, hyphen or underscore with the edge or such a letter run beyond it (a digit run beyond the separator joins the two, and anything else beyond it is not on the list).
+   Any other neighbor (a dot, a comma, any other punctuation, symbol or space, a format or combining character, a non-ASCII letter or digit, a single letter between two numbers) puts the WHOLE pair in text mode: every digit run of both strings is compared by its text, so no rule between them can say a number kept its value.
+   A list of marks could never be complete (the Arabic decimal separator, a fullwidth full stop, a letter-like apostrophe, a word joiner after a dot, `0p05` in a BIDS name each hid a tenfold change behind "zero padding changed"), so no character is named except the allowed ones.
+   `sub-01_ses-02`, `0100 Hz`, `EEG 001`, `x_02_y`, `E001`, `ECOG1` and `Fp1` still repad; `0.05`, `5 000`, `1'000`, `1e05` and `05 Hz` to `.5 Hz` do not, the last because the mark can be in the text a rule adds, which is why the pair, not the run, decides.
+   Compared as text, a rule that rebuilds the string exactly is still found and never carries `repadded` (`07 Hz` to `.07 Hz` is the prefix `.`).
+   The lookup of section 4.4 indexes every key by its digits' values, so it finds every candidate either reading could accept, and the rule decides.
 4. `insert` or `delete`: the shorter string's runs appear in order in the longer string, a digit run only as a whole digit run of the same value, a letter or other run preferably where it starts and ends on a run boundary of the longer string, else at its first occurrence after the previous match; the rule is the list of inserted texts and the shape (`L`, `D`, `O` per run).
    `GA01` to `EEGGA_01REF` is `"EEG" + letters + "_" + digits + "REF"`.
    **Anchor** (D2): the string with fewer runs must contain at least one digit run, the anchor.
@@ -375,6 +402,10 @@ Owner Question A2 asks whether relocation elsewhere should also count; the defau
 Since `T` names the one file it can serve, no two different files compete for a copy, and the order the files are diffed in does not change what either is told.
 The pool lists the copies of one file in sorted path order, so which of two copies is taken does not depend on the order the pool was built from.
 The caller (phase 3) still diffs the candidate files in sorted path order, so nothing about a run depends on the order git listed the files in; the only consumption that depends on order is a second diff of the same path against the same pool, which the caller never makes.
+(Phase 3: `summarizeChanges` sorts the candidates by path in code-unit order and diffs them in that order.
+A path given twice is refused as `internal_mismatch` every time it appears, so the one order-dependent consumption cannot happen.
+The pool itself is passed to `buildPools` unsorted, which gives the same pools in any order; a mutation run showed a sort there was dead code.
+Phase 3 review: a pool path listed more than once contributes nothing at all, so no row or leaf of either entry is ever a copy and the removals they would explain stay removals; keeping the first entry made the pool depend on the order of the list. A JSON path listed twice is named unreadable rather than left out, so it still stops a move past it as a nearer sidecar would: left out, a key removed from a file and set by that nearer sidecar would read as moved to a farther one.)
 
 **JSON moves.**
 A removed leaf `(p, v)` of file `F` is `json_key_moved` when some added or modified JSON file `T` (not `F`) has leaf `p` with value `v` that it did not have before, and `T` **applies to `F` under BIDS inheritance**: `T`'s directory is `F`'s directory or an ancestor of it, `T` and `F` have the same suffix and extension (everything after the first dot), and every `key-value` entity of `T`'s name is in `F`'s name.
@@ -417,20 +448,27 @@ A class renders whole or not at all.
 export const SUMMARY_LIMITS = {
   maxBlobBytes: 8 * 1024 * 1024, // per file side
   maxRows: 200_000, // per table
+  maxColumns: 10_000, // phase 3 review: per table; a wider header is too_large before it is split
   maxJsonDepth: 64,
   maxJsonNodes: 200_000,
   maxKeyChars: 128, // longer keys get no relabel rule
+  maxNameChars: 1024, // phase 3 review: a longer column name, JSON key or JSON path refuses the file too_large
   maxRuns: 24,
   maxPairingSteps: 12_000_000, // per file: the pairing passes' work, in steps of about one lookup (section 4.4)
   maxTotalBytes: 256 * 1024 * 1024, // all blobs the summary reads in one run
   maxSummaryChars: 30_000, // the fenced block
   maxClasses: 120, // classes rendered
+  maxTrackedClasses: 5_000, // phase 3 review: classes a run may hold; a file that would pass it is refused too_large
   maxPairsPerClass: 12, // distinct value pairs rendered per class
   maxValueChars: 300, // per rendered value
   samplesPerClass: 2,
   timeReserveMs: 40_000, // stop summarizing when less than this is left of the content pass
 } as const;
 ```
+
+(Phase 3 review: `maxNameChars` is counted in UTF-16 code units and checked where a name is read, a table's header and a JSON key, and where a JSON path is joined, before any atom or class key is built from it, because every atom of a file can carry its column or path and the cost of a file would otherwise be its rows times its longest name.
+It is above `maxValueChars` on purpose, so a name between 301 and 1,024 units is summarized and its cut class line makes it incomplete.
+A top-level JSON key of exactly 1,024 units parses, but its path is 1,025 and refuses the file.)
 
 ### 5.3 Completeness
 
@@ -440,13 +478,23 @@ A rendered class is **complete** when:
 - for a **rule** kind (`key_relabeled`, `cell_templated`, `json_key_renamed`, `row_relocated`, `json_key_moved`, `column_removed`, the three reorder kinds, `format`): the class line is rendered (the rule is the full description; examples only illustrate);
 - an **additive** kind is never needed for coverage, rendered or not.
 
+(Phase 3, the stricter reading: a class whose class line was cut is incomplete whatever its kind, because a rule describes its members only if the reader can read which column or key it applies to.
+The line is cut when its shape, a relocation's target, its field, a rename's names or a rule's added text is cut by `renderValue`.
+Phase 3 review: every path is rendered by `renderValue` too, an example's file path included, and a cut example path cuts the class line as well, since a path is a token of the block's grammar; a value cut inside an example changes nothing.)
+
 ### 5.4 At the bounds
 
-- A class that does not fit is not rendered, its number does not appear, and `classes_cut` counts it; the fenced block ends with `(N more change classes not shown)`.
-- A paired class with more than 12 distinct pairs renders 12 and the line `(N more distinct values not shown)`, and is incomplete.
+- A class that does not fit is not rendered, its number does not appear, and `classes_cut` counts it; the fenced block ends with `(N more change classes not shown)` (`(1 more change class not shown)` for one, phase 3 review).
+  (Phase 3: rendering stops at the FIRST class that does not fit `maxClasses` or `maxSummaryChars`, so the shown classes are always a prefix of the order of section 5.1 and a later, smaller class is never shown in place of an earlier one; room for the closing count line is kept from the start, so the block never exceeds `maxSummaryChars`.)
+- A paired class with more than 12 distinct pairs renders 12 and the line `(N more distinct values not shown)` (`(1 more distinct value not shown)` for one), and is incomplete.
 - A file over a per-file cap is refused; a run over `maxTotalBytes` stops reading at the cap and the files not read are refused (`too_large`).
+  (Phase 3: the pure module counts the bytes of both sides of each candidate in sorted path order; the file that would pass the cap and every later one are refused `too_large`, even a small later one. The pool's bytes are bounded by the caller's blob reader, `readBlobs`.)
 - **If the summary pass reaches its deadline, the whole summary is abandoned**: no file is accounted for by it, nothing of it is shown, and `change_summary.abandoned` is true in the facts.
   All-or-nothing is simpler to prove than a partial account, and an abandoned summary leaves today's behavior.
+  (Phase 3: the deadline is checked before each file with the caller's clock, and since the phase 3 review also after each file is folded in and once after the last file, before rendering; an abandoned summary has no outcomes, classes or text, and its loss facts are zero.)
+- **A file whose atoms would make the run hold more than `maxTrackedClasses` classes is refused `too_large`, whole, and the run goes on** (phase 3 review): no atom, class or loss fact of it is kept, it is never accounted for and stays on the raw-diff path, and since the files are folded in sorted path order, which file is refused depends on nothing else.
+  (A first version abandoned the whole run, as the deadline does; one JSON document with thousands of changed leaves then cost every other file its summary.)
+  The files are folded into their classes one at a time, each file's keys computed once and counted before anything of it is folded, and each file's loss facts are added as it is folded, so a run holds its classes (counts, pairs and at most three atoms each, for the examples), never every atom of every file; the examples are rendered only for the first `maxClasses` classes, the only ones that can be shown.
 
 ---
 
@@ -581,7 +629,9 @@ change_summary: {
 }
 ```
 
-The kind words come from a closed table (`KIND_WORDS`), the counts from the platform, and the completeness from section 5.3 (`in full`, `values not all shown`); no attacker text is in this block.
+The kind words come from a closed table (`KIND_WORDS`), the counts from the platform, and the completeness from section 5.3 (`in full`, `not shown in full`); no attacker text is in this block.
+(Phase 3 review: the incomplete word was `values not all shown`; it is `not shown in full` because a class is also incomplete when a token of its line is cut, and the word must not name a cause the block does not have.)
+(Phase 3: `classTable` writes `1 item` and `1 file` in the singular; `KIND_WORDS` gives every kind its own words, so a line names its kind exactly.)
 `fence()` already breaks any `<facts>` text inside fenced material, so the class table cannot be forged from a value.
 
 The existing `changed-metadata-groups` block gains a column, `accounted for by the summary`, and `PathGroup` gains `summarized: number` (an internal type, not in the report).
@@ -601,10 +651,10 @@ fence(
 Each class renders as:
 
 ```text
-C<n> | <shape> | <column "x" | key path | parent path> | <rule words>
+C<n> | "<shape>" | <column "x" | key "path" | under "parent"> | <kind words>[: <rule>]
     "<before>" -> "<after>" x<count>          (paired kinds, at most 12 lines)
     (<k> more distinct values not shown)      (when cut)
-    e.g. <path> row "<key>" -> "<new key>"    (at most 2)
+    e.g. "<path>" row "<key>" -> "<new key>"  (at most 2)
 ```
 
 **Value rendering** (`renderValue`), so that what the model sees is unambiguous:
@@ -614,12 +664,23 @@ C<n> | <shape> | <column "x" | key path | parent path> | <rule words>
 - pairs that are equal after NFC normalization but not byte for byte (a precomposed letter against the letter and a combining mark) render alike and need the annotation below too (Phase 2);
 - when a pair's two rendered texts are equal after the fence's own replacements, or differ only in escaped characters, append `(first difference at character k: U+XXXX to U+YYYY)`, computed on the raw values.
 
-Paths and shapes go through `tidyPath`, as today.
+Paths and shapes are rendered with `renderValue` too (phase 3 review; the design first said `tidyPath`): a path is always one quoted token, so ` | `, quotes, the platform's own words or an invisible character in a path cannot add a field, a line or a look-alike path.
 Nothing from the pull request can start a line: values are escaped, so a newline in a value is `\n`.
 
-### 8.3 The example, computed from `on004551` #1
+**As built (phase 3).**
+The class line is `C<n> | "<shape>" | <field> | <kind words>[: <rule>]`, where the field part is `column "x"` for a table, `key "<leaf path>"` (or `the whole document`) for a JSON value kind, `under "<parent path>"` (or `top level`) for a JSON key kind, and absent for the kinds without a field; the rule part is the relabel rule's words, `to "<target shape>"` for a relocation, the quoted `old -> new` of a rename, or the format word.
+An example line is `e.g. "<file path>"` and what in that file changed (`row "<key>"`, `"<before>" -> "<after>"`, `key "<name>"`, a column's count, a layout change).
+The shape, a relocation's target, every example's file path, column names, JSON paths, rename names and a rule's added text are rendered with `renderValue` (a rule's added text is put where `ruleWords` puts its quotes), so each path is one quoted token and a zero-width prefix and the six characters that spell its escape read differently.
+A cut in any of them, the example paths included, makes the class incomplete (section 5.3).
+A pair line is `"<before>" -> "<after>" x<count>`, a removal's `"<text>" x<count>`; the twelve shown are the most frequent, then by text.
+A pair gets the first-difference note when its rendered texts are equal, when its raw values differ only in characters the renderer escapes, when they are equal after NFC, or when they first differ at a character outside ASCII (so a Latin `a` and a Cyrillic one are annotated, case 10 of section 11); the last condition covers the NFC one, which is kept as the design states it.
 
-Facts (768 characters):
+### 8.3 The example, computed from a run shaped like `on004551` #1
+
+Regenerated (phase 3 review) from a real run of the summary on the `on004551`-shaped test of `test/pr-review-change-summarize.unit.test.ts`, at 125 channel tables of 200 rows: names gain `POL `, four names in every table but the last are wrapped in `EEG ` and `-Ref`, three rows of every second table move verbatim to `sourcedata/channels-removed-2026-10-18/<same path>`, the kept rows are reversed, and two rows are added.
+The real pull request has the same five classes with its own counts (1,203 relocated rows in 56 files, 14,135 and 341 relabels, 2,043 added rows); the text below is the synthetic run's, character for character.
+
+Facts (774 characters):
 
 ```json
 "change_summary": {
@@ -630,42 +691,42 @@ Facts (768 characters):
   "classes_shown": 5,
   "classes_cut": 0,
   "rows_removed_not_found_elsewhere": 0,
-  "rows_removed_found_verbatim_in_sourcedata": 1203,
+  "rows_removed_found_verbatim_in_sourcedata": 186,
   "columns_with_values_removed": 0,
   "keys_removed_not_found_elsewhere": 0,
   "keys_moved_to_an_inherited_sidecar": 0,
   "values_emptied": 0,
   "classes": [
-    "C1 rows removed and found verbatim in a row this pull request adds | 1203 items in 56 files | in full",
-    "C2 rows relabeled | 14135 items in 125 files | in full",
+    "C1 rows removed and found verbatim in a row this pull request adds | 186 items in 62 files | in full",
+    "C2 rows relabeled | 24318 items in 125 files | in full",
     "C3 row order changed | 125 items in 125 files | in full",
-    "C4 rows relabeled | 341 items in 124 files | in full",
-    "C5 rows added | 2043 items in 125 files | in full"
+    "C4 rows relabeled | 496 items in 124 files | in full",
+    "C5 rows added | 250 items in 125 files | in full"
   ]
 }
 ```
 
-Fenced block (1,617 characters):
+Fenced block (1,576 characters):
 
 ```text
-C1 | sub-*/ses-*/ieeg/sub-*_ses-*_task-*_run-*_channels.tsv | column "name" | to sourcedata/channels-removed-2026-10-18/sub-*/ses-*/ieeg/sub-*_ses-*_task-*_run-*_channels.tsv
-    e.g. sub-001/ses-01/ieeg/sub-001_ses-01_task-sleep_run-01_channels.tsv row "B43"
-    e.g. sub-003/ses-01/ieeg/sub-003_ses-01_task-sleep_run-01_channels.tsv row "B15"
-C2 | sub-*/ses-*/ieeg/sub-*_ses-*_task-*_run-*_channels.tsv | column "name" | prefix "POL " added
-    e.g. sub-001/ses-01/ieeg/sub-001_ses-01_task-sleep_run-01_channels.tsv row "A3" -> "POL A3"
-    e.g. sub-002/ses-01/ieeg/sub-002_ses-01_task-sleep_run-01_channels.tsv row "A3" -> "POL A3"
-C3 | sub-*/ses-*/ieeg/sub-*_ses-*_task-*_run-*_channels.tsv | row order changed
-    e.g. sub-001/ses-01/ieeg/sub-001_ses-01_task-sleep_run-01_channels.tsv
-    e.g. sub-002/ses-01/ieeg/sub-002_ses-01_task-sleep_run-01_channels.tsv
-C4 | sub-*/ses-*/ieeg/sub-*_ses-*_task-*_run-*_channels.tsv | column "name" | prefix "EEG " and suffix "-Ref" added
-    e.g. sub-001/ses-01/ieeg/sub-001_ses-01_task-sleep_run-01_channels.tsv row "A1" -> "EEG A1-Ref"
-    e.g. sub-002/ses-01/ieeg/sub-002_ses-01_task-sleep_run-01_channels.tsv row "A1" -> "EEG A1-Ref"
-C5 | sub-*/ses-*/ieeg/sub-*_ses-*_task-*_run-*_channels.tsv | column "name" | rows added
-    e.g. sub-001/ses-01/ieeg/sub-001_ses-01_task-sleep_run-01_channels.tsv row "POL E"
-    e.g. sub-002/ses-01/ieeg/sub-002_ses-01_task-sleep_run-01_channels.tsv row "POL E"
+C1 | "sub-*/ses-*/ieeg/sub-*_ses-*_task-*_run-*_channels.tsv" | column "name" | rows removed and found verbatim in a row this pull request adds: to "sourcedata/channels-removed-2026-10-18/sub-*/ses-*/ieeg/sub-*_ses-*_task-*_run-*_channels.tsv"
+    e.g. "sub-002/ses-01/ieeg/sub-002_ses-01_task-sleep_run-01_channels.tsv" row "B13"
+    e.g. "sub-004/ses-01/ieeg/sub-004_ses-01_task-sleep_run-01_channels.tsv" row "B13"
+C2 | "sub-*/ses-*/ieeg/sub-*_ses-*_task-*_run-*_channels.tsv" | column "name" | rows relabeled: added prefix "POL "
+    e.g. "sub-001/ses-01/ieeg/sub-001_ses-01_task-sleep_run-01_channels.tsv" row "A1" -> "POL A1"
+    e.g. "sub-002/ses-01/ieeg/sub-002_ses-01_task-sleep_run-01_channels.tsv" row "A1" -> "POL A1"
+C3 | "sub-*/ses-*/ieeg/sub-*_ses-*_task-*_run-*_channels.tsv" | row order changed
+    e.g. "sub-001/ses-01/ieeg/sub-001_ses-01_task-sleep_run-01_channels.tsv"
+    e.g. "sub-002/ses-01/ieeg/sub-002_ses-01_task-sleep_run-01_channels.tsv"
+C4 | "sub-*/ses-*/ieeg/sub-*_ses-*_task-*_run-*_channels.tsv" | column "name" | rows relabeled: added prefix "EEG " and suffix "-Ref"
+    e.g. "sub-001/ses-01/ieeg/sub-001_ses-01_task-sleep_run-01_channels.tsv" row "Fp1" -> "EEG Fp1-Ref"
+    e.g. "sub-002/ses-01/ieeg/sub-002_ses-01_task-sleep_run-01_channels.tsv" row "Fp1" -> "EEG Fp1-Ref"
+C5 | "sub-*/ses-*/ieeg/sub-*_ses-*_task-*_run-*_channels.tsv" | column "name" | rows added
+    e.g. "sub-001/ses-01/ieeg/sub-001_ses-01_task-sleep_run-01_channels.tsv" row "POL E"
+    e.g. "sub-002/ses-01/ieeg/sub-002_ses-01_task-sleep_run-01_channels.tsv" row "POL E"
 ```
 
-Total 2,385 characters (about 700 tokens), against the 80,000 characters of diffs it replaces.
+Total 2,350 characters (about 700 tokens), against the 80,000 characters of diffs it replaces in the real pull request.
 The README and CHANGES diffs are still shown raw, and the remaining patch budget shows up to three accounted files as illustration (section 8.5).
 
 ### 8.4 The system prompt
@@ -841,6 +902,8 @@ export function firstDifference(a: string, b: string): string | null;
 export const EMPTY_SUMMARY: ChangeSummary; // abandoned: false, nothing in it
 ```
 
+Phase 3 also exports the pieces `summarizeChanges` is built from, each tested on its own: `DISPLAY_OF` (how each kind is shown completely), `foldIndices`, `classKeyOf`, `classify`, `renderClasses`, `accountedFiles`, `lossFactsOf` with `NO_LOSS`, `classTable`, `summaryFacts`, `stripJsonSpace`, and `summarizeChangesWith`, which takes the two totality checks so a test can prove that a diff the check rejects is refused (`internal_mismatch`) and accounts for nothing.
+
 ### 10.2 `scripts/ci/pr-review-evidence.ts`
 
 ```ts
@@ -939,7 +1002,7 @@ Each case names how the design answers it; the test of section 12 that pins it i
     The summary is abandoned at its deadline (all-or-nothing) and the raw path runs as today; an abandoned summary never accounts for anything.
     Within one file, the relabel passes share a step budget and the keyless and JSON rename passes are linear (section 4.4), so no input makes one file's diff slow, and what the budget leaves unpaired is removed and added. [`deadline abandons`, `pairing budget`]
 17. **A value that forges a class line or the facts.**
-    Values are escaped (no newline), paths are `tidyPath`ed, the class table is in `<facts>`, and `fence()` breaks `<facts` and `<untrusted` in fenced text. [`forged class line`]
+    Values are escaped (no newline), paths are quoted and escaped like values (phase 3 review; first `tidyPath`ed), the class table is in `<facts>`, and `fence()` breaks `<facts` and `<untrusted` in fenced text. [`forged class line`]
 18. **Steering text in a cell.**
     It reaches the model only inside the fence, where the trust-boundary rule applies as to any content. [existing fence tests]
 19. **A mode or type change riding on a content change.**
