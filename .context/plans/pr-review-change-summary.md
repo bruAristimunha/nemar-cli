@@ -210,6 +210,8 @@ A strict recursive-descent parser over the decoded text (same steps 1 to 4 as TS
 
 Whitespace is not a JSON difference (the cosmetic proof handles a reindent).
 A file whose tree is equal but whose token text differs beyond whitespace (a respelled escape) gets the format class `json_respelled`.
+(Phase 2 note: `json_respelled` is deferred to phase 3.
+The parser keeps no token text to compare, so the change model's format words are `bom`, `line_endings`, `line_ending_pattern` and `final_newline`, declared as the type `FormatDetail`; phase 3 adds the fifth word with the renderer that shows it.)
 
 ### 3.3 Encodings
 
@@ -231,18 +233,18 @@ Each summarized file yields atoms of these kinds, each with a **role**.
 | `column_removed` | loss | A column of the before header is not in the after header; carries the count of non-missing values lost |
 | `row_removed` | loss | A before row is matched to nothing after and was not relocated |
 | `json_key_removed` | loss | A leaf with a non-missing value is gone and was not renamed or moved |
-| `row_relocated` | relocated | A before row was removed and appears verbatim in a row the pull request adds at the corresponding `sourcedata` path |
-| `json_key_moved` | relocated | A leaf was removed and the same path and value appear in a JSON file of the pull request that applies to this file by BIDS inheritance |
-| `key_relabeled` | modification | A keyed row's key changed by a relabel rule (section 4.3) |
-| `cell_templated` | modification | A cell changed by a relabel rule of kind `wrap`, `strip`, `repad` or `case` |
+| `row_relocated` | relocated | A before row was removed and appears verbatim in a row the pull request adds at `sourcedata/<one directory>/<its path>` (section 4.6) |
+| `json_key_moved` | relocated | A leaf was removed, the same path and value appear in a JSON file of the pull request that applies to this file by BIDS inheritance, and this file no longer has the leaf's top-level key (section 4.6) |
+| `key_relabeled` | modification | A keyed row's key changed by a relabel rule (section 4.3), with the evidence of section 4.4 |
+| `cell_templated` | modification | A cell changed by a relabel rule of kind `wrap`, `strip` or `repad` (a case change in a cell is `cell_replaced`) |
 | `cell_replaced` | modification | A cell changed from one non-missing value to another |
 | `cell_emptied` | modification | A non-missing cell became missing |
 | `json_value_changed` | modification | A leaf's value changed, type kept |
 | `json_type_changed` | modification | A leaf's value changed type (`"1"` to `1`) |
 | `json_emptied` | modification | A non-missing leaf became missing |
-| `json_key_renamed` | modification | A leaf moved to a sibling key with the same value whose name folds to the same (case and punctuation) or matches by a relabel rule |
+| `json_key_renamed` | modification | A leaf moved to a sibling key with the same value, unique within its parent on both sides, whose name folds to the same (case and punctuation) or matches by a relabel rule (section 4.7) |
 | `json_empty_key_removed` | modification | A leaf whose value was missing was removed |
-| `rows_reordered`, `columns_reordered`, `json_keys_reordered` | modification | Order changed, content kept |
+| `rows_reordered`, `columns_reordered`, `json_keys_reordered` | modification | Order changed, content kept (for tables, decided over every paired row, so a keyless row paired as an edit counts too) |
 | `format` | modification | BOM, line endings, final newline, `json_respelled`, (slice 4) `encoding_repaired` |
 | `column_added`, `row_added`, `cell_filled`, `json_key_added`, `json_filled` | additive | New content, or a missing value filled |
 
@@ -268,30 +270,74 @@ So two files with the same logical change land in the same class whatever their 
 
 1. `case`: equal after `toLowerCase()`.
 2. Split each string into **runs**: a maximal run of letters (`\p{L}`), a maximal run of digits (`\p{N}`), or a single other character.
-   At most 24 runs and 128 characters, else no rule.
+   At most 24 runs and 128 characters (each side checked on its own), else no rule.
 3. `wrap` or `strip`: the shorter string's runs appear contiguously in the longer one's runs, digits compared by value (`01` equals `1`); the rule is the text before and after, plus `repadded` when a digit run's padding differs.
    With empty prefix and suffix and `repadded`, the rule is `repad` ("only the zero padding of numbers changed").
+   **Decimals** (phase 2 review, decision D4): a digit run directly before or after a `.` or `,` is compared by its text, not its value, wherever runs are compared.
+   So `0.05` to `0.5`, `A1.05` to `A1.5` and `0.05 Hz` to `0.5 Hz` get no `repad`: a tenfold change must never read as formatting.
 4. `insert` or `delete`: the shorter string's runs appear in order in the longer string, a digit run only as a whole digit run of the same value, a letter or other run preferably where it starts and ends on a run boundary of the longer string, else at its first occurrence after the previous match; the rule is the list of inserted texts and the shape (`L`, `D`, `O` per run).
    `GA01` to `EEGGA_01REF` is `"EEG" + letters + "_" + digits + "REF"`.
+   **Anchor** (D2): the string with fewer runs must contain at least one digit run, the anchor.
+   Names with no digit run get no `insert` or `delete` rule, so `Cz`/`FCz` and `Pz`/`POz` get none from this rule.
+   `case`, `repad`, `wrap` and `strip` are unchanged by this.
 5. Only when `chars` is true: the shorter string is a character subsequence of the longer one (`DCEMBRACE` to `DC EMBRACE-REF`); the rule is the inserted text after each character position.
+   **Whole runs** (D1): every inserted or deleted text must consist of whole runs of the longer string (the leftmost subsequence is used, and a pair that only another alignment would describe in whole runs gets no rule).
+   This keeps `DCEMBRACE` to and from `DC EMBRACE-REF` (the space and `-REF` are runs of the longer name) and rejects `A1`/`A10`, `sub-2`/`sub-12`, `sub-1`/`sub-10`, `Cz`/`FCz` and `Pz`/`POz`, where the inserted text would join a run that was already there.
+   **No split numbers** (phase 2 delta review, D13): a non-empty gap between two kept characters that are both digits is no rule, in either direction, so `LA12`/`LA1-2`, `LA12`/`LA1-LA2`, `E10`/`E1.0` and `sub-12`/`sub-1-2` are removals and additions; the text would split one number into two or merge two into one.
+
+**No numbers in the added or removed text** (D14).
+A `wrap`, `strip`, `insert`, `delete` or character rule whose gap text holds a digit (`\p{N}`) is no rule, whichever rule found it: a number put in or taken out is never a respelling.
+So `A1` and `A2` removed with `A1-A2` added are two removals and an addition, and `A1-A2` to `A2` is a removal and an addition, while `A01` to `POL A01`, `GA01` to `EEGGA_01REF`, `1` to `sub-1` and `DCEMBRACE` to `DC EMBRACE-REF` keep their rules.
+This holds for cells too: a cell that gains `-A2` is `cell_replaced`.
 
 Numeric pairs (both sides match `^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$`) never get a rule: `64` to `640` is a replaced value, not "suffix 0 added".
-For cells, only `wrap`, `strip`, `repad` and `case` are rules; `insert`, `delete` and character rules are for keys alone.
+For cells, only `wrap`, `strip` and `repad` are rules (D5); `case`, `insert`, `delete` and character rules are for keys alone.
+A cell's case is part of its value (`mV` to `MV` is millivolts to megavolts), so a case change in a cell is `cell_replaced` and its pair is shown.
+
+A rule is a function of the before value except for what `case`, `repad` and the `repadded` flag leave open: they say a spelling changed (which letters are upper case, how many zeros pad a number), never what the new spelling is.
+
+**Residual, stated plainly.**
+A rule says only that a pair *could* be one name respelled.
+Whether a table pairs it is decided by the evidence of section 4.4, and a pair the rules and the evidence allow is shown to the model as a relabel with its rule and its every changed cell.
+The model still sees `insert`, `delete`, `wrap` and `strip` pairs it must judge, the ones whose added text holds no digit: `FC3` to `FCC3h` or `C3` to `CCP3h` (letters matched inside a longer letter run, anchored by the digit), `C3` to `C3h`, `Fz` to `Fz Cz`, each with at least one equal cell that says something and no more changed cells than equal ones.
+Those are shown exactly; they are not hidden, but the platform does not decide whether they are one row.
+The evidence is weak exactly where these pairs arise: in a real `channels.tsv`, columns such as `type`, `units` and the filter cutoffs are the same on every row, so a removed electrode and an unrelated new one have every other cell equal and the strict evidence holds (`FC3` removed with `FCC3h` added pairs as a relabel).
+The model sees the exact pair; phase 3 decides how a small, isolated relabel class is surfaced.
 
 ### 4.4 Keyed tables: the pairing order
 
 For a keyed table, with `gone` the before keys absent after (in before order) and `added` the after keys absent before (in after order):
 
 1. **Strict relabel by lookup.**
-   For each added key, in after order, enumerate the whole key and its substrings that start and end on run boundaries, longest first then leftmost; look each up (digits normalized, lower case) among unpaired gone keys; take the first candidate whose other common cells are all equal and for which `relabelRule(gone, added, { chars: false })` holds.
+   For each added key, in after order, enumerate the whole key and its substrings that start and end on run boundaries, longest first then leftmost; look each up (digits normalized, lower case) among unpaired gone keys; take the first candidate that meets the strict evidence below and for which `relabelRule(gone, added, { chars: false })` holds.
    Then the same from each gone key to the added keys (the `strip` direction).
 2. **Strict relabel by position.**
-   Walk the unpaired gone keys and unpaired added keys with two pointers; pair `(g, a)` when the other cells are all equal and `relabelRule(g, a, { chars: true })` holds; otherwise skip `a` if `g` pairs with the next added key, else skip `g` if the next gone key pairs with `a`, else skip both.
+   Walk the unpaired gone keys and unpaired added keys with two pointers; pair `(g, a)` when the strict evidence holds and `relabelRule(g, a, { chars: true })` holds; otherwise skip `a` if `g` pairs with the next added key, else skip `g` if the next gone key pairs with `a`, else skip both.
 3. **Relocation** (section 4.6) of every still-unpaired gone row.
-4. **Lenient relabel**: steps 1 and 2 again without the equal-cells condition and with `chars: false`.
+4. **Lenient relabel**: steps 1 and 2 again with the lenient evidence below and `chars: false`.
 5. What is left: gone keys are `row_removed`, added keys are `row_added`.
 
+**Evidence** (phase 2 review, decision D3, replacing the earlier "other common cells all equal" and the `strongEvidence` helper).
+Let OTHERS be the non-key common columns; for a candidate pair, EQ is the number of OTHERS cells that are equal and not missing, DIFF the number that differ.
+A cell equal only because both sides are missing proves nothing about whose row it is, so it counts toward neither.
+
+- Rules of kind `case` and `repad` need no evidence: they change how a key is spelled, never which key it is.
+  The strict passes still take them only with DIFF 0, so a row whose cells are all equal is paired before a look-alike whose cells changed; the lenient passes take them whatever the cells.
+- Every other kind (`wrap`, `strip`, `insert`, `delete`, the character rule): in a strict pass DIFF is 0 and EQ is at least 1; in a lenient pass EQ is at least DIFF and EQ is at least 1.
+
+So a table of ids alone, or of `n/a`, has no evidence, and `1` removed with `sub-1` added is a removal and an addition; `FC3 EEG uV` to `FCC3h MISC mV` and `LA1 SEEG uV 0.5` to `LA1-LA2 BIP mV 1` are removals and additions; `DCEMBRACE` to `DC EMBRACE-REF`, `A01` to `POL A01` and `GA01` to `EEGGA_01REF` with their other cells equal and not missing are relabels.
+
+**Bounds** (D10).
+A lookup looks at no more than 64 candidates, counting the ones already paired, and passes a paired prefix of a candidate list with a cursor that only moves forward, so the work of one lookup does not grow with what was paired before it.
+The four relabel passes of one file share one step budget, `maxPairingSteps` (section 5.2): a substring looked up costs one step, and a candidate pair tried costs a fixed part plus one step per 8 characters of the two keys and per 8 compared cells, and one per 8 pairs of runs (the rules match the runs of one name against the runs of the other; D16).
+Rule 4 finds the occurrence of a letter or other run that starts and ends on run boundaries among the runs of the longer name (such an occurrence is always a whole run), so its cost does not grow with how often the text repeats.
+When the budget is spent no further pair is made, and whatever is unpaired is removed and added, exactly as if no rule had held: the budget can only show more change, it never pairs a row it did not check, and it is spent in the same order on every run.
+Measured on a laptop: 100,000 case variants of one word relabel in about 0.2 s; the costliest crafted tables that fit in 8 MiB spend the whole budget in about 0.75 s (100,000 keys of 23 runs tried against keys of 24, each failing only at its last digit) and 0.76 s (keys whose every substring is looked up and missed); legitimate 200,000-row relabels use 28% of the budget (a prefix stripped) to 66% (a prefix added with every age changed, so only the lenient pass pairs them).
+
 Every pair, kept keys included, then has its common non-key cells compared (section 4.1), and the after positions of the paired rows, taken in before order, decide `rows_reordered`.
+
+What this order cannot rule out is a removed row paired with an unrelated new row under a rule the evidence allows (section 4.3, residual).
+Such a pair is a `key_relabeled` atom with its rule and every changed cell beside it, never a silent match.
 
 Why this order: a relabel whose every other cell is equal is the strongest evidence that a row is the same row; a verbatim copy is the next strongest evidence that a row was removed on purpose; a relabel on the name alone is the weakest.
 A mistake in this order can only turn "relocated" into "relabeled with changed cells" or into "removed", that is, into more visible change or into a loss fact; it can never make content vanish from the account (section 6.2).
@@ -301,10 +347,14 @@ A mistake in this order can only turn "relocated" into "relabeled with changed c
 1. Rows are projected on the common columns (before order) and joined with `\t` (injective, since no cell holds a tab).
 2. Multiset match: each after row takes the earliest unconsumed equal before row; the matched before indices, in after order, decide `rows_reordered`.
 3. Relocation of each unmatched before row (full before row).
-4. Two-pointer pairing of the remaining before and after rows, in file order, accepting a pair only when **at most half** of the common columns differ; a paired row's differing cells become cell atoms.
+4. Two-pointer pairing of the remaining before and after rows, in file order, accepting a pair only when **at most half** of the common columns differ **and** EQ is at least DIFF, where EQ counts only the equal common cells that are not missing (D6); a paired row's differing cells become cell atoms.
+   (The first condition follows from the second, since EQ + DIFF is at most the number of common columns; it stays as the statement of what an edit is.)
+   It needs no step budget: it compares at most three pairs of rows per row, each over the common columns, so its work is bounded by the size of the table (a few million cell comparisons at the 8 MiB cap).
 5. What is left: `row_removed` and `row_added`.
 
 The half-columns condition makes a deleted event and an unrelated new event a removal plus an addition (a loss fact) instead of a "changed onset and trial type".
+The EQ condition does the same where the equal cells are all `n/a`: `1.0 n/a go n/a n/a n/a n/a` and `9.3 n/a stop n/a n/a n/a n/a` differ in two of seven columns, but share nothing that says something, so they are a removal and an addition (case 20 of section 11).
+A pair that meets both conditions is shown as an edit, its changed cells listed; the paired rows also count toward `rows_reordered`.
 
 ### 4.6 Relocation
 
@@ -312,23 +362,45 @@ The **row pool** is built before any file is diffed: for every pool file, the ro
 
 A removed row of file `F`, with before header `H`, is **relocated** when some pool file `T` satisfies all of:
 
-- `T` is not `F`;
-- `T` starts with `sourcedata/` and ends with `/` + `F` (its full path), the layout the canary uses (`sourcedata/channels-removed-2026-10-18/<F>`);
-- `T`'s after header equals `H` exactly;
+- `T` is exactly `sourcedata/<D>/<F>`, where `D` is one path segment with no slash and `F` is the full path of `F`: the layout the canary uses (`sourcedata/channels-removed-2026-10-18/<F>`) and nothing looser (D9).
+  `sourcedata/<F>` itself (the file's own path one level down, where a dataset may keep a real table) and any deeper nesting (`sourcedata/a/b/<F>`) do not count, and `T` is never `F`;
+- `T`'s after header equals `H` (the BEFORE header of `F`) exactly;
 - `T` has an unconsumed pool row equal to the removed row; that count is decremented.
 
 Two identical removed rows and one copy give one relocated row and one removed row.
 A copy that differs in one byte (a redacted name) is not a relocation.
 Owner Question A2 asks whether relocation elsewhere should also count; the default is no, and every relocation on the open set uses the corresponding path.
 
+**Order.**
+Since `T` names the one file it can serve, no two different files compete for a copy, and the order the files are diffed in does not change what either is told.
+The pool lists the copies of one file in sorted path order, so which of two copies is taken does not depend on the order the pool was built from.
+The caller (phase 3) still diffs the candidate files in sorted path order, so nothing about a run depends on the order git listed the files in; the only consumption that depends on order is a second diff of the same path against the same pool, which the caller never makes.
+
 **JSON moves.**
-A removed leaf `(p, v)` of file `F` is `json_key_moved` when some added or modified JSON file `T` (not `F`) has leaf `p` with value `v` that it did not have before, and `T` **applies to `F` under BIDS inheritance**: `T`'s directory is `F`'s directory or an ancestor of it, `T` and `F` have the same suffix and extension, and every `key-value` entity of `T`'s name is in `F`'s name.
+A removed leaf `(p, v)` of file `F` is `json_key_moved` when some added or modified JSON file `T` (not `F`) has leaf `p` with value `v` that it did not have before, and `T` **applies to `F` under BIDS inheritance**: `T`'s directory is `F`'s directory or an ancestor of it, `T` and `F` have the same suffix and extension (everything after the first dot), and every `key-value` entity of `T`'s name is in `F`'s name.
+In addition (D7), `F`'s after document must be an object that does not contain the leaf's **top-level key** at all.
+The BIDS validator merges sidecars one level deep: a nearer file that has a top-level key replaces the farther file's whole value under it, so a nested leaf removed from a key `F` keeps is gone for `F` however many sidecars hold it.
+A leaf with no top-level key (the root of a non-object document) and a document that is no longer an object are never moved.
+**The nearest changed sidecar decides** (phase 2 delta review, D12): the pool records the top-level keys of the after document of EVERY JSON file the pull request adds or modifies, whether it adds a leaf or not, and names the ones whose after document cannot be read.
+Among the files that apply to `F` and have the leaf's top-level key (an unreadable one counts as having every key), the nearest is the one whose value `F` sees: the deepest directory first, then the most name entities.
+The leaf is moved only if that nearest file is a home of the leaf (it holds the same path and value as a leaf it did not have before).
+A tie between two equally near files is not decidable and means not moved, and so does an unreadable nearest file.
+So `F` dropping `SamplingFrequency: 500` while the root sidecar gains `500` and the subject sidecar, nearer, has `250` (new, or already there with something else changed) is `json_key_removed`.
+A nearer file that already held the same value before is not a home either, so that case is a removed key too: the conservative reading, and the same answer an unchanged nearer file gets.
 Otherwise it is `json_key_removed`.
+
+**Remaining limit of the move rule.**
+A nearer sidecar that the pull request CHANGED is handled above.
+An UNCHANGED sidecar between `T` and `F` (nearer to `F` than `T`) that has the top-level key also overrides the moved value, and the pure module, which reads only the files the pull request changed, cannot see it.
+The move is then shown as `json_key_moved` though the value no longer reaches `F`.
+The model prompt (section 8.4) tells the model that a moved key reaches the file only if no nearer sidecar that the pull request did not change has the same top-level key, so the model weighs that limit instead of the platform deciding it.
 
 ### 4.7 JSON renames
 
 A removed leaf and an added leaf are a `json_key_renamed` pair when they have the same parent path and the same value, and their last names are equal after lower-casing and removing every character that is not a letter or digit, or when `relabelRule(oldName, newName, { chars: false })` holds.
-Each added leaf is used at most once; candidates are taken in before order.
+Punctuation with a digit on both sides is part of a number and is not removed by the folding (D15): `12` to `1.2` and `0.5` to `05` are a removed key and an added one, not a rename.
+In addition (D8), the shared value must be **unique within its parent** in the before document and in the after document: a shared value is no evidence of which key became which, so with `go` and `go2` both `"Go"`, `go` removed and `go3` added is `json_key_removed` plus `json_key_added`, not a rename.
+A removed leaf then has at most one candidate, and a relabel rule refuses a name over 128 characters before reading it, so the pass is linear in the document and needs neither a candidate cap nor the step budget of section 4.4.
 
 ---
 
@@ -349,6 +421,7 @@ export const SUMMARY_LIMITS = {
   maxJsonNodes: 200_000,
   maxKeyChars: 128, // longer keys get no relabel rule
   maxRuns: 24,
+  maxPairingSteps: 12_000_000, // per file: the pairing passes' work, in steps of about one lookup (section 4.4)
   maxTotalBytes: 256 * 1024 * 1024, // all blobs the summary reads in one run
   maxSummaryChars: 30_000, // the fenced block
   maxClasses: 120, // classes rendered
@@ -406,6 +479,9 @@ Let `F` be accounted for.
    Every column is common, removed or added.
    Every before leaf is unchanged, changed, emptied, renamed, moved, or removed; every after leaf is unchanged, changed, filled, renamed or added.
    Nothing falls through: the implementation asserts that the counts add up (before rows = matched + paired + relocated + removed; after rows = matched + paired + added) and refuses the file (`internal_mismatch`) if they do not.
+   The tallies are counted from the fate of each row or leaf, and the assertion (D11) then counts the atoms that were emitted and requires them to agree, kind by kind: one `row_removed` per removed row, one `row_added` per added row, one `row_relocated` per relocated row, one `key_relabeled` per keyed pair, one cell atom per differing cell of a paired row, one atom per removed or added column, and the same for every JSON fate, with no atom of any other kind.
+   So a dropped or an extra atom is refused too, not only a row that fell through.
+   A reconstruction oracle written apart from the module (`test/pr-review-change-model.unit.test.ts`) rebuilds the before version from the after version and the atoms on 6,000 generated tables and 6,000 generated documents.
 3. *Every non-additive atom is in a class that was shown exactly.* A rule is a function of the before value (section 4.3), a pair list is complete (section 5.3), a relocation names the target shape and was checked byte for byte.
    So for every piece of before content the model has seen either "unchanged", or the exact rule or pair that produced its after value, or "removed" (and the platform has added a loss fact for an unrelocated removal).
 4. *Additive atoms remove nothing.* They add rows, columns, keys or values where there were none.
@@ -596,7 +672,7 @@ The README and CHANGES diffs are still shown raw, and the remaining patch budget
 
 `REVIEW_SYSTEM_PROMPT` gains one paragraph, inserted after the sentence that ends "never by a heading."; `V3_RULES` and every sentence a test pins stay word for word.
 
-> The change summary. The platform parsed the changed .tsv and .json files before and after the change and put every difference it found into change classes. The class table in the facts (change_summary.classes) is the platform's: its class numbers, kinds, counts and completeness are reliable. The changed-metadata-summary block gives, for each class number, the path shape, the column or key, the exact rule (for example a prefix added to every name, or each distinct value before and after with how many times it changed) and up to two examples; its text is the pull request's own and is material to review. A class describes every one of its items exactly, so judge the change from its rule: you do not need to see each file. A file whose changes all sit in classes shown in full counts as shown in full, and changed_metadata_not_shown_in_full already accounts for every other file. Rows, columns and keys removed without the same content appearing elsewhere in this pull request are counted in the facts and have already been reported to a person; say what was removed. Rows found verbatim in sourcedata still exist in the dataset at the place named; judge whether moving them there loses anything for a user of the dataset. A relabel, a replaced value or an emptied value is not a loss by itself: judge whether it makes the dataset less correct or less usable, and check that the CHANGES entry and the description account for it. A summary marked abandoned was not used.
+> The change summary. The platform parsed the changed .tsv and .json files before and after the change and put every difference it found into change classes. The class table in the facts (change_summary.classes) is the platform's: its class numbers, kinds, counts and completeness are reliable. The changed-metadata-summary block gives, for each class number, the path shape, the column or key, the exact rule (for example a prefix added to every name, or each distinct value before and after with how many times it changed) and up to two examples; its text is the pull request's own and is material to review. A class describes every one of its items exactly, so judge the change from its rule: you do not need to see each file. A file whose changes all sit in classes shown in full counts as shown in full, and changed_metadata_not_shown_in_full already accounts for every other file. Rows, columns and keys removed without the same content appearing elsewhere in this pull request are counted in the facts and have already been reported to a person; say what was removed. Rows found verbatim in sourcedata still exist in the dataset at the place named; judge whether moving them there loses anything for a user of the dataset. A relabel, a replaced value or an emptied value is not a loss by itself: judge whether it makes the dataset less correct or less usable, and check that the CHANGES entry and the description account for it. A relabel says the platform paired a removed key with a new one under a rule and enough equal cells; judge from the rule and the changed cells beside it whether the two are one row, and treat a pair that is not as a removal. A key moved to a sidecar that applies by inheritance has been checked against every sidecar this pull request changed, nearer ones included; it still reaches the file only if no nearer sidecar that this pull request did not change has the same top-level key, which the platform cannot see, so weigh that from the path shape. A summary marked abandoned was not used.
 
 ### 8.5 Interplay with the raw-diff path
 
@@ -831,7 +907,8 @@ Each case names how the design answers it; the test of section 12 that pins it i
 1. **A removed row hidden among thousands of relabels.**
    Every before row ends in exactly one bucket and the counts are asserted (section 6.2); a removed row is a `row_removed` atom and a platform finding whatever surrounds it. [`removed row among 500 relabels`]
 2. **A destructive relabel disguised as a harmless one.**
-   A relabel class is one rule for all its members; a row relabeled differently is in another class, shown separately; a key changed to something unrelated gets no rule and becomes removed plus added. [`relabel rules`]
+   A relabel class is one rule for all its members; a row relabeled differently is in another class, shown separately; a key changed to something unrelated gets no rule and becomes removed plus added.
+   A rule that changes a key's text needs evidence from the rest of the row (section 4.4), and a character rule inserts only whole runs, so `A1` removed and `A10` added are never one channel. [`relabel rules`]
 3. **Removing a row and "relocating" it to a junk file.**
    Relocation counts only into `sourcedata/.../<same path>` with the same header and the same bytes (default); a copy elsewhere, or a copy with one byte changed (the real `on007119` redaction), is a removal. [`relocation is exact and corresponding`]
 4. **Stealing another file's relocated copy.**
@@ -857,9 +934,10 @@ Each case names how the design answers it; the test of section 12 that pins it i
 14. **Rename or case-only rename of a file.**
     `--no-renames` makes it a removal and an addition; the removal rule already applies. [existing tests]
 15. **A JSON key moved somewhere it no longer applies.**
-    A move counts only into a sidecar that applies by BIDS inheritance; elsewhere it is a removed key. [`json moved needs inheritance`]
+    A move counts only into a sidecar that applies by BIDS inheritance, and only when the file no longer has the key's top-level key; elsewhere, or under a top-level key the file keeps, it is a removed key. [`json moved needs inheritance`]
 16. **Slow input to time out the review.**
-    The summary is abandoned at its deadline (all-or-nothing) and the raw path runs as today; an abandoned summary never accounts for anything. [`deadline abandons`]
+    The summary is abandoned at its deadline (all-or-nothing) and the raw path runs as today; an abandoned summary never accounts for anything.
+    Within one file, the relabel passes share a step budget and the keyless and JSON rename passes are linear (section 4.4), so no input makes one file's diff slow, and what the budget leaves unpaired is removed and added. [`deadline abandons`, `pairing budget`]
 17. **A value that forges a class line or the facts.**
     Values are escaped (no newline), paths are `tidyPath`ed, the class table is in `<facts>`, and `fence()` breaks `<facts` and `<untrusted` in fenced text. [`forged class line`]
 18. **Steering text in a cell.**
@@ -867,7 +945,7 @@ Each case names how the design answers it; the test of section 12 that pins it i
 19. **A mode or type change riding on a content change.**
     Not a candidate; raw path. [`mode change is not summarized`]
 20. **A keyless table where one event is deleted and another added.**
-    The half-columns rule makes it a removal plus an addition. [`keyless pairing`]
+    The half-columns rule, and the rule that equal missing cells are no evidence, make it a removal plus an addition. [`keyless pairing`]
 
 ---
 
@@ -883,6 +961,7 @@ Each case names how the design answers it; the test of section 12 that pins it i
 - Parse, diff and classify are linear: 0.45 ms per file on average over the open set (2.6 s for 5,907 files), 0.74 ms on the largest (567 ms for 768 files).
   For 2,000 files expect under 2 s on a laptop and under 4 s on a runner.
 - Relabel lookups are bounded by 24 runs and 128 characters per key (at most 300 substrings per key) and positional passes are linear.
+  Every relabel pass of a file spends from one step budget (`maxPairingSteps`, section 4.4), and the keyless and JSON rename passes are linear, so no input makes one file's diff take more than about a second on a laptop; past the budget, what is unpaired is removed and added.
 - **Budget**: the content pass keeps its 120 s (`EVIDENCE_BUDGET_MS.content`); the summary starts only if more than `timeReserveMs` (40 s) remain and abandons itself at that line, which leaves the raw path its own 20 s reserve as today.
   No new budget enters the job's worst case (ADR 0107's 45.4 minutes are unchanged), and `test/pr-review-workflow.test.ts` needs no new term.
 - **Memory**: `maxTotalBytes` (256 MiB) bounds what the summary holds; the largest open pull request read 20.6 MB.
