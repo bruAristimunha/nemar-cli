@@ -17,6 +17,11 @@
 #   diff-<id>.txt       the gating errors that differ, for each changed dataset
 #   run/                the raw reports, stderr and annex lists, kept as evidence
 #
+# The clones of the reference datasets, and the canary layouts the script generates, are working
+# copies, not evidence. They are made in a temporary directory outside <dir> (under $TMPDIR, or
+# /tmp) and removed when the script exits, so <dir>, which a job may upload whole, holds only the
+# comparison.
+#
 # A dataset that cannot be cloned or validated is listed as not compared, and named with its reason
 # on stderr. It is never reported as unchanged. The script then exits 1, so an incomplete comparison
 # fails the job that runs it; --allow-partial accepts a partial comparison for a manual run.
@@ -73,11 +78,18 @@ if ! mkdir -p "$OUT" 2>/dev/null || ! OUT=$(cd "$OUT" && pwd); then
   exit 1
 fi
 RUN="$OUT/run"
-DATA="$OUT/data"
-if ! mkdir -p "$RUN" "$DATA" || ! printf 'dataset\tstatus\tgating_old\tgating_new\tchanged\tnote\n' > "$OUT/results.tsv"; then
+if ! mkdir -p "$RUN" || ! printf 'dataset\tstatus\tgating_old\tgating_new\tchanged\tnote\n' > "$OUT/results.tsv"; then
   echo "compare-gating.sh: cannot write into $OUT" >&2
   exit 1
 fi
+
+# The clones and the generated layouts live in a temporary directory that every exit removes, so
+# they never reach $OUT. The script stops if it cannot make one: an empty path would put them in /.
+if ! DATA=$(mktemp -d "${TMPDIR:-/tmp}/compare-gating-data.XXXXXX"); then
+  echo "compare-gating.sh: cannot create a temporary directory for the clones" >&2
+  exit 1
+fi
+trap 'rm -rf "$DATA"' EXIT
 
 # Diff files left by an earlier run in the same directory would describe a comparison that no
 # longer holds, so they are removed before this run writes its own.
@@ -127,15 +139,14 @@ make_canary() {
 TARGETS=()
 for id in $IDS; do
   dir="$DATA/$id"
-  if [ ! -d "$dir/.git" ]; then
+  # DATA is new for this run, so a directory exists here only when --ids names the id twice.
+  rm -rf "$dir"
+  # A connection below 1 KB/s for two minutes is abandoned, so a stalled clone fails its own row
+  # rather than holding the job until the job's timeout.
+  if ! GIT_TERMINAL_PROMPT=0 GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=120 git clone --depth 1 --quiet "https://github.com/nemarDatasets/$id.git" "$dir" 2>"$RUN/$id.clone.err"; then
     rm -rf "$dir"
-    # A connection below 1 KB/s for two minutes is abandoned, so a stalled clone fails its own row
-    # rather than holding the job until the job's timeout.
-    if ! GIT_TERMINAL_PROMPT=0 GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=120 git clone --depth 1 --quiet "https://github.com/nemarDatasets/$id.git" "$dir" 2>"$RUN/$id.clone.err"; then
-      rm -rf "$dir"
-      printf '%s\tnot_compared\t-\t-\t-\tclone failed: %s\n' "$id" "$(failure_note "$RUN/$id.clone.err")" >> "$OUT/results.tsv"
-      continue
-    fi
+    printf '%s\tnot_compared\t-\t-\t-\tclone failed: %s\n' "$id" "$(failure_note "$RUN/$id.clone.err")" >> "$OUT/results.tsv"
+    continue
   fi
   TARGETS+=("$id|$dir")
 done

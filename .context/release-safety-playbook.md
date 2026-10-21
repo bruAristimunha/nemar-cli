@@ -29,7 +29,7 @@ The gaps are documented at the end.
 1. **Feature branch -> PR to `dev`.**
    `test.yml` runs: `lint` + `unit-pure` (required) and `integration-dev` (soft on dev, drives the live dev worker), plus `e2e-sandbox`, `api-test`, `publish`.
    Merge is squash.
-2. **Merge to `dev`** runs `auto-bump-dev.yml`, which bumps the `-devN` version and then calls `deploy-backend.yml` once on the bump (every bumped merge, as the bump touches `backend/package.json`; an unbumped push only on `backend/**`, `shared/**` or a change to `deploy-backend.yml` itself): applies migrations to `nemar-db-dev`, deploys `nemar-api-dev`, then the new **/health smoke** asserts the deployed version is serving.
+2. **Merge to `dev`** runs `auto-bump-dev.yml`, which bumps the `-devN` version and then calls `deploy-backend.yml` once on the bump (every bumped merge, as the bump touches `backend/package.json`; an unbumped push only on `backend/**`, `shared/**`, `validator-version.json` or a change to `deploy-backend.yml` itself): applies migrations to `nemar-db-dev`, deploys `nemar-api-dev`, then the new **/health smoke** asserts the deployed version is serving.
    Website: push to the `staging` branch triggers `deploy-test.yml` -> `test.nemar.org`.
 3. **Exercise on staging** (see next section) before promoting.
 4. **`dev -> main` PR** runs `test.yml` with `integration-dev` now **required**.

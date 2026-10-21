@@ -1,6 +1,6 @@
 # ADR 0108: The BIDS validator tracks the newest stable release, and a pin move is a reviewed bump
 
-**Status:** proposed
+**Status:** accepted
 **Date:** 2026-10-20
 **Owner:** Seyed Yahya Shirazi
 

@@ -13,7 +13,7 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
-## 0.10.22 - 2026-10-20
+## 0.10.22 - 2026-10-21
 
 The Worker's report parser now accepts three finding codes that nothing emits yet.
 This release has no migration and sets no new Worker secret or variable.
@@ -36,6 +36,7 @@ It moves the Brain Imaging Data Structure (BIDS) validator from 2.4.1 to 3.0.2, 
 - **A validator run that fails is reported as a failure.**
   An exit other than 0 (valid) or 16 (errors found) is a failed run: `nemar dataset validate` shows the validator's own message and exits with its code.
   A report without a list of issues is refused rather than read as clean.
+  The message for a failed run is written to stderr, not stdout, so a script that reads only stdout sees no error text.
 
 ### Production behavior changes
 

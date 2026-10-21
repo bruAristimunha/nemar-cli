@@ -17,6 +17,7 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -117,17 +118,13 @@ describe("compare-gating.sh", () => {
   }, 120_000);
 
   test("a release compared with itself changes nothing, on the fixture and all three layouts", () => {
-    const run1 = compare([
-      "--old",
-      "3.0.2",
-      "--new",
-      "3.0.2",
-      "--ids",
-      "",
-      "--local",
-      FIXTURE,
-      "--canary",
-    ]);
+    // The script makes its working copies in a directory under TMPDIR, so a directory of our own
+    // shows what the script leaves behind.
+    const scratch = freshDir("compare-scratch-");
+    const run1 = compare(
+      ["--old", "3.0.2", "--new", "3.0.2", "--ids", "", "--local", FIXTURE, "--canary"],
+      { TMPDIR: scratch },
+    );
     expect(run1.exitCode).toBe(0);
     expect(rows(run1.out)["bids-minimal"]?.slice(1, 5)).toEqual(["compared", "0", "0", "no"]);
     // A key-shaped annex link: the central gate filters it, and no release changes it.
@@ -141,6 +138,10 @@ describe("compare-gating.sh", () => {
     // A bare broken link: under 3.0.2 the detector's sidecar error survives the filter.
     expect(rows(run1.out)["detector-bare-link"]?.slice(1, 5)).toEqual(["compared", "1", "1", "no"]);
     expect(readOut(run1.out, "summary.md")).toContain("Compared 4 of 4 datasets; 0 changed.");
+    // The clones and the generated layouts are working copies, not evidence. They are made outside
+    // the output directory, which the bump job uploads whole, and removed when the script exits.
+    expect(existsSync(join(run1.out, "data"))).toBe(false);
+    expect(readdirSync(scratch)).toEqual([]);
   }, 120_000);
 
   test("only the bare-link detector's gating verdict changes between 2.4.1 and 3.0.2", () => {
@@ -176,6 +177,23 @@ describe("compare-gating.sh", () => {
     ).toBe(0);
     expect(readOut(out, "summary.md")).not.toContain("### detector-bare-link");
     expect(existsSync(join(out, "diff-detector-bare-link.txt"))).toBe(false);
+  }, 120_000);
+
+  test("a reference dataset is cloned and compared, and only the comparison is kept", () => {
+    // The one test of a successful clone: a real clone of the public exemplar xx099900, one of the
+    // script's default reference ids. What the dataset's own error counts are may change, so this
+    // checks that it was cloned and compared (the same release on both sides never changes), and
+    // that the clone is gone when the script exits.
+    const scratch = freshDir("compare-clone-scratch-");
+    const cloned = compare(["--old", "3.0.2", "--new", "3.0.2", "--ids", "xx099900"], {
+      TMPDIR: scratch,
+    });
+    expect(cloned.exitCode).toBe(0);
+    const row = rows(cloned.out).xx099900;
+    expect(row?.[1]).toBe("compared");
+    expect(row?.[4]).toBe("no");
+    expect(existsSync(join(cloned.out, "data"))).toBe(false);
+    expect(readdirSync(scratch)).toEqual([]);
   }, 120_000);
 
   test("a dataset that cannot be cloned fails the run, unless partial results are accepted", () => {

@@ -223,11 +223,27 @@ describe("scripts/ci/classify-push.sh", () => {
       BOT,
       "chore: bump version to 0.10.18-dev5",
     );
+    // The pin file is a deploy path as well, so this push touches one even though it is no bump.
     expect(classify(base, pin, BOT, "chore: bump version to 0.10.18-dev5")).toEqual({
       ...ORDINARY_BUMP,
-      deploy_paths: "false",
+      deploy_paths: "true",
     });
     base = pin;
+  });
+
+  test("a push that changes only the validator pin is ordinary and touches a deploy path", () => {
+    // The Worker bundles validator-version.json. Before the file was listed, such a push matched
+    // no deploy path, so dev kept the previous pin until some later backend change.
+    const moved = commit(
+      { "validator-version.json": '{ "version": "2.0.3" }\n' },
+      HUMAN,
+      "chore: move the validator pin",
+    );
+    expect(classify(base, moved, HUMAN, "chore: move the validator pin")).toEqual({
+      ...ORDINARY_BUMP,
+      deploy_paths: "true",
+    });
+    base = moved;
   });
 
   test("a bot 'bump' that changes package.json beyond the version is ordinary", () => {
