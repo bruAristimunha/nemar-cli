@@ -63,6 +63,12 @@ export const SUMMARY_LIMITS = {
   maxRuns: 24,
   maxPairingSteps: 12_000_000, // per file: the pairing passes' work, in steps of about one lookup
   maxTotalBytes: 256 * 1024 * 1024, // all blobs the summary reads in one run
+  // What the relocation pools hold in one run, in UTF-16 code units: a table's header and new rows,
+  // and a JSON document's top-level keys and, per new leaf, its path, its value and its key in
+  // `byLeaf`. `maxTotalBytes` does not bound this: a leaf repeats its whole path, so a document can
+  // hold hundreds of times its size. A pool file that would pass it is left out as one that cannot
+  // be read (see `buildPools`).
+  maxPoolChars: 32 * 1024 * 1024,
   maxSummaryChars: 30_000, // the fenced block
   maxClasses: 120, // classes rendered
   // Distinct classes a run may hold. A file whose atoms would make more is refused `too_large`
@@ -1385,9 +1391,21 @@ export interface JsonLeaf {
  * the bound is ever built, and the caller refuses the file (`too_large`).
  */
 export function flattenJson(root: JsonValue): JsonLeaf[] | null {
+  const leaves = leavesWithin(root, Number.POSITIVE_INFINITY);
+  return typeof leaves === "string" ? null : leaves;
+}
+
+/**
+ * The walk of {@link flattenJson}, which also stops once the paths and values of the leaves it has
+ * found pass `maxChars` code units together: `too_long` for a path over `maxNameChars`,
+ * `over_budget` for `maxChars`, whichever the walk meets first in source order. So a caller with a
+ * bound never has a document flattened further than it could hold (see `jsonPart`).
+ */
+function leavesWithin(root: JsonValue, maxChars: number): JsonLeaf[] | "too_long" | "over_budget" {
   const out: JsonLeaf[] = [];
   const max = SUMMARY_LIMITS.maxNameChars;
-  let tooLong = false;
+  let stop: "too_long" | "over_budget" | null = null;
+  let chars = 0;
   const walk = (
     v: JsonValue,
     path: string,
@@ -1401,18 +1419,18 @@ export function flattenJson(root: JsonValue): JsonLeaf[] | null {
         // A segment is at least the key and one character, so a key that cannot fit is never
         // escaped either.
         if (path.length + key.length + 1 > max) {
-          tooLong = true;
+          stop = "too_long";
           return;
         }
         const segment = BARE_KEY.test(key) ? `.${key}` : `[${JSON.stringify(key)}]`;
         if (path.length + segment.length > max) {
-          tooLong = true;
+          stop = "too_long";
           return;
         }
         // The root (the one place whose path is empty) holds the top-level keys; below them the
         // top-level key is inherited.
         walk(v.v.get(key) as JsonValue, path + segment, path, key, true, path === "" ? key : top);
-        if (tooLong) return;
+        if (stop !== null) return;
       }
       return;
     }
@@ -1420,18 +1438,24 @@ export function flattenJson(root: JsonValue): JsonLeaf[] | null {
       for (let i = 0; i < v.v.length; i++) {
         const segment = `[${i}]`;
         if (path.length + segment.length > max) {
-          tooLong = true;
+          stop = "too_long";
           return;
         }
         walk(v.v[i] as JsonValue, path + segment, path, segment, false, top);
-        if (tooLong) return;
+        if (stop !== null) return;
       }
       return;
     }
-    out.push({ path, parent, name, isKey, top, value: canonicalJson(v), json: v });
+    const value = canonicalJson(v);
+    chars += path.length + value.length;
+    if (chars > maxChars) {
+      stop = "over_budget";
+      return;
+    }
+    out.push({ path, parent, name, isKey, top, value, json: v });
   };
   walk(root, "", "", "", false, null);
-  return tooLong ? null : out;
+  return stop ?? out;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1542,89 +1566,106 @@ function sameCells(a: readonly string[], b: readonly string[]): boolean {
  * pool depend on the order of `files`; keeping neither means no row or leaf of either can be shown
  * relocated or moved, so the removals they would have explained stay removals. A JSON path listed
  * twice is named `unreadable`, never simply left out: left out, a nearer sidecar that sets a key
- * would no longer stop a move past it, and a removed key would read as moved. Nothing else about
- * the pool depends on the order of `files`.
+ * would no longer stop a move past it, and a removed key would read as moved.
+ *
+ * **What the pools hold is bounded by `maxPoolChars`** (UTF-16 code units, over the whole pool):
+ * a table's header and each distinct new row, as the cells joined with tabs; a JSON document's
+ * top-level keys, and for each new leaf its path, its value and its key in `byLeaf`. A file whose
+ * pieces would take the total past the bound is left out as one that cannot be read, and the next
+ * file is tried: a table is skipped (none of its rows is a copy, so a removal it would have
+ * explained stays a removal) and a JSON document is `unreadable` (it is never a home and stops
+ * every move past it). A file is counted as it is read and dropped as soon as it passes what is
+ * left, so no file is held whole past the bound; a document added whole is not even flattened past
+ * it. A document whose leaves pass the bound before its walk reaches a path over `maxNameChars` is
+ * therefore `unreadable` rather than kept for its top-level keys alone, the stricter of the two.
+ *
+ * Which files fit is decided in code-unit path order, whatever the order of `files`; what fits is
+ * then added in the order given, which only orders the lists below. So nothing about the pools
+ * depends on the order of `files` but the order of the paths within one list, which no reader of
+ * the pools depends on.
  */
-export function buildPools(files: readonly PoolFile[]): { rows: RowPool; json: JsonPool } {
+export function buildPools(files: readonly PoolFile[]): Pools {
+  return poolsWithin(files, () => false) as Pools;
+}
+
+/** The two pools of a run (see {@link buildPools}). */
+type Pools = { rows: RowPool; json: JsonPool };
+
+/** What one pool file adds to the pools: decided for every file before anything is added. */
+type PoolPart =
+  | { kind: "nothing" }
+  | { kind: "unreadable" }
+  | { kind: "table"; header: string; rows: Map<string, number>; chars: number }
+  | {
+      kind: "json";
+      topKeys: readonly string[];
+      /** Null when the document's leaves are left out (a side that does not parse, a long path). */
+      fresh: Map<string, string> | null;
+      /** The `byLeaf` key of each entry of `fresh`, in its order. */
+      leafKeys: readonly string[];
+      chars: number;
+    };
+
+const NOTHING: PoolPart = { kind: "nothing" };
+const UNREADABLE: PoolPart = { kind: "unreadable" };
+
+/**
+ * {@link buildPools}, which checks `expired` before each file, in the order the files are read, and
+ * gives null as soon as it is true: the pools of a run that reached its deadline are never used.
+ */
+function poolsWithin(files: readonly PoolFile[], expired: () => boolean): Pools | null {
+  const listed = new Map<string, number>();
+  for (const file of files) listed.set(file.path, (listed.get(file.path) ?? 0) + 1);
+
+  // Read in path order, so which files fit `maxPoolChars` does not depend on the order given.
+  const order = files
+    .map((_, i) => i)
+    .sort((a, b) => byCodeUnits(files[a]?.path ?? "", files[b]?.path ?? ""));
+  const parts: PoolPart[] = new Array(files.length);
+  let room = SUMMARY_LIMITS.maxPoolChars;
+  for (const i of order) {
+    if (expired()) return null;
+    const file = files[i] as PoolFile;
+    let part = NOTHING;
+    if ((listed.get(file.path) ?? 0) > 1) {
+      // Which entry is the document cannot be decided, so it is read as one that could not be
+      // read at all: it may hold any key, blocks every move past it, and is never a home.
+      if (file.path.endsWith(".json")) part = UNREADABLE;
+    } else if (file.path.endsWith(".tsv")) {
+      part = tablePart(file, room);
+    } else if (file.path.endsWith(".json")) {
+      part = jsonPart(file, room);
+    }
+    if (part.kind === "table" || part.kind === "json") room -= part.chars;
+    parts[i] = part;
+  }
+
   const rows = new Map<string, RowPoolFile>();
   const sourcedataFor = new Map<string, string[]>();
   const jsonFiles = new Map<string, Map<string, string>>();
   const byLeaf = new Map<string, string[]>();
   const byTopKey = new Map<string, string[]>();
   const unreadable = new Set<string>();
-
-  const listed = new Map<string, number>();
-  for (const file of files) listed.set(file.path, (listed.get(file.path) ?? 0) + 1);
-  for (const file of files) {
-    if ((listed.get(file.path) ?? 0) > 1) {
-      // Which entry is the document cannot be decided, so it is read as one that could not be
-      // read at all: it may hold any key, blocks every move past it, and is never a home.
-      if (file.path.endsWith(".json")) unreadable.add(file.path);
-      continue;
-    }
-    if (file.path.endsWith(".tsv")) {
-      const after = parseTsv(file.after);
-      const before = file.before === null ? null : parseTsv(file.before);
-      if (!after.ok || (before !== null && !before.ok)) continue;
-      const known = new Map<string, number>();
-      if (before?.ok && sameCells(before.value.header, after.value.header)) {
-        for (const row of before.value.rows) {
-          const text = row.join("\t");
-          known.set(text, (known.get(text) ?? 0) + 1);
-        }
-      }
-      const added = new Map<string, number>();
-      for (const row of after.value.rows) {
-        const text = row.join("\t");
-        const have = known.get(text) ?? 0;
-        if (have > 0) known.set(text, have - 1);
-        else added.set(text, (added.get(text) ?? 0) + 1);
-      }
-      if (added.size === 0) continue;
-      rows.set(file.path, { header: after.value.header.join("\t"), rows: added });
+  const add = (map: Map<string, string[]>, key: string, path: string): void => {
+    const listed = map.get(key);
+    if (listed === undefined) map.set(key, [path]);
+    else listed.push(path);
+  };
+  for (const [i, file] of files.entries()) {
+    const part = parts[i] as PoolPart;
+    if (part.kind === "unreadable") {
+      unreadable.add(file.path);
+    } else if (part.kind === "table") {
+      rows.set(file.path, { header: part.header, rows: part.rows });
       const kept = correspondingFile(file.path);
-      if (kept !== null) {
-        const listed = sourcedataFor.get(kept);
-        if (listed === undefined) sourcedataFor.set(kept, [file.path]);
-        else listed.push(file.path);
-      }
-    } else if (file.path.endsWith(".json")) {
-      const after = parseJson(file.after);
-      const before = file.before === null ? null : parseJson(file.before);
-      if (!after.ok) {
-        unreadable.add(file.path);
-        continue;
-      }
-      // Every top-level key the file has now, before anything decides whether it adds a leaf: a
-      // file that only changed elsewhere still overrides a farther sidecar under these keys.
-      const root = after.value.value;
-      if (root.t === "obj") {
-        for (const key of root.keys) {
-          const listed = byTopKey.get(key);
-          if (listed === undefined) byTopKey.set(key, [file.path]);
-          else listed.push(file.path);
-        }
-      }
-      if (before !== null && !before.ok) continue;
-      // A path over `maxNameChars` on either side leaves the file's leaves out, as a side that
-      // does not parse does: it keeps its top-level keys above, and is never a home.
-      const beforeLeaves = before?.ok ? flattenJson(before.value.value) : [];
-      const afterLeaves = flattenJson(after.value.value);
-      if (beforeLeaves === null || afterLeaves === null) continue;
-      const had = new Map<string, string>();
-      for (const leaf of beforeLeaves) had.set(leaf.path, leaf.value);
-      const fresh = new Map<string, string>();
-      for (const leaf of afterLeaves) {
-        if (had.get(leaf.path) !== leaf.value) fresh.set(leaf.path, leaf.value);
-      }
-      if (fresh.size === 0) continue;
-      jsonFiles.set(file.path, fresh);
-      for (const [leafPath, value] of fresh) {
-        const key = leafKey(leafPath, value);
-        const listed = byLeaf.get(key);
-        if (listed === undefined) byLeaf.set(key, [file.path]);
-        else listed.push(file.path);
-      }
+      if (kept !== null) add(sourcedataFor, kept, file.path);
+    } else if (part.kind === "json") {
+      // Every top-level key the file has now, whether it adds a leaf or not: a file that only
+      // changed elsewhere still overrides a farther sidecar under these keys.
+      for (const key of part.topKeys) add(byTopKey, key, file.path);
+      if (part.fresh === null || part.fresh.size === 0) continue;
+      jsonFiles.set(file.path, part.fresh);
+      for (const key of part.leafKeys) add(byLeaf, key, file.path);
     }
   }
   // Sorted, so which of two copies of one removed row is taken does not depend on the order of
@@ -1634,6 +1675,77 @@ export function buildPools(files: readonly PoolFile[]): { rows: RowPool; json: J
     rows: { files: rows, sourcedataFor },
     json: { files: jsonFiles, byLeaf, byTopKey, unreadable },
   };
+}
+
+/** What a table adds to the row pool, within `room` code units (see {@link buildPools}). */
+function tablePart(file: PoolFile, room: number): PoolPart {
+  const after = parseTsv(file.after);
+  const before = file.before === null ? null : parseTsv(file.before);
+  if (!after.ok || (before !== null && !before.ok)) return NOTHING;
+  const known = new Map<string, number>();
+  if (before?.ok && sameCells(before.value.header, after.value.header)) {
+    for (const row of before.value.rows) {
+      const text = row.join("\t");
+      known.set(text, (known.get(text) ?? 0) + 1);
+    }
+  }
+  const header = after.value.header.join("\t");
+  let chars = header.length;
+  const added = new Map<string, number>();
+  for (const row of after.value.rows) {
+    const text = row.join("\t");
+    const have = known.get(text) ?? 0;
+    if (have > 0) {
+      known.set(text, have - 1);
+      continue;
+    }
+    const copies = added.get(text) ?? 0;
+    // A row is held once however many copies there are; the count is a number.
+    if (copies === 0) {
+      chars += text.length;
+      if (chars > room) return NOTHING;
+    }
+    added.set(text, copies + 1);
+  }
+  return added.size === 0 ? NOTHING : { kind: "table", header, rows: added, chars };
+}
+
+/**
+ * What a JSON document adds to the leaf pool, within `room` code units (see {@link buildPools}).
+ */
+function jsonPart(file: PoolFile, room: number): PoolPart {
+  const after = parseJson(file.after);
+  if (!after.ok) return UNREADABLE;
+  const root = after.value.value;
+  const topKeys = root.t === "obj" ? root.keys : [];
+  let chars = 0;
+  for (const key of topKeys) chars += key.length;
+  if (chars > room) return UNREADABLE;
+  // A side that does not parse, or a path over `maxNameChars` on either side, leaves the file's
+  // leaves out: it keeps its top-level keys, and is never a home.
+  const keysOnly: PoolPart = { kind: "json", topKeys, fresh: null, leafKeys: [], chars };
+  const before = file.before === null ? null : parseJson(file.before);
+  if (before !== null && !before.ok) return keysOnly;
+  const beforeLeaves = before === null ? [] : flattenJson(before.value.value);
+  if (beforeLeaves === null) return keysOnly;
+  // Every leaf of an added document is new, so its walk stops at the room left; which leaves of a
+  // modified one are new is known only against its earlier version, so it is walked whole.
+  const afterLeaves = leavesWithin(root, before === null ? room - chars : Number.POSITIVE_INFINITY);
+  if (afterLeaves === "over_budget") return UNREADABLE;
+  if (afterLeaves === "too_long") return keysOnly;
+  const had = new Map<string, string>();
+  for (const leaf of beforeLeaves) had.set(leaf.path, leaf.value);
+  const fresh = new Map<string, string>();
+  const leafKeys: string[] = [];
+  for (const leaf of afterLeaves) {
+    if (had.get(leaf.path) === leaf.value) continue;
+    const key = leafKey(leaf.path, leaf.value);
+    chars += leaf.path.length + leaf.value.length + key.length;
+    if (chars > room) return UNREADABLE;
+    fresh.set(leaf.path, leaf.value);
+    leafKeys.push(key);
+  }
+  return { kind: "json", topKeys, fresh, leafKeys, chars };
 }
 
 /** Code-unit order, the one order that is the same on every machine and in every locale. */
@@ -2651,6 +2763,84 @@ export function sidecarApplies(sidecar: string, target: string): boolean {
   if (!inherited) return false;
   for (const entity of t.entities) if (!f.entities.has(entity)) return false;
   return true;
+}
+
+/**
+ * Which pool files can change what a run says about `candidates`: the predicate, built once per run
+ * from the candidates' paths, that {@link summarizeChanges} prunes its pool with, and that the
+ * evidence reader applies before it reads a pool file's blobs.
+ *
+ * A diff consults the pools for one candidate at a time, and only in two ways:
+ *
+ * - a table diff reads the rows of the pool tables at `sourcedata/<D>/<the candidate's path>`
+ *   (`sourcedataFor`), and no other table: a table is kept when it is such a copy of a candidate;
+ * - a JSON diff asks, per removed leaf, which file of the pull request that applies to the
+ *   candidate under BIDS inheritance ({@link sidecarApplies}) and has the leaf's top-level key, or
+ *   is unreadable, is the nearest, and then whether THAT file is a home of the leaf (see
+ *   {@link diffJson}): a document is kept when it applies to some candidate.
+ *
+ * A file this says false for is therefore never a copy, a decider, a blocker or a home for any
+ * candidate, and the pools without it answer every one of those questions as the pools with it
+ * do; a test compares whole summaries with and without it on generated pull requests. Any other
+ * extension is never pooled, `.JSON` included. What the pruning does change is the room the files
+ * that do matter have within `maxPoolChars` and `maxTotalBytes`, which is only ever more.
+ *
+ * One pool path is answered by a lookup and a scan of few candidates: they are indexed by
+ * extension, suffix and each of their ancestor directories, then by entity, and a sidecar is
+ * checked only against the candidates that hold the rarest of its entities.
+ */
+export function poolFileMatters(candidates: readonly string[]): (path: string) => boolean {
+  const tables = new Set<string>();
+  type Indexed = { path: string; entities: ReadonlySet<string> };
+  const near = new Map<string, { all: Indexed[]; byEntity: Map<string, Indexed[]> }>();
+  const bucketKey = (extension: string, suffix: string, dir: string): string =>
+    JSON.stringify([extension, suffix, dir]);
+  for (const path of candidates) {
+    if (path.endsWith(".tsv")) tables.add(path);
+    const name = bidsName(path);
+    if (name === null) continue;
+    const indexed: Indexed = { path, entities: name.entities };
+    // Every directory a sidecar may sit in to apply to this candidate: the root, each ancestor and
+    // its own (see `sidecarApplies`).
+    const dirs = new Set(["", name.dir]);
+    for (let at = name.dir.indexOf("/"); at >= 0; at = name.dir.indexOf("/", at + 1)) {
+      dirs.add(name.dir.slice(0, at));
+    }
+    for (const dir of dirs) {
+      const key = bucketKey(name.extension, name.suffix, dir);
+      let bucket = near.get(key);
+      if (bucket === undefined) {
+        bucket = { all: [], byEntity: new Map() };
+        near.set(key, bucket);
+      }
+      bucket.all.push(indexed);
+      for (const entity of name.entities) {
+        const listed = bucket.byEntity.get(entity);
+        if (listed === undefined) bucket.byEntity.set(entity, [indexed]);
+        else listed.push(indexed);
+      }
+    }
+  }
+  return (path: string): boolean => {
+    if (path.endsWith(".tsv")) {
+      const kept = correspondingFile(path);
+      return kept !== null && tables.has(kept);
+    }
+    if (!path.endsWith(".json")) return false;
+    const name = bidsName(path);
+    if (name === null) return false;
+    const bucket = near.get(bucketKey(name.extension, name.suffix, name.dir));
+    if (bucket === undefined) return false;
+    let fewest = bucket.all;
+    for (const entity of name.entities) {
+      const listed = bucket.byEntity.get(entity);
+      if (listed === undefined) return false;
+      if (listed.length < fewest.length) fewest = listed;
+    }
+    return fewest.some(
+      (c) => c.path !== path && [...name.entities].every((entity) => c.entities.has(entity)),
+    );
+  };
 }
 
 /**
@@ -3960,6 +4150,16 @@ function frozenSet(): ReadonlySet<string> {
 export const EMPTY_SUMMARY: ChangeSummary = emptySummary(false, frozenSet);
 
 /**
+ * The summary of a pull request whose summary was not made: its caller reached the line it starts
+ * by with too little time left, or could not read the blobs it is made from. Abandoned and empty,
+ * so it accounts for nothing, as the result of {@link summarizeChanges} does past its deadline, and
+ * leaves the review where it was without a summary; a caller can say so without faking a deadline
+ * that has passed. Unlike a run's own result it is one frozen object shared by every caller, like
+ * {@link EMPTY_SUMMARY}.
+ */
+export const ABANDONED_SUMMARY: ChangeSummary = emptySummary(true, frozenSet);
+
+/**
  * JSON text with the whitespace between its tokens removed (space, tab, LF and CR outside a
  * string; a string is copied exactly, escapes and all). Two documents whose trees are equal and
  * whose texts differ after this differ only in how a string was spelled, which is the
@@ -4089,7 +4289,8 @@ export function summarizeChanges(input: {
 
 /**
  * {@link summarizeChanges} with the totality checks passed in, so a test can prove that a diff the
- * check rejects is refused (`internal_mismatch`) and accounts for nothing. A run:
+ * check rejects is refused (`internal_mismatch`) and accounts for nothing, and with the pool's
+ * pruning passed in, so a test can compare a run that keeps every pool file. A run:
  *
  * 1. **Sorts the candidates by path, in code-unit order**, and processes them in that order. So
  *    nothing about a run depends on the order git listed the files in: not the outcomes, not the
@@ -4097,15 +4298,19 @@ export function summarizeChanges(input: {
  *    its corresponding path, so two different files never compete for one; the only order that
  *    could matter is two candidates with ONE path, and a path given twice is refused, every time
  *    it appears, as `internal_mismatch`, the word for the platform's own reading not adding up.)
- * 2. Builds the pools once, from `pool`. {@link buildPools} gives the same pools for the files in
- *    any order (it sorts the copies of one file itself, and a path listed twice contributes
- *    nothing, whichever entry comes first), so the pool needs no sorting here.
- * 3. Checks the deadline BEFORE each file, AFTER each file it folds in (a diff can be long), and
- *    once more after the last file, before anything is rendered. When `now()` has reached it at
- *    any of the three, the WHOLE summary is abandoned: no file is accounted for, no class or text
- *    is kept, and the loss facts are zero. All or nothing is simpler to prove than a partial
- *    account, and an abandoned summary leaves the review where it was without one (design section
- *    5.4). A null deadline never abandons, and the clock is then never read.
+ * 2. Builds the pools once, from the files of `pool` that can matter to a candidate (`keep`, which
+ *    is {@link poolFileMatters} unless a test passes another): any other file is never consulted,
+ *    so it is not read, and takes nothing of `maxPoolChars`. {@link buildPools} gives the same
+ *    pools for the files in any order (it decides which files fit `maxPoolChars` in path order,
+ *    sorts the copies of one file itself, and a path listed twice contributes nothing, whichever
+ *    entry comes first), so the pool needs no sorting here.
+ * 3. Checks the deadline BEFORE each pool file it reads, BEFORE each candidate, AFTER each file it
+ *    folds in (a diff can be long), and once more after the last file, before anything is
+ *    rendered. When `now()` has reached it at any of these, the WHOLE summary is abandoned: no file
+ *    is accounted for, no class or text is kept, and the loss facts are zero. All or nothing is
+ *    simpler to prove than a partial account, and an abandoned summary leaves the review where it
+ *    was without one (design section 5.4). A null deadline never abandons, and the clock is then
+ *    never read.
  * 4. Reads each file whose path ends in `.tsv` or `.json`; any other path is not a candidate and is
  *    left out. Once the bytes read (both sides of every file so far) would pass `maxTotalBytes`,
  *    that file and EVERY later one is refused `too_large`, so what the summary holds is bounded.
@@ -4128,6 +4333,7 @@ export function summarizeChangesWith(
     now?: () => number;
   },
   checks: SummaryChecks,
+  keep: (candidates: readonly string[]) => (path: string) => boolean = poolFileMatters,
 ): ChangeSummary {
   const now = input.now ?? Date.now;
   const expired = (): boolean => input.deadline !== null && now() >= input.deadline;
@@ -4136,7 +4342,12 @@ export function summarizeChangesWith(
   for (const candidate of candidates) {
     listed.set(candidate.path, (listed.get(candidate.path) ?? 0) + 1);
   }
-  const pools = buildPools(input.pool);
+  const matters = keep(candidates.map((c) => c.path));
+  const pools = poolsWithin(
+    input.pool.filter((file) => matters(file.path)),
+    expired,
+  );
+  if (pools === null) return emptySummary(true);
 
   const outcomes: FileOutcome[] = [];
   const builder = new ClassBuilder(SUMMARY_LIMITS.maxTrackedClasses);

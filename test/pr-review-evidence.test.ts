@@ -19,6 +19,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:tes
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -45,9 +46,11 @@ import {
   textFactsOf,
 } from "../scripts/ci/pr-review";
 import {
+  type ContentOptions,
   EVIDENCE_BUDGET_MS,
   EVIDENCE_ERRORS,
   EvidenceError,
+  type Listing,
   MAX_DIFFS_EXAMINED,
   MAX_GROUPS,
   MAX_MODEL_FILES,
@@ -63,7 +66,9 @@ import {
   gatherGitFacts,
   gatherListing,
   parseNameStatus,
+  parseRawEntries,
   pathPattern,
+  readBlobs,
 } from "../scripts/ci/pr-review-evidence";
 import {
   MAX_BODY_CHARS,
@@ -77,6 +82,7 @@ import {
   fence,
   tidy,
 } from "../scripts/ci/pr-review-prompt";
+import { ABANDONED_SUMMARY, EMPTY_SUMMARY, NO_LOSS } from "../scripts/ci/pr-review-summary";
 import {
   FINDING_CODES,
   type PrReviewReport,
@@ -96,7 +102,8 @@ import {
   stalledReply,
   standInMessage,
 } from "./helpers/anthropic-sse";
-import { installGitShim, readEnvLog } from "./helpers/git-shim";
+import { type ShimRule, installGitShim, readEnvLog } from "./helpers/git-shim";
+import { longKeyDocument } from "./helpers/summary-pool";
 
 let root: string;
 const GIT_ENV = {
@@ -113,7 +120,7 @@ function git(dir: string, ...args: string[]): string {
   return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", env: GIT_ENV }).trim();
 }
 
-function write(dir: string, rel: string, content: string) {
+function write(dir: string, rel: string, content: string | Buffer) {
   const full = join(dir, rel);
   mkdirSync(dirname(full), { recursive: true });
   writeFileSync(full, content);
@@ -535,7 +542,7 @@ describe("reading a real pull request as git data", () => {
     expect(e.truncated).toBe(true);
     expect(e.listed.length).toBeLessThanOrEqual(50);
     expect(facts.patches.length).toBeLessThanOrEqual(MAX_PATCH_FILES);
-  });
+  }, 30_000);
 
   test("name-status output is parsed with NUL separators, so odd names survive", () => {
     expect(parseNameStatus("A\0new file.json\0M\0dir/a\nb.json\0D\0gone.edf\0")).toEqual([
@@ -579,6 +586,348 @@ describe("each evidence pass reads git within a time budget", () => {
     const err = new EvidenceError("timed_out");
     expect(mapError(err)).toBe("evidence_unavailable");
     expect(describeError(err)).toBe("EvidenceError: timed_out");
+  });
+});
+
+/** The lines a shim rule's `log` recorded, or none when the rule never matched. */
+function loggedCalls(log: string): string[] {
+  return existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : [];
+}
+
+/** A fresh path for a shim rule's `log`. */
+function callLog(name: string): string {
+  return join(root, `${name}-${Math.random().toString(36).slice(2)}.log`);
+}
+
+describe("readBlobs and rawEntries", () => {
+  const ZERO = "0".repeat(40);
+  const CAPS = { maxBytes: 1024, maxTotalBytes: 1024 * 1024 };
+
+  /** A repository whose one commit holds `files`, with each file's blob id. */
+  function blobRepo(name: string, files: Record<string, string | Buffer>) {
+    const dir = join(root, name);
+    mkdirSync(dir, { recursive: true });
+    git(dir, "init", "-q", "-b", "main");
+    for (const [rel, content] of Object.entries(files)) write(dir, rel, content);
+    git(dir, "add", "-A");
+    git(dir, "commit", "-q", "-m", "blobs");
+    const id = (rel: string) => git(dir, "rev-parse", `HEAD:${rel}`);
+    return { dir, id };
+  }
+
+  /** The blobs as text, by id, so a failed expectation prints what was read. */
+  const texts = (blobs: Map<string, Buffer> | null) =>
+    blobs === null
+      ? null
+      : Object.fromEntries([...blobs].map(([k, v]) => [k, v.toString("latin1")]));
+
+  test("a missing blob is absent while the others are read: an id nobody wrote, and an object whose file is gone", () => {
+    const { dir, id } = blobRepo("blobs-missing", { "a.txt": "alpha\n", "b.txt": "beta\n" });
+    const a = id("a.txt");
+    const b = id("b.txt");
+    unlinkSync(join(dir, ".git", "objects", b.slice(0, 2), b.slice(2)));
+    const nobody = "1234567890abcdef1234567890abcdef12345678";
+    expect(texts(readBlobs(dir, [nobody, a, b], CAPS))).toEqual({ [a]: "alpha\n" });
+  });
+
+  test("a blob one byte over maxBytes is absent and one exactly at it is read, and the reading goes on past it", () => {
+    const { id, dir } = blobRepo("blobs-per-cap", {
+      "ten.txt": "0123456789",
+      "eleven.txt": "0123456789A",
+      "after.txt": "x",
+    });
+    const caps = { maxBytes: 10, maxTotalBytes: 1000 };
+    const blobs = readBlobs(dir, [id("eleven.txt"), id("ten.txt"), id("after.txt")], caps);
+    expect(texts(blobs)).toEqual({ [id("ten.txt")]: "0123456789", [id("after.txt")]: "x" });
+  });
+
+  test("the total cap keeps a prefix in the order given: the blob that would pass it and every later one are absent, a smaller one too", () => {
+    const { id, dir } = blobRepo("blobs-total-cap", {
+      "a.txt": "aaaa",
+      "b.txt": "bbbb",
+      "c.txt": "cccc",
+      "d.txt": "d",
+    });
+    const caps = { maxBytes: 100, maxTotalBytes: 9 };
+    const order = ["a.txt", "b.txt", "c.txt", "d.txt"].map(id);
+    expect(texts(readBlobs(dir, order, caps))).toEqual({
+      [id("a.txt")]: "aaaa",
+      [id("b.txt")]: "bbbb",
+    });
+    // Another order keeps another prefix: the cap follows the order, not the sizes.
+    expect(
+      texts(readBlobs(dir, [id("d.txt"), id("c.txt"), id("a.txt"), id("b.txt")], caps)),
+    ).toEqual({ [id("d.txt")]: "d", [id("c.txt")]: "cccc", [id("a.txt")]: "aaaa" });
+    // Exactly at the total, everything is read.
+    expect(readBlobs(dir, order, { maxBytes: 100, maxTotalBytes: 13 })?.size).toBe(4);
+  });
+
+  test("an id given more than once costs the total cap once", () => {
+    const { id, dir } = blobRepo("blobs-dedupe", { "a.txt": "aaaaa", "b.txt": "bbbbb" });
+    const a = id("a.txt");
+    const blobs = readBlobs(dir, [a, a, a, id("b.txt"), a], { maxBytes: 100, maxTotalBytes: 10 });
+    expect(texts(blobs)).toEqual({ [a]: "aaaaa", [id("b.txt")]: "bbbbb" });
+  });
+
+  test("the zero id, a short or upper-case id, HEAD and a rev:path are never asked: no cat-file starts", () => {
+    const { id, dir } = blobRepo("blobs-not-ids", { "a.txt": "alpha\n" });
+    const a = id("a.txt");
+    const commit = git(dir, "rev-parse", "HEAD");
+    const log = callLog("blobs-not-ids");
+    const restore = installGitShim(root, [{ match: " cat-file ", log }]);
+    let none: Map<string, Buffer> | null;
+    let control: Map<string, Buffer> | null;
+    let before: string[];
+    try {
+      none = readBlobs(
+        dir,
+        [ZERO, a.slice(0, 7), a.toUpperCase(), "HEAD", "HEAD:a.txt", `${commit}:a.txt`, ` ${a}`],
+        CAPS,
+      );
+      before = loggedCalls(log);
+      control = readBlobs(dir, [a], CAPS);
+    } finally {
+      restore();
+    }
+    expect(texts(none)).toEqual({});
+    expect(before).toEqual([]);
+    // Not vacuous: the same id in its full form is asked about, by the two processes.
+    expect(texts(control)).toEqual({ [a]: "alpha\n" });
+    expect(loggedCalls(log).map((c) => c.split("never ")[1]?.trim())).toEqual([
+      "cat-file --batch-check",
+      "cat-file --batch",
+    ]);
+  });
+
+  test("a tree, a commit and a tag are not blobs: they are absent, and a blob beside them is read", () => {
+    const { id, dir } = blobRepo("blobs-not-blobs", { "a.txt": "alpha\n", "d/b.txt": "beta\n" });
+    git(dir, "tag", "-a", "v1", "-m", "a tag");
+    const tree = git(dir, "rev-parse", "HEAD^{tree}");
+    const subtree = git(dir, "rev-parse", "HEAD:d");
+    const commit = git(dir, "rev-parse", "HEAD");
+    const tag = git(dir, "rev-parse", "v1");
+    expect(git(dir, "cat-file", "-t", tag)).toBe("tag");
+    const blobs = readBlobs(dir, [tree, subtree, commit, tag, id("a.txt")], CAPS);
+    expect(texts(blobs)).toEqual({ [id("a.txt")]: "alpha\n" });
+  });
+
+  test("the bytes are exact: an empty blob, NUL, CR, bytes that are not UTF-8, and no final newline", () => {
+    const files: Record<string, Buffer> = {
+      "empty.txt": Buffer.alloc(0),
+      "nul.bin": Buffer.from([0x00, 0x61, 0x00, 0x0a, 0x00]),
+      "cr.txt": Buffer.from("a\r\nb\rc\r\n\r\n", "latin1"),
+      "latin1.tsv": Buffer.from([0x63, 0x61, 0x66, 0xe9, 0xff, 0xfe, 0x0a]),
+      "open.txt": Buffer.from("no final newline"),
+      "newlines.txt": Buffer.from("\n\n\n"),
+    };
+    const { id, dir } = blobRepo("blobs-exact", files);
+    const ids = Object.keys(files).map(id);
+    const blobs = readBlobs(dir, ids, CAPS);
+    expect(blobs?.size).toBe(ids.length);
+    for (const rel of Object.keys(files)) {
+      expect(blobs?.get(id(rel))?.equals(files[rel] as Buffer), rel).toBe(true);
+    }
+    expect(blobs?.get(id("empty.txt"))?.length).toBe(0);
+  });
+
+  test("nothing to read starts no process and is an empty answer, not 'could not say'", () => {
+    const { dir } = blobRepo("blobs-nothing", { "a.txt": "a" });
+    const log = callLog("blobs-nothing");
+    const restore = installGitShim(root, [{ match: " cat-file ", log }]);
+    try {
+      expect(readBlobs(dir, [], CAPS)).toEqual(new Map());
+      expect(readBlobs(dir, [ZERO, ZERO], CAPS)).toEqual(new Map());
+    } finally {
+      restore();
+    }
+    expect(loggedCalls(log)).toEqual([]);
+  });
+
+  test("a read that stalls past its own deadline is null, quickly, and is not timed_out; a deadline in the past is null and starts no process", () => {
+    const { id, dir } = blobRepo("blobs-stall", { "a.txt": "alpha\n" });
+    const log = callLog("blobs-stall");
+    const restore = installGitShim(root, [{ match: " cat-file ", log, sleepSeconds: 5 }]);
+    let stalled: Map<string, Buffer> | null | string = "not run";
+    let past: Map<string, Buffer> | null | string = "not run";
+    let started = 0;
+    let elapsed = 0;
+    let calls: string[] = [];
+    try {
+      started = Date.now();
+      stalled = readBlobs(dir, [id("a.txt")], CAPS, Date.now() + 1_000);
+      elapsed = Date.now() - started;
+      calls = loggedCalls(log);
+      past = readBlobs(dir, [id("a.txt")], CAPS, Date.now() - 1);
+    } finally {
+      restore();
+    }
+    expect(stalled).toBeNull();
+    expect(elapsed).toBeLessThan(3_000);
+    // The first process was started and stopped at the deadline; no second one followed it.
+    expect(calls).toHaveLength(1);
+    expect(past).toBeNull();
+    expect(loggedCalls(log)).toHaveLength(1);
+    // The same read with time to spare is answered: the stall was what made it null.
+    expect(texts(readBlobs(dir, [id("a.txt")], CAPS, Date.now() + 60_000))).toEqual({
+      [id("a.txt")]: "alpha\n",
+    });
+  }, 30_000);
+
+  test("a deadline that is exactly now is expired, not 'no timeout': a timeout of 0 would let git run unbounded", () => {
+    // `execFileSync` takes a timeout of 0 to mean none, so a call with no time left must never be
+    // given 0. A negative timeout is refused by the runtime anyway, which is why the test above
+    // cannot tell; only a clock that stands still makes the time left exactly zero.
+    const { id, dir } = blobRepo("blobs-zero", { "a.txt": "alpha\n" });
+    const a = id("a.txt");
+    const log = callLog("blobs-zero");
+    const restore = installGitShim(root, [{ match: " cat-file ", log }]);
+    const clock = Date.now;
+    const now = clock();
+    let frozen: Map<string, Buffer> | null | string = "not run";
+    try {
+      Date.now = () => now;
+      frozen = readBlobs(dir, [a], CAPS, now);
+    } finally {
+      Date.now = clock;
+      restore();
+    }
+    expect(frozen).toBeNull();
+    expect(loggedCalls(log)).toEqual([]);
+    // The same read, a moment later, is answered: the deadline is what made it null.
+    expect(texts(readBlobs(dir, [a], CAPS, Date.now() + 60_000))).toEqual({ [a]: "alpha\n" });
+  });
+
+  test("the call that reads the blobs has the deadline too: a stall in the second process is null, quickly, and not timed_out", () => {
+    const { id, dir } = blobRepo("blobs-stall-second", { "a.txt": "alpha\n" });
+    const a = id("a.txt");
+    const log = callLog("blobs-stall-second");
+    // The log first, so the call that is stopped while the later rule holds it is still recorded.
+    // Only the second cat-file stalls: the first, which asks for the sizes, answers at once.
+    const restore = installGitShim(root, [
+      { match: " cat-file ", log },
+      { match: " cat-file ", sleepSeconds: 5, fromCall: 2 },
+    ]);
+    let stalled: Map<string, Buffer> | null | string = "not run";
+    let elapsed = 0;
+    let calls: string[] = [];
+    try {
+      const started = Date.now();
+      stalled = readBlobs(dir, [a], CAPS, Date.now() + 1_500);
+      elapsed = Date.now() - started;
+      calls = loggedCalls(log).map((c) => c.split("never ")[1]?.trim() ?? "");
+    } finally {
+      restore();
+    }
+    expect(stalled).toBeNull();
+    expect(elapsed).toBeLessThan(4_000);
+    expect(calls).toEqual(["cat-file --batch-check", "cat-file --batch"]);
+    // The same read, nothing stalling, is answered: the second process is what made it null.
+    expect(texts(readBlobs(dir, [a], CAPS, Date.now() + 60_000))).toEqual({ [a]: "alpha\n" });
+  }, 30_000);
+
+  test("parseRawEntries reads what git writes: added, modified, removed, a type change and a submodule", () => {
+    const dir = join(root, "raw-entries");
+    mkdirSync(dir, { recursive: true });
+    git(dir, "init", "-q", "-b", "main");
+    write(dir, "m.json", '{"a":1}');
+    write(dir, "d.json", "{}");
+    write(dir, "t.json", "{}");
+    write(dir, "x.json", "{}");
+    git(dir, "add", "-A");
+    git(dir, "commit", "-q", "-m", "files");
+    const first = git(dir, "rev-parse", "HEAD");
+    git(dir, "update-index", "--add", "--cacheinfo", `160000,${first},vendor/sub`);
+    git(dir, "commit", "-q", "-m", "a submodule");
+    const base = git(dir, "rev-parse", "HEAD");
+    write(dir, "m.json", '{"a":2}');
+    unlinkSync(join(dir, "d.json"));
+    unlinkSync(join(dir, "t.json"));
+    symlinkSync("x.json", join(dir, "t.json"));
+    write(dir, "n.json", "{}");
+    chmodSync(join(dir, "x.json"), 0o755);
+    git(dir, "add", "m.json", "d.json", "t.json", "n.json", "x.json");
+    git(dir, "update-index", "--cacheinfo", `160000,${base},vendor/sub`);
+    git(dir, "commit", "-q", "-m", "changes");
+    const head = git(dir, "rev-parse", "HEAD");
+    const raw = execFileSync(
+      "git",
+      ["-C", dir, "diff", "--raw", "-z", "--no-renames", "--no-abbrev", base, head],
+      { encoding: "utf8", env: GIT_ENV },
+    );
+    const blob = (rev: string, path: string) => git(dir, "rev-parse", `${rev}:${path}`);
+    const entries = parseRawEntries(raw);
+    expect(entries === null ? null : [...entries.values()]).toEqual([
+      {
+        status: "removed",
+        modeBefore: "100644",
+        modeAfter: "000000",
+        oidBefore: blob(base, "d.json"),
+        oidAfter: ZERO,
+        path: "d.json",
+      },
+      {
+        status: "modified",
+        modeBefore: "100644",
+        modeAfter: "100644",
+        oidBefore: blob(base, "m.json"),
+        oidAfter: blob(head, "m.json"),
+        path: "m.json",
+      },
+      {
+        status: "added",
+        modeBefore: "000000",
+        modeAfter: "100644",
+        oidBefore: ZERO,
+        oidAfter: blob(head, "n.json"),
+        path: "n.json",
+      },
+      {
+        status: "typechange",
+        modeBefore: "100644",
+        modeAfter: "120000",
+        oidBefore: blob(base, "t.json"),
+        oidAfter: blob(head, "t.json"),
+        path: "t.json",
+      },
+      {
+        status: "modified",
+        modeBefore: "160000",
+        modeAfter: "160000",
+        oidBefore: first,
+        oidAfter: base,
+        path: "vendor/sub",
+      },
+      {
+        status: "modified",
+        modeBefore: "100644",
+        modeAfter: "100755",
+        oidBefore: blob(base, "x.json"),
+        oidAfter: blob(head, "x.json"),
+        path: "x.json",
+      },
+    ]);
+  });
+
+  test("parseRawEntries refuses whatever git did not write: the whole answer is null", () => {
+    const a = "a".repeat(40);
+    const b = "b".repeat(40);
+    const ok = `:100644 100644 ${a} ${b} M\0x.json\0`;
+    expect(parseRawEntries(ok)?.get("x.json")?.status).toBe("modified");
+    expect(parseRawEntries("")).toEqual(new Map());
+    const refused: [string, string][] = [
+      ["an unknown status", `${ok}:100644 100644 ${a} ${b} X\0y.json\0`],
+      ["a rename, which --no-renames never writes", `${ok}:100644 100644 ${a} ${b} R100\0y.json\0`],
+      ["a 64-hex id", `${ok}:100644 100644 ${a}${"c".repeat(24)} ${b} M\0y.json\0`],
+      ["an abbreviated id", `${ok}:100644 100644 ${a.slice(0, 7)} ${b} M\0y.json\0`],
+      ["an upper-case id", `${ok}:100644 100644 ${a.toUpperCase()} ${b} M\0y.json\0`],
+      ["a mode that is not six octal digits", `${ok}:100648 100644 ${a} ${b} M\0y.json\0`],
+      ["a path given twice", `${ok}${ok}`],
+      ["an empty path", `${ok}:100644 100644 ${a} ${b} M\0\0`],
+      ["a token with no path after it", `${ok}:100644 100644 ${a} ${b} M\0`],
+      ["no final NUL", ok.slice(0, -1)],
+      ["text after the status", `${ok}:100644 100644 ${a} ${b} M \0y.json\0`],
+    ];
+    for (const [name, raw] of refused) expect(parseRawEntries(raw), name).toBeNull();
   });
 });
 
@@ -1716,8 +2065,9 @@ describe("what the reviewer was not shown is a fact", () => {
           `onset\tduration\n${i}\n`,
         );
       }
+      // A key given twice: the change summary refuses the file, so only its diff could cover it.
       for (let i = 0; i < 18; i++) {
-        write(dir, `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_eeg.json`, `{"n":${i}}`);
+        write(dir, `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_eeg.json`, `{"n":${i},"n":${i}}`);
       }
       release(dir);
     });
@@ -1768,8 +2118,10 @@ describe("what the reviewer was not shown is a fact", () => {
   test("a metadata file whose diff is cut is flagged", () => {
     const dir = newBigDataset("huge-diff", 5);
     const r = branch(dir, () => {
+      // Rows of one cell under a header of two: the change summary refuses the table (ragged), so
+      // its cut diff is all the reviewer has of it.
       const rows = Array.from({ length: 4000 }, (_, i) => `sub-${pad(i)}`).join("\n");
-      write(dir, "participants.tsv", `participant_id\n${rows}\n`);
+      write(dir, "participants.tsv", `participant_id\tage\n${rows}\n`);
       write(dir, "dataset_description.json", desc("1.1.0"));
     });
     const facts = gatherGitFacts(r.dir, r.base, r.head);
@@ -1782,7 +2134,12 @@ describe("what the reviewer was not shown is a fact", () => {
     const r = branch(dir, () => {
       const bulk = "x".repeat(9000);
       for (let i = 0; i < 14; i++) {
-        write(dir, `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_events.tsv`, `onset\n${bulk}${i}\n`);
+        // One cell under two column names: refused by the change summary, read only as diffs.
+        write(
+          dir,
+          `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_events.tsv`,
+          `onset\tduration\n${bulk}${i}\n`,
+        );
       }
       write(dir, "sub-900/eeg/sub-900_task-rest_eeg.json", "{}");
     });
@@ -1839,8 +2196,13 @@ describe("what the reviewer was not shown is a fact", () => {
     const dir = newBigDataset("prompt-flag", 30);
     const r = branch(dir, () => {
       for (let i = 0; i < 30; i++) {
-        write(dir, `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_events.tsv`, `onset\n${i}\n`);
-        write(dir, `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_channels.tsv`, `name\n${i}\n`);
+        // Ragged tables, which the change summary refuses: what is not shown stays unread.
+        write(
+          dir,
+          `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_events.tsv`,
+          `onset\tduration\n${i}\n`,
+        );
+        write(dir, `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_channels.tsv`, `name\ttype\n${i}\n`);
       }
     });
     const facts = gatherGitFacts(r.dir, r.base, r.head);
@@ -2116,6 +2478,89 @@ describe("cosmetic changes are proven from the blobs, never assumed", () => {
     expect(facts.readIncomplete).toBe(false);
   });
 
+  test("60 cosmetic proofs read their 120 blobs with two cat-file processes and no git show of a file", () => {
+    const dir = newBigDataset("n2-one-batch", 60);
+    const r = branch(dir, () => {
+      for (let i = 0; i < 60; i++) write(dir, sidecar(i), JSON.stringify(base, null, 4));
+    });
+    const listing = gatherListing(r.dir, r.base, r.head);
+    const log = callLog("n2-one-batch");
+    const restore = installGitShim(root, [{ match: " ", log }]);
+    let content: ReturnType<typeof gatherContent>;
+    try {
+      content = gatherContent(r.dir, listing);
+    } finally {
+      restore();
+    }
+    expect(content.cosmeticOnlyFiles).toBe(60);
+    const calls = loggedCalls(log).map((c) => c.split("protocol.ext.allow=never ")[1]?.trim());
+    expect(calls.filter((c) => c?.startsWith("cat-file"))).toEqual([
+      "cat-file --batch-check",
+      "cat-file --batch",
+    ]);
+    // The change log is still read with `git show`; no sidecar or table is.
+    expect(calls.filter((c) => /^show \S+\.(json|tsv)$/.test(c ?? ""))).toEqual([]);
+  });
+
+  test("at most 2,000 files are compared for a cosmetic change: the 2,001st is not proven, so it is read as a diff", () => {
+    // MAX_COSMETIC_CHECKS. Every file is reindented and so would be proven cosmetic, which is what
+    // makes the one past the cap show: it is shown as a diff because it was never compared.
+    const cap = 2_000;
+    // At the root, so the fixture is 2,001 files and not 2,001 directories as well.
+    const path = (i: number) => `task-${i}_eeg.json`;
+    const files = Array.from({ length: cap + 1 }, (_, i) => path(i));
+    const r = changed(
+      "n2-check-cap",
+      Object.fromEntries(files.map((f, i) => [f, JSON.stringify({ n: i })])),
+      (dir) => {
+        for (const [i, f] of files.entries()) write(dir, f, JSON.stringify({ n: i }, null, 4));
+      },
+    );
+    const listing = gatherListing(r.dir, r.base, r.head);
+    expect(listing.changes).toHaveLength(cap + 1);
+    const content = gatherContent(r.dir, listing);
+    // The files are compared in review order, which within one status and area is path order.
+    const last = [...files].sort()[cap] as string;
+    expect(content.cosmeticOnlyFiles).toBe(cap);
+    expect(content.patches.map((p) => p.path)).toEqual([last]);
+    expect(content.readIncomplete).toBe(false);
+  }, 60_000);
+
+  test("a cosmetic read that stalls has no deadline of its own: inside a 2 s content budget the pass is timed_out", () => {
+    const dir = newBigDataset("n2-stall", 3);
+    const r = branch(dir, () => write(dir, sidecar(0), JSON.stringify(base, null, 4)));
+    const listing = gatherListing(r.dir, r.base, r.head);
+    const restore = installGitShim(root, [{ match: " cat-file ", sleepSeconds: 5 }]);
+    __setEvidenceBudgetForTests({ content: 2_000 });
+    const started = Date.now();
+    try {
+      expect(codeOf(() => gatherContent(r.dir, listing))).toBe("timed_out");
+    } finally {
+      __setEvidenceBudgetForTests(null);
+      restore();
+    }
+    expect(Date.now() - started).toBeLessThan(4_500);
+    // The same pass with nothing stalling proves the file cosmetic.
+    expect(gatherContent(r.dir, listing).cosmeticOnlyFiles).toBe(1);
+  }, 30_000);
+
+  test("a cosmetic proof does not depend on the summary's 8 MiB cap: a reindented 9 MiB sidecar is cosmetic", () => {
+    const dir = newBigDataset("n2-over-8mib", 3);
+    // Over the summary's per-file cap on both sides, and far under the cosmetic batch's own bound.
+    const big = {
+      TaskName: "rest",
+      Notes: Array.from({ length: 9_000 }, (_, i) => `${i}`.padEnd(1_000, "x")),
+    };
+    write(dir, sidecar(0), JSON.stringify(big));
+    git(dir, "add", "-A");
+    git(dir, "commit", "-q", "-m", "a large sidecar");
+    const r = branch(dir, () => write(dir, sidecar(0), JSON.stringify(big, null, 1)));
+    const facts = gatherGitFacts(r.dir, r.base, r.head);
+    expect(JSON.stringify(big).length).toBeGreaterThan(8 * 1024 * 1024);
+    expect(facts.cosmeticOnlyFiles).toBe(1);
+    expect(facts.readIncomplete).toBe(false);
+  });
+
   test("trailing spaces and CRLF endings in a table are cosmetic", () => {
     const dir = newBigDataset("n2-crlf", 50);
     const r = branch(dir, () => {
@@ -2364,7 +2809,9 @@ describe("a bulk edit reads as groups, and the cut says what it cut", () => {
 describe("one change repeated across files is read once", () => {
   const sidecar = (i: number) => `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_eeg.json`;
   const channels = (i: number) => `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_channels.tsv`;
-  const fixed = JSON.stringify({ TaskName: "rest", SamplingFrequency: 512 });
+  // A key given twice, so the change summary refuses every one of these files and what covers them
+  // is the folding alone, which is what this block tests.
+  const fixed = '{"TaskName":"rest","SamplingFrequency":512,"SamplingFrequency":512}';
   const SHAPE = "sub-*/eeg/sub-*_task-rest_eeg.json";
 
   test("the same edit in 60 sidecars is one diff that covers all of them, and nothing is unread", () => {
@@ -2405,13 +2852,16 @@ describe("one change repeated across files is read once", () => {
     const shown = facts.patches.find((p) => p.path === sidecar(0));
     expect(shown?.same).toHaveLength(58);
     expect(shown?.same).not.toContain(sidecar(41));
+    // `{}` parses, so the summary accounts for it: it is shown as an illustration, after the rest.
+    expect(facts.summary.accounted.has(sidecar(41))).toBe(true);
   });
 
   test("a change that names its own subject is a different change in every file", () => {
     const dir = newBigDataset("fold-label", 50);
     const r = branch(dir, () => {
       for (let i = 0; i < 50; i++) {
-        write(dir, channels(i), `name\ttype\nCz\tMISC\nsub-${pad(i)}\tn/a\n`);
+        // A last row of one cell: refused by the change summary, so the folding alone decides.
+        write(dir, channels(i), `name\ttype\nCz\tMISC\nsub-${pad(i)}\n`);
       }
     });
     const facts = gatherGitFacts(r.dir, r.base, r.head);
@@ -2424,7 +2874,8 @@ describe("one change repeated across files is read once", () => {
 
   test("a repeated change whose diff was cut covers none of the files it repeats in", () => {
     const dir = newBigDataset("fold-cut", 6);
-    const rows = Array.from({ length: 3000 }, (_, k) => `Ch${k}\tEEG`).join("\n");
+    // Rows of one cell under two column names: refused by the change summary.
+    const rows = Array.from({ length: 3000 }, (_, k) => `Ch${k}`).join("\n");
     const r = branch(dir, () => {
       for (let i = 0; i < 5; i++) write(dir, channels(i), `name\ttype\n${rows}\n`);
     });
@@ -2497,7 +2948,7 @@ describe("one change repeated across files is read once", () => {
     const dir = newBigDataset("fold-after-cap", 100);
     const r = branch(dir, () => {
       for (let i = 0; i < 100; i++) {
-        write(dir, sidecar(i), i === 0 || i === 99 ? fixed : JSON.stringify({ n: i }));
+        write(dir, sidecar(i), i === 0 || i === 99 ? fixed : `{"n":${i},"n":${i}}`);
       }
     });
     const facts = gatherGitFacts(r.dir, r.base, r.head);
@@ -2520,6 +2971,8 @@ describe("one change repeated across files is read once", () => {
     __setEvidenceBudgetForTests({ content: 19_000 });
     try {
       const content = gatherContent(r.dir, listing);
+      // 19 seconds is under the change summary's reserve, so it was not started.
+      expect(content.summary.abandoned).toBe(true);
       expect(content.patches).toHaveLength(MAX_PATCH_FILES);
       // File 49 would have ridden on file 0; with the search stopped it is unread, which fails closed.
       expect(content.patches.find((p) => p.path === sidecar(0))?.same).toEqual([]);
@@ -2539,6 +2992,38 @@ describe("one change repeated across files is read once", () => {
     const shown = facts.patches.find((p) => p.path === sidecar(0));
     expect(shown?.same).toHaveLength(MAX_DIFFS_EXAMINED - 1);
     expect(facts.readIncomplete).toBe(true);
+  }, 120_000);
+
+  test("the same cap holds for added files: MAX_DIFFS_EXAMINED are examined, one diff call each, and the rest stay unread", () => {
+    // Added files never fail the read, so the cap is the only thing that stops the search.
+    const n = MAX_DIFFS_EXAMINED + 10;
+    const added = (i: number) => `sub-${100 + i}/eeg/sub-${100 + i}_task-rest_eeg.json`;
+    const dir = newBigDataset("fold-added-cap", 3);
+    const r = branch(dir, () => {
+      for (let i = 0; i < n; i++) write(dir, added(i), fixed);
+    });
+    const listing = gatherListing(r.dir, r.base, r.head);
+    const log = callLog("fold-added-cap");
+    const restore = installGitShim(root, [{ match: " -U2 ", log }]);
+    let content: ReturnType<typeof gatherContent>;
+    try {
+      content = gatherContent(r.dir, listing);
+    } finally {
+      restore();
+    }
+    // The first added file is the one patch; the next MAX_DIFFS_EXAMINED - 1 ride on it.
+    expect(content.patches.map((p) => p.path)).toEqual([added(0)]);
+    expect(content.patches[0]?.same).toEqual(
+      Array.from({ length: MAX_DIFFS_EXAMINED - 1 }, (_, i) => added(i + 1)),
+    );
+    // One diff call per file examined, and none for the ten past the cap.
+    expect(loggedCalls(log)).toHaveLength(MAX_DIFFS_EXAMINED);
+    expect(content.groups.find((g) => g.pattern === SHAPE)).toMatchObject({
+      status: "added",
+      files: n,
+      shown: MAX_DIFFS_EXAMINED,
+    });
+    expect(content.readIncomplete).toBe(false);
   }, 120_000);
 
   test("the review is told which change repeats and in how many files", () => {
@@ -3531,6 +4016,954 @@ describe("the facts come before any model, and fail the verdict whatever it says
   });
 });
 
+// ---------------------------------------------------------------------------------------------
+// The change summary inside the content pass
+// ---------------------------------------------------------------------------------------------
+
+/** The path of the `s`-th channel table of {@link bulkRelabel}. */
+const bulkTable = (s: number): string =>
+  `sub-${pad(s)}/ses-01/ieeg/sub-${pad(s)}_ses-01_task-sleep_run-01_channels.tsv`;
+const BULK_HEADER = "name\ttype\tunits\tlow_cutoff\thigh_cutoff\tstatus";
+const bulkRow = (name: string): string => `${name}\tSEEG\tuV\t0.1\t300\tgood`;
+
+/**
+ * A pull request shaped like `nemarDatasets/on004551` #1 (the change summary design's example):
+ * `files` channel tables of `rows` rows whose names gain `POL `; four names in every table but the
+ * last wrapped in `EEG ` and `-Ref`; three rows of every second table moved verbatim to
+ * `sourcedata/channels-removed-2026-10-18/<same path>`; the kept rows reversed; two rows added; the
+ * README and CHANGES edited, and `dataset_description.json` left alone. Every name carries its
+ * subject, so no two tables' diffs are one change and the folding covers nothing: what covers the
+ * tables is the summary, or nothing. `setUp` and `edit` add to the base and to the change.
+ */
+function bulkRelabel(
+  name: string,
+  opts: {
+    files?: number;
+    rows?: number;
+    setUp?: (dir: string) => void;
+    edit?: (dir: string) => void;
+  } = {},
+): Repo {
+  const files = opts.files ?? 125;
+  const rows = opts.rows ?? 12;
+  const dir = join(root, name);
+  mkdirSync(dir, { recursive: true });
+  git(dir, "init", "-q", "-b", "main");
+  write(dir, "dataset_description.json", desc("1.0.0"));
+  write(dir, "README.md", "# iEEG\n\nSleep recordings.\n");
+  write(dir, "CHANGES", "1.0.0 2026-01-01\n - Initial release\n");
+  const changes: { path: string; after: string; moved: string[] }[] = [];
+  for (let s = 1; s <= files; s++) {
+    const tag = `s${pad(s)}`;
+    const relocated = s % 2 === 0 ? ["B13", "B14", "B15"].map((n) => `${n}${tag}`) : [];
+    const wrapped = s < files ? ["Fp1", "Fp2", "C3", "C4"].map((n) => `${n}${tag}`) : [];
+    const prefixed = Array.from(
+      { length: rows - relocated.length - wrapped.length },
+      (_, i) => `A${i + 1}${tag}`,
+    );
+    const before = [...prefixed, ...wrapped, ...relocated].map(bulkRow);
+    const after = [
+      ...[...wrapped].reverse().map((n) => bulkRow(`EEG ${n}-Ref`)),
+      ...[...prefixed].reverse().map((n) => bulkRow(`POL ${n}`)),
+      bulkRow(`POL E${tag}`),
+      bulkRow(`POL DC${tag}`),
+    ];
+    write(dir, bulkTable(s), `${BULK_HEADER}\n${before.join("\n")}\n`);
+    changes.push({
+      path: bulkTable(s),
+      after: `${BULK_HEADER}\n${after.join("\n")}\n`,
+      moved: relocated.map(bulkRow),
+    });
+  }
+  opts.setUp?.(dir);
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "initial");
+  return branch(dir, () => {
+    for (const c of changes) {
+      write(dir, c.path, c.after);
+      if (c.moved.length > 0) {
+        write(
+          dir,
+          `sourcedata/channels-removed-2026-10-18/${c.path}`,
+          `${BULK_HEADER}\n${c.moved.join("\n")}\n`,
+        );
+      }
+    }
+    write(dir, "README.md", "# iEEG\n\nSleep recordings, channels renamed.\n");
+    write(
+      dir,
+      "CHANGES",
+      "Unreleased\n - Renamed channels\n1.0.0 2026-01-01\n - Initial release\n",
+    );
+    opts.edit?.(dir);
+  });
+}
+
+/** The 125-table pull request, built once for every test that reads it (nothing writes to it). */
+let bulkRepo: Repo | null = null;
+function bulk(): Repo {
+  bulkRepo ??= bulkRelabel("bulk-relabel");
+  return bulkRepo;
+}
+
+/** The content facts but the summary, which the raw path never reads. */
+function withoutSummary(content: ReturnType<typeof gatherContent>) {
+  const { summary: _summary, ...rest } = content;
+  return rest;
+}
+
+/** A repository with one commit, then one change of it, for the small cases below. */
+function changed(name: string, base: Record<string, string>, edit: (dir: string) => void): Repo {
+  const dir = join(root, name);
+  mkdirSync(dir, { recursive: true });
+  git(dir, "init", "-q", "-b", "main");
+  for (const [rel, text] of Object.entries(base)) write(dir, rel, text);
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "initial");
+  return branch(dir, () => edit(dir));
+}
+
+describe("the change summary", () => {
+  const sidecar = (i: number) => `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_eeg.json`;
+  const channels = (i: number) => `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_channels.tsv`;
+  const events = (i: number) => `sub-${pad(i)}/eeg/sub-${pad(i)}_task-rest_events.tsv`;
+
+  test("a bulk channels.tsv relabel across 125 subjects is accounted for and read as complete", () => {
+    const r = bulk();
+    const listing = gatherListing(r.dir, r.base, r.head);
+    const started = performance.now();
+    const content = gatherContent(r.dir, listing);
+    const elapsed = performance.now() - started;
+    const facts = { ...listing, ...content };
+    const { summary } = content;
+    expect(summary.abandoned).toBe(false);
+    expect(summary.classes.map((c) => `${c.kind} ${c.items}/${c.files.size}`)).toEqual([
+      "row_relocated 186/62",
+      "key_relabeled 818/125",
+      "rows_reordered 125/125",
+      "key_relabeled 496/124",
+      "row_added 250/125",
+    ]);
+    expect(summary.loss).toEqual({ ...NO_LOSS, rowsRelocated: 186 });
+    expect([...summary.accounted].sort()).toEqual(
+      Array.from({ length: 125 }, (_, i) => bulkTable(i + 1)),
+    );
+    expect(content.readIncomplete).toBe(false);
+    // The README and CHANGES diffs, which nothing else covers, then three tables to illustrate.
+    expect(content.patches.map((p) => p.path)).toEqual([
+      "CHANGES",
+      "README.md",
+      bulkTable(1),
+      bulkTable(2),
+      bulkTable(3),
+    ]);
+    expect(content.patches.every((p) => p.same.length === 0)).toBe(true);
+    expect(
+      content.groups.find(
+        (g) => g.pattern === "sub-*/ses-*/ieeg/sub-*_ses-*_task-sleep_run-*_channels.tsv",
+      ),
+    ).toMatchObject({ status: "modified", files: 125, shown: 3, cosmeticOnly: 0, summarized: 125 });
+    const e = buildEvidence(facts, NO_TEXT_PROBLEMS);
+    // 125 tables, 62 copies in sourcedata, the README and CHANGES.
+    expect(e.files_changed).toBe(189);
+    expect(e.files_read).toBe(127);
+    expect(e.truncated).toBe(false);
+    // The whole content pass, summary included, in well under the time the raw path left it.
+    expect(elapsed).toBeLessThan(10_000);
+
+    // The control: 39 seconds is under the summary's reserve, so it is not started and the tables
+    // are read as diffs, which cannot cover 125 of them.
+    __setEvidenceBudgetForTests({ content: 39_000 });
+    let late: ReturnType<typeof gatherContent>;
+    try {
+      late = gatherContent(r.dir, listing);
+    } finally {
+      __setEvidenceBudgetForTests(null);
+    }
+    expect(late.summary.abandoned).toBe(true);
+    expect(late.readIncomplete).toBe(true);
+  }, 60_000);
+
+  test("a removed row among 500 relabels is a loss fact, and the file is still accounted for", () => {
+    const table = channels(1);
+    const kept = Array.from({ length: 500 }, (_, k) => `Ch${k}`);
+    const r = changed(
+      "cs-removed-row",
+      { [table]: `name\ttype\n${[...kept, "Ch500"].map((n) => `${n}\tEEG`).join("\n")}\n` },
+      (dir) => write(dir, table, `name\ttype\n${kept.map((n) => `POL ${n}\tEEG`).join("\n")}\n`),
+    );
+    const content = gatherContent(r.dir, gatherListing(r.dir, r.base, r.head));
+    expect(content.summary.loss).toEqual({
+      ...NO_LOSS,
+      rowsRemoved: 1,
+      rowsRemovedFiles: 1,
+      firstBlockingPath: table,
+    });
+    expect(content.summary.classes.map((c) => `${c.kind} ${c.items}`)).toEqual([
+      "row_removed 1",
+      "key_relabeled 500",
+    ]);
+    expect(content.summary.accounted.has(table)).toBe(true);
+    expect(content.readIncomplete).toBe(false);
+  });
+
+  test("a relocated copy that differs in one byte is not a relocation", () => {
+    const table = channels(1);
+    const copy = `sourcedata/channels-removed-2026-10-18/${table}`;
+    const of = (kept: string) =>
+      changed(
+        `cs-copy-${kept.replace(/\W/g, "")}`,
+        { [table]: "name\ttype\nCz\tEEG\nFz\tEEG\nPz\tEEG\n" },
+        (dir) => {
+          write(dir, table, "name\ttype\nCz\tEEG\nFz\tEEG\n");
+          write(dir, copy, `name\ttype\n${kept}\n`);
+        },
+      );
+    const loss = (r: Repo) =>
+      gatherContent(r.dir, gatherListing(r.dir, r.base, r.head)).summary.loss;
+    expect(loss(of("Pz\tEEG"))).toEqual({ ...NO_LOSS, rowsRelocated: 1 });
+    expect(loss(of("Pz\tEEH"))).toEqual({
+      ...NO_LOSS,
+      rowsRemoved: 1,
+      rowsRemovedFiles: 1,
+      firstBlockingPath: table,
+    });
+  });
+
+  test("two identical removed rows and one copy: one relocated, one removed", () => {
+    const table = events(1);
+    const r = changed(
+      "cs-two-one",
+      { [table]: "onset\tduration\ttrial_type\n1\t1\tgo\n5\t1\tstop\n5\t1\tstop\n9\t1\tgo\n" },
+      (dir) => {
+        write(dir, table, "onset\tduration\ttrial_type\n1\t1\tgo\n9\t1\tgo\n");
+        write(
+          dir,
+          `sourcedata/events-removed/${table}`,
+          "onset\tduration\ttrial_type\n5\t1\tstop\n",
+        );
+      },
+    );
+    const { summary } = gatherContent(r.dir, gatherListing(r.dir, r.base, r.head));
+    expect(summary.loss).toEqual({
+      ...NO_LOSS,
+      rowsRemoved: 1,
+      rowsRemovedFiles: 1,
+      rowsRelocated: 1,
+      firstBlockingPath: table,
+    });
+  });
+
+  test("a table the summary refuses is read as a diff, and counts as unread when the diff does not fit", () => {
+    const latin1 = (n: number, edits: number) => {
+      const dir = newBigDataset(`cs-refused-${n}`, n);
+      for (let i = 0; i < n; i++) {
+        writeFileSync(join(dir, channels(i)), Buffer.from("name\ttype\nCz\tcaf\xe9\n", "latin1"));
+      }
+      git(dir, "add", "-A");
+      git(dir, "commit", "-q", "-m", "latin1");
+      return branch(dir, () => {
+        for (let i = 0; i < edits; i++) {
+          const text = `name\ttype\nCz\tcaf\xe9 ${i}\n`;
+          writeFileSync(join(dir, channels(i)), Buffer.from(text, "latin1"));
+        }
+      });
+    };
+    for (const [n, unread] of [
+      [41, true],
+      [3, false],
+    ] as const) {
+      const r = latin1(n, n);
+      const content = gatherContent(r.dir, gatherListing(r.dir, r.base, r.head));
+      expect(content.summary.files.map((f) => f.refusal)).toEqual(
+        Array.from({ length: n }, () => "invalid_utf8"),
+      );
+      expect(content.summary.accounted.size).toBe(0);
+      expect(content.patches).toHaveLength(Math.min(n, MAX_PATCH_FILES));
+      expect(content.readIncomplete).toBe(unread);
+      const e = buildEvidence(
+        { ...gatherListing(r.dir, r.base, r.head), ...content },
+        NO_TEXT_PROBLEMS,
+      );
+      expect(e.files_read).toBe(Math.min(n, MAX_PATCH_FILES));
+    }
+  });
+
+  test("a file both shown and accounted for counts once in files_read", () => {
+    const r = changed(
+      "cs-once",
+      { [channels(1)]: "name\ttype\nCz\tEEG\n", "README.md": "# R\n" },
+      (dir) => {
+        write(dir, channels(1), "name\ttype\nCz\tMISC\n");
+        write(dir, "README.md", "# R, edited\n");
+      },
+    );
+    const listing = gatherListing(r.dir, r.base, r.head);
+    const content = gatherContent(r.dir, listing);
+    expect([...content.summary.accounted]).toEqual([channels(1)]);
+    expect(content.patches.map((p) => p.path)).toEqual(["README.md", channels(1)]);
+    const e = buildEvidence({ ...listing, ...content }, NO_TEXT_PROBLEMS);
+    expect(e.files_changed).toBe(2);
+    expect(e.files_read).toBe(2);
+  });
+
+  test("a summary cut by its character bound leaves the cut classes' files unread", () => {
+    // Five tables, each with twelve long values replaced in a column of its own (one complete
+    // class per table, about 8,000 characters each) and 2,000 rows added, so no table's diff fits.
+    const columns = ["d1", "d2", "d3", "d4", "d5"];
+    const long = (c: string, k: number) => `${c.repeat(285)}${k}`;
+    const base: Record<string, string> = {};
+    const after: Record<string, string> = {};
+    columns.forEach((column, t) => {
+      const keys = Array.from({ length: 12 }, (_, k) => `C${k}`);
+      const added = Array.from({ length: 2_000 }, (_, k) => `N${k}\tx`);
+      base[channels(t)] =
+        `name\t${column}\n${keys.map((k, i) => `${k}\t${long("a", i)}`).join("\n")}\n`;
+      after[channels(t)] =
+        `name\t${column}\n${keys.map((k, i) => `${k}\t${long("b", i)}`).join("\n")}\n${added.join("\n")}\n`;
+    });
+    const r = changed("cs-cut", base, (dir) => {
+      for (const [path, text] of Object.entries(after)) write(dir, path, text);
+    });
+    const content = gatherContent(r.dir, gatherListing(r.dir, r.base, r.head));
+    const { summary } = content;
+    expect(summary.files.every((f) => f.refusal === null)).toBe(true);
+    expect(summary.facts.classes_cut).toBeGreaterThan(0);
+    // Which tables are accounted for is decided by which of their classes were shown, and the
+    // bound cuts the replaced-value classes after the third.
+    const shownFields = summary.classes
+      .filter((c) => summary.shown.has(c.key) && c.kind === "cell_replaced")
+      .map((c) => c.field);
+    expect(shownFields).toEqual(["d1", "d2", "d3"]);
+    expect([...summary.accounted].sort()).toEqual([channels(0), channels(1), channels(2)]);
+    // The other two are read only as diffs, which are cut: unread, and the read is incomplete.
+    expect(
+      content.patches.filter((p) => !summary.accounted.has(p.path)).map((p) => p.path),
+    ).toEqual([channels(3), channels(4)]);
+    expect(content.patches.every((p) => p.truncated)).toBe(true);
+    expect(content.readIncomplete).toBe(true);
+    expect(
+      content.groups.find((g) => g.pattern === "sub-*/eeg/sub-*_task-rest_channels.tsv"),
+    ).toMatchObject({ files: 5, shown: 0, summarized: 3 });
+  });
+
+  test("an accounted file whose illustration is cut still counts as read", () => {
+    const dir = newBigDataset("cs-cut-illustration", 5);
+    const r = branch(dir, () => {
+      // 3,995 participants added and none lost: accounted for, and its diff is far over the cap.
+      const rows = Array.from({ length: 4000 }, (_, i) => `sub-${pad(i)}`).join("\n");
+      write(dir, "participants.tsv", `participant_id\n${rows}\n`);
+      write(dir, "dataset_description.json", desc("1.1.0"));
+    });
+    const facts = gatherGitFacts(r.dir, r.base, r.head);
+    expect(facts.summary.accounted.has("participants.tsv")).toBe(true);
+    expect(facts.patches.find((p) => p.path === "participants.tsv")?.truncated).toBe(true);
+    expect(facts.readIncomplete).toBe(false);
+    const e = buildEvidence(facts, NO_TEXT_PROBLEMS);
+    expect(e.files_read).toBe(2);
+    expect(e.truncated).toBe(false);
+  });
+
+  /** A sidecar the summary refuses (a key given twice), a different one for each `i`. */
+  const refusedSidecar = (i: number) => `{"n":${i},"n":${i}}`;
+  /** A channel table change the summary accounts for, a different one for each `i`. */
+  const accountedTable = (i: number) => `name\ttype\nCz\tMISC${i}\n`;
+
+  test("at most three illustrations: after the files the summary did not cover, before the added ones", () => {
+    const dir = newBigDataset("cs-illustrations", 8);
+    const r = branch(dir, () => {
+      unlinkSync(join(dir, events(0)));
+      for (const i of [0, 1]) write(dir, sidecar(i), refusedSidecar(i));
+      for (const i of [0, 1, 2, 3, 4]) write(dir, channels(i), accountedTable(i));
+      write(dir, "sub-900/eeg/sub-900_task-rest_eeg.json", "{}");
+      write(dir, "sub-901/eeg/sub-901_task-rest_eeg.json", '{"a":1}');
+    });
+    const facts = gatherGitFacts(r.dir, r.base, r.head);
+    expect([...facts.summary.accounted].sort()).toEqual([0, 1, 2, 3, 4].map(channels));
+    expect(facts.patches.map((p) => p.path)).toEqual([
+      events(0),
+      sidecar(0),
+      sidecar(1),
+      channels(0),
+      channels(1),
+      channels(2),
+      "sub-900/eeg/sub-900_task-rest_eeg.json",
+      "sub-901/eeg/sub-901_task-rest_eeg.json",
+    ]);
+    expect(facts.readIncomplete).toBe(false);
+    const e = buildEvidence(facts, NO_TEXT_PROBLEMS);
+    expect(e.files_read).toBe(e.files_changed);
+  });
+
+  test("an illustration only takes room that is left: never past 40 patches, and none once the unaccounted files fill them", () => {
+    // 38 files the summary refuses leave room for two of the five it accounts for.
+    const at = (unaccounted: number) => {
+      const dir = newBigDataset(`cs-room-${unaccounted}`, unaccounted + 5);
+      return branch(dir, () => {
+        for (let i = 0; i < unaccounted; i++) write(dir, sidecar(i), refusedSidecar(i));
+        for (let i = unaccounted; i < unaccounted + 5; i++)
+          write(dir, channels(i), accountedTable(i));
+        write(dir, "sub-900/eeg/sub-900_task-rest_eeg.json", "{}");
+      });
+    };
+    const two = at(38);
+    const twoFacts = gatherGitFacts(two.dir, two.base, two.head);
+    expect(twoFacts.patches).toHaveLength(MAX_PATCH_FILES);
+    expect(twoFacts.patches.slice(38).map((p) => p.path)).toEqual([channels(38), channels(39)]);
+    expect(twoFacts.readIncomplete).toBe(false);
+
+    // 40 refused files fill the patches: no illustration is even read, and nothing is unread.
+    const none = at(40);
+    const listing = gatherListing(none.dir, none.base, none.head);
+    const log = callLog("cs-room-40");
+    const restore = installGitShim(root, [{ match: " -U2 ", log }]);
+    let content: ReturnType<typeof gatherContent>;
+    try {
+      content = gatherContent(none.dir, listing);
+    } finally {
+      restore();
+    }
+    expect(content.patches.map((p) => p.path)).toEqual(
+      Array.from({ length: 40 }, (_, i) => sidecar(i)),
+    );
+    expect(content.summary.accounted.size).toBe(5);
+    expect(content.readIncomplete).toBe(false);
+    // The 40 shown and the added file, which is still examined for a repeat; no accounted file.
+    const read = loggedCalls(log).map((c) => c.split(" -- ")[1]?.trim());
+    expect(read).toEqual([
+      ...Array.from({ length: 40 }, (_, i) => sidecar(i)),
+      "sub-900/eeg/sub-900_task-rest_eeg.json",
+    ]);
+  }, 30_000);
+
+  test("illustrations are not counted among the diffs examined: past MAX_DIFFS_EXAMINED one is still shown", () => {
+    const n = MAX_DIFFS_EXAMINED + 5;
+    const dir = newBigDataset("cs-illustration-cap", n + 1);
+    const r = branch(dir, () => {
+      // One refused change repeated in every sidecar: one patch, which leaves room.
+      for (let i = 0; i < n; i++) write(dir, sidecar(i), refusedSidecar(-1));
+      write(dir, channels(n), accountedTable(n));
+    });
+    const facts = gatherGitFacts(r.dir, r.base, r.head);
+    expect(facts.patches.find((p) => p.path === sidecar(0))?.same).toHaveLength(
+      MAX_DIFFS_EXAMINED - 1,
+    );
+    expect(facts.patches.map((p) => p.path)).toContain(channels(n));
+    expect(facts.readIncomplete).toBe(true);
+  }, 120_000);
+
+  test("a mode change, a type change, a symlink and a submodule named like a sidecar are never summarized", () => {
+    const dir = join(root, "cs-not-regular");
+    mkdirSync(dir, { recursive: true });
+    git(dir, "init", "-q", "-b", "main");
+    write(dir, "dataset_description.json", desc("1.0.0"));
+    write(dir, sidecar(1), '{"TaskName":"rest"}');
+    write(dir, sidecar(2), '{"TaskName":"rest"}');
+    mkdirSync(join(dir, "sub-003/eeg"), { recursive: true });
+    symlinkSync("a.json", join(dir, sidecar(3)));
+    write(dir, channels(5), "name\ttype\nCz\tEEG\n");
+    git(dir, "add", "-A");
+    git(dir, "commit", "-q", "-m", "initial");
+    const first = git(dir, "rev-parse", "HEAD");
+    git(dir, "update-index", "--add", "--cacheinfo", `160000,${first},${sidecar(4)}`);
+    git(dir, "commit", "-q", "-m", "a submodule named like a sidecar");
+    const base = git(dir, "rev-parse", "HEAD");
+    git(dir, "checkout", "-q", "-b", "contrib");
+    // A mode change with a content change, a file become a symlink, a symlink pointed elsewhere, a
+    // submodule moved on, and the control: a plain edit of a table.
+    write(dir, sidecar(1), '{"TaskName":"sleep"}');
+    chmodSync(join(dir, sidecar(1)), 0o755);
+    unlinkSync(join(dir, sidecar(2)));
+    symlinkSync("b.json", join(dir, sidecar(2)));
+    unlinkSync(join(dir, sidecar(3)));
+    symlinkSync("b.json", join(dir, sidecar(3)));
+    write(dir, channels(5), "name\ttype\nCz\tMISC\n");
+    git(dir, "add", sidecar(1), sidecar(2), sidecar(3), channels(5));
+    git(dir, "update-index", "--cacheinfo", `160000,${base},${sidecar(4)}`);
+    git(dir, "commit", "-q", "-m", "update");
+    const head = git(dir, "rev-parse", "HEAD");
+    git(dir, "checkout", "-q", "main");
+    const content = gatherContent(dir, gatherListing(dir, base, head));
+    expect(content.summary.files.map((f) => f.path)).toEqual([channels(5)]);
+    expect([...content.summary.accounted]).toEqual([channels(5)]);
+    for (const i of [1, 2, 3, 4]) {
+      expect(
+        content.patches.map((p) => p.path),
+        sidecar(i),
+      ).toContain(sidecar(i));
+    }
+    expect(content.readIncomplete).toBe(false);
+  });
+
+  test("the candidates are exactly the modified .tsv and .json files of the dataset description, participants and sidecars", () => {
+    const paths = {
+      readmeJson: "README.json",
+      changesTsv: "CHANGES.tsv",
+      // Another name than the sidecar's: a file system that ignores case would make them one file.
+      upper: "sub-001/eeg/sub-001_task-other_eeg.JSON",
+      sourcedata: "sourcedata/raw/sub-001_scans.tsv",
+      derivatives: "derivatives/pipeline/sub-001/sub-001_eeg.json",
+      participants: "participants.tsv",
+      description: "dataset_description.json",
+      sidecar: "sub-001/eeg/sub-001_task-rest_eeg.json",
+    };
+    // Every file's change is its own, so no diff repeats another and folds onto it.
+    const json = (path: string, a: number) => JSON.stringify({ file: path, a });
+    const r = changed(
+      "cs-candidates",
+      {
+        [paths.readmeJson]: json(paths.readmeJson, 1),
+        [paths.changesTsv]: "a\tb\n1\t2\n",
+        [paths.upper]: json(paths.upper, 1),
+        [paths.sourcedata]: "filename\tx\nf\t1\n",
+        [paths.derivatives]: json(paths.derivatives, 1),
+        [paths.participants]: "participant_id\tage\nsub-001\t30\n",
+        [paths.description]: desc("1.0.0"),
+        [paths.sidecar]: json(paths.sidecar, 1),
+      },
+      (dir) => {
+        write(dir, paths.readmeJson, json(paths.readmeJson, 2));
+        write(dir, paths.changesTsv, "a\tb\n1\t3\n");
+        write(dir, paths.upper, json(paths.upper, 2));
+        write(dir, paths.sourcedata, "filename\tx\nf\t2\n");
+        write(dir, paths.derivatives, json(paths.derivatives, 2));
+        write(dir, paths.participants, "participant_id\tage\nsub-001\t31\n");
+        write(dir, paths.description, desc("1.1.0"));
+        write(dir, paths.sidecar, json(paths.sidecar, 2));
+      },
+    );
+    const listing = gatherListing(r.dir, r.base, r.head);
+    expect(listing.changes.filter((c) => c.status === "modified")).toHaveLength(8);
+    const content = gatherContent(r.dir, listing);
+    expect(content.summary.files.map((f) => f.path)).toEqual(
+      [paths.description, paths.participants, paths.sidecar].sort(),
+    );
+    // The README and the change log, whatever their extension, are prose read as diffs, and so is a
+    // sidecar whose extension is not written the way BIDS writes it.
+    const shown = content.patches.map((p) => p.path);
+    for (const path of [paths.readmeJson, paths.changesTsv, paths.upper]) {
+      expect(shown, path).toContain(path);
+    }
+  });
+
+  /**
+   * A key removed from a subject's sidecar and set, with the same value, in the root sidecar, which
+   * applies to it under BIDS inheritance; `between` is what the pull request does to the
+   * subject-level sidecar between the two.
+   */
+  const moved = (name: string, between: (dir: string) => void, setUp = true) => {
+    const file = "sub-01/eeg/sub-01_task-rest_eeg.json";
+    const nearer = "sub-01/sub-01_task-rest_eeg.json";
+    const base: Record<string, string> = {
+      [file]: '{"TaskName":"rest","PowerLineFrequency":60}',
+      "task-rest_eeg.json": '{"TaskName":"rest"}',
+    };
+    if (setUp) base[nearer] = '{"EEGReference":"Cz"}';
+    const r = changed(name, base, (dir) => {
+      write(dir, file, '{"TaskName":"rest"}');
+      write(dir, "task-rest_eeg.json", '{"TaskName":"rest","PowerLineFrequency":60}');
+      between(dir);
+    });
+    return { summary: gatherContent(r.dir, gatherListing(r.dir, r.base, r.head)).summary, file };
+  };
+
+  test("a changed sidecar the summary cannot read stops a key from being read as moved past it", () => {
+    const nearer = "sub-01/sub-01_task-rest_eeg.json";
+    // The control: nothing between the two, so the key reached the file from the root.
+    expect(moved("cs-move", () => {}).summary.loss).toEqual({ ...NO_LOSS, keysMoved: 1 });
+    // A removed sidecar is not there to stop it.
+    expect(moved("cs-move-removed", (dir) => unlinkSync(join(dir, nearer))).summary.loss).toEqual({
+      ...NO_LOSS,
+      keysMoved: 1,
+    });
+    // A nearer sidecar turned into a symlink: what it now says cannot be read, so it may set the
+    // key itself, and the key is removed as far as the platform can tell.
+    const symlink = moved("cs-move-symlink", (dir) => {
+      unlinkSync(join(dir, nearer));
+      symlinkSync("elsewhere.json", join(dir, nearer));
+    });
+    expect(symlink.summary.loss).toEqual({
+      ...NO_LOSS,
+      keysRemoved: 1,
+      keysRemovedFiles: 1,
+      firstBlockingPath: symlink.file,
+    });
+  });
+
+  test("pool files no candidate can consult are never read, and change nothing the summary says", () => {
+    const file = sidecar(1);
+    const table = channels(1);
+    // Added, so in the pool and never a candidate: the home of the moved key, and the row's copy.
+    const nearer = "sub-001/sub-001_task-rest_eeg.json";
+    const copy = `sourcedata/channels-removed-2026-10-18/${table}`;
+    // Files no candidate can consult: long-key documents that would each hold about a hundred
+    // million code units, a table of the moved row where no copy counts, and a copy of a table
+    // that is not a candidate.
+    const unconsulted = [
+      ...[1, 2, 3].map((p) => `derivatives/p${p}/${file}`),
+      `derivatives/p1/${table}`,
+      `sourcedata/old/${channels(9)}`,
+    ];
+    const base = {
+      "dataset_description.json": desc("1.0.0"),
+      [file]: '{"TaskName":"rest","PowerLineFrequency":60}',
+      [table]: "name\ttype\nCz\tEEG\nPz\tEEG\n",
+    };
+    const edit = (others: boolean) => (dir: string) => {
+      write(dir, file, '{"TaskName":"rest"}');
+      write(dir, nearer, '{"PowerLineFrequency":60}');
+      write(dir, table, "name\ttype\nCz\tEEG\n");
+      write(dir, copy, "name\ttype\nPz\tEEG\n");
+      if (!others) return;
+      // Each with content of its own, so no blob id is shared with a file that is read.
+      for (const [i, path] of unconsulted.entries()) {
+        write(
+          dir,
+          path,
+          path.endsWith(".json")
+            ? longKeyDocument(60_000, `"Copy":${i},`)
+            : `name\ttype\nPz\tEEG\nX${i}\tEEG\n`,
+        );
+      }
+    };
+    const read = (r: Repo) => {
+      const listing = gatherListing(r.dir, r.base, r.head);
+      const log = callLog("cs-unconsulted");
+      const restore = installGitShim(root, [{ match: " cat-file ", stdinLog: log }]);
+      try {
+        const content = gatherContent(r.dir, listing);
+        const evidence = buildEvidence({ ...listing, ...content }, NO_TEXT_PROBLEMS);
+        return { content, evidence, asked: new Set(loggedCalls(log)) };
+      } finally {
+        restore();
+      }
+    };
+    const plain = changed("cs-unconsulted-plain", base, edit(false));
+    const crowded = changed("cs-unconsulted-crowded", base, edit(true));
+    const without = read(plain);
+    const withOthers = read(crowded);
+    for (const run of [without, withOthers]) {
+      expect(run.content.summary.loss).toEqual({ ...NO_LOSS, keysMoved: 1, rowsRelocated: 1 });
+      expect([...run.content.summary.accounted].sort()).toEqual([table, file].sort());
+    }
+    expect(withOthers.content.readIncomplete).toBe(without.content.readIncomplete);
+    expect(withOthers.evidence.files_read).toBe(without.evidence.files_read);
+    // A blob's id is its content's, so the two repositories share the ids of the shared files: the
+    // other files added nothing to what cat-file was asked about.
+    const id = (r: Repo, path: string) => git(r.dir, "rev-parse", `${r.head}:${path}`);
+    expect(withOthers.asked).toContain(id(crowded, nearer));
+    expect(withOthers.asked).toContain(id(crowded, copy));
+    for (const path of unconsulted) expect(withOthers.asked, path).not.toContain(id(crowded, path));
+    expect([...withOthers.asked].sort()).toEqual([...without.asked].sort());
+  });
+
+  test("a pool table whose earlier version cannot be read lends no copies", () => {
+    const table = channels(1);
+    const copy = `sourcedata/channels-removed-2026-10-18/${table}`;
+    const r = changed(
+      "cs-pool-missing",
+      { [table]: "name\ttype\nCz\tEEG\nPz\tEEG\n", [copy]: "name\ttype\nOz\tEEG\n" },
+      (dir) => {
+        write(dir, table, "name\ttype\nCz\tEEG\n");
+        write(dir, copy, "name\ttype\nOz\tEEG\nPz\tEEG\n");
+      },
+    );
+    const listing = gatherListing(r.dir, r.base, r.head);
+    // The control: the copy's two versions are read, and the removed row is found in it.
+    expect(gatherContent(r.dir, listing).summary.loss).toEqual({ ...NO_LOSS, rowsRelocated: 1 });
+    // Without its earlier version the copy cannot say which rows are new, so it is no copy at all.
+    const earlier = git(r.dir, "rev-parse", `${r.base}:${copy}`);
+    unlinkSync(join(r.dir, ".git", "objects", earlier.slice(0, 2), earlier.slice(2)));
+    expect(gatherContent(r.dir, listing).summary.loss).toEqual({
+      ...NO_LOSS,
+      rowsRemoved: 1,
+      rowsRemovedFiles: 1,
+      firstBlockingPath: table,
+    });
+  });
+
+  test("a pool table that was a symlink before is no copy: its earlier version is not a table", () => {
+    const table = channels(1);
+    const copy = `sourcedata/channels-removed-2026-10-18/${table}`;
+    const dir = join(root, "cs-pool-typechange");
+    mkdirSync(join(dir, dirname(copy)), { recursive: true });
+    git(dir, "init", "-q", "-b", "main");
+    write(dir, table, "name\ttype\nCz\tEEG\nPz\tEEG\n");
+    symlinkSync("elsewhere.tsv", join(dir, copy));
+    git(dir, "add", "-A");
+    git(dir, "commit", "-q", "-m", "initial");
+    // A type change: what the copy held before cannot be read, so none of its rows is known new.
+    const r = branch(dir, () => {
+      write(dir, table, "name\ttype\nCz\tEEG\n");
+      unlinkSync(join(dir, copy));
+      write(dir, copy, "name\ttype\nPz\tEEG\n");
+    });
+    expect(git(dir, "diff", "--raw", r.base, r.head, "--", copy)).toMatch(/ T\t/);
+    const { summary } = gatherContent(r.dir, gatherListing(r.dir, r.base, r.head));
+    expect(summary.loss).toEqual({
+      ...NO_LOSS,
+      rowsRemoved: 1,
+      rowsRemovedFiles: 1,
+      firstBlockingPath: table,
+    });
+  });
+});
+
+describe("the change summary keeps to its deadline, and leaves the raw path as it was", () => {
+  /**
+   * What the content pass of the 125-table pull request is without a summary, worked out by hand:
+   * the first 40 changed files in review order shown, each its own change and none cut, the rest
+   * unread, nothing accounted for.
+   */
+  const expectRaw = (content: ReturnType<typeof gatherContent>, listing: Listing) => {
+    const order = [
+      "CHANGES",
+      "README.md",
+      ...Array.from({ length: 125 }, (_, i) => bulkTable(i + 1)),
+    ];
+    expect(content.summary.abandoned).toBe(true);
+    expect(content.summary.accounted.size).toBe(0);
+    expect(content.patches.map((p) => p.path)).toEqual(order.slice(0, MAX_PATCH_FILES));
+    expect(content.patches.every((p) => p.same.length === 0 && !p.truncated)).toBe(true);
+    expect(content.readIncomplete).toBe(true);
+    expect(content.groups.every((g) => g.summarized === 0)).toBe(true);
+    expect(buildEvidence({ ...listing, ...content }, NO_TEXT_PROBLEMS).files_read).toBe(40);
+  };
+
+  /** A content pass of the 125-table pull request, with the cat-file calls it made. */
+  const read = (budget: number | null, options?: ContentOptions, rules: ShimRule[] = []) => {
+    const r = bulk();
+    const listing = gatherListing(r.dir, r.base, r.head);
+    const log = callLog("deadline");
+    // The log first, so a call stopped while a later rule holds it is still recorded.
+    const restore = installGitShim(root, [{ match: " cat-file ", log }, ...rules]);
+    if (budget !== null) __setEvidenceBudgetForTests({ content: budget });
+    const started = Date.now();
+    try {
+      const content = gatherContent(r.dir, listing, options);
+      return {
+        listing,
+        content,
+        elapsed: Date.now() - started,
+        catFile: loggedCalls(log).map((c) => c.split("never ")[1]?.trim()),
+      };
+    } finally {
+      __setEvidenceBudgetForTests(null);
+      restore();
+    }
+  };
+  /** The pass with 39 seconds left, which never starts the summary: what other runs must equal. */
+  let reference: ReturnType<typeof read> | null = null;
+  const tooLate = () => {
+    reference ??= read(39_000);
+    return reference;
+  };
+  const COSMETIC_READS = ["cat-file --batch-check", "cat-file --batch"];
+
+  test("with less than 40 seconds left the summary is not started: two cat-file processes, no pool read", () => {
+    const late = tooLate();
+    expect(late.content.summary).toBe(ABANDONED_SUMMARY);
+    expect(late.catFile).toEqual(COSMETIC_READS);
+    expectRaw(late.content, late.listing);
+    // The same through the clock alone, with the real budget: the start is decided by the clock
+    // the summary is given, read once, and nothing of the summary is read once it says too late.
+    let reads = 0;
+    const clocked = read(null, {
+      now: () => {
+        reads++;
+        return Number.MAX_SAFE_INTEGER;
+      },
+    });
+    expect(reads).toBe(1);
+    expect(clocked.content.summary).toBe(ABANDONED_SUMMARY);
+    expect(clocked.catFile).toEqual(COSMETIC_READS);
+    expectRaw(clocked.content, clocked.listing);
+    expect(withoutSummary(clocked.content)).toEqual(withoutSummary(late.content));
+  }, 30_000);
+
+  test("a summary that reaches its deadline while it runs is abandoned, and the raw path is as it was", () => {
+    let reads = 0;
+    // The real time for the start and the check before the first pool file, then past the deadline.
+    const midway = read(null, { now: () => (++reads <= 2 ? Date.now() : Number.MAX_SAFE_INTEGER) });
+    expect(reads).toBeGreaterThanOrEqual(3);
+    // It was started: the pool was read.
+    expect(midway.catFile).toHaveLength(4);
+    expectRaw(midway.content, midway.listing);
+    expect(withoutSummary(midway.content)).toEqual(withoutSummary(tooLate().content));
+  }, 30_000);
+
+  test("a pool read that stalls past the summary's deadline abandons the summary, and the pass goes on", () => {
+    // 42 seconds leaves the summary two seconds before its line; the third cat-file is the pool's
+    // first read.
+    const stalled = read(42_000, undefined, [
+      { match: " cat-file ", sleepSeconds: 10, fromCall: 3 },
+    ]);
+    expect(stalled.elapsed).toBeLessThan(8_000);
+    expect(stalled.catFile).toEqual([...COSMETIC_READS, "cat-file --batch-check"]);
+    expect(stalled.content.summary).toBe(ABANDONED_SUMMARY);
+    expectRaw(stalled.content, stalled.listing);
+    expect(withoutSummary(stalled.content)).toEqual(withoutSummary(tooLate().content));
+  }, 30_000);
+
+  test("a pass that is late after the first diffs shows no illustration, though the summary ran", () => {
+    // 45 seconds: the summary starts only with 40 left (SUMMARY_LIMITS.timeReserveMs), so the
+    // cosmetic proofs and the summary have 5 seconds to be done, and 20 tables take a fraction of
+    // one. 26 seconds on the diff of CHANGES: 19 are left, under the 20 an illustration needs, and
+    // still positive, so the pass goes on and does not end timed_out. Every second lost anywhere
+    // else makes the pass later, never earlier, and it takes 19 more to end it.
+    const r = bulkRelabel("late-illustration", { files: 20 });
+    const listing = gatherListing(r.dir, r.base, r.head);
+    const log = callLog("late-illustration");
+    const restore = installGitShim(root, [
+      { match: " -U2 ", log },
+      { match: " -- CHANGES ", sleepSeconds: 26 },
+    ]);
+    __setEvidenceBudgetForTests({ content: 45_000 });
+    let content: ReturnType<typeof gatherContent>;
+    let elapsed = 0;
+    try {
+      const started = Date.now();
+      content = gatherContent(r.dir, listing);
+      elapsed = Date.now() - started;
+    } finally {
+      __setEvidenceBudgetForTests(null);
+      restore();
+    }
+    expect(elapsed).toBeGreaterThanOrEqual(25_000);
+    // The summary was started and finished: it accounts for the tables.
+    expect(content.summary.abandoned).toBe(false);
+    expect(content.summary.accounted.size).toBe(20);
+    // Only the files it did not account for were read, and no illustration of the ones it did.
+    expect(content.patches.map((p) => p.path)).toEqual(["CHANGES", "README.md"]);
+    expect(loggedCalls(log).map((c) => c.split(" -- ")[1]?.trim())).toEqual([
+      "CHANGES",
+      "README.md",
+    ]);
+    expect(content.readIncomplete).toBe(false);
+    // The control: with time to spare the same pass shows three illustrations after them.
+    expect(gatherContent(r.dir, listing).patches.map((p) => p.path)).toEqual([
+      "CHANGES",
+      "README.md",
+      bulkTable(1),
+      bulkTable(2),
+      bulkTable(3),
+    ]);
+  }, 60_000);
+});
+
+describe("the content pass on the job's blob-less clone", () => {
+  /**
+   * A clone made as the review job makes one: a bare origin that allows blob-less fetches, a
+   * promisor remote, and one fetch of the base and the head with `--filter=blob:none`, no checkout.
+   */
+  function blobLessClone(name: string, origin: Repo): string {
+    const bare = join(root, `${name}-origin.git`);
+    execFileSync("git", ["clone", "-q", "--bare", origin.dir, bare], { env: GIT_ENV });
+    git(bare, "config", "uploadpack.allowFilter", "true");
+    git(bare, "config", "uploadpack.allowAnySHA1InWant", "true");
+    const clone = join(root, name);
+    mkdirSync(clone, { recursive: true });
+    git(clone, "init", "-q", "-b", "main");
+    git(clone, "config", "extensions.partialClone", "origin");
+    git(clone, "remote", "add", "origin", `file://${bare}`);
+    git(
+      clone,
+      "fetch",
+      "-q",
+      "--no-tags",
+      "--filter=blob:none",
+      "origin",
+      "+refs/heads/main:refs/remotes/origin/main",
+      "+refs/heads/contrib:refs/remotes/pr/head",
+    );
+    return clone;
+  }
+
+  /** Whether the clone holds the object, asked so that asking cannot fetch it. */
+  function holds(clone: string, oid: string): boolean {
+    try {
+      execFileSync("git", ["-C", clone, "cat-file", "-e", oid], {
+        env: { ...GIT_ENV, GIT_NO_LAZY_FETCH: "1" },
+        stdio: "ignore",
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  const NO_LAZY_FETCH = { GIT_NO_LAZY_FETCH: "1" };
+  /** Twenty tables of the bulk relabel and one sidecar reindented, which is cosmetic. */
+  const origin = () =>
+    bulkRelabel(`clone-source-${Math.random().toString(36).slice(2)}`, {
+      files: 20,
+      setUp: (dir) => write(dir, "task-sleep_ieeg.json", '{"TaskName":"sleep"}'),
+      edit: (dir) => write(dir, "task-sleep_ieeg.json", '{\n  "TaskName": "sleep"\n}\n'),
+    });
+
+  test("one prefetch brings every blob: the cosmetic proof and the summary read them with no fetch of their own", () => {
+    const r = origin();
+    const clone = blobLessClone("clone-lazy", r);
+    const before = git(r.dir, "rev-parse", `${r.base}:${bulkTable(1)}`);
+    const after = git(r.dir, "rev-parse", `${r.head}:${bulkTable(1)}`);
+    expect(holds(clone, before)).toBe(false);
+    expect(holds(clone, after)).toBe(false);
+    const listing = gatherListing(clone, r.base, r.head);
+    const log = callLog("clone-lazy");
+    // cat-file may not fetch: what it reads, the prefetch must already have brought.
+    const restore = installGitShim(root, [
+      { match: " cat-file ", env: NO_LAZY_FETCH },
+      { match: " ", log },
+    ]);
+    let content: ReturnType<typeof gatherContent>;
+    try {
+      content = gatherContent(clone, listing);
+    } finally {
+      restore();
+    }
+    expect(content.cosmeticOnlyFiles).toBe(1);
+    expect([...content.summary.accounted].sort()).toEqual(
+      Array.from({ length: 20 }, (_, i) => bulkTable(i + 1)),
+    );
+    expect(content.summary.loss.rowsRelocated).toBe(30);
+    expect(content.readIncomplete).toBe(false);
+    const calls = loggedCalls(log).map(
+      (c) => c.split("protocol.ext.allow=never ")[1]?.trim() ?? "",
+    );
+    expect(calls.filter((c) => c.startsWith("diff --numstat"))).toHaveLength(1);
+    expect(calls.filter((c) => c.startsWith("diff --raw"))).toHaveLength(1);
+    // Two processes for the cosmetic proofs, two for the summary's pool: no more, no fewer.
+    expect(calls.filter((c) => c.startsWith("cat-file"))).toEqual([
+      "cat-file --batch-check",
+      "cat-file --batch",
+      "cat-file --batch-check",
+      "cat-file --batch",
+    ]);
+    expect(calls.filter((c) => /^show \S+\.(json|tsv)$/.test(c))).toEqual([]);
+    // The README and CHANGES, which nothing else covers, and three illustrations.
+    expect(calls.filter((c) => c.startsWith("diff -U2"))).toHaveLength(2 + 3);
+  }, 30_000);
+
+  test("when the prefetch cannot fetch either, nothing is proven cosmetic and nothing is accounted for", () => {
+    const r = origin();
+    const clone = blobLessClone("clone-cut-off", r);
+    const listing = gatherListing(clone, r.base, r.head);
+    const restore = installGitShim(root, [
+      { match: " cat-file ", env: NO_LAZY_FETCH },
+      { match: " --numstat ", env: NO_LAZY_FETCH },
+    ]);
+    let content: ReturnType<typeof gatherContent>;
+    try {
+      content = gatherContent(clone, listing);
+    } finally {
+      restore();
+    }
+    expect(content.cosmeticOnlyFiles).toBe(0);
+    expect(content.summary.accounted.size).toBe(0);
+    expect(content.summary).toBe(EMPTY_SUMMARY);
+  }, 30_000);
+});
+
 describe("the worst case fits", () => {
   test("the worst-case user messages of both stages stay under 300,000 characters", () => {
     const long = (n: number, c = "x") => c.repeat(n);
@@ -3586,9 +5019,11 @@ describe("the worst case fits", () => {
         files: 1000,
         shown: 1,
         cosmeticOnly: 0,
+        summarized: 0,
       })),
       groupsOmittedFiles: 1,
       changelogEntry: "added" as const,
+      summary: EMPTY_SUMMARY,
     };
     const review = buildReviewMessages({
       facts,

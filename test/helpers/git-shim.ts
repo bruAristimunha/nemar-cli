@@ -1,7 +1,8 @@
 /**
  * A pass-through wrapper for the real Git executable. Tests may add environment
- * variables to one matching call, record its arguments or its environment, or delay it; it
- * never changes Git's output or exit status.
+ * variables to one matching call, record its arguments, its environment or its standard
+ * input, or delay it, from its first matching call or from a later one; it never changes
+ * Git's input, output or exit status.
  *
  * `env` lets a test steer one child process (for example point git-annex's HTTP client
  * at a dead local proxy) without writing to `process.env`: Bun keeps a proxy variable
@@ -25,11 +26,22 @@ export interface ShimRule {
    */
   envLog?: string;
   /**
+   * Append the call's standard input, then run the real Git executable on that same input: what a
+   * batch call such as `cat-file --batch-check` was asked about.
+   */
+  stdinLog?: string;
+  /**
    * Wait this many seconds before running the real Git executable: a fetch that stalls. The wait
    * holds none of the call's pipes, so a caller that kills the call on a timeout is not kept
    * waiting for it.
    */
   sleepSeconds?: number;
+  /**
+   * Act only from this matching call on, counting from 1: the earlier matches run the real Git
+   * executable untouched (and are not logged). Counted in a file beside the wrapper, so a test can
+   * stall the third read of a kind and not the first two. Unset, the rule acts on every match.
+   */
+  fromCall?: number;
 }
 
 const quote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
@@ -67,7 +79,7 @@ export function installGitShim(root: string, rules: ShimRule[]): () => void {
   if (!real) throw new Error("git not found");
   const dir = join(root, `git-wrapper-${Math.random().toString(36).slice(2, 8)}`);
   mkdirSync(dir, { recursive: true });
-  const blocks = rules.map((rule) => {
+  const blocks = rules.map((rule, index) => {
     const lines: string[] = Object.entries(rule.env ?? {}).map(
       ([k, v]) => `  export ${k}=${quote(v)}`,
     );
@@ -75,8 +87,30 @@ export function installGitShim(root: string, rules: ShimRule[]): () => void {
     if (rule.envLog !== undefined) {
       lines.push(`  { printf '== %s\\n' "$args"; env; } >> ${quote(rule.envLog)}`);
     }
+    if (rule.stdinLog !== undefined) {
+      // A copy of the input, appended to the log and then made the input of the real call.
+      lines.push(
+        `  stdin_copy=$(mktemp ${quote(join(dir, "stdin.XXXXXX"))})`,
+        '  cat > "$stdin_copy"',
+        `  cat "$stdin_copy" >> ${quote(rule.stdinLog)}`,
+        '  exec < "$stdin_copy"',
+      );
+    }
     if (rule.sleepSeconds !== undefined) {
       lines.push(`  sleep ${Number(rule.sleepSeconds)} </dev/null >/dev/null 2>&1`);
+    }
+    if (rule.fromCall !== undefined) {
+      const counter = quote(join(dir, `calls-${index}`));
+      return [
+        `case "$args" in *${quote(rule.match)}*)`,
+        `  n=$(( $(cat ${counter} 2>/dev/null || echo 0) + 1 ))`,
+        `  echo "$n" > ${counter}`,
+        `  if [ "$n" -ge ${Number(rule.fromCall)} ]; then`,
+        ...lines.map((line) => `  ${line}`),
+        "  fi",
+        "  ;;",
+        "esac",
+      ].join("\n");
     }
     return [`case "$args" in *${quote(rule.match)}*)`, ...lines, "  ;;", "esac"].join("\n");
   });

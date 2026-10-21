@@ -12,6 +12,7 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  ABANDONED_SUMMARY,
   type Atom,
   CLASS_KINDS,
   type ChangeClass,
@@ -43,6 +44,7 @@ import {
   lossFactsOf,
   parseJson,
   parseTsv,
+  poolFileMatters,
   renderClasses,
   renderValue,
   ruleWords,
@@ -53,6 +55,7 @@ import {
   verifyJsonCounts,
   verifyTableCounts,
 } from "../scripts/ci/pr-review-summary";
+import { documentHolding } from "./helpers/summary-pool";
 
 const enc = (text: string): Uint8Array => new TextEncoder().encode(text);
 
@@ -2439,6 +2442,55 @@ describe("summarizeChanges: the deadline abandons the whole summary", () => {
   // comes next (before the next file, or after the loop), so no clock can trip it alone. The read
   // counts below are what pin it.
 
+  test("only the check before a pool file sees the time between two pool files: it abandons", () => {
+    const path = channels(1);
+    const [first, second] = [`sourcedata/a/${path}`, `sourcedata/b/${path}`];
+    const touched = new Set<string>();
+    // Pool files that record when their bytes are first read, in path order.
+    const watchedPool = (where: string, text: string): PoolFile => ({
+      path: where,
+      before: null,
+      get after() {
+        touched.add(where);
+        return enc(text);
+      },
+    });
+    const run = (from: string) =>
+      summarizeChanges({
+        candidates: [
+          candidate(
+            path,
+            tsv(CHANNELS, ["A1", "EEG", "uV"], ["R1", "EEG", "uV"]),
+            tsv(CHANNELS, ["A1", "EEG", "uV"]),
+          ),
+        ],
+        // Given in reverse: the pools are read in path order whatever order they come in.
+        pool: [
+          watchedPool(second, tsv(CHANNELS, ["R2", "EEG", "uV"])),
+          watchedPool(first, tsv(CHANNELS, ["R1", "EEG", "uV"])),
+        ],
+        deadline: 10,
+        now: () => (touched.has(from) && !touched.has(second) ? 10 : 0),
+      });
+    abandonedShape(run(first));
+    // Not vacuous: with the state never reached, the run goes on and finds the copy.
+    touched.clear();
+    const kept = run("never");
+    expect(kept.abandoned).toBe(false);
+    expect(kept.loss.rowsRelocated).toBe(1);
+  });
+
+  test("the clock is read once before each pool file, on top of the reads per candidate", () => {
+    const pool = [1, 3].map((n) =>
+      pooled(`sourcedata/old/${channels(n)}`, null, tsv(CHANNELS, ["Z9", "EEG", "uV"])),
+    );
+    const c = clock([9]);
+    const summary = summarizeChanges({ candidates: files(), pool, deadline: 10, now: c.now });
+    expect(summary.abandoned).toBe(false);
+    // Two pool files, then twice per candidate and once after.
+    expect(c.reads()).toBe(2 + 7);
+  });
+
   test("a deadline already reached abandons before the first file", () => {
     const c = clock([5]);
     abandonedShape(summarizeChanges({ candidates: files(), pool: [], deadline: 5, now: c.now }));
@@ -2537,6 +2589,97 @@ describe("summarizeChanges: the deadline abandons the whole summary", () => {
     (abandoned.accounted as Set<string>).add("sub-01/x.tsv");
     expect(abandoned.accounted.size).toBe(1);
     expect(EMPTY_SUMMARY.accounted.size).toBe(0);
+  });
+
+  // The summary a caller returns when it does not start one, or cannot read what one is made of:
+  // the same three properties as the empty summary's, and abandoned.
+
+  test("the abandoned summary is abandoned and holds nothing: what a run past its deadline returns", () => {
+    expect(ABANDONED_SUMMARY.abandoned).toBe(true);
+    expect(ABANDONED_SUMMARY.text).toBe("");
+    abandonedShape(ABANDONED_SUMMARY);
+    const past = summarizeChanges({ candidates: files(), pool: [], deadline: 0, now: () => 0 });
+    expect(ABANDONED_SUMMARY.facts).toEqual(past.facts);
+    expect(ABANDONED_SUMMARY.loss).toEqual(past.loss);
+    expect(ABANDONED_SUMMARY.files).toEqual(past.files);
+    expect(ABANDONED_SUMMARY.classes).toEqual(past.classes);
+    expect(ABANDONED_SUMMARY).not.toBe(EMPTY_SUMMARY);
+    expect(EMPTY_SUMMARY.abandoned).toBe(false);
+  });
+
+  test("the abandoned summary is one shared object, so it is frozen: a caller cannot change it for the next", () => {
+    expect(Object.isFrozen(ABANDONED_SUMMARY)).toBe(true);
+    expect(Object.isFrozen(ABANDONED_SUMMARY.facts)).toBe(true);
+    expect(Object.isFrozen(ABANDONED_SUMMARY.facts.classes)).toBe(true);
+    expect(Object.isFrozen(ABANDONED_SUMMARY.loss)).toBe(true);
+    expect(Object.isFrozen(ABANDONED_SUMMARY.files)).toBe(true);
+    expect(Object.isFrozen(ABANDONED_SUMMARY.classes)).toBe(true);
+    expect(() => {
+      (ABANDONED_SUMMARY.facts.classes as string[]).push("C1 forged");
+    }).toThrow();
+    expect(() => {
+      (ABANDONED_SUMMARY as { abandoned: boolean }).abandoned = false;
+    }).toThrow();
+    expect(() => {
+      (ABANDONED_SUMMARY.facts as { files_accounted_for: number }).files_accounted_for = 3;
+    }).toThrow();
+    expect(ABANDONED_SUMMARY.abandoned).toBe(true);
+    expect(ABANDONED_SUMMARY.facts.classes).toEqual([]);
+    expect(ABANDONED_SUMMARY.facts.files_accounted_for).toBe(0);
+  });
+
+  test("the abandoned summary's sets cannot be filled through a cast", () => {
+    for (const set of [
+      ABANDONED_SUMMARY.shown,
+      ABANDONED_SUMMARY.complete,
+      ABANDONED_SUMMARY.accounted,
+    ]) {
+      const writable = set as Set<string>;
+      expect(() => writable.add("sub-01/x.tsv")).toThrow();
+      expect(() => writable.delete("sub-01/x.tsv")).toThrow();
+      expect(() => writable.clear()).toThrow();
+      expect(set.size).toBe(0);
+      expect(set.has("sub-01/x.tsv")).toBe(false);
+    }
+    expect([...ABANDONED_SUMMARY.accounted]).toEqual([]);
+  });
+});
+
+describe("summarizeChanges: the pool's bound is shared out in path order", () => {
+  const path = "sub-01/eeg/sub-01_task-x_eeg.json";
+  const input = [candidate(path, '{"SamplingFrequency": 500, "A": 1}', '{"A": 1}')];
+  // The subject-level sidecar, nearer to the file than the root, gains the removed value.
+  const home = pooled("sub-01/sub-01_task-x_eeg.json", null, '{"SamplingFrequency": 500}');
+
+  test("a file that fits only on its own cannot take an earlier, nearer home's room, in either order", () => {
+    // A root sidecar that applies too, and alone takes the whole bound: after the home, it no
+    // longer fits, and is unreadable; that is farther than the home, so it decides nothing.
+    const root = documentHolding("task-x_eeg.json", SUMMARY_LIMITS.maxPoolChars, 15_000);
+    for (const pool of [
+      [root, home],
+      [home, root],
+    ]) {
+      const summary = summarize(input, pool);
+      expect(summary.loss).toEqual({ ...NO_LOSS, keysMoved: 1 });
+      expect(summary.classes.map((c) => c.kind)).toEqual(["json_key_moved"]);
+    }
+  });
+
+  test("the same file sorted before the home takes the room, and the home, unreadable and nearest, stops the move", () => {
+    // `eeg.json` applies to the file as the root `task-x_eeg.json` does, and sorts first.
+    const root = documentHolding("eeg.json", SUMMARY_LIMITS.maxPoolChars, 15_000);
+    for (const pool of [
+      [root, home],
+      [home, root],
+    ]) {
+      const summary = summarize(input, pool);
+      expect(summary.loss).toEqual({
+        ...NO_LOSS,
+        keysRemoved: 1,
+        keysRemovedFiles: 1,
+        firstBlockingPath: path,
+      });
+    }
   });
 });
 
@@ -4034,4 +4177,277 @@ describe("the hidden-loss round-trip oracle", () => {
     }
     for (const kind of CLASS_KINDS) expect(seen.has(kind), kind).toBe(true);
   }, 120_000);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Pruning the pool to the files a candidate can consult changes no decision
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A summary as text, every set and map in its own order: two summaries that say the same are equal.
+ */
+const snapshot = (summary: ChangeSummary): string =>
+  JSON.stringify(summary, (_key, value: unknown) =>
+    value instanceof Set ? { set: [...value] } : value instanceof Map ? { map: [...value] } : value,
+  );
+
+const dirOf = (path: string): string => path.slice(0, Math.max(0, path.lastIndexOf("/")));
+
+const PRUNE_JSON = [
+  "sub-01/eeg/sub-01_task-x_eeg.json",
+  "sub-02/ses-1/eeg/sub-02_ses-1_task-x_eeg.json",
+  "sub-02/ses-1/eeg/sub-02_ses-1_task-x_acq-a_eeg.json",
+  "task-x_events.json",
+  "derivatives/p/sub-01/eeg/sub-01_task-x_eeg.json",
+  "sourcedata/raw/sub-01/sub-01_task-x_eeg.json",
+];
+const PRUNE_DIRS = [
+  "",
+  "sub-01",
+  "sub-01/eeg",
+  "sub-02",
+  "sub-02/ses-1",
+  "sub-02/ses-1/eeg",
+  "sub-02/ses-2/eeg",
+  "sub-03/eeg",
+  "derivatives/p",
+  "derivatives/p/sub-01",
+  "derivatives/p/sub-01/eeg",
+  "derivatives/q/sub-01/eeg",
+  "sourcedata/raw",
+  "sourcedata/raw/sub-01",
+  "sourcedata/channels-removed-1/sub-01/eeg",
+];
+const PRUNE_NAMES = [
+  "task-x_eeg.json",
+  "eeg.json",
+  "sub-01_task-x_eeg.json",
+  "sub-01_eeg.json",
+  "sub-02_ses-1_eeg.json",
+  "ses-1_task-x_eeg.json",
+  "acq-a_eeg.json",
+  "task-x_acq-a_eeg.json",
+  "task-x_events.json",
+  "events.json",
+  "task-y_eeg.json",
+  "task-x_channels.json",
+  "notes_eeg.json",
+  "task-x_eeg.JSON",
+];
+const PRUNE_TABLES = [
+  "sub-01/eeg/sub-01_task-x_channels.tsv",
+  "sub-02/ses-1/eeg/sub-02_ses-1_task-x_channels.tsv",
+  "participants.tsv",
+  "derivatives/p/sub-01_channels.tsv",
+];
+const PRUNE_KEYS = ["A", "B", "C", "D"];
+const PRUNE_VALUES: Plain[] = [1, 2, "x", { n: 1 }, [1, 2], null];
+const PRUNE_ROWS = ["Cz", "Pz", "Oz", "Fz", "T7"].flatMap((n) => [
+  [n, "EEG"],
+  [n, "EOG"],
+]);
+
+/**
+ * A pull request whose pool mixes the files its candidates can consult with files they cannot:
+ * JSON candidates at the root, in subject and session directories, under `derivatives/` and under
+ * `sourcedata/`, losing keys; table candidates losing rows; sidecars at every level of a small tree
+ * that hold the lost leaves or other values, unreadable ones, ones listed twice, and the candidates
+ * themselves; and tables holding the lost rows at the corresponding sourcedata path and at paths
+ * that are not one. The values are few, so a sidecar often holds a lost leaf.
+ */
+function prunableCase(random: () => number): { candidates: SummaryCandidate[]; pool: PoolFile[] } {
+  const { pick, chance, int } = kit(random);
+  const object = (): { [key: string]: Plain } => {
+    const o: { [key: string]: Plain } = {};
+    for (const key of PRUNE_KEYS) if (chance(0.55)) o[key] = pick(PRUNE_VALUES);
+    return o;
+  };
+  const candidates: SummaryCandidate[] = [];
+  // The keys each JSON candidate lost, with the values it lost.
+  const gone = new Map<string, { [key: string]: Plain }>();
+  for (const path of PRUNE_JSON) {
+    if (!chance(0.4)) continue;
+    const before = { A: 1, ...object() };
+    const after = { ...before } as { [key: string]: Plain };
+    const lostKeys: { [key: string]: Plain } = {};
+    for (const key of Object.keys(after)) {
+      const op = random();
+      if (op < 0.45) {
+        lostKeys[key] = after[key] as Plain;
+        delete after[key];
+      } else if (op < 0.6) after[key] = pick(PRUNE_VALUES);
+    }
+    gone.set(path, lostKeys);
+    candidates.push(candidate(path, JSON.stringify(before), JSON.stringify(after)));
+  }
+  const lost = new Map<string, string[][]>();
+  for (const path of PRUNE_TABLES) {
+    if (!chance(0.35)) continue;
+    const rows = PRUNE_ROWS.filter(() => chance(0.4));
+    const kept = rows.filter(() => chance(0.55));
+    lost.set(
+      path,
+      rows.filter((row) => !kept.includes(row)),
+    );
+    const added = chance(0.3) ? [pick(PRUNE_ROWS)] : [];
+    candidates.push(
+      candidate(path, tsv(["name", "type"], ...rows), tsv(["name", "type"], ...kept, ...added)),
+    );
+  }
+  if (candidates.length === 0) {
+    candidates.push(candidate(PRUNE_JSON[0] as string, '{"A": 1, "B": 2}', '{"B": 2}'));
+  }
+
+  const pool: PoolFile[] = [];
+  // The candidates are pool files too, as the evidence reader hands them on.
+  for (const c of candidates) if (chance(0.7)) pool.push({ ...c });
+  // A sidecar near a JSON candidate: in one of its ancestor directories, named with some of its
+  // entities and its suffix, now and then with an entity it lacks; it often holds a lost leaf.
+  const near = (path: string): { path: string; holds: { [key: string]: Plain } } => {
+    const dir = dirOf(path);
+    const file = path.slice(path.lastIndexOf("/") + 1);
+    const parts = file.slice(0, file.indexOf(".")).split("_");
+    const segments = dir === "" ? [] : dir.split("/");
+    const up = segments.slice(0, int(0, segments.length)).join("/");
+    const entities = parts.slice(0, -1).filter(() => chance(0.5));
+    if (chance(0.1)) entities.push("acq-b");
+    const name = `${[...entities, parts[parts.length - 1]].join("_")}.json`;
+    const holds: { [key: string]: Plain } = {};
+    for (const [key, value] of Object.entries(gone.get(path) ?? {})) {
+      if (chance(0.6)) holds[key] = chance(0.85) ? value : pick(PRUNE_VALUES);
+    }
+    return { path: up === "" ? name : `${up}/${name}`, holds };
+  };
+  const json = candidates.filter((c) => c.path.endsWith(".json")).map((c) => c.path);
+  for (let i = int(2, 10); i > 0; i--) {
+    const placed = json.length > 0 && chance(0.6) ? near(pick(json)) : null;
+    const dir = pick(PRUNE_DIRS);
+    const name = pick(PRUNE_NAMES);
+    const path = placed?.path ?? (dir === "" ? name : `${dir}/${name}`);
+    const roll = random();
+    const after = roll < 0.08 ? "{" : JSON.stringify({ ...object(), ...placed?.holds });
+    const before =
+      roll < 0.12 && roll >= 0.08 ? "{" : chance(0.5) ? null : chance(0.4) ? after : "{}";
+    pool.push(pooled(path, before, after));
+    if (chance(0.05)) pool.push(pooled(path, null, JSON.stringify(object())));
+  }
+  for (let i = int(0, 4); i > 0; i--) {
+    const target = pick(PRUNE_TABLES);
+    const rows = [
+      ...(lost.get(target) ?? []).filter(() => chance(0.75)),
+      ...(chance(0.3) ? [pick(PRUNE_ROWS)] : []),
+    ];
+    const where = pick([
+      `sourcedata/channels-removed-1/${target}`,
+      `sourcedata/old/${target}`,
+      `sourcedata/${target}`,
+      `sourcedata/a/b/${target}`,
+      `derivatives/p/${target}`,
+      "sourcedata/old/sub-09/eeg/sub-09_task-x_channels.tsv",
+    ]);
+    const swapped = chance(0.15);
+    const header = swapped ? ["type", "name"] : ["name", "type"];
+    const cells = rows.map((row) => (swapped ? [row[1] as string, row[0] as string] : row));
+    pool.push(pooled(where, chance(0.8) ? null : tsv(header), tsv(header, ...cells)));
+  }
+  return { candidates, pool };
+}
+
+describe("pruning the pool to the files a candidate can consult changes no decision", () => {
+  const CHECKS = { table: verifyTableCounts, json: verifyJsonCounts };
+  const everything = () => () => true;
+
+  test("on 400 generated pull requests the whole summary is the same with the pruned pool as with every pool file", () => {
+    const random = seeded(1856);
+    const differences: string[] = [];
+    let pruned = 0;
+    let moved = 0;
+    let relocated = 0;
+    let removedKeys = 0;
+    // Not vacuous: leaving out any one kind of file that matters changes some summaries. Each
+    // narrowing keeps only what the real predicate keeps, less one kind.
+    const narrowings = (pool: readonly PoolFile[]) => {
+      // The documents that can stop a move but are never a home: unreadable, listed twice, or
+      // modified with no leaf changed (they still list their top-level keys).
+      const text = (bytes: Uint8Array | null) =>
+        bytes === null ? null : new TextDecoder().decode(bytes);
+      const blockers = new Set(
+        pool
+          .filter(
+            (f) =>
+              f.path.endsWith(".json") &&
+              (!parseJson(f.after).ok ||
+                pool.filter((g) => g.path === f.path).length > 1 ||
+                text(f.before) === text(f.after)),
+          )
+          .map((f) => f.path),
+      );
+      const less =
+        (drop: (path: string, candidates: readonly string[]) => boolean) =>
+        (candidates: readonly string[]) => {
+          const matters = poolFileMatters(candidates);
+          return (path: string) => matters(path) && !drop(path, candidates);
+        };
+      return {
+        root: less((p) => p.endsWith(".json") && dirOf(p) === ""),
+        intermediate: less(
+          (p, cs) =>
+            p.endsWith(".json") && dirOf(p) !== "" && !cs.some((c) => dirOf(c) === dirOf(p)),
+        ),
+        tables: less((p) => p.endsWith(".tsv")),
+        blockers: less((p) => blockers.has(p)),
+      };
+    };
+    const narrowed = new Map<string, number>();
+    for (let n = 0; n < 400; n++) {
+      const c = prunableCase(random);
+      const input = { candidates: c.candidates, pool: c.pool, deadline: null };
+      const full = summarizeChangesWith(input, CHECKS, everything);
+      const reference = snapshot(full);
+      if (snapshot(summarizeChanges(input)) !== reference) differences.push(`case ${n}`);
+      const matters = poolFileMatters(c.candidates.map((x) => x.path));
+      if (c.pool.some((f) => !matters(f.path))) pruned++;
+      if (full.loss.keysMoved > 0) moved++;
+      if (full.loss.rowsRelocated > 0) relocated++;
+      if (full.loss.keysRemoved > 0) removedKeys++;
+      for (const [name, keep] of Object.entries(narrowings(c.pool))) {
+        if (snapshot(summarizeChangesWith(input, CHECKS, keep)) !== reference) {
+          narrowed.set(name, (narrowed.get(name) ?? 0) + 1);
+        }
+      }
+    }
+    expect(differences).toEqual([]);
+    expect(pruned).toBeGreaterThan(350);
+    expect(moved).toBeGreaterThan(60);
+    expect(relocated).toBeGreaterThan(40);
+    expect(removedKeys).toBeGreaterThan(60);
+    for (const name of ["root", "intermediate", "tables", "blockers"]) {
+      expect(narrowed.get(name) ?? 0, name).toBeGreaterThan(10);
+    }
+  });
+
+  test("a pool file no candidate can consult takes none of the room: a home after it is still a home", () => {
+    const path = "sub-01/eeg/sub-01_task-x_eeg.json";
+    const input = [candidate(path, '{"SamplingFrequency": 500, "A": 1}', '{"A": 1}')];
+    const home = pooled("task-x_eeg.json", null, '{"SamplingFrequency": 500}');
+    // A derivatives sidecar, first in path order, that alone takes the whole bound.
+    const derived = documentHolding(
+      "derivatives/p/sub-01/eeg/sub-01_task-x_eeg.json",
+      SUMMARY_LIMITS.maxPoolChars,
+      15_000,
+    );
+    expect(summarize(input, [derived, home]).loss).toEqual({ ...NO_LOSS, keysMoved: 1 });
+    // Kept, it would take the room, and the home, unreadable, would stop the move.
+    const kept = summarizeChangesWith(
+      { candidates: input, pool: [derived, home], deadline: null },
+      CHECKS,
+      everything,
+    );
+    expect(kept.loss).toEqual({
+      ...NO_LOSS,
+      keysRemoved: 1,
+      keysRemovedFiles: 1,
+      firstBlockingPath: path,
+    });
+  });
 });
