@@ -142,6 +142,13 @@ export const FINDING_CODES = [
   "name_template_field",
   // The pull request changes dataset_description.json and its new name could not be read.
   "name_unchecked",
+  // What the original authors published was changed or what was recorded was replaced (epic #1851,
+  // Part B). The script decides these from platform facts and never a model, and they are accepted
+  // here before anything emits them, because the review script runs from `main` as soon as it is
+  // released while the Worker deploys separately.
+  "original_text_altered",
+  "original_field_altered",
+  "recording_replaced",
   "other",
 ] as const;
 export type FindingCode = (typeof FINDING_CODES)[number];
@@ -1308,6 +1315,9 @@ const CODE_LABEL: Record<FindingCode, string> = {
   name_doi: "New dataset name has a citation (an author and a year, or a DOI)",
   name_template_field: "New dataset name has an unfilled template field",
   name_unchecked: "New dataset name could not be read",
+  original_text_altered: "Original text changed",
+  original_field_altered: "Original field changed",
+  recording_replaced: "Recorded data changed",
   other: "Other",
 };
 
