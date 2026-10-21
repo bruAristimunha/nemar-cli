@@ -13,6 +13,55 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
+## 0.10.22 - 2026-10-21
+
+The Worker's report parser now accepts three finding codes that nothing emits yet.
+This release has no migration and sets no new Worker secret or variable.
+It moves the Brain Imaging Data Structure (BIDS) validator from 2.4.1 to 3.0.2, which changes one dataset's publication gate verdict; see Production behavior changes below before releasing.
+
+### Changed
+
+- **The review report accepts `original_text_altered`, `original_field_altered` and `recording_replaced` (epic #1851, S0).**
+  They are for the rules on what a contributor may change of the original authors' content, which a later release adds.
+  The review script runs from `main` as soon as a release lands while the Worker deploys separately, so a script that emitted a code the Worker did not know would have its report refused as `report_invalid`.
+  The codes are therefore accepted, labeled for the check ("Original text changed", "Original field changed", "Recorded data changed") and kept out of the codes the review model is offered, one release before anything emits them.
+
+- **The BIDS validator is pinned at 3.0.2, and a monthly pull request moves the pin to the newest stable release (issue #1036).**
+  The pin was 2.4.1, and the bump workflow selected only the 2.x line, so the pin could not move to 3.x by itself.
+  The bump runs on the first day of each month, selects the newest stable release of any major version from the JavaScript Registry (JSR) metadata, skips yanked and prerelease versions, and runs the reference-dataset comparison before it opens its pull request.
+  If the comparison is incomplete, the bump fails rather than opening a pull request, and the comparison is kept as a run artifact.
+- **Every validation report names the validator release that produced it.**
+  `nemar dataset validate` prints `Validator: @bids/validator <version>` after the validator's own text report, and adds a top-level `validatorVersion` key to the `--json` report.
+  A report written with `--outfile` names the release in the same way: the key in a `--json` file, or a final `Validator:` line in a text file.
+- **A validator run that fails is reported as a failure.**
+  An exit other than 0 (valid) or 16 (errors found) is a failed run: `nemar dataset validate` shows the validator's own message and exits with its code.
+  A report without a list of issues is refused rather than read as clean.
+  The message for a failed run is written to stderr, not stdout, so a script that reads only stdout sees no error text.
+
+### Production behavior changes
+
+- **One dataset's publication gate verdict changes under 3.0.2.**
+  The comparison covered 1,091 of the 1,093 datasets in the nemarDatasets organization. `nm000255` and `nm000256` crash under both releases, so neither could be compared.
+  `on008837` passes under 2.4.1 and fails under 3.0.2 with 38 HED `SIDECAR_INVALID` errors: its events sidecar has a top-level `HED` key that holds a column description, which 3.0.2 rejects and 2.4.1 accepts.
+  Its next validation refuses it until its sidecar is fixed or the rule is judged wrong.
+  `on003004` already fails the gate and gains one HED error (`SCHEMA_LOAD_FAILED`): its events files have a HED column whose values are all `n/a`, with no HED version declared, and 3.0.2 requires a schema for that column.
+  No other dataset's gating errors change.
+- **Real git-annex links are read the same by both releases.**
+  A link to a git-annex key, the layout real datasets have, gives the same gating errors under 2.4.1 and 3.0.2, and so does a pointer file.
+  A link to no annex key is reported as broken, with its sidecar as orphaned, by 3.0.2 only. The comparison carries that layout as a detector, not as a layout that exists.
+- **Under the upload preflight's flags, which keep warnings, 3.0.2 reports fewer warnings on six reference datasets.**
+  The six are `nm000189`, `xx099905`, and `nm000104` to `nm000107`. The other six reference datasets report the same number of warnings under both releases, and no warning gates.
+
+### Deploy coupling
+
+- **Pushes and pull requests validate with the pin in each dataset's shim until the shim is rewritten.**
+  The `bids-validation.yml` shim in each dataset repository sends the pinned release in its dispatch payload, and the central workflow in `nemarDatasets/.github` runs the release that the payload names.
+  Sampled repositories still sent 2.4.1 when this release was prepared, so until a fleet sync rewrites them, their pushes use 2.4.1.
+- **Revalidation uses the Worker's pin as soon as the Worker deploys.**
+  `POST /admin/datasets/:id/revalidate`, which `nemar admin fleet revalidate` calls, sends the Worker's pin directly, so it validates with 3.0.2 whatever a shim says.
+- **The browser validator is not part of this release.**
+  The in-browser validation planned in website#161 pins its own release, so it has to move to 3.0.2 on its side, with a check against this repository's `validator-version.json`.
+
 ## 0.10.21 - 2026-10-20
 
 The dataset pull-request review is given the room to finish, and a bulk edit that repeats one change across files is read once.

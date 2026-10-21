@@ -1,13 +1,16 @@
 name: Deploy Backend
 
 on:
-  # Production: every push to main that touches the backend.
+  # Production: every push to main that touches the backend, or the validator pin the
+  # Worker bundles (backend/src/services/github/shared.ts reads validator-version.json
+  # from the repository root), so a change to the pin alone redeploys the Worker.
   push:
     branches:
       - main
     paths:
       - 'backend/**'
       - 'shared/**'
+      - 'validator-version.json'
       - '.github/workflows/deploy-backend.yml'
   # The dev worker: called by auto-bump-dev.yml, ONCE per push to dev, after it has
   # pushed the version bump, with the commit to deploy (the bump). Until 2026-10, a

@@ -89,9 +89,9 @@ export function isoWeekLabel(now: Date): string {
 /**
  * Is today the day the weekly summary posts?
  *
- * Monday UTC, matching the repo's only two existing weekly cadences
- * (`check-summary-drift.yml` and `bump-validator.yml`, both `* * 1`), so the
- * fleet has one weekly rhythm rather than several.
+ * Monday UTC, matching `check-summary-drift.yml`, the repo's other weekly
+ * cadence (`* * 1`). `bump-validator.yml` runs monthly, so it is not a second
+ * weekly rhythm.
  *
  * The daily cron fires at 03:00 UTC, so the report covers the week ending Monday
  * 03:00 UTC. That is stated in the body: an unstated window cannot be checked

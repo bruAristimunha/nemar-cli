@@ -115,6 +115,11 @@ jobs:
               - 'src/**'
               - 'package.json'
               - 'tsconfig.json'
+              # The BIDS validator pin, read by src/lib/bids-validator.ts and by the backend.
+              # Without this entry a pull request that changes only the pin (the monthly
+              # bump) matches no filter, so lint and unit-pure skip, and a skipped job
+              # reports its required check as passing.
+              - 'validator-version.json'
               # CI-support scripts that ship and are tested alongside the CLI
               # (e.g. scripts/ci/probe-github-token.ts) but live outside src/.
               # Without this, a change to the probe alone matched no category,

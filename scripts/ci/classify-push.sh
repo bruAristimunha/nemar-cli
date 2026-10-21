@@ -26,10 +26,11 @@
 #   auto_bump=true|false     ...and exactly one commit, on top of the previous
 #                            head: the shape of auto-bump-dev.yml's own push
 #                            (sync-dev.yml pushes a merge commit as well)
-#   deploy_paths=true|false  the push changed backend/**, shared/** or
-#                            .github/workflows/deploy-backend.yml, the paths a
-#                            dev deploy was triggered by before auto-bump-dev.yml
-#                            took it over
+#   deploy_paths=true|false  the push changed backend/**, shared/**,
+#                            validator-version.json (the pin the Worker bundles)
+#                            or .github/workflows/deploy-backend.yml, the paths
+#                            a deploy of the Worker is triggered by (a dev deploy
+#                            was, before auto-bump-dev.yml took it over)
 # The reasoning goes to stderr.
 
 set -uo pipefail
@@ -80,7 +81,9 @@ if ! changed=$(git diff --name-only --no-renames "$before" "$after"); then
   emit
 fi
 
-if ! grep -qE '^(backend/|shared/|\.github/workflows/deploy-backend\.yml$)' <<<"$changed"; then
+# The Worker bundles validator-version.json, so a push that changes only the pin deploys it
+# as a backend change does.
+if ! grep -qE '^(backend/|shared/|validator-version\.json$|\.github/workflows/deploy-backend\.yml$)' <<<"$changed"; then
   deploy_paths=false
 fi
 

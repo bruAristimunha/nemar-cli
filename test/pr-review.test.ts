@@ -1143,6 +1143,67 @@ describe("the evidence block cannot claim more than it can hold", () => {
   });
 });
 
+describe("the codes for what the original authors published and what was recorded (epic #1851)", () => {
+  // The script will decide these from platform facts; until it does, the Worker only has to accept
+  // them, because the review script runs from `main` as soon as it is released while the Worker
+  // deploys separately.
+  const platformCodes: [string, string][] = [
+    ["original_text_altered", "Original text changed"],
+    ["original_field_altered", "Original field changed"],
+    ["recording_replaced", "Recorded data changed"],
+  ];
+
+  test.each(platformCodes)(
+    "%s is accepted, parsed back, round-tripped and rendered",
+    (code, label) => {
+      const raw = report({
+        criteria: {
+          no_degradation: "unknown",
+          advances_revision: "pass",
+          material_improvement: "pass",
+        },
+        findings: [
+          {
+            criterion: "no_degradation",
+            severity: "blocker",
+            code,
+            path: null,
+            note: "A fixed note.",
+          },
+        ],
+      });
+      expect(refusal(raw)).toBe("accepted");
+      expect(parseStoredPrReviewReport(raw).findings[0]?.code).toBe(code);
+      const outcome = parseCallbackOutcome({ outcome: "reported", report: raw, error: undefined });
+      expect(outcome.kind).toBe("reported");
+      expect(conclusionOf(outcome)).toBe("action_required");
+      const { text } = renderCheck(outcome);
+      expect(text).toContain("A fixed note.");
+      expect(text).toContain(label);
+      expect(text).not.toContain(code);
+      // The pull request's comment says the same, in the same words.
+      const comment = renderComment(outcome, "0123456789abcdef0123456789abcdef01234567");
+      expect(comment).toContain(label);
+      expect(comment).not.toContain(code);
+    },
+  );
+
+  test("a code outside the vocabulary is still refused", () => {
+    const raw = report({
+      findings: [
+        {
+          criterion: "no_degradation",
+          severity: "note",
+          code: "original_text",
+          path: null,
+          note: "",
+        },
+      ],
+    });
+    expect(refusal(raw)).not.toBe("accepted");
+  });
+});
+
 describe("the callback body becomes an outcome, and never a verdict by itself", () => {
   test("a good report is a reported outcome", () => {
     const o = parseCallbackOutcome({ outcome: "reported", report: report(), error: undefined });

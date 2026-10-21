@@ -323,3 +323,37 @@ describe("the repo's own test workflow routes changes to jobs", () => {
     }
   });
 });
+
+describe("a change to the validator pin alone", () => {
+  /**
+   * `validator-version.json` is read by the CLI (`src/lib/bids-validator.ts`) and bundled into
+   * the Worker (`backend/src/services/github/shared.ts`), and the monthly bump changes that file
+   * and nothing else. A path that no filter in `test.yml` lists runs no job, and a skipped job
+   * reports its required check as passing; a path that `deploy-backend.yml` does not list
+   * redeploys nothing. Both fail silently, so both are asserted from the real workflow files.
+   */
+  const readWorkflow = (file: string): unknown =>
+    parse(readFileSync(new URL(`../.github/workflows/${file}`, import.meta.url), "utf8"));
+
+  test("runs lint and unit-pure: the cli filter lists the pin", () => {
+    const workflow = readWorkflow("test.yml") as {
+      jobs: Record<string, { if?: string; steps?: { with?: { filters?: string } }[] }>;
+    };
+    const filtersText = workflow.jobs.changes.steps?.find((s) => s.with?.filters)?.with?.filters;
+    // Parsed, not searched: the entry must sit under `cli:`, not merely appear in the block
+    // (under another filter, or in a comment).
+    const filters = parse(filtersText ?? "") as Record<string, string[]>;
+    expect(filters.cli).toContain("validator-version.json");
+    for (const job of ["lint", "unit-pure"]) {
+      expect(workflow.jobs[job]?.if ?? "", job).toContain("outputs.cli == 'true'");
+    }
+  });
+
+  test("redeploys the Worker: a push to main that changes the pin is a deploy path", () => {
+    const deploy = readWorkflow("deploy-backend.yml") as {
+      on: { push: { branches: string[]; paths: string[] } };
+    };
+    expect(deploy.on.push.branches).toEqual(["main"]);
+    expect(deploy.on.push.paths).toContain("validator-version.json");
+  });
+});
