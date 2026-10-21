@@ -190,7 +190,8 @@ Both parsers run on the blob's bytes, are single-pass and linear, allocate at mo
 8. Header = first line split on `\t`.
    An empty column name: `empty_column_name`; a repeated one: `duplicate_column`.
 9. Every other line split on `\t` must have exactly the header's number of cells: otherwise `ragged_row`.
-   More than `maxRows` (200,000): `too_many_rows`.
+   More than `maxRows` (200,000): `too_many_rows`, reported only when no row was ragged.
+   (Added in the Phase 1 review: in a table with ONE column an empty or all-space line is `ragged_row`, decided before the row loop, because csv readers skip an empty line and pandas a line of only spaces, so two readers would disagree about the rows; with two or more columns every reader agrees.)
 10. Any cell or header name that **starts** with `"`: `quoted_cell`.
     BIDS tables do not quote, but pandas does at a field's start, so a file that two readers would split differently is refused instead of guessed.
 11. **Round trip**: `serializeTsv(parse(bytes))` must equal `bytes` exactly (BOM, the recorded line endings per line, final newline); otherwise `no_round_trip`.
@@ -532,8 +533,9 @@ C<n> | <shape> | <column "x" | key path | parent path> | <rule words>
 
 **Value rendering** (`renderValue`), so that what the model sees is unambiguous:
 
-- quote with `JSON.stringify` after escaping every character in `\p{C}` or `\p{Z}` other than U+0020, and U+00AD, as `\u{XXXX}`;
-- cut at 300 characters with `...(cut)`, which makes the class incomplete;
+- cut to 300 code points, then quote the kept text with `JSON.stringify` (which doubles backslashes, so a value cannot imitate an escape the platform writes), then replace every remaining character in `\p{C}`, `\p{Z}` or `\p{Default_Ignorable_Code_Point}`, and U+2800, other than U+0020, with `\u{XXXX}` (this order, decided in Phase 1);
+- when the value was cut, `...(cut)` follows the closing quote, so a value cannot forge it, and the class is incomplete;
+- pairs that are equal after NFC normalization but not byte for byte (a precomposed letter against the letter and a combining mark) render alike and need the annotation below too (Phase 2);
 - when a pair's two rendered texts are equal after the fence's own replacements, or differ only in escaped characters, append `(first difference at character k: U+XXXX to U+YYYY)`, computed on the raw values.
 
 Paths and shapes go through `tidyPath`, as today.
@@ -652,6 +654,8 @@ export type SummaryRefusal = (typeof SUMMARY_REFUSALS)[number];
 export interface TextFormat {
   bom: boolean;
   eol: "lf" | "crlf" | "mixed" | "none";
+  /** Mixed tables only: one character per terminated line, "1" for CRLF and "0" for LF; "" otherwise (always "" for JSON). */
+  crPattern: string;
   finalNewline: boolean;
 }
 export interface Table {
@@ -664,6 +668,8 @@ export interface Table {
 export type Parsed<T> = { ok: true; value: T } | { ok: false; refusal: SummaryRefusal };
 
 export function parseTsv(bytes: Uint8Array): Parsed<Table>;
+/** parseTsv with the round-trip serializer passed in: for tests of the guard only. */
+export function parseTsvWith(bytes: Uint8Array, check: (table: Table) => Uint8Array): Parsed<Table>;
 export function serializeTsv(table: Table): Uint8Array;
 
 export type JsonValue =
