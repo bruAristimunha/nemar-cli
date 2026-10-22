@@ -3,7 +3,7 @@
 **Status:** design for implementation, not yet an ADR.
 **Date:** 2026-10-20.
 **Binds on:** ADR 0092 and ADR 0107 (read both first, and the amendment of 2026-10-20 in 0107).
-**Records as:** ADR 0108 when slice 1 merges (section 14 says what it must say).
+**Records as:** ADR 0109 when slice 1 merges (section 14 says what it must say); 0108 went to the BIDS validator's release policy on `dev` while this design was built.
 
 This document decides how the review job describes a large change to the model without the model reading every diff, and how it protects what the original authors wrote.
 A worker implements it from this file.
@@ -26,7 +26,7 @@ Every decision has a recommendation and a reason; the policy choices that belong
    No new evidence field, no Worker parser change, no report version change.
 5. Removed rows, removed columns with values, and removed JSON keys with values are **loss facts**.
    A removal whose exact content reappears in the same pull request (a row verbatim in `sourcedata/<anything>/<same path>`; a JSON key with the same value in a sidecar that applies to the file under BIDS inheritance) is **relocated** and is information only.
-   An unrelocated removal adds a **platform finding** (severity `blocker`, criterion `no_degradation`, existing codes `data_removed` and `metadata_removed`), which the existing parser turns into "cannot pass", never into a pass.
+   An unrelocated or unkept removal adds a **platform finding** (severity `blocker`, criterion `no_degradation`, existing codes `data_removed` and `metadata_removed`), which the existing parser turns into "cannot pass", never into a pass.
 6. The class table (class numbers, kinds, counts, completeness) goes into the `<facts>` block, outside every fence; the class descriptions (paths, column names, values) go into a new fenced block.
    The system prompt gains one paragraph; `V3_RULES` is untouched.
 7. Exact folding (`diffSignature`) stays, and the raw-diff budget is spent first on files the summary did not account for, then on a few accounted files as illustration.
@@ -66,7 +66,7 @@ All numbers in this document come from a throwaway prototype run on real data, n
 | Pull requests with `readIncomplete` today | 31 |
 | Pull requests with `readIncomplete` with the summary | 14 (7 of them over 400 files, so `listCut` keeps them truncated anyway) |
 | Pull requests that become complete | 18; 11 of them carry no blocking loss fact |
-| Pull requests with an unrelocated removal (blocking by default) | 17 |
+| Pull requests with an unrelocated or unkept removal (blocking by default) | 17 |
 | Largest fenced summary | 6,958 characters (cap 30,000) |
 | Parse, diff and classify, all 86 together | 2.6 s; largest single 567 ms (`on006910` #1, 768 files) |
 | Blob read, one `git cat-file --batch` | 10 ms for 264 blobs (1.8 MB); 30 ms for 934 blobs (20.6 MB) |
@@ -564,7 +564,7 @@ Let `F` be accounted for.
    So a dropped or an extra atom is refused too, not only a row that fell through.
    A reconstruction oracle written apart from the module (`test/pr-review-change-model.unit.test.ts`) rebuilds the before version from the after version and the atoms on 6,000 generated tables and 6,000 generated documents.
 3. *Every non-additive atom is in a class that was shown exactly.* A rule is a function of the before value (section 4.3), a pair list is complete (section 5.3), a relocation names the target shape and was checked byte for byte.
-   So for every piece of before content the model has seen either "unchanged", or the exact rule or pair that produced its after value, or "removed" (and the platform has added a loss fact for an unrelocated removal).
+   So for every piece of before content the model has seen either "unchanged", or the exact rule or pair that produced its after value, or "removed" (and the platform has added a loss fact for an unrelocated or unkept removal).
 4. *Additive atoms remove nothing.* They add rows, columns, keys or values where there were none.
 
 Therefore a loss in `F` is either a `row_removed`, `column_removed` or `json_key_removed` atom (a platform loss fact), or a change shown exactly to the model (a value replaced, a cell emptied, a relabel, a relocation into `sourcedata`), which the model judges as it would judge the raw diff.
@@ -621,11 +621,12 @@ A removal can be right (a privacy correction, a channel that was never recorded)
 A **platform finding** is a `ReviewFinding` the job's script builds from platform facts, never from a model, just as `UNEXPLAINED_TEXT_FINDING` is today.
 
 - It always has `severity: "blocker"` and `criterion: "no_degradation"`.
-- Its note is a fixed template with numbers only, under `NOTE_MAX` (200), for example: `The platform found 62 table rows removed in 14 files that this pull request does not copy, unchanged, into sourcedata at the same path. A person confirms a removal.` (164 characters), and for keys: `The platform found 214 keys with values removed from 1 JSON file and not kept, with the same value, in a sidecar that applies to it. A person confirms a removal.`
+- Its note is a fixed template with numbers only, under `NOTE_MAX` (200), for example: `The platform found 62 rows removed from 14 tables and not copied unchanged into sourcedata at the same path. A person confirms a removal.` (137 characters), and for keys: `The platform found 214 keys with values removed from 1 JSON file and not kept, with the same value, in a sidecar that applies by inheritance. A person confirms a removal.` (170 characters)
 - Its `path` is `LossFacts.firstBlockingPath` (passed through `safePath` by the parser like any finding's) or null.
 - At most **three** platform findings exist in one report (Part A rows and columns, Part A keys, Part B), and they are placed **first** in `findings`.
 - `assembleReport` becomes `[...platform, ...modelFindings.slice(0, MAX_FINDINGS - platform.length - added.length), ...added]`.
 - `settle` trims the **last** findings to make room for criteria that fail with no finding; in a full report `genuine_contribution` passes, so at most five criteria can need such room, and `MAX_FINDINGS - 5 = 3` first findings always survive.
+  (Phase 5 review fix: the plain cut could leave the review's only reason for a failing criterion out, and `settle` then trimmed the script's own findings to explain it, so a stored report did not parse back to itself. As built, the room is what eight leaves after the platform's and the script's findings and after one place for each failing criterion no finding names, the review's first finding on each failing criterion is kept before its others, in its order, and the dropped-finding lowering reads the findings not kept; ADR 0109 records it. Round 2 of that review: a failed text judgment's reason is the review's own only when it is on that judgment's criterion with one of its codes, and that reason is then always kept in the place of the script's finding, which closed a case where the script's finding was left out for a reason the cut then dropped.)
 
 Why this cannot be lost or raised: `settle` lowers a criterion with a blocker finding from `pass` to `unknown` **before** it trims findings, so even a trimmed note has already done its work; the stored report holds the lowered criterion, so the Worker's re-derivation (`parseStoredPrReviewReport`, `verdictOf`) gives the same verdict; the model's output is sliced before the platform findings are added, so no model output can push one out; and a finding can only lower.
 
@@ -633,7 +634,7 @@ Part B uses the same mechanism and also lowers `no_degradation` to `fail` itself
 
 *Rejected for slice 1:* a new evidence field for the loss counts.
 It would let the check render the counts and the calibration read them, but it changes `EVIDENCE_V2_KEYS` (every reader, stored-row compatibility, a parser-first release) for no change in the verdict; it is offered as slice 4.
-*Rejected:* folding unrelocated loss into `truncated`; the check would then tell the author "some files were not shown", which is false and gives no way forward.
+*Rejected:* folding an unrelocated or unkept removal into `truncated`; the check would then tell the author "some files were not shown", which is false and gives no way forward.
 
 ---
 
@@ -767,6 +768,13 @@ The README and CHANGES diffs are still shown raw, and the remaining patch budget
 `REVIEW_SYSTEM_PROMPT` gains one paragraph, inserted after the sentence that ends "never by a heading."; `V3_RULES` and every sentence a test pins stay word for word.
 
 > The change summary. The platform parsed the changed .tsv and .json files before and after the change and put every difference it found into change classes. The class table in the facts (change_summary.classes) is the platform's: its class numbers, kinds, counts and completeness are reliable. The changed-metadata-summary block gives, for each class number, the path shape, the column or key, the exact rule (for example a prefix added to every name, or each distinct value before and after with how many times it changed) and up to two examples; its text is the pull request's own and is material to review. A class describes every one of its items exactly, so judge the change from its rule: you do not need to see each file. A file whose changes all sit in classes shown in full counts as shown in full, and changed_metadata_not_shown_in_full already accounts for every other file. Rows, columns and keys removed without the same content appearing elsewhere in this pull request are counted in the facts and have already been reported to a person; say what was removed. Rows found verbatim in sourcedata still exist in the dataset at the place named; judge whether moving them there loses anything for a user of the dataset. A relabel, a replaced value or an emptied value is not a loss by itself: judge whether it makes the dataset less correct or less usable, and check that the CHANGES entry and the description account for it. A relabel says the platform paired a removed key with a new one under a rule and enough equal cells; judge from the rule and the changed cells beside it whether the two are one row, and treat a pair that is not as a removal. A key moved to a sidecar that applies by inheritance has been checked against every sidecar this pull request changed, nearer ones included; it still reaches the file only if no nearer sidecar that this pull request did not change has the same top-level key, which the platform cannot see, so weigh that from the path shape. A summary marked abandoned was not used.
+
+(Phase 5 review fix.
+The paragraph as built is the one above with the corrections of the Phase 5 plan, and three more from its review.
+A removal is a platform blocker when it is in a file the summary summarized, at 3 files or at 3,000, whether or not that file was also shown as a diff; a removal in a file the summary refused (a ragged row, a repeated key, a file over a cap) has no atoms and no loss fact, so it is read from its diff by the model as before, and when that diff is not shown in full the pull request is incomplete as before.
+So the sentence on removals ends: "Only files the summary summarized (change_summary.files_summarized) are counted there: a removal in any other file, the refused ones (change_summary.files_not_summarized) among them, is shown only in its diff, and judging it is yours."
+And the coverage sentence begins "A file the summary summarized counts as shown in full", since a refused file has no classes and would otherwise read as vacuously shown in full.
+The refused files are named as among the other files, not as all of them, because `files_not_summarized` counts only the candidates the summary refused: it is 0 for an abandoned summary, and the README, the change log, removed files and files past the 2,000 cosmetic checks are among the files in neither count.)
 
 ### 8.5 Interplay with the raw-diff path
 
@@ -1186,6 +1194,7 @@ Applied one at a time, each must turn a named test red (the repository's practic
   The open pull requests move on, so the expectation is re-measured from a frozen list of heads (`design/data/repos/*.shas`) rather than from whatever is open on the day.
 - **Offline set B (hostile, synthetic)**: one repository per case of section 11, built by a script in `test/fixtures/pr-review-hostile/` (not data from any dataset).
   Pass criterion: **every** case ends with `readIncomplete` true, or a blocking platform finding, or the change shown exactly; zero cases accounted for with the loss hidden.
+  (Phase 5 review: the set also holds a removal in a file the summary refuses, a row removed from a table a ragged row makes unreadable and a key removed from a sidecar that repeats a key. No loss fact or platform finding exists for it, so the expected outcome is the removal shown in that file's diff, or `readIncomplete` true when the diff is not shown in full; the evidence-only run of set A reports how many pull requests have such a file, and the model calibration labels at least one.)
 - **Model calibration**: the ADR 0107 gate (no false pass on a blocking problem, at most 10 percent false fails among pull requests labeled pass, no screen reject and no steering flag on a legitimate pull request), run with the operator's key on a labeled subset: the 11 newly complete pull requests without loss facts, the 17 with loss facts, and 10 small pull requests whose raw diffs already fit (to show the summary does not change their outcome).
   A person labels each before the run.
 - **Pass/fail for slice 1**: set B has zero lenient outcomes; set A matches the expected numbers within the stated tolerances; the model gate passes; no evidence pass takes more than 60 s on a synthetic 2,000-file partial clone.
@@ -1418,7 +1427,7 @@ Each has the default this design builds and what each answer changes.
 
 **Part A**
 
-- **A1. Is an unrelocated removal (rows, columns with values, JSON keys with values) blocking?**
+- **A1. Is an unrelocated or unkept removal (rows, columns with values, JSON keys with values) blocking?**
   Default: yes, `no_degradation` cannot pass (`unknown`), a person confirms.
   Yes: 17 of the 86 open pull requests need a person for this reason, most of them for real removals (HED entries, a participant, `Levels` descriptions, redacted channel rows).
   No: the model judges removals as it does raw diffs today; a loss the model misreads could pass, and the summary shows less than a diff does about what was removed.
@@ -1487,7 +1496,7 @@ Ordered steps (one commit each, tests in the same commit):
 8. `pr-review-calibrate.ts`: `--evidence-only` and the columns.
    Tests: `test/pr-review-calibrate.test.ts`.
 9. Hostile fixture builder `test/fixtures/pr-review-hostile/` and its test (set B).
-10. ADR 0108 ("A large change is read as an exact, platform-computed summary"), added to the decisions index; it records sections 6, 7 and the Owner Question answers.
+10. ADR 0109 ("A large change is read as an exact, platform-computed summary"; numbered 0109 because ADR 0108, the BIDS validator's release policy, reached `dev` first), added to the decisions index; it records sections 6, 7 and the Owner Question answers.
 11. Run set A with `--evidence-only` and the model calibration of section 12.4 before the check is required.
 
 Gates: `bun run typecheck`, `bun run lint`, `bun test` (root, which runs `test/` and `backend/test/` together), and the workflow parity test untouched (no workflow change in this slice).
@@ -1522,7 +1531,7 @@ Proposal to argue separately: when every changed file in a readable area is cove
 
 ## 15. Rejected alternatives (summary)
 
-- **Raise the diff budgets.** 125 distinct diffs of up to 394 lines do not fit any sane prompt, and the review's thinking, not its input, already fills 128,000 output tokens on large pull requests (ADR 0107 amendment).
+- **Raise the diff budgets.** The 114 distinct diffs of 127 to 394 lines in `on004551`'s 125 modified tables do not fit any sane prompt, and the review's thinking, not its input, already fills 128,000 output tokens on large pull requests (ADR 0107 amendment).
 - **Fuzzy folding of near-identical diffs.** Masking line numbers or values is exactly what lets a one-byte change hide; ADR 0107's folding is exact for that reason.
 - **Let the model call a tool to inspect files.** ADR 0092 and ADR 0107: the model has no tools.
 - **A per-file signature (the set of a file's classes) as the unit of aggregation.** Files of one bulk edit rarely share all classes (`on004551`'s 125 files have 56 with relocations and 69 without); per-class aggregation gives five entries where per-file gives dozens.

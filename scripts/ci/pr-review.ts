@@ -50,12 +50,14 @@ import { namingProblemOf } from "../../shared/naming-rule";
 import {
   type PrReviewReport,
   PrReviewReportError,
+  type ReviewEvidence,
   type RunError,
   type StageTokens,
 } from "../../shared/pr-review";
 import { tidy } from "../../shared/untrusted-text";
 import {
   EvidenceError,
+  type GitFacts,
   type Listing,
   SHA40,
   type TextFacts,
@@ -74,6 +76,7 @@ import {
   assembleReport,
   buildReviewMessages,
   buildScreenMessages,
+  platformFindings,
   readScreenAnswer,
 } from "./pr-review-prompt";
 
@@ -271,6 +274,78 @@ export interface StageObservation {
 
 export type StageObserver = (o: StageObservation) => void;
 
+/**
+ * What the content pass came to, for an observer: the calibration's evidence columns. Numbers and
+ * booleans only, counted by the platform, so printing them quotes nothing of the pull request; the
+ * summary's first path with a removal is the one fact about it that is text, and it is left out.
+ *
+ *  - `files` changed in all, `wanted` of them in the areas the review reads (every path shape
+ *    listed and the files of those not listed), `cosmetic` proven cosmetic, `read` counted as read
+ *    (`files_read`), and `patches` diffs shown; `readIncomplete` and `truncated` as the evidence
+ *    says.
+ *  - The change summary: whether it was `summaryAbandoned`, the files it `summarized`, `refused`
+ *    and `accounted` for, the `classes` it showed and the ones it `cut`, the characters of its
+ *    block (`summaryChars`), its loss facts, and how many `platformFindings` they make.
+ */
+export interface EvidenceStats {
+  files: number;
+  wanted: number;
+  cosmetic: number;
+  read: number;
+  patches: number;
+  readIncomplete: boolean;
+  truncated: boolean;
+  summaryAbandoned: boolean;
+  summarized: number;
+  refused: number;
+  accounted: number;
+  classes: number;
+  cut: number;
+  summaryChars: number;
+  rowsRemoved: number;
+  rowsRemovedFiles: number;
+  rowsRelocated: number;
+  columnsRemoved: number;
+  keysRemoved: number;
+  keysRemovedFiles: number;
+  keysMoved: number;
+  valuesEmptied: number;
+  platformFindings: number;
+}
+
+export type EvidenceObserver = (s: EvidenceStats) => void;
+
+/** The {@link EvidenceStats} of a content pass and the evidence built from it. */
+export function evidenceStats(facts: GitFacts, evidence: ReviewEvidence): EvidenceStats {
+  const { summary } = facts;
+  const loss = summary.loss;
+  return {
+    files: evidence.files_changed,
+    wanted: facts.groups.reduce((n, g) => n + g.files, 0) + facts.groupsOmittedFiles,
+    cosmetic: facts.cosmeticOnlyFiles,
+    read: evidence.files_read,
+    patches: facts.patches.length,
+    readIncomplete: facts.readIncomplete,
+    truncated: evidence.truncated,
+    summaryAbandoned: summary.abandoned,
+    summarized: summary.facts.files_summarized,
+    refused: summary.facts.files_not_summarized,
+    accounted: summary.facts.files_accounted_for,
+    classes: summary.facts.classes_shown,
+    cut: summary.facts.classes_cut,
+    summaryChars: summary.text.length,
+    rowsRemoved: loss.rowsRemoved,
+    rowsRemovedFiles: loss.rowsRemovedFiles,
+    rowsRelocated: loss.rowsRelocated,
+    columnsRemoved: loss.columnsRemoved,
+    keysRemoved: loss.keysRemoved,
+    keysRemovedFiles: loss.keysRemovedFiles,
+    keysMoved: loss.keysMoved,
+    valuesEmptied: loss.valuesEmptied,
+    platformFindings: platformFindings(summary).length,
+  };
+}
+
 /** What a stage answered: the model's JSON, and what it cost. */
 export interface StageAnswer {
   output: unknown;
@@ -461,10 +536,16 @@ export interface PullRequestUnderReview {
  * when the screen let it through. Throws what it meets; {@link
  * runReview} turns that into a fixed word. The calibration runs exactly this, on pull requests that
  * are no longer open, which is why the dispatch's own checks are not part of it.
+ *
+ * `observe` is told about each model call; `observeEvidence` is told once what the content pass
+ * came to ({@link EvidenceStats}), after the content was read and before the review is asked, and
+ * not at all when the review ended at the facts or at the screen, which read no content. Both are
+ * for the calibration, and neither may throw: a throw ends the run like any error.
  */
 export async function reviewPullRequest(
   input: PullRequestUnderReview,
   observe?: StageObserver,
+  observeEvidence?: EvidenceObserver,
 ): Promise<PrReviewReport> {
   const { repoDir, base, head, pr, fromFork } = input;
   const text = { title: pr.title, body: pr.body };
@@ -504,6 +585,10 @@ export async function reviewPullRequest(
 
   const all = { ...listing, ...gatherContent(repoDir, listing) };
   const evidence = buildEvidence(all, facts);
+  // The removals the change summary found and nothing in the pull request keeps: the platform's
+  // own findings, decided from git before the review is asked, which can only lower its answer.
+  const platform = platformFindings(all.summary);
+  observeEvidence?.(evidenceStats(all, evidence));
   const reviewMessages = buildReviewMessages({
     facts: all,
     evidence,
@@ -518,10 +603,13 @@ export async function reviewPullRequest(
     observe,
     client,
   );
-  return assembleReport(screen.output, review.output, evidence, {
-    screen: screen.usage,
-    review: review.usage,
-  });
+  return assembleReport(
+    screen.output,
+    review.output,
+    evidence,
+    { screen: screen.usage, review: review.usage },
+    platform,
+  );
 }
 
 /** Review one pull request. Never throws: every failure is a fixed word. */
