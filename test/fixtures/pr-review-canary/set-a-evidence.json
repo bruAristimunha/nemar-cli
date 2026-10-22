@@ -1,0 +1,6000 @@
+[
+  {
+    "pr": "nm000118#4",
+    "error": null,
+    "evidence": {
+      "files": 3,
+      "wanted": 1,
+      "cosmetic": 0,
+      "read": 1,
+      "unread": 0,
+      "patches": 1,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000157#4",
+    "error": null,
+    "evidence": {
+      "files": 4,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000176#6",
+    "error": null,
+    "evidence": {
+      "files": 4,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000187#5",
+    "error": null,
+    "evidence": {
+      "files": 4,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000191#4",
+    "error": null,
+    "evidence": {
+      "files": 4,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000196#5",
+    "error": null,
+    "evidence": {
+      "files": 3,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000197#5",
+    "error": null,
+    "evidence": {
+      "files": 4,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000200#6",
+    "error": null,
+    "evidence": {
+      "files": 4,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000201#5",
+    "error": null,
+    "evidence": {
+      "files": 83,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000205#5",
+    "error": null,
+    "evidence": {
+      "files": 3,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000214#6",
+    "error": null,
+    "evidence": {
+      "files": 3,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000218#4",
+    "error": null,
+    "evidence": {
+      "files": 4,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000237#7",
+    "error": null,
+    "evidence": {
+      "files": 2,
+      "wanted": 1,
+      "cosmetic": 0,
+      "read": 1,
+      "unread": 0,
+      "patches": 1,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000247#5",
+    "error": null,
+    "evidence": {
+      "files": 4,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000248#5",
+    "error": null,
+    "evidence": {
+      "files": 4,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000301#6",
+    "error": null,
+    "evidence": {
+      "files": 4,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000303#5",
+    "error": null,
+    "evidence": {
+      "files": 4,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000308#1",
+    "error": null,
+    "evidence": {
+      "files": 3,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000312#1",
+    "error": null,
+    "evidence": {
+      "files": 2,
+      "wanted": 1,
+      "cosmetic": 0,
+      "read": 1,
+      "unread": 0,
+      "patches": 1,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 2,
+      "cut": 0,
+      "summaryChars": 292,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000313#5",
+    "error": null,
+    "evidence": {
+      "files": 4,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000326#5",
+    "error": null,
+    "evidence": {
+      "files": 4,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000336#6",
+    "error": null,
+    "evidence": {
+      "files": 4,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000340#6",
+    "error": null,
+    "evidence": {
+      "files": 4,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000351#5",
+    "error": null,
+    "evidence": {
+      "files": 4,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000424#2",
+    "error": null,
+    "evidence": {
+      "files": 3,
+      "wanted": 3,
+      "cosmetic": 0,
+      "read": 3,
+      "unread": 0,
+      "patches": 3,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 2,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 8,
+      "cut": 0,
+      "summaryChars": 2717,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": false
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": false
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 3,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000501#2",
+    "error": null,
+    "evidence": {
+      "files": 3,
+      "wanted": 3,
+      "cosmetic": 0,
+      "read": 3,
+      "unread": 0,
+      "patches": 3,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 2,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 7,
+      "cut": 0,
+      "summaryChars": 2831,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 4,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": false
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": false
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000501#3",
+    "error": null,
+    "evidence": {
+      "files": 43,
+      "wanted": 43,
+      "cosmetic": 0,
+      "read": 43,
+      "unread": 0,
+      "patches": 5,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 41,
+      "refused": 0,
+      "accounted": 41,
+      "classes": 6,
+      "cut": 0,
+      "summaryChars": 1730,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_empty_key_removed",
+        "items": 20,
+        "files": 20,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "cell_filled",
+        "items": 3584,
+        "files": 20,
+        "complete": true
+      },
+      {
+        "kind": "cell_filled",
+        "items": 3584,
+        "files": 20,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 60,
+        "files": 20,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000501#4",
+    "error": null,
+    "evidence": {
+      "files": 6,
+      "wanted": 6,
+      "cosmetic": 0,
+      "read": 6,
+      "unread": 0,
+      "patches": 1,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 6,
+      "refused": 0,
+      "accounted": 6,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 303,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "key_relabeled",
+        "items": 6,
+        "files": 6,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "nm000513#2",
+    "error": null,
+    "evidence": {
+      "files": 3,
+      "wanted": 3,
+      "cosmetic": 0,
+      "read": 3,
+      "unread": 0,
+      "patches": 3,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 2,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 6,
+      "cut": 0,
+      "summaryChars": 2425,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": false
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": false
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on002181#1",
+    "error": null,
+    "evidence": {
+      "files": 456,
+      "wanted": 456,
+      "cosmetic": 0,
+      "read": 456,
+      "unread": 0,
+      "patches": 6,
+      "listCut": true,
+      "readIncomplete": false,
+      "truncated": true,
+      "summaryAbandoned": false,
+      "summarized": 453,
+      "refused": 0,
+      "accounted": 453,
+      "classes": 9,
+      "cut": 0,
+      "summaryChars": 1728,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 1,
+      "keysRemovedFiles": 1,
+      "keysMoved": 0,
+      "valuesEmptied": 226,
+      "platformFindings": 1
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_key_removed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "cell_replaced",
+        "items": 28250,
+        "files": 226,
+        "complete": true
+      },
+      {
+        "kind": "cell_emptied",
+        "items": 226,
+        "files": 226,
+        "complete": true
+      },
+      {
+        "kind": "json_key_renamed",
+        "items": 226,
+        "files": 226,
+        "complete": true
+      },
+      {
+        "kind": "json_keys_reordered",
+        "items": 226,
+        "files": 226,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on002578#2",
+    "error": null,
+    "evidence": {
+      "files": 2,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 3,
+      "cut": 0,
+      "summaryChars": 601,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 3,
+      "keysRemovedFiles": 1,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 1
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_key_removed",
+        "items": 3,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on003029#1",
+    "error": null,
+    "evidence": {
+      "files": 44,
+      "wanted": 3,
+      "cosmetic": 0,
+      "read": 3,
+      "unread": 0,
+      "patches": 3,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 12,
+      "cut": 0,
+      "summaryChars": 2145,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 12,
+      "keysRemovedFiles": 1,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 1
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_key_removed",
+        "items": 5,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_removed",
+        "items": 5,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_removed",
+        "items": 2,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_empty_key_removed",
+        "items": 5,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_renamed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_renamed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_renamed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_renamed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_renamed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 7,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 5,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 5,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on003194#1",
+    "error": null,
+    "evidence": {
+      "files": 35,
+      "wanted": 35,
+      "cosmetic": 0,
+      "read": 35,
+      "unread": 0,
+      "patches": 7,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 31,
+      "refused": 0,
+      "accounted": 31,
+      "classes": 9,
+      "cut": 0,
+      "summaryChars": 1901,
+      "rowsRemoved": 1,
+      "rowsRemovedFiles": 1,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 29,
+      "keysRemovedFiles": 29,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 2
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_key_removed",
+        "items": 29,
+        "files": 29,
+        "complete": true
+      },
+      {
+        "kind": "row_removed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 29,
+        "files": 29,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 29,
+        "files": 29,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on003195#1",
+    "error": null,
+    "evidence": {
+      "files": 27,
+      "wanted": 27,
+      "cosmetic": 0,
+      "read": 27,
+      "unread": 0,
+      "patches": 8,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 21,
+      "refused": 1,
+      "accounted": 21,
+      "classes": 7,
+      "cut": 0,
+      "summaryChars": 1528,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 20,
+      "keysRemovedFiles": 20,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 1
+    },
+    "refusedBy": {
+      "empty_column_name": 1
+    },
+    "classes": [
+      {
+        "kind": "json_key_removed",
+        "items": 20,
+        "files": 20,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 20,
+        "files": 20,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 20,
+        "files": 20,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 1,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on003343#3",
+    "error": null,
+    "evidence": {
+      "files": 180,
+      "wanted": 119,
+      "cosmetic": 0,
+      "read": 119,
+      "unread": 0,
+      "patches": 3,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 118,
+      "refused": 0,
+      "accounted": 118,
+      "classes": 10,
+      "cut": 0,
+      "summaryChars": 2964,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "format",
+        "items": 59,
+        "files": 59,
+        "complete": true
+      },
+      {
+        "kind": "column_added",
+        "items": 59,
+        "files": 59,
+        "complete": true
+      },
+      {
+        "kind": "column_added",
+        "items": 59,
+        "files": 59,
+        "complete": true
+      },
+      {
+        "kind": "column_added",
+        "items": 59,
+        "files": 59,
+        "complete": true
+      },
+      {
+        "kind": "column_added",
+        "items": 59,
+        "files": 59,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 59,
+        "files": 59,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 59,
+        "files": 59,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 59,
+        "files": 59,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 59,
+        "files": 59,
+        "complete": true
+      },
+      {
+        "kind": "row_added",
+        "items": 59,
+        "files": 59,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on003374#1",
+    "error": null,
+    "evidence": {
+      "files": 18,
+      "wanted": 18,
+      "cosmetic": 0,
+      "read": 18,
+      "unread": 0,
+      "patches": 4,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 16,
+      "refused": 0,
+      "accounted": 16,
+      "classes": 5,
+      "cut": 0,
+      "summaryChars": 1486,
+      "rowsRemoved": 22,
+      "rowsRemovedFiles": 7,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 9,
+      "keysRemovedFiles": 9,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 2
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_key_removed",
+        "items": 9,
+        "files": 9,
+        "complete": true
+      },
+      {
+        "kind": "row_removed",
+        "items": 22,
+        "files": 7,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 9,
+        "files": 9,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 9,
+        "files": 9,
+        "complete": true
+      },
+      {
+        "kind": "row_added",
+        "items": 22,
+        "files": 7,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on003380#1",
+    "error": null,
+    "evidence": {
+      "files": 3,
+      "wanted": 2,
+      "cosmetic": 0,
+      "read": 2,
+      "unread": 0,
+      "patches": 2,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 4,
+      "cut": 0,
+      "summaryChars": 563,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on003620#1",
+    "error": null,
+    "evidence": {
+      "files": 183,
+      "wanted": 183,
+      "cosmetic": 0,
+      "read": 183,
+      "unread": 1,
+      "patches": 10,
+      "listCut": false,
+      "readIncomplete": true,
+      "truncated": true,
+      "summaryAbandoned": false,
+      "summarized": 48,
+      "refused": 44,
+      "accounted": 48,
+      "classes": 9,
+      "cut": 0,
+      "summaryChars": 1729,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 2,
+      "keysRemovedFiles": 1,
+      "keysMoved": 0,
+      "valuesEmptied": 48,
+      "platformFindings": 1
+    },
+    "refusedBy": {
+      "invalid_utf8": 43,
+      "ragged_row": 1
+    },
+    "classes": [
+      {
+        "kind": "json_key_removed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_removed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 43,
+        "files": 43,
+        "complete": true
+      },
+      {
+        "kind": "json_key_renamed",
+        "items": 43,
+        "files": 43,
+        "complete": true
+      },
+      {
+        "kind": "cell_emptied",
+        "items": 48,
+        "files": 3,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 43,
+      "incomplete": 1,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on003848#1",
+    "error": null,
+    "evidence": {
+      "files": 5,
+      "wanted": 5,
+      "cosmetic": 0,
+      "read": 5,
+      "unread": 0,
+      "patches": 4,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 2,
+      "refused": 0,
+      "accounted": 2,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 345,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "cell_replaced",
+        "items": 2,
+        "files": 2,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on003876#3",
+    "error": null,
+    "evidence": {
+      "files": 70,
+      "wanted": 59,
+      "cosmetic": 0,
+      "read": 52,
+      "unread": 14,
+      "patches": 9,
+      "listCut": false,
+      "readIncomplete": true,
+      "truncated": true,
+      "summaryAbandoned": false,
+      "summarized": 57,
+      "refused": 0,
+      "accounted": 43,
+      "classes": 14,
+      "cut": 0,
+      "summaryChars": 5937,
+      "rowsRemoved": 849,
+      "rowsRemovedFiles": 14,
+      "rowsRelocated": 16,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 1
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "row_removed",
+        "items": 849,
+        "files": 14,
+        "complete": false
+      },
+      {
+        "kind": "row_relocated",
+        "items": 16,
+        "files": 11,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 2636,
+        "files": 23,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 14,
+        "files": 12,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 11,
+        "files": 11,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 48,
+        "files": 6,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 6,
+        "files": 6,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 5,
+        "files": 5,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 485,
+        "files": 4,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 142,
+        "files": 2,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 52,
+        "files": 2,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 39,
+        "files": 2,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 29,
+        "files": 2,
+        "complete": true
+      },
+      {
+        "kind": "row_added",
+        "items": 865,
+        "files": 23,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004018#1",
+    "error": null,
+    "evidence": {
+      "files": 4,
+      "wanted": 4,
+      "cosmetic": 0,
+      "read": 4,
+      "unread": 0,
+      "patches": 4,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 2,
+      "refused": 0,
+      "accounted": 2,
+      "classes": 6,
+      "cut": 0,
+      "summaryChars": 1102,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 1,
+      "keysRemovedFiles": 1,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 1
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_key_removed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 3,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004022#1",
+    "error": null,
+    "evidence": {
+      "files": 88,
+      "wanted": 87,
+      "cosmetic": 0,
+      "read": 74,
+      "unread": 0,
+      "patches": 16,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 4,
+      "cut": 0,
+      "summaryChars": 747,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_empty_key_removed",
+        "items": 3,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004100#1",
+    "error": null,
+    "evidence": {
+      "files": 59,
+      "wanted": 59,
+      "cosmetic": 0,
+      "read": 59,
+      "unread": 0,
+      "patches": 3,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 57,
+      "refused": 0,
+      "accounted": 57,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 414,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 57,
+        "files": 57,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004194#1",
+    "error": null,
+    "evidence": {
+      "files": 217,
+      "wanted": 205,
+      "cosmetic": 0,
+      "read": 205,
+      "unread": 0,
+      "patches": 3,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 203,
+      "refused": 0,
+      "accounted": 203,
+      "classes": 17,
+      "cut": 0,
+      "summaryChars": 6940,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 24,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "row_relocated",
+        "items": 24,
+        "files": 12,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 14997,
+        "files": 153,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 3052,
+        "files": 26,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 276,
+        "files": 26,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 52,
+        "files": 26,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 2184,
+        "files": 12,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 240,
+        "files": 12,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 24,
+        "files": 12,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 12,
+        "files": 12,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 12,
+        "files": 12,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 12,
+        "files": 12,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 12,
+        "files": 12,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 12,
+        "files": 12,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 12,
+        "files": 12,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 12,
+        "files": 12,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 12,
+        "files": 12,
+        "complete": true
+      },
+      {
+        "kind": "row_added",
+        "items": 24,
+        "files": 12,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004306#1",
+    "error": null,
+    "evidence": {
+      "files": 33,
+      "wanted": 1,
+      "cosmetic": 0,
+      "read": 1,
+      "unread": 0,
+      "patches": 1,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 0,
+      "refused": 0,
+      "accounted": 0,
+      "classes": 0,
+      "cut": 0,
+      "summaryChars": 0,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004370#1",
+    "error": null,
+    "evidence": {
+      "files": 9,
+      "wanted": 9,
+      "cosmetic": 0,
+      "read": 9,
+      "unread": 0,
+      "patches": 3,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 0,
+      "refused": 0,
+      "accounted": 0,
+      "classes": 0,
+      "cut": 0,
+      "summaryChars": 0,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004551#1",
+    "error": null,
+    "evidence": {
+      "files": 307,
+      "wanted": 251,
+      "cosmetic": 0,
+      "read": 251,
+      "unread": 0,
+      "patches": 6,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 125,
+      "refused": 0,
+      "accounted": 125,
+      "classes": 5,
+      "cut": 0,
+      "summaryChars": 1572,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 1203,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "row_relocated",
+        "items": 1203,
+        "files": 56,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 14135,
+        "files": 125,
+        "complete": true
+      },
+      {
+        "kind": "rows_reordered",
+        "items": 125,
+        "files": 125,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 341,
+        "files": 124,
+        "complete": true
+      },
+      {
+        "kind": "row_added",
+        "items": 2043,
+        "files": 125,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004588#1",
+    "error": null,
+    "evidence": {
+      "files": 89,
+      "wanted": 88,
+      "cosmetic": 0,
+      "read": 88,
+      "unread": 1,
+      "patches": 5,
+      "listCut": false,
+      "readIncomplete": true,
+      "truncated": true,
+      "summaryAbandoned": false,
+      "summarized": 86,
+      "refused": 1,
+      "accounted": 86,
+      "classes": 21,
+      "cut": 0,
+      "summaryChars": 3427,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {
+      "invalid_utf8": 1
+    },
+    "classes": [
+      {
+        "kind": "key_relabeled",
+        "items": 5,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_empty_key_removed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "column_added",
+        "items": 42,
+        "files": 42,
+        "complete": true
+      },
+      {
+        "kind": "column_added",
+        "items": 42,
+        "files": 42,
+        "complete": true
+      },
+      {
+        "kind": "column_added",
+        "items": 42,
+        "files": 42,
+        "complete": true
+      },
+      {
+        "kind": "column_added",
+        "items": 41,
+        "files": 41,
+        "complete": true
+      },
+      {
+        "kind": "column_added",
+        "items": 41,
+        "files": 41,
+        "complete": true
+      },
+      {
+        "kind": "column_added",
+        "items": 41,
+        "files": 41,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 3,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 2,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 2,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 2,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 1,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004624#1",
+    "error": null,
+    "evidence": {
+      "files": 3,
+      "wanted": 3,
+      "cosmetic": 0,
+      "read": 3,
+      "unread": 0,
+      "patches": 3,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 0,
+      "refused": 0,
+      "accounted": 0,
+      "classes": 0,
+      "cut": 0,
+      "summaryChars": 0,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004661#1",
+    "error": null,
+    "evidence": {
+      "files": 21,
+      "wanted": 21,
+      "cosmetic": 0,
+      "read": 21,
+      "unread": 1,
+      "patches": 5,
+      "listCut": false,
+      "readIncomplete": true,
+      "truncated": true,
+      "summaryAbandoned": false,
+      "summarized": 19,
+      "refused": 0,
+      "accounted": 18,
+      "classes": 15,
+      "cut": 0,
+      "summaryChars": 3230,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 214,
+      "keysRemovedFiles": 1,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 1
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_key_removed",
+        "items": 107,
+        "files": 1,
+        "complete": false
+      },
+      {
+        "kind": "json_key_removed",
+        "items": 107,
+        "files": 1,
+        "complete": false
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": false
+      },
+      {
+        "kind": "cell_filled",
+        "items": 1088,
+        "files": 17,
+        "complete": true
+      },
+      {
+        "kind": "cell_filled",
+        "items": 1088,
+        "files": 17,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 2,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004703#1",
+    "error": null,
+    "evidence": {
+      "files": 58,
+      "wanted": 47,
+      "cosmetic": 0,
+      "read": 41,
+      "unread": 5,
+      "patches": 14,
+      "listCut": false,
+      "readIncomplete": true,
+      "truncated": true,
+      "summaryAbandoned": false,
+      "summarized": 22,
+      "refused": 0,
+      "accounted": 22,
+      "classes": 7,
+      "cut": 0,
+      "summaryChars": 2698,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 17,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "row_relocated",
+        "items": 12,
+        "files": 10,
+        "complete": true
+      },
+      {
+        "kind": "row_relocated",
+        "items": 5,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 11,
+        "files": 11,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 11,
+        "files": 11,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 8,
+        "files": 8,
+        "complete": true
+      },
+      {
+        "kind": "row_added",
+        "items": 8,
+        "files": 7,
+        "complete": true
+      },
+      {
+        "kind": "row_added",
+        "items": 2,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004745#1",
+    "error": null,
+    "evidence": {
+      "files": 10,
+      "wanted": 10,
+      "cosmetic": 0,
+      "read": 10,
+      "unread": 0,
+      "patches": 4,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 8,
+      "refused": 0,
+      "accounted": 8,
+      "classes": 22,
+      "cut": 0,
+      "summaryChars": 3087,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 1,
+      "keysRemovedFiles": 1,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 1
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_key_removed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_renamed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_renamed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_renamed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_renamed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_renamed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_renamed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_renamed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_renamed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_renamed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_keys_reordered",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "cell_filled",
+        "items": 48,
+        "files": 6,
+        "complete": true
+      },
+      {
+        "kind": "cell_filled",
+        "items": 48,
+        "files": 6,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004752#1",
+    "error": null,
+    "evidence": {
+      "files": 70,
+      "wanted": 70,
+      "cosmetic": 0,
+      "read": 70,
+      "unread": 0,
+      "patches": 3,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 0,
+      "refused": 0,
+      "accounted": 0,
+      "classes": 0,
+      "cut": 0,
+      "summaryChars": 0,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004774#1",
+    "error": null,
+    "evidence": {
+      "files": 34,
+      "wanted": 34,
+      "cosmetic": 0,
+      "read": 31,
+      "unread": 0,
+      "patches": 13,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 5,
+      "refused": 0,
+      "accounted": 5,
+      "classes": 2,
+      "cut": 0,
+      "summaryChars": 566,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "rows_reordered",
+        "items": 5,
+        "files": 5,
+        "complete": true
+      },
+      {
+        "kind": "cell_filled",
+        "items": 17,
+        "files": 2,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004789#1",
+    "error": null,
+    "evidence": {
+      "files": 38,
+      "wanted": 26,
+      "cosmetic": 0,
+      "read": 26,
+      "unread": 0,
+      "patches": 4,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 24,
+      "refused": 0,
+      "accounted": 24,
+      "classes": 2,
+      "cut": 0,
+      "summaryChars": 899,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 101,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "row_relocated",
+        "items": 101,
+        "files": 12,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 12,
+        "files": 12,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004809#1",
+    "error": null,
+    "evidence": {
+      "files": 41,
+      "wanted": 30,
+      "cosmetic": 0,
+      "read": 30,
+      "unread": 1,
+      "patches": 10,
+      "listCut": false,
+      "readIncomplete": true,
+      "truncated": true,
+      "summaryAbandoned": false,
+      "summarized": 22,
+      "refused": 0,
+      "accounted": 22,
+      "classes": 2,
+      "cut": 0,
+      "summaryChars": 859,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 120,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "row_relocated",
+        "items": 120,
+        "files": 11,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 11,
+        "files": 11,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004849#1",
+    "error": null,
+    "evidence": {
+      "files": 5,
+      "wanted": 5,
+      "cosmetic": 0,
+      "read": 5,
+      "unread": 0,
+      "patches": 4,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 4,
+      "refused": 0,
+      "accounted": 4,
+      "classes": 11,
+      "cut": 0,
+      "summaryChars": 1761,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 2,
+      "keysRemovedFiles": 1,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 1
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_key_removed",
+        "items": 2,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "cell_filled",
+        "items": 64,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "cell_filled",
+        "items": 64,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 3,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004852#1",
+    "error": null,
+    "evidence": {
+      "files": 5,
+      "wanted": 5,
+      "cosmetic": 0,
+      "read": 5,
+      "unread": 0,
+      "patches": 4,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 4,
+      "refused": 0,
+      "accounted": 4,
+      "classes": 14,
+      "cut": 0,
+      "summaryChars": 2238,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 2,
+      "keysRemovedFiles": 1,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 1
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_key_removed",
+        "items": 2,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "cell_filled",
+        "items": 64,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "cell_filled",
+        "items": 64,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 3,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004853#1",
+    "error": null,
+    "evidence": {
+      "files": 5,
+      "wanted": 5,
+      "cosmetic": 0,
+      "read": 5,
+      "unread": 0,
+      "patches": 4,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 4,
+      "refused": 0,
+      "accounted": 4,
+      "classes": 14,
+      "cut": 0,
+      "summaryChars": 2238,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 2,
+      "keysRemovedFiles": 1,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 1
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_key_removed",
+        "items": 2,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "cell_filled",
+        "items": 64,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "cell_filled",
+        "items": 64,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 3,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004854#1",
+    "error": null,
+    "evidence": {
+      "files": 5,
+      "wanted": 5,
+      "cosmetic": 0,
+      "read": 5,
+      "unread": 0,
+      "patches": 4,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 4,
+      "refused": 0,
+      "accounted": 4,
+      "classes": 14,
+      "cut": 0,
+      "summaryChars": 2238,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 2,
+      "keysRemovedFiles": 1,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 1
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_key_removed",
+        "items": 2,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "cell_filled",
+        "items": 64,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "cell_filled",
+        "items": 64,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 3,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004855#1",
+    "error": null,
+    "evidence": {
+      "files": 5,
+      "wanted": 5,
+      "cosmetic": 0,
+      "read": 5,
+      "unread": 0,
+      "patches": 4,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 4,
+      "refused": 0,
+      "accounted": 4,
+      "classes": 14,
+      "cut": 0,
+      "summaryChars": 2238,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 2,
+      "keysRemovedFiles": 1,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 1
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_key_removed",
+        "items": 2,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "cell_filled",
+        "items": 64,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "cell_filled",
+        "items": 64,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 3,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on004859#1",
+    "error": null,
+    "evidence": {
+      "files": 27,
+      "wanted": 20,
+      "cosmetic": 0,
+      "read": 20,
+      "unread": 0,
+      "patches": 6,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 9,
+      "refused": 0,
+      "accounted": 9,
+      "classes": 3,
+      "cut": 0,
+      "summaryChars": 920,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 130,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "row_relocated",
+        "items": 130,
+        "files": 7,
+        "complete": true
+      },
+      {
+        "kind": "rows_reordered",
+        "items": 9,
+        "files": 9,
+        "complete": true
+      },
+      {
+        "kind": "row_added",
+        "items": 129,
+        "files": 9,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on005007#2",
+    "error": null,
+    "evidence": {
+      "files": 51,
+      "wanted": 49,
+      "cosmetic": 0,
+      "read": 49,
+      "unread": 0,
+      "patches": 6,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 43,
+      "refused": 0,
+      "accounted": 43,
+      "classes": 9,
+      "cut": 0,
+      "summaryChars": 2894,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 55,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "row_relocated",
+        "items": 55,
+        "files": 2,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 4074,
+        "files": 42,
+        "complete": true
+      },
+      {
+        "kind": "rows_reordered",
+        "items": 41,
+        "files": 41,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 248,
+        "files": 33,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 38,
+        "files": 2,
+        "complete": true
+      },
+      {
+        "kind": "cell_replaced",
+        "items": 58,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 8,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "row_added",
+        "items": 1057,
+        "files": 42,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on005346#1",
+    "error": null,
+    "evidence": {
+      "files": 5,
+      "wanted": 5,
+      "cosmetic": 0,
+      "read": 5,
+      "unread": 0,
+      "patches": 5,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 150,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on005398#1",
+    "error": null,
+    "evidence": {
+      "files": 4,
+      "wanted": 4,
+      "cosmetic": 0,
+      "read": 4,
+      "unread": 0,
+      "patches": 4,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 2,
+      "refused": 0,
+      "accounted": 2,
+      "classes": 4,
+      "cut": 0,
+      "summaryChars": 1085,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "cell_replaced",
+        "items": 32,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "cell_replaced",
+        "items": 32,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on005415#1",
+    "error": null,
+    "evidence": {
+      "files": 15,
+      "wanted": 15,
+      "cosmetic": 0,
+      "read": 9,
+      "unread": 13,
+      "patches": 9,
+      "listCut": false,
+      "readIncomplete": true,
+      "truncated": true,
+      "summaryAbandoned": false,
+      "summarized": 13,
+      "refused": 0,
+      "accounted": 0,
+      "classes": 2,
+      "cut": 0,
+      "summaryChars": 702,
+      "rowsRemoved": 2744,
+      "rowsRemovedFiles": 13,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 1
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "row_removed",
+        "items": 2744,
+        "files": 13,
+        "complete": false
+      },
+      {
+        "kind": "row_added",
+        "items": 2744,
+        "files": 13,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on005420#1",
+    "error": null,
+    "evidence": {
+      "files": 75,
+      "wanted": 75,
+      "cosmetic": 0,
+      "read": 75,
+      "unread": 0,
+      "patches": 4,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 74,
+      "refused": 0,
+      "accounted": 74,
+      "classes": 6,
+      "cut": 0,
+      "summaryChars": 1043,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 72,
+      "keysRemovedFiles": 72,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 1
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_key_removed",
+        "items": 72,
+        "files": 72,
+        "complete": true
+      },
+      {
+        "kind": "cell_replaced",
+        "items": 37,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 72,
+        "files": 72,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on005489#1",
+    "error": null,
+    "evidence": {
+      "files": 8,
+      "wanted": 6,
+      "cosmetic": 0,
+      "read": 6,
+      "unread": 0,
+      "patches": 4,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 4,
+      "refused": 0,
+      "accounted": 4,
+      "classes": 2,
+      "cut": 0,
+      "summaryChars": 769,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 2,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "row_relocated",
+        "items": 2,
+        "files": 2,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 2,
+        "files": 2,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on005522#1",
+    "error": null,
+    "evidence": {
+      "files": 21,
+      "wanted": 15,
+      "cosmetic": 0,
+      "read": 15,
+      "unread": 1,
+      "patches": 5,
+      "listCut": false,
+      "readIncomplete": true,
+      "truncated": true,
+      "summaryAbandoned": false,
+      "summarized": 13,
+      "refused": 0,
+      "accounted": 12,
+      "classes": 8,
+      "cut": 0,
+      "summaryChars": 4736,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 58,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 15,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "row_relocated",
+        "items": 58,
+        "files": 6,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 6,
+        "files": 6,
+        "complete": true
+      },
+      {
+        "kind": "cell_replaced",
+        "items": 121,
+        "files": 1,
+        "complete": false
+      },
+      {
+        "kind": "cell_replaced",
+        "items": 121,
+        "files": 1,
+        "complete": false
+      },
+      {
+        "kind": "cell_replaced",
+        "items": 121,
+        "files": 1,
+        "complete": false
+      },
+      {
+        "kind": "cell_emptied",
+        "items": 5,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "cell_emptied",
+        "items": 5,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "cell_emptied",
+        "items": 5,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on005545#1",
+    "error": null,
+    "evidence": {
+      "files": 1010,
+      "wanted": 674,
+      "cosmetic": 0,
+      "read": 674,
+      "unread": 0,
+      "patches": 6,
+      "listCut": true,
+      "readIncomplete": false,
+      "truncated": true,
+      "summaryAbandoned": false,
+      "summarized": 336,
+      "refused": 0,
+      "accounted": 336,
+      "classes": 2,
+      "cut": 0,
+      "summaryChars": 698,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 43524,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "row_relocated",
+        "items": 43524,
+        "files": 336,
+        "complete": true
+      },
+      {
+        "kind": "row_added",
+        "items": 16864,
+        "files": 336,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on005574#1",
+    "error": null,
+    "evidence": {
+      "files": 8,
+      "wanted": 5,
+      "cosmetic": 0,
+      "read": 5,
+      "unread": 0,
+      "patches": 5,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 3,
+      "refused": 0,
+      "accounted": 3,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 363,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 3,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "row_relocated",
+        "items": 3,
+        "files": 3,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on005628#1",
+    "error": null,
+    "evidence": {
+      "files": 617,
+      "wanted": 617,
+      "cosmetic": 0,
+      "read": 617,
+      "unread": 0,
+      "patches": 5,
+      "listCut": true,
+      "readIncomplete": false,
+      "truncated": true,
+      "summaryAbandoned": false,
+      "summarized": 615,
+      "refused": 0,
+      "accounted": 615,
+      "classes": 22,
+      "cut": 0,
+      "summaryChars": 4146,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 3672,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_key_moved",
+        "items": 3366,
+        "files": 306,
+        "complete": true
+      },
+      {
+        "kind": "json_key_moved",
+        "items": 306,
+        "files": 306,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 306,
+        "files": 306,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 306,
+        "files": 306,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 306,
+        "files": 306,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_empty_key_removed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "cell_filled",
+        "items": 2448,
+        "files": 306,
+        "complete": true
+      },
+      {
+        "kind": "cell_filled",
+        "items": 2448,
+        "files": 306,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on005670#1",
+    "error": null,
+    "evidence": {
+      "files": 4,
+      "wanted": 4,
+      "cosmetic": 0,
+      "read": 4,
+      "unread": 0,
+      "patches": 4,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 3,
+      "cut": 0,
+      "summaryChars": 530,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on005931#1",
+    "error": null,
+    "evidence": {
+      "files": 50,
+      "wanted": 34,
+      "cosmetic": 0,
+      "read": 34,
+      "unread": 0,
+      "patches": 6,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 16,
+      "refused": 0,
+      "accounted": 16,
+      "classes": 3,
+      "cut": 0,
+      "summaryChars": 968,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 990,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "row_relocated",
+        "items": 990,
+        "files": 16,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 990,
+        "files": 16,
+        "complete": true
+      },
+      {
+        "kind": "rows_reordered",
+        "items": 16,
+        "files": 16,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on006107#1",
+    "error": null,
+    "evidence": {
+      "files": 341,
+      "wanted": 335,
+      "cosmetic": 0,
+      "read": 335,
+      "unread": 0,
+      "patches": 6,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 167,
+      "refused": 0,
+      "accounted": 167,
+      "classes": 4,
+      "cut": 0,
+      "summaryChars": 1131,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 47,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "row_relocated",
+        "items": 47,
+        "files": 6,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 18189,
+        "files": 167,
+        "complete": true
+      },
+      {
+        "kind": "rows_reordered",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "row_added",
+        "items": 2,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on006126#1",
+    "error": null,
+    "evidence": {
+      "files": 119,
+      "wanted": 119,
+      "cosmetic": 0,
+      "read": 119,
+      "unread": 0,
+      "patches": 4,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 118,
+      "refused": 0,
+      "accounted": 118,
+      "classes": 17,
+      "cut": 0,
+      "summaryChars": 3317,
+      "rowsRemoved": 1,
+      "rowsRemovedFiles": 1,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 93,
+      "keysRemovedFiles": 92,
+      "keysMoved": 0,
+      "valuesEmptied": 1,
+      "platformFindings": 2
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_key_removed",
+        "items": 90,
+        "files": 90,
+        "complete": true
+      },
+      {
+        "kind": "json_key_removed",
+        "items": 2,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_removed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "row_removed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 90,
+        "files": 90,
+        "complete": true
+      },
+      {
+        "kind": "cell_replaced",
+        "items": 1320,
+        "files": 24,
+        "complete": true
+      },
+      {
+        "kind": "cell_replaced",
+        "items": 1320,
+        "files": 24,
+        "complete": true
+      },
+      {
+        "kind": "cell_templated",
+        "items": 3,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_emptied",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 90,
+        "files": 90,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on006136#1",
+    "error": null,
+    "evidence": {
+      "files": 18,
+      "wanted": 18,
+      "cosmetic": 0,
+      "read": 18,
+      "unread": 0,
+      "patches": 6,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 15,
+      "refused": 0,
+      "accounted": 15,
+      "classes": 10,
+      "cut": 0,
+      "summaryChars": 2197,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 3,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "key_relabeled",
+        "items": 46,
+        "files": 9,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 32,
+        "files": 9,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 24,
+        "files": 6,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 24,
+        "files": 6,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 17,
+        "files": 2,
+        "complete": true
+      },
+      {
+        "kind": "cell_emptied",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "cell_emptied",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "cell_emptied",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "column_added",
+        "items": 12,
+        "files": 12,
+        "complete": true
+      },
+      {
+        "kind": "column_added",
+        "items": 2,
+        "files": 2,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on006233#2",
+    "error": null,
+    "evidence": {
+      "files": 1043,
+      "wanted": 696,
+      "cosmetic": 0,
+      "read": 9,
+      "unread": 346,
+      "patches": 9,
+      "listCut": true,
+      "readIncomplete": true,
+      "truncated": true,
+      "summaryAbandoned": false,
+      "summarized": 0,
+      "refused": 347,
+      "accounted": 0,
+      "classes": 0,
+      "cut": 0,
+      "summaryChars": 0,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {
+      "invalid_utf8": 347
+    },
+    "classes": [],
+    "refusedDeleted": {
+      "shown": 1,
+      "incomplete": 346,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on006392#1",
+    "error": null,
+    "evidence": {
+      "files": 4,
+      "wanted": 4,
+      "cosmetic": 0,
+      "read": 4,
+      "unread": 0,
+      "patches": 4,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 1,
+      "refused": 0,
+      "accounted": 1,
+      "classes": 1,
+      "cut": 0,
+      "summaryChars": 254,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on006910#1",
+    "error": null,
+    "evidence": {
+      "files": 1154,
+      "wanted": 770,
+      "cosmetic": 0,
+      "read": 770,
+      "unread": 0,
+      "patches": 4,
+      "listCut": true,
+      "readIncomplete": false,
+      "truncated": true,
+      "summaryAbandoned": false,
+      "summarized": 768,
+      "refused": 0,
+      "accounted": 768,
+      "classes": 8,
+      "cut": 0,
+      "summaryChars": 3015,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 49832,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "row_relocated",
+        "items": 49832,
+        "files": 384,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 384,
+        "files": 384,
+        "complete": true
+      },
+      {
+        "kind": "json_empty_key_removed",
+        "items": 384,
+        "files": 384,
+        "complete": true
+      },
+      {
+        "kind": "json_keys_reordered",
+        "items": 384,
+        "files": 384,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 384,
+        "files": 384,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 384,
+        "files": 384,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 384,
+        "files": 384,
+        "complete": true
+      },
+      {
+        "kind": "row_added",
+        "items": 19155,
+        "files": 384,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on006914#1",
+    "error": null,
+    "evidence": {
+      "files": 1061,
+      "wanted": 708,
+      "cosmetic": 0,
+      "read": 708,
+      "unread": 0,
+      "patches": 4,
+      "listCut": true,
+      "readIncomplete": false,
+      "truncated": true,
+      "summaryAbandoned": false,
+      "summarized": 706,
+      "refused": 0,
+      "accounted": 706,
+      "classes": 8,
+      "cut": 0,
+      "summaryChars": 3011,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 45762,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "row_relocated",
+        "items": 45762,
+        "files": 353,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 353,
+        "files": 353,
+        "complete": true
+      },
+      {
+        "kind": "json_empty_key_removed",
+        "items": 353,
+        "files": 353,
+        "complete": true
+      },
+      {
+        "kind": "json_keys_reordered",
+        "items": 353,
+        "files": 353,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 353,
+        "files": 353,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 353,
+        "files": 353,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 353,
+        "files": 353,
+        "complete": true
+      },
+      {
+        "kind": "row_added",
+        "items": 17648,
+        "files": 353,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on007095#1",
+    "error": null,
+    "evidence": {
+      "files": 5,
+      "wanted": 4,
+      "cosmetic": 0,
+      "read": 4,
+      "unread": 0,
+      "patches": 4,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 2,
+      "refused": 0,
+      "accounted": 2,
+      "classes": 2,
+      "cut": 0,
+      "summaryChars": 557,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 1,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "row_relocated",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on007118#1",
+    "error": null,
+    "evidence": {
+      "files": 85,
+      "wanted": 84,
+      "cosmetic": 0,
+      "read": 84,
+      "unread": 0,
+      "patches": 5,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 82,
+      "refused": 0,
+      "accounted": 82,
+      "classes": 2,
+      "cut": 0,
+      "summaryChars": 768,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 8,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "row_relocated",
+        "items": 8,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 9328,
+        "files": 82,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on007119#1",
+    "error": null,
+    "evidence": {
+      "files": 122,
+      "wanted": 108,
+      "cosmetic": 0,
+      "read": 108,
+      "unread": 0,
+      "patches": 4,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 106,
+      "refused": 0,
+      "accounted": 106,
+      "classes": 6,
+      "cut": 0,
+      "summaryChars": 1854,
+      "rowsRemoved": 4,
+      "rowsRemovedFiles": 1,
+      "rowsRelocated": 140,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 1
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "row_removed",
+        "items": 4,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "row_relocated",
+        "items": 140,
+        "files": 13,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 10668,
+        "files": 105,
+        "complete": true
+      },
+      {
+        "kind": "rows_reordered",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "row_added",
+        "items": 8,
+        "files": 4,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on007120#1",
+    "error": null,
+    "evidence": {
+      "files": 73,
+      "wanted": 72,
+      "cosmetic": 0,
+      "read": 72,
+      "unread": 0,
+      "patches": 5,
+      "listCut": false,
+      "readIncomplete": false,
+      "truncated": false,
+      "summaryAbandoned": false,
+      "summarized": 70,
+      "refused": 0,
+      "accounted": 70,
+      "classes": 2,
+      "cut": 0,
+      "summaryChars": 768,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 12,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "row_relocated",
+        "items": 12,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "key_relabeled",
+        "items": 8274,
+        "files": 70,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  },
+  {
+    "pr": "on007353#1",
+    "error": null,
+    "evidence": {
+      "files": 935,
+      "wanted": 933,
+      "cosmetic": 0,
+      "read": 933,
+      "unread": 0,
+      "patches": 7,
+      "listCut": true,
+      "readIncomplete": false,
+      "truncated": true,
+      "summaryAbandoned": false,
+      "summarized": 929,
+      "refused": 0,
+      "accounted": 929,
+      "classes": 7,
+      "cut": 0,
+      "summaryChars": 1944,
+      "rowsRemoved": 0,
+      "rowsRemovedFiles": 0,
+      "rowsRelocated": 0,
+      "columnsRemoved": 0,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
+      "keysMoved": 0,
+      "valuesEmptied": 0,
+      "platformFindings": 0
+    },
+    "refusedBy": {},
+    "classes": [
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "column_added",
+        "items": 240,
+        "files": 240,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 240,
+        "files": 240,
+        "complete": true
+      },
+      {
+        "kind": "column_added",
+        "items": 224,
+        "files": 224,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 224,
+        "files": 224,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 3,
+        "files": 1,
+        "complete": true
+      }
+    ],
+    "refusedDeleted": {
+      "shown": 0,
+      "incomplete": 0,
+      "hidden": 0
+    }
+  }
+]

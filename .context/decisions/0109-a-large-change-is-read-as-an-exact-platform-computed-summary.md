@@ -101,8 +101,12 @@ No new budget enters the job: ADR 0107's 45.4 minutes are unchanged.
   A removal in a file the summary did not summarize is read from its diff by the model, as before the summary existed, and when that diff is not shown in full the pull request is incomplete, as before.
 - The prompt is a calibrated one, changed: the model calibration of ADR 0107 is required again before the check is required.
 - The longest review message, system prompt included, grows to 258,381 characters, under the 300,000 a test holds it to.
-- Two values that the fence makes equal (a `<facts>` and a `</facts>`) show as equal text with no note on where they differ, because the note is computed before the fence.
-  No loss can hide this way, since a removal is an atom of its own with a finding; the calibration phase adds the case to its hostile fixtures and fixes it there.
+- Two values that the fence makes equal (a `<facts>` and a `</facts>`) used to show as equal text with no note on where they differ, because the note was computed before the fence.
+  No loss could hide this way, since a removal is an atom of its own with a finding; the calibration phase fixed it (`fencedForm` in the summary module, held equal to the prompt's fence by a test over generated text).
+- Measured on the real code, not the prototype (design section 12.4, 86 frozen pull requests, no network, no model): 5,482 of 9,208 changed files are accounted for, 15 pull requests are truncated (7 of them by the 400-name cut), and 20 carry a platform blocker.
+  The prototype's 5,495, 14 and 17 differ in three pull requests that block, one of which also stops being accounted for, each from a decided rule (a relabel refuses added text with a digit; a JSON rename needs a value unique in its parent); the owner may narrow either rule, and the baseline test (it runs where the frozen clones exist, not in CI) then fails until the baseline is recorded again.
+- A diff git writes as binary (a NUL byte in a table) is no read at all: the file stays unread and a removed row in it keeps the content incomplete.
+  So does a modified or removed binary file in a read area (a `README.pdf`), whose one-line `Binary files differ` diff used to count as read; the pull request cannot pass on it and a person looks.
 
 ## Alternatives considered
 

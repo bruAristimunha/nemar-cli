@@ -3637,15 +3637,34 @@ function withoutUnseen(v: string): string {
 }
 
 /**
+ * Text as the review prompt's fence leaves it, less the per-run nonce: an opening or closing
+ * `facts` tag in any case becomes `< ` and the word as written, then an opening or closing
+ * `untrusted` tag in any case becomes `< untrusted`. The fenced block that carries the summary
+ * makes these two replacements (the `fence` of `pr-review-prompt.ts` and the shared one it calls),
+ * so `<facts>` and `</facts>` reach the model as the same text. This module imports nothing, so the
+ * two replacements are written here again, and a test compares the result with the real fence on
+ * generated text so that the copy cannot drift. The nonce is random per run and is not repeated
+ * here: a value cannot know it.
+ */
+export function fencedForm(text: string): string {
+  return text.replace(/<\/?\s*(facts)/gi, "< $1").replace(/<\/?\s*untrusted/gi, "< untrusted");
+}
+
+/**
  * The note a pair needs when its two sides may LOOK alike (design section 8.2), or null. A pair
- * gets one when its two rendered texts are equal (two values cut at the same place), when they
- * differ only in characters the renderer escapes (a zero-width space, a bidirectional mark, a
- * control character), when the raw values are equal after NFC normalization but not byte for byte
- * (a precomposed letter against the letter and a combining mark), or when they first differ at a
- * character outside ASCII (a Latin `a` against a Cyrillic one, U+0430). The last is wider than it
- * must be, and deliberately: a note on a pair that did not need one costs a few words, while a
- * look-alike without one is a change the reader cannot see. The note is computed on the raw
- * values, never on the rendered ones.
+ * gets one when its two rendered texts are equal (two values cut at the same place) or are equal
+ * once the prompt's fence has made its own replacements in them ({@link fencedForm}: `<facts>` and
+ * `</facts>` both reach the model as `< facts>`), when they differ only in characters the renderer
+ * escapes (a zero-width space, a bidirectional mark, a control character), when the raw values are
+ * equal after NFC normalization but not byte for byte (a precomposed letter against the letter and
+ * a combining mark), or when they first differ at a character outside ASCII (a Latin `a` against a
+ * Cyrillic one, U+0430). The last is wider than it must be, and deliberately: a note on a pair that
+ * did not need one costs a few words, while a look-alike without one is a change the reader cannot
+ * see. The note is computed on the raw values, never on the rendered ones.
+ *
+ * The fence's replacements are compared one rendered value at a time, and that is exact for the
+ * whole line: no match of either replacement can hold a `"` or a line break, and each rendered value
+ * is one quoted token with no raw line break in it, so a match never spans two tokens.
  */
 function differenceNote(
   before: string,
@@ -3663,6 +3682,7 @@ function differenceNote(
   // condition annotates that the last one would not.
   if (
     b.text === a.text ||
+    fencedForm(b.text) === fencedForm(a.text) ||
     withoutUnseen(before) === withoutUnseen(after) ||
     before.normalize("NFC") === after.normalize("NFC")
   ) {

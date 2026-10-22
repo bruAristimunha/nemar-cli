@@ -6156,6 +6156,78 @@ describe("the change summary in the prompt", () => {
     }
   });
 
+  test('a table with a NUL byte is not read by its "Binary files differ" line', () => {
+    const table = tableOf("sub-01");
+    // A NUL byte in a cell: the summary refuses the table, and git calls it binary, so its diff is
+    // one line that names the file and shows none of its content, the removed Cz row included.
+    const r = releaseChanging(
+      "nul-table",
+      { [table]: "name\ttype\tunits\nCz\tEEG\tuV\nPz\tEEG\tu\0V\n" },
+      (dir) => write(dir, table, "name\ttype\tunits\nPz\tEEG\tu\0V\n"),
+    );
+    expect(
+      git(r.dir, "diff", "-U2", "--no-ext-diff", "--no-textconv", r.base, r.head, "--", table),
+    ).toMatch(/^Binary files a\/\S+ and b\/\S+ differ$/m);
+    const f = gatherGitFacts(r.dir, r.base, r.head);
+    expect(f.summary.files.map((o) => [o.path, o.refusal])).toEqual([
+      ["dataset_description.json", null],
+      [table, "nul_byte"],
+    ]);
+    // No patch stands for the table, so it is not read, and what was not read is said.
+    expect(f.patches.map((p) => p.path)).not.toContain(table);
+    expect(f.readIncomplete).toBe(true);
+    const e = buildEvidence(f, NO_TEXT_PROBLEMS);
+    expect(e.truncated).toBe(true);
+    expect(verdictOf(full(allPass, e))).toBe("uncertain");
+
+    // The control without the NUL byte: a ragged row refuses the same table, git shows its diff,
+    // and the removed row is in it, so the table is read.
+    const ragged = releaseChanging(
+      "nul-free-table",
+      { [table]: "name\ttype\tunits\nCz\tEEG\tuV\nPz\tEEG\tuV\n" },
+      (dir) => write(dir, table, "name\ttype\tunits\nPz\tEEG\tuV\textra\n"),
+    );
+    const g = gatherGitFacts(ragged.dir, ragged.base, ragged.head);
+    expect(g.summary.files.find((o) => o.path === table)?.refusal).toBe("ragged_row");
+    const shown = g.patches.find((p) => p.path === table);
+    expect(shown?.text).toContain("-Cz\tEEG\tuV");
+    expect(shown?.truncated).toBe(false);
+    expect(g.readIncomplete).toBe(false);
+
+    // The control with the NUL byte and only the mode changed: git prints the two modes and no
+    // "Binary files" line, because the content is the same, so the diff shows all there is.
+    const mode = releaseChanging(
+      "nul-mode-only",
+      { [table]: "name\ttype\tunits\nCz\tEEG\tuV\nPz\tEEG\tu\0V\n" },
+      (dir) => chmodSync(join(dir, table), 0o755),
+    );
+    const h = gatherGitFacts(mode.dir, mode.base, mode.head);
+    const modePatch = h.patches.find((p) => p.path === table);
+    expect(modePatch?.text).toContain("new mode 100755");
+    expect(modePatch?.text).not.toContain("Binary files");
+    expect(modePatch?.truncated).toBe(false);
+    expect(h.readIncomplete).toBe(false);
+  });
+
+  test('a bare carriage return in a cell cannot forge the "Binary files differ" line', () => {
+    const table = tableOf("sub-01");
+    // A text table, no NUL byte, whose cell holds a bare carriage return and then the words git
+    // writes for a binary diff, beside a removed row. The summary refuses it; git writes its diff as
+    // text, the words inside one context line, so the diff is shown and the removed row with it.
+    const r = releaseChanging(
+      "cr-forged-binary",
+      { [table]: "name\ttype\tunits\nCz\tEEG\tuV\nPz\tEEG\tx\rBinary files a differ\n" },
+      (dir) => write(dir, table, "name\ttype\tunits\nPz\tEEG\tx\rBinary files a differ\n"),
+    );
+    const f = gatherGitFacts(r.dir, r.base, r.head);
+    expect(f.summary.files.find((o) => o.path === table)?.refusal).toBe("bare_cr");
+    const shown = f.patches.find((p) => p.path === table);
+    expect(shown?.text).toContain("\n Pz\tEEG\tx\rBinary files a differ\n");
+    expect(shown?.text).toContain("\n-Cz\tEEG\tuV\n");
+    expect(shown?.truncated).toBe(false);
+    expect(f.readIncomplete).toBe(false);
+  });
+
   test("an abandoned summary says so in the facts, with no block and no finding", () => {
     const r = bulk();
     const listing = gatherListing(r.dir, r.base, r.head);
@@ -6226,7 +6298,9 @@ describe("the evidence observer", () => {
       wanted: 6,
       cosmetic: 0,
       read: 6,
+      unread: 0,
       patches: 4,
+      listCut: false,
       readIncomplete: false,
       truncated: false,
       summaryAbandoned: false,
@@ -6245,8 +6319,12 @@ describe("the evidence observer", () => {
       keysMoved: 0,
       valuesEmptied: 0,
       platformFindings: 2,
+      listingMs: expect.any(Number),
+      contentMs: expect.any(Number),
     });
     expect(s.summaryChars).toBeGreaterThan(0);
+    expect(Number.isInteger(s.listingMs) && s.listingMs >= 0).toBe(true);
+    expect(Number.isInteger(s.contentMs) && s.contentMs > 0).toBe(true);
     // The numbers the report carries are the same ones.
     expect([s.files, s.read, s.truncated]).toEqual([
       report.evidence.files_changed,
@@ -6302,6 +6380,7 @@ describe("the evidence observer", () => {
       groups: [29, 31].map((files) => ({ ...group, files })),
       groupsOmittedFiles: 37,
       cosmeticOnlyFiles: 41,
+      unreadFiles: 157,
       summary,
     };
     const evidence = {
@@ -6309,17 +6388,24 @@ describe("the evidence observer", () => {
       files_changed: 101,
       files_read: 103,
     };
-    const stat = (readIncomplete: boolean, truncated: boolean) =>
-      evidenceStats({ ...facts, readIncomplete }, { ...evidence, truncated });
+    const stat = (readIncomplete: boolean, truncated: boolean, listCut: boolean) =>
+      evidenceStats(
+        { ...facts, readIncomplete, listCut },
+        { ...evidence, truncated },
+        { listingMs: 163, contentMs: 167 },
+      );
 
-    // Only the two flags are told apart by being different, so they are read both ways round.
-    const stated = stat(false, true);
+    // The flags are told apart only by being different, so they are read in three combinations:
+    // in one of them each flag differs from each other one (`summaryAbandoned` is always true).
+    const stated = stat(false, true, false);
     expect(stated).toEqual({
       files: 101,
       wanted: 29 + 31 + 37,
       cosmetic: 41,
       read: 103,
+      unread: 157,
       patches: 4,
+      listCut: false,
       readIncomplete: false,
       truncated: true,
       summaryAbandoned: true,
@@ -6339,13 +6425,100 @@ describe("the evidence observer", () => {
       valuesEmptied: 149,
       // One finding for the rows and columns, one for the keys.
       platformFindings: 2,
+      listingMs: 163,
+      contentMs: 167,
     });
-    expect(stat(true, false)).toEqual({ ...stated, readIncomplete: true, truncated: false });
+    expect(stat(true, false, false)).toEqual({ ...stated, readIncomplete: true, truncated: false });
+    expect(stat(false, false, true)).toEqual({ ...stated, listCut: true, truncated: false });
     // The fixture does its job only while no two counts are alike.
     const counts = Object.values(stated).filter((v) => typeof v === "number");
     expect(new Set(counts).size).toBe(counts.length);
-    expect(counts).toHaveLength(20);
+    expect(counts).toHaveLength(23);
   });
+
+  test("unreadFiles counts exactly the wanted files that are not covered, and readIncomplete is unreadFiles > 0", () => {
+    // One file of each way to be covered, and of each way not to be; the count is worked out by
+    // hand from that list, not from the reader.
+    const ragged = (rows: number, tag: string) =>
+      `name\ttype\tunits\n${Array.from({ length: rows }, (_, i) => `${tag}${i}\tEEG\tuV\textra`).join("\n")}\n`;
+    const base: Record<string, string> = {
+      [tableOf("sub-01")]: "name\ttype\tunits\nCz\tEEG\tuV\nPz\tEEG\tuV\n",
+      [tableOf("sub-02")]: "name\ttype\tunits\nCz\tEEG\tuV\nPz\tEEG\tu\0V\n",
+      [tableOf("sub-03")]: "name\ttype\tunits\nCz\tEEG\tuV\nPz\tEEG\tuV\n",
+      [sidecarOf("sub-04")]: '{"TaskName":"rest"}',
+      [tableOf("sub-05")]: "name\ttype\tunits\nCz\tEEG\tuV\n",
+    };
+    for (const s of ["sub-06", "sub-07", "sub-08"]) base[tableOf(s)] = "name\ttype\tunits\n";
+    const r = releaseChanging("unread-count", base, (dir) => {
+      // Shown in full: a small ragged table (the summary refuses it, git shows all of it).
+      write(dir, tableOf("sub-01"), "name\ttype\tunits\nPz\tEEG\tuV\textra\n");
+      // Not read: a table with a NUL byte, which git writes as binary.
+      write(dir, tableOf("sub-02"), "name\ttype\tunits\nPz\tEEG\tu\0V\n");
+      // Accounted for by the summary: one cell changed.
+      write(dir, tableOf("sub-03"), "name\ttype\tunits\nCz\tEEG\tmV\nPz\tEEG\tuV\n");
+      // Cosmetic only: the same tokens reindented.
+      write(dir, sidecarOf("sub-04"), '{\n  "TaskName": "rest"\n}\n');
+      // Removed, and its diff shown in full.
+      execFileSync("git", ["-C", dir, "rm", "-q", tableOf("sub-05")], { env: GIT_ENV });
+      // Not read: three ragged tables whose diffs are each cut at the per-file limit.
+      for (const s of ["sub-06", "sub-07", "sub-08"]) write(dir, tableOf(s), ragged(600, s));
+      // Added: never counted.
+      write(dir, tableOf("sub-09"), "name\ttype\tunits\nCz\tEEG\tuV\n");
+      write(dir, sidecarOf("sub-09"), '{"TaskName":"rest"}');
+    });
+    const f = gatherGitFacts(r.dir, r.base, r.head);
+    const cut = f.patches.filter((p) => p.truncated).map((p) => p.path);
+    expect(cut.sort()).toEqual(["sub-06", "sub-07", "sub-08"].map(tableOf));
+    expect([...f.summary.accounted].sort()).toEqual([
+      "dataset_description.json",
+      tableOf("sub-03"),
+    ]);
+    expect(f.cosmeticOnlyFiles).toBe(1);
+    expect(f.patches.map((p) => p.path)).not.toContain(tableOf("sub-02"));
+    // Three cut diffs and one binary diff.
+    expect(f.unreadFiles).toBe(4);
+    expect(f.readIncomplete).toBe(true);
+
+    // Exactly one file not covered, the table with the NUL byte: the count is 1 and the flag true.
+    const one = releaseChanging(
+      "unread-one",
+      { [tableOf("sub-01")]: "name\ttype\tunits\nCz\tEEG\tu\0V\n" },
+      (dir) => write(dir, tableOf("sub-01"), "name\ttype\tunits\nPz\tEEG\tu\0V\n"),
+    );
+    const g = gatherGitFacts(one.dir, one.base, one.head);
+    expect(g.unreadFiles).toBe(1);
+    expect(g.readIncomplete).toBe(true);
+    // And none: the count is 0 and the flag false.
+    const h = gatherGitFacts(stats().dir, stats().base, stats().head);
+    expect(h.unreadFiles).toBe(0);
+    expect(h.readIncomplete).toBe(false);
+  });
+
+  test("the content time is the content pass's, and the listing time the listing's", async () => {
+    const r = stats();
+    // A call only the content pass makes (its one prefetch) and one only the listing makes (the
+    // merge base) are each held for three seconds, in turn; each wait shows in its own pass's time.
+    const timesWith = async (match: string): Promise<EvidenceStats> => {
+      const seen: EvidenceStats[] = [];
+      const restore = installGitShim(root, [{ match, sleepSeconds: 3 }]);
+      try {
+        await reviewPullRequest(under(r, "Remove the Cz channel"), undefined, (s) => {
+          seen.push(s);
+        });
+      } finally {
+        restore();
+      }
+      expect(seen).toHaveLength(1);
+      return seen[0] as EvidenceStats;
+    };
+    const content = await timesWith(" --numstat ");
+    expect(content.contentMs).toBeGreaterThanOrEqual(3_000);
+    const listing = await timesWith(" merge-base ");
+    expect(listing.listingMs).toBeGreaterThanOrEqual(3_000);
+    // Neither wait is counted twice: the two passes are timed apart.
+    expect(content.listingMs).toBeLessThan(content.contentMs);
+    expect(listing.contentMs).toBeLessThan(listing.listingMs);
+  }, 30_000);
 
   test("it is not told anything when the review ends at the facts or at the screen", async () => {
     const r = stats();

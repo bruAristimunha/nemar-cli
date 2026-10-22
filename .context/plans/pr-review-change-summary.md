@@ -72,6 +72,10 @@ All numbers in this document come from a throwaway prototype run on real data, n
 | Blob read, one `git cat-file --batch` | 10 ms for 264 blobs (1.8 MB); 30 ms for 934 blobs (20.6 MB) |
 | Today's content pass, largest | 14.3 s (`on007353` #1), 11.7 s (`on006910` #1); most of it is starting two `git show` processes per cosmetic check, not fetching (section 12.1) |
 
+These are the prototype's numbers.
+Phase 6 ran the real code on the same 86 frozen pull requests and measured them again; five numbers moved (accounted for 5,482, truncated 15, newly complete 17 of which 9 carry no blocking loss fact, blocking loss 20, largest fenced block 6,940 characters), each for a decided rule or a definition, and the table of section 12.4 ("Measured on the real code") lists every difference.
+The prototype counted every candidate as `summarized` and folded a cut listing into `readIncomplete`; the real code keeps `summarized` (parsed without refusal, 5,514 here) apart from `refused` (393) and `listCut` apart from `readIncomplete`, so those two rows above agree with the real code only after that change of definition.
+
 **`nemarDatasets/on004551` #1** (307 files: 125 modified `*_channels.tsv`, 124 added `coordsystem.json`, 56 added `sourcedata/channels-removed-2026-10-18/.../*_channels.tsv`, README, CHANGES).
 
 | | Today | With the summary |
@@ -1198,6 +1202,87 @@ Applied one at a time, each must turn a named test red (the repository's practic
 - **Model calibration**: the ADR 0107 gate (no false pass on a blocking problem, at most 10 percent false fails among pull requests labeled pass, no screen reject and no steering flag on a legitimate pull request), run with the operator's key on a labeled subset: the 11 newly complete pull requests without loss facts, the 17 with loss facts, and 10 small pull requests whose raw diffs already fit (to show the summary does not change their outcome).
   A person labels each before the run.
 - **Pass/fail for slice 1**: set B has zero lenient outcomes; set A matches the expected numbers within the stated tolerances; the model gate passes; no evidence pass takes more than 60 s on a synthetic 2,000-file partial clone.
+
+#### Measured on the real code (Phase 6)
+
+The expectations above are the prototype's.
+Phase 6 ran the real `gatherListing`, `gatherContent` and `buildEvidence` on the frozen set A with no network and no model: `bun run scripts/ci/pr-review-calibrate.ts --evidence-only --offline --clones ~/.local/share/nemar-canary/set-a --prs test/fixtures/pr-review-canary/set-a.txt --json`.
+The counts are deterministic, so the baseline `test/fixtures/pr-review-canary/set-a-evidence.json` (86 rows, no timings) is compared with tolerance 0 by a test that runs wherever the frozen clones exist; a rule change that moves one pull request turns it red and is then a decision to record the baseline again.
+The clones themselves stay outside the repository (a git pack holds committer addresses).
+`set-a.txt` pins each pull request's base and head, so a clone can be made again by id while GitHub still serves them; a head that was force-pushed away reads `fetch_failed`.
+
+**Set A, 86 pull requests, 0 row errors, no summary abandoned, no class cut, no removal HIDDEN.**
+
+| Measure | Prototype | Real code |
+| --- | --- | --- |
+| Files changed, wanted | 9,208, 7,356 | 9,208, 7,356 |
+| Parsed without refusal (`summarized`) | 5,514 | 5,514 |
+| Refused | 393 | 393 (`invalid_utf8` 391, `ragged_row` 1, `empty_column_name` 1) |
+| Accounted for | 5,495 | **5,482** (all of the 13 in `on005415` #1 are gone) |
+| Truncated | 14 (7 list cut) | **15** (7 list cut, 9 content not read in full, `on006233` #2 in both) |
+| Content not read in full without the summary | 31 | 31 |
+| Newly complete (content not read in full without the summary, read in full with it, listing not cut), of which with no blocking loss fact | 18, 11 | **17, 9** |
+| Blocking loss (a platform finding) | 17 | **20** |
+| Most classes in one pull request, largest fenced block | 22, 6,958 characters | 22, 6,940 characters |
+| Slowest listing, slowest content pass, all 86 passes | | 0.1 to 0.2 s, 3 to 6 s (`on006233` #2), 26 to 34 s, on local blobs |
+
+The times are of local blobs on a laptop that was loaded by other work, so they vary from run to run; the production pass also fetches (section 12.1), which this run does not measure.
+The guard on time is the scale test's 60 s per pass, not these numbers.
+
+**Every pull request that differs from the prototype, and why.**
+No row is a regression: each is a rule decided in the design, reported here with the numbers it moves.
+
+| Pull request | What moved | Cause | Class |
+| --- | --- | --- | --- |
+| `on005415` #1 | accounted for 13 to 0, 2,744 rows removed (0 before), blocking, content not read in full | channel names gain a suffix with digits (`LAMY1` to `LAMY1-20000`); the relabel rules refuse added text with a digit (D14, section 4.3) | decided; owner question Q1 |
+| `on003876` #3 | rows removed 62 to 849 (blocking before and after) | the same, D14 | decided; Q1 |
+| `on003374` #1 | rows removed 0 to 22 (blocking before and after for 9 keys) | the same, D14 | decided; Q1 |
+| `on005420` #1 | keys removed 0 to 72, blocking | `MiscChannelCount` to `MISCChannelCount` beside siblings with the same value (`0`): a rename needs a value unique within its parent (D8, section 4.7) | decided; owner question Q2 |
+| `on003195` #1 | keys removed 0 to 20, blocking | the same, D8 | decided; Q2 |
+| `on003194` #1 | keys removed 0 to 29 (blocking before and after) | the same, D8 | decided; Q2 |
+| `on006126` #1 | keys removed 3 to 93 (blocking before and after) | the same, D8 | decided; Q2 |
+| `on004745` #1 | keys removed **10 to 1** (blocking before and after) | nine keys `x1` to `x10` (without the `x`) under one `Levels` object, each with a value unique in its parent, are now `json_key_renamed`: the `strip` arm of the relabel rule (section 4.7) accepts a one-letter prefix with no digit in the gap, which the prototype's rename (case and punctuation only) lacked. They are shown exactly in complete classes, so nothing is hidden; the key of a `Levels` map is the coded value, so a person may still want the rename confirmed | decided; named in Q2 |
+| `on002181` #1, `on005545` #1, `on005628` #1, `on006910` #1, `on006914` #1, `on007353` #1 | prototype `new_readIncomplete` 1, real 0 | the prototype folded a cut listing (these six are list cut) into `readIncomplete`; truncated is identical | definition |
+| `on003620` #1, `on003195` #1, `on004588` #1, `on006233` #2 | `summarized` 92 to 48, 22 to 21, 87 to 86, 347 to 0 | the prototype counted every candidate; the real `summarized` plus `refused` equals it, and accounted for is equal | definition |
+
+Relocation and move counts are identical in all 86 pull requests; no cap binds; no summary is abandoned.
+With `--without-summary` (the pass as it was before the summary existed) 31 pull requests have content not read in full and 32 are truncated, which is the 31 of section 1.1.
+
+**Owner questions this run puts, with the data.**
+Neither changes a rule in Phase 6.
+
+- **Q1 (D14, digits in a relabel).**
+  Three pull requests carry a bulk relabel that adds digits to a name (`on005415` #1: 2,744 rows, now a platform blocker).
+  (a) Keep: a person confirms these; the author can split the pull request or say so in CHANGES. No code. **Recommended**: three of 86, and the cases the rule refuses (`A1` to `A10`, `Cz` to `FCz`) are the ones a quiet acceptance would hide.
+  (b) Widen D14 for the `wrap` and `strip` rules only, when the gap is identical for every pair of the class in every file, joined to the kept text by a non-digit, and no key of either table equals the gap's letters and digits (so `A1` to `A1-A2` stays a removal and an addition).
+  (c) The author splits the pull request.
+- **Q2 (D8, unique value).**
+  D8 as written defeats the case that motivated rename detection: `MiscChannelCount` to `MISCChannelCount` (value `0` beside other counts of `0`) is the lesson of section 1.1, and under D8 it is 72 removed keys in `on005420`, 20 in `on003195`, 29 in `on003194` and 93 in `on006126` (3 before): four of 86 pull requests, so likely common in the fleet.
+  (a) Keep D8: each is a platform blocker and a person confirms. No code.
+  (b) **Recommended.** Narrow D8: the shared value must be unique among the parent's removed leaves and among its added leaves, and only for names equal after folding case and punctuation. `MiscChannelCount` to `MISCChannelCount` is then a rename (the siblings with `0` are neither removed nor added), `go` and `go2` with `go3` added stays a removal and an addition, and the nine `x1` to `1` renames of `on004745` #1 return to removed keys (the safer direction; one pull request).
+  (c) The author splits the pull request.
+  It would be one small change to `relabelRule` and the JSON pairing with its tests, and a fresh run of this baseline.
+
+**Removals in a file the summary refused.**
+Four pull requests have a refused file that deletes a line: `on006233` #2 (1 file shown, 346 incomplete, its listing is cut too), `on003620` #1 (43 shown, 1 incomplete), `on004588` #1 (1 incomplete), `on003195` #1 (1 shown).
+Across set A: 45 files are shown in full, 348 are in a pull request whose content is incomplete, 0 are HIDDEN.
+HIDDEN is a tripwire, not an expected outcome: a refused file with a deleted line is either shown in full or left unread, and an unread one keeps the content incomplete.
+A file counts as shown only when its patch is not cut and holds at least as many `-` lines as git's own count of deleted lines (a binary file never does).
+HIDDEN appears when the pass counts such a file as read without all of them in the patch, which is how the binary-diff hole would have shown up.
+The run fixes the git configuration for every git it starts (no global or system configuration), so a setting such as `diff.algorithm` in an operator's `~/.gitconfig` cannot make git's count and the patch disagree.
+`on004588` #1 is the label template's case of a removal only the model can see, and `on003620` #1 and `on003195` #1 are in its blocking group.
+
+**Set B, the hostile set.**
+24 synthetic pull requests (22 cases; 16 and 21 are split in two) built by `test/fixtures/pr-review-hostile/build.ts`, each a real repository read by the real passes.
+One oracle independent of the code under test (brute force on raw bytes) holds for every case: a file shown in full shows every lost line; an accounted file with a loss carries a loss class and a platform finding; a file neither shown nor accounted keeps `readIncomplete` true; a pair of values that reads as one value after the fence, first differs at a character outside ASCII, or differs only in escaped characters carries the first-difference note; the fenced block is well formed.
+Through the calibration script: 10 pull requests carry a blocking loss (cases 1, 2, 3, 4, 5, 8, 12, 15, 16b, 20), 4 are truncated (7, 11, 16b, 21b), 7 have a refused file that deletes a line, 0 are HIDDEN.
+Two defects were found and fixed in this phase by the cases that predicted them: a diff git writes as `Binary files differ` (a NUL byte in a table) counted as a read, so a removed row in it left `readIncomplete` false (case 7); and two values that differ only by `<facts>` against `</facts>` showed as equal text with no note (case 22).
+The first fix has a side effect worth stating: a modified or removed binary file in a read area (a `README.pdf`) now keeps the content incomplete, where its one-line `Binary files differ` diff used to count as read. That fails closed, as every unknown does.
+A 2,000-file partial clone (1,000 relabeled tables, 500 sidecars with a changed value, 500 ragged tables, 300 copies) reads in about 4 s.
+
+**The model calibration is the owner's step.**
+`test/fixtures/pr-review-canary/model-labels.template.txt` lists 40 reviews (9 newly complete without a loss fact, 20 with a blocking loss, 10 small, 1 removal in a refused file); the 3 pull requests of the platform's own account are left out.
+It calls the Anthropic API with the operator's key, so neither CI nor an agent runs it.
 
 ---
 

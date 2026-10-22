@@ -281,18 +281,24 @@ export type StageObserver = (o: StageObservation) => void;
  *
  *  - `files` changed in all, `wanted` of them in the areas the review reads (every path shape
  *    listed and the files of those not listed), `cosmetic` proven cosmetic, `read` counted as read
- *    (`files_read`), and `patches` diffs shown; `readIncomplete` and `truncated` as the evidence
- *    says.
+ *    (`files_read`), `unread` the modified and removed ones not covered (`readIncomplete` is
+ *    `unread > 0`), and `patches` diffs shown; `listCut`, `readIncomplete` and `truncated` as the
+ *    evidence says (`truncated` is either of the other two).
  *  - The change summary: whether it was `summaryAbandoned`, the files it `summarized`, `refused`
  *    and `accounted` for, the `classes` it showed and the ones it `cut`, the characters of its
  *    block (`summaryChars`), its loss facts, and how many `platformFindings` they make.
+ *  - How long each evidence pass took, whole, in milliseconds: `listingMs` and `contentMs` (the
+ *    content pass includes its one batched prefetch of the blobs, which on a blob-less clone is the
+ *    fetch).
  */
 export interface EvidenceStats {
   files: number;
   wanted: number;
   cosmetic: number;
   read: number;
+  unread: number;
   patches: number;
+  listCut: boolean;
   readIncomplete: boolean;
   truncated: boolean;
   summaryAbandoned: boolean;
@@ -311,12 +317,24 @@ export interface EvidenceStats {
   keysMoved: number;
   valuesEmptied: number;
   platformFindings: number;
+  listingMs: number;
+  contentMs: number;
 }
 
 export type EvidenceObserver = (s: EvidenceStats) => void;
 
-/** The {@link EvidenceStats} of a content pass and the evidence built from it. */
-export function evidenceStats(facts: GitFacts, evidence: ReviewEvidence): EvidenceStats {
+/** How long the two evidence passes took, in whole milliseconds. */
+export interface PassTimes {
+  listingMs: number;
+  contentMs: number;
+}
+
+/** The {@link EvidenceStats} of a content pass, the evidence built from it, and the passes' times. */
+export function evidenceStats(
+  facts: GitFacts,
+  evidence: ReviewEvidence,
+  ms: PassTimes,
+): EvidenceStats {
   const { summary } = facts;
   const loss = summary.loss;
   return {
@@ -324,7 +342,9 @@ export function evidenceStats(facts: GitFacts, evidence: ReviewEvidence): Eviden
     wanted: facts.groups.reduce((n, g) => n + g.files, 0) + facts.groupsOmittedFiles,
     cosmetic: facts.cosmeticOnlyFiles,
     read: evidence.files_read,
+    unread: facts.unreadFiles,
     patches: facts.patches.length,
+    listCut: facts.listCut,
     readIncomplete: facts.readIncomplete,
     truncated: evidence.truncated,
     summaryAbandoned: summary.abandoned,
@@ -343,7 +363,16 @@ export function evidenceStats(facts: GitFacts, evidence: ReviewEvidence): Eviden
     keysMoved: loss.keysMoved,
     valuesEmptied: loss.valuesEmptied,
     platformFindings: platformFindings(summary).length,
+    listingMs: ms.listingMs,
+    contentMs: ms.contentMs,
   };
+}
+
+/** What `pass` returns, and how long it took in whole milliseconds. */
+export function timed<T>(pass: () => T): { value: T; ms: number } {
+  const started = performance.now();
+  const value = pass();
+  return { value, ms: Math.round(performance.now() - started) };
 }
 
 /** What a stage answered: the model's JSON, and what it cost. */
@@ -550,8 +579,9 @@ export async function reviewPullRequest(
   const { repoDir, base, head, pr, fromFork } = input;
   const text = { title: pr.title, body: pr.body };
 
-  // What the screen is shown, with no file's content read but dataset_description.json's.
-  const listing = gatherListing(repoDir, base, head);
+  // What the screen is shown, with no file's content read but dataset_description.json's. Each pass
+  // is timed whole, for the evidence observer only.
+  const { value: listing, ms: listingMs } = timed(() => gatherListing(repoDir, base, head));
   if (listing.changes.length > MAX_REVIEWABLE_FILES) throw new RunFailure("too_large");
   // The facts, before any model call.
   const facts = textFactsOf(pr, listing);
@@ -583,12 +613,13 @@ export async function reviewPullRequest(
     });
   }
 
-  const all = { ...listing, ...gatherContent(repoDir, listing) };
+  const { value: content, ms: contentMs } = timed(() => gatherContent(repoDir, listing));
+  const all = { ...listing, ...content };
   const evidence = buildEvidence(all, facts);
   // The removals the change summary found and nothing in the pull request keeps: the platform's
   // own findings, decided from git before the review is asked, which can only lower its answer.
   const platform = platformFindings(all.summary);
-  observeEvidence?.(evidenceStats(all, evidence));
+  observeEvidence?.(evidenceStats(all, evidence, { listingMs, contentMs }));
   const reviewMessages = buildReviewMessages({
     facts: all,
     evidence,
