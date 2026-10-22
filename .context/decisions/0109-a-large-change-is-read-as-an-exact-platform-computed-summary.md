@@ -76,7 +76,7 @@ The paragraph says that only the files the summary summarized are counted in the
 - A3: emptying a value is shown exactly and does not block.
 - A4: removing a JSON key whose value was already missing is not a loss.
 - A5: the 400-name cut keeps truncating; it is argued in its own phase.
-- A6: the relabel rules (prefix and suffix, zero padding, case, letters and digits in order) are exact descriptions of a renamed key.
+- A6: the relabel rules (prefix and suffix, zero padding, case, letters and digits in order) are exact descriptions of a renamed table key (a JSON key is renamed by case and punctuation alone, design section 4.7).
 
 Part B, what a contributor may change of the original authors' content (questions B1 to B7), was answered with the design's defaults the same day and is built in later phases.
 Until then only its three finding codes are in force: the Worker accepts them, and nothing emits them.
@@ -103,8 +103,12 @@ No new budget enters the job: ADR 0107's 45.4 minutes are unchanged.
 - The longest review message, system prompt included, grows to 258,381 characters, under the 300,000 a test holds it to.
 - Two values that the fence makes equal (a `<facts>` and a `</facts>`) used to show as equal text with no note on where they differ, because the note was computed before the fence.
   No loss could hide this way, since a removal is an atom of its own with a finding; the calibration phase fixed it (`fencedForm` in the summary module, held equal to the prompt's fence by a test over generated text).
-- Measured on the real code, not the prototype (design section 12.4, 86 frozen pull requests, no network, no model): 5,482 of 9,208 changed files are accounted for, 15 pull requests are truncated (7 of them by the 400-name cut), and 20 carry a platform blocker.
-  The prototype's 5,495, 14 and 17 differ in three pull requests that block, one of which also stops being accounted for, each from a decided rule (a relabel refuses added text with a digit; a JSON rename needs a value unique in its parent); the owner may narrow either rule, and the baseline test (it runs where the frozen clones exist, not in CI) then fails until the baseline is recorded again.
+- Measured on the real code, not the prototype (design section 12.4, 86 frozen pull requests, no network, no model): 5,482 of 9,208 changed files are accounted for, 15 pull requests are truncated (7 of them by the 400-name cut), and 18 carry a platform blocker.
+  The prototype's 5,495, 14 and 17 differ in one pull request that blocks and stops being accounted for (`on005415` #1), from a decided rule: a relabel refuses added text with a digit, which the owner kept on 2026-10-22.
+  The first measurement also showed the JSON rename rule, as first written (a value unique within its whole parent, and relabel rules for keys), blocking `MiscChannelCount` to `MISCChannelCount` in four pull requests; the owner narrowed it: a JSON key is renamed when its name differs from the new one in case, punctuation and separators only.
+  Symbols and combining marks must match, a hyphen or dash inside a longer name is punctuation, and a bare number such as `-1` or `5%` is compared as written and pairs only with another bare number.
+  The value must be unique among the parent's removed and among its added leaves (design 4.7).
+  A change to either rule moves the baseline test (it runs where the frozen clones exist, not in CI), which then fails until the baseline is recorded again.
 - A diff git writes as binary (a NUL byte in a table) is no read at all: the file stays unread and a removed row in it keeps the content incomplete.
   So does a modified or removed binary file in a read area (a `README.pdf`), whose one-line `Binary files differ` diff used to count as read; the pull request cannot pass on it and a person looks.
 

@@ -73,7 +73,7 @@ All numbers in this document come from a throwaway prototype run on real data, n
 | Today's content pass, largest | 14.3 s (`on007353` #1), 11.7 s (`on006910` #1); most of it is starting two `git show` processes per cosmetic check, not fetching (section 12.1) |
 
 These are the prototype's numbers.
-Phase 6 ran the real code on the same 86 frozen pull requests and measured them again; five numbers moved (accounted for 5,482, truncated 15, newly complete 17 of which 9 carry no blocking loss fact, blocking loss 20, largest fenced block 6,940 characters), each for a decided rule or a definition, and the table of section 12.4 ("Measured on the real code") lists every difference.
+Phase 6 ran the real code on the same 86 frozen pull requests and measured them again; five numbers moved (accounted for 5,482, truncated 15, newly complete 17 of which 10 carry no blocking loss fact, blocking loss 18, largest fenced block 6,940 characters), each for a decided rule or a definition, and the table of section 12.4 ("Measured on the real code") lists every difference.
 The prototype counted every candidate as `summarized` and folded a cut listing into `readIncomplete`; the real code keeps `summarized` (parsed without refusal, 5,514 here) apart from `refused` (393) and `listCut` apart from `readIncomplete`, so those two rows above agree with the real code only after that change of definition.
 
 **`nemarDatasets/on004551` #1** (307 files: 125 modified `*_channels.tsv`, 124 added `coordsystem.json`, 56 added `sourcedata/channels-removed-2026-10-18/.../*_channels.tsv`, README, CHANGES).
@@ -265,7 +265,7 @@ Each summarized file yields atoms of these kinds, each with a **role**.
 | `json_value_changed` | modification | A leaf's value changed, type kept |
 | `json_type_changed` | modification | A leaf's value changed type (`"1"` to `1`) |
 | `json_emptied` | modification | A non-missing leaf became missing |
-| `json_key_renamed` | modification | A leaf moved to a sibling key with the same value, unique within its parent on both sides, whose name folds to the same (case and punctuation) or matches by a relabel rule (section 4.7) |
+| `json_key_renamed` | modification | A leaf moved to a sibling key with the same value, unique among its parent's removed leaves and among its added leaves, whose name folds to the same non-empty text (case and punctuation, section 4.7) |
 | `json_empty_key_removed` | modification | A leaf whose value was missing was removed |
 | `rows_reordered`, `columns_reordered`, `json_keys_reordered` | modification | Order changed, content kept (for tables, decided over every paired row, so a keyless row paired as an edit counts too) |
 | `format` | modification | BOM, line endings, final newline, `json_respelled`, (slice 4) `encoding_repaired` |
@@ -463,10 +463,24 @@ Two changes close it.
 
 ### 4.7 JSON renames
 
-A removed leaf and an added leaf are a `json_key_renamed` pair when they have the same parent path and the same value, and their last names are equal after lower-casing and removing every character that is not a letter or digit, or when `relabelRule(oldName, newName, { chars: false })` holds.
-Punctuation with a digit on both sides is part of a number and is not removed by the folding (D15): `12` to `1.2` and `0.5` to `05` are a removed key and an added one, not a rename.
-In addition (D8), the shared value must be **unique within its parent** in the before document and in the after document: a shared value is no evidence of which key became which, so with `go` and `go2` both `"Go"`, `go` removed and `go3` added is `json_key_removed` plus `json_key_added`, not a rename.
-A removed leaf then has at most one candidate, and a relabel rule refuses a name over 128 characters before reading it, so the pass is linear in the document and needs neither a candidate cap nor the step budget of section 4.4.
+A removed leaf and an added leaf are a `json_key_renamed` pair when both are keys (not list positions) with the same parent path and the same value, and their last names fold to the same, non-empty text.
+The fold trims a name, lower-cases it, and removes its runs of Unicode punctuation and separators: `_`, `-` (a hyphen or dash is punctuation), `.`, `%`, `#`, `*`, `?`, `/`, quotes, brackets and spaces.
+Letters, digits, combining marks and symbols (`+`, `<`, `=`, `$`) stay and must match.
+A name that is a number literal (`-1`, `+3`, `.5`, `1.2`, `1e-3`, `5%`) is only trimmed and lower-cased, never folded, and it pairs only with another number literal: a changed sign, point, exponent or percent sign is a changed code.
+So `-1` to `1`, `.5` to `5` and `1e-3` to `1e3` are a removed key and an added one, and so are `-1 ` (with a space), `(-1)` and `5 %` to the bare number on the other side; `1E3` to `1e3` is a rename.
+Punctuation with a digit on both sides, in a name that is not a bare number, is part of a number and is not removed by the folding (D15): `v1.2` to `v12` is a removed key and an added one, not a rename.
+A name made only of punctuation folds to nothing and is never renamed (`-` to `_`).
+A sign or point in a name that is not a bare number (`Level -1` to `Level 1`, `x-1` to `x1`) is punctuation like any other and folds; the summary shows both names exactly.
+In addition (D8, narrowed on 2026-10-22, issue #1879), the shared value must be **unique among the parent's removed leaves and among its added leaves**.
+Two removed keys with one value, or two added ones, are no evidence of which became which, so `Foo` and `Bar` (both `0`) removed and `FOO` added is `json_key_removed` twice plus `json_key_added`, not a rename.
+"Removed" and "added" mean the leaves the first pairing (same path, value changed there) left unpaired, so a leaf that a later pass explains as a move still counts.
+`Foo` and `Bar` (both `1`) removed, `FOO` added and `Bar` gained by a sidecar leaves `Foo` a removed key, which over-blocks and never hides.
+A sibling that is unchanged, or whose value changed at its own path, is not a candidate and does not count: `MiscChannelCount` to `MISCChannelCount` beside other counts of `0` is a rename.
+Only case and punctuation make a respelling a rename.
+A key that gained or lost a prefix, a suffix or a digit (`Fz` to `EEG_Fz`, `x1` to `1`, `go` to `go3`) is a removed key and an added one: the relabel rules of section 4.3 apply to table cells, not to JSON keys.
+(Before the narrowing the value had to be unique within its whole parent, and a relabel rule could also pair two keys.
+The first measurement on the real code, section 12.4, showed that blocking `MiscChannelCount` to `MISCChannelCount` in four of 86 pull requests, the very case that motivated rename detection.)
+A removed leaf has at most one candidate and the number-literal test is linear in the name, so the pass is linear in the document and needs neither a candidate cap nor the step budget of section 4.4.
 
 ---
 
@@ -1189,7 +1203,9 @@ Applied one at a time, each must turn a named test red (the repository's practic
 - account files of an abandoned summary;
 - put platform findings last, or let the model's findings be sliced after them;
 - render a value without escaping `\p{Cf}`;
-- count a file in `files_read` twice.
+- count a file in `files_read` twice;
+- in a JSON rename group, count every leaf of the parent (not only the unpaired ones), let a relabel rule pair two keys, let the added side keep its last candidate, ignore the removed-side count, or compare the folded names always equal;
+- fold signs, symbols or combining marks away, fold a number literal, drop the digit exception, accept an empty fold, skip the trim, or pair a number literal with a name that is not one, in the JSON key fold.
 
 ### 12.4 Calibration
 
@@ -1221,8 +1237,8 @@ The clones themselves stay outside the repository (a git pack holds committer ad
 | Accounted for | 5,495 | **5,482** (all of the 13 in `on005415` #1 are gone) |
 | Truncated | 14 (7 list cut) | **15** (7 list cut, 9 content not read in full, `on006233` #2 in both) |
 | Content not read in full without the summary | 31 | 31 |
-| Newly complete (content not read in full without the summary, read in full with it, listing not cut), of which with no blocking loss fact | 18, 11 | **17, 9** |
-| Blocking loss (a platform finding) | 17 | **20** |
+| Newly complete (content not read in full without the summary, read in full with it, listing not cut), of which with no blocking loss fact | 18, 11 | **17, 10** |
+| Blocking loss (a platform finding) | 17 | **18** (`on005415` #1 is the one that differs) |
 | Most classes in one pull request, largest fenced block | 22, 6,958 characters | 22, 6,940 characters |
 | Slowest listing, slowest content pass, all 86 passes | | 0.1 to 0.2 s, 3 to 6 s (`on006233` #2), 26 to 34 s, on local blobs |
 
@@ -1231,37 +1247,36 @@ The guard on time is the scale test's 60 s per pass, not these numbers.
 
 **Every pull request that differs from the prototype, and why.**
 No row is a regression: each is a rule decided in the design, reported here with the numbers it moves.
+The first run also differed in five pull requests by the JSON rename rule (D8 as first written: `MiscChannelCount` to `MISCChannelCount` read as 72, 20, 29 and 93 removed keys in `on005420`, `on003195`, `on003194` and `on006126`, and `on004745` #1 had nine `x1` to `1` renames); the owner narrowed the rule (question Q2 below, issue #1879) and those five match the prototype again, so they are not listed.
 
 | Pull request | What moved | Cause | Class |
 | --- | --- | --- | --- |
 | `on005415` #1 | accounted for 13 to 0, 2,744 rows removed (0 before), blocking, content not read in full | channel names gain a suffix with digits (`LAMY1` to `LAMY1-20000`); the relabel rules refuse added text with a digit (D14, section 4.3) | decided; owner question Q1 |
 | `on003876` #3 | rows removed 62 to 849 (blocking before and after) | the same, D14 | decided; Q1 |
 | `on003374` #1 | rows removed 0 to 22 (blocking before and after for 9 keys) | the same, D14 | decided; Q1 |
-| `on005420` #1 | keys removed 0 to 72, blocking | `MiscChannelCount` to `MISCChannelCount` beside siblings with the same value (`0`): a rename needs a value unique within its parent (D8, section 4.7) | decided; owner question Q2 |
-| `on003195` #1 | keys removed 0 to 20, blocking | the same, D8 | decided; Q2 |
-| `on003194` #1 | keys removed 0 to 29 (blocking before and after) | the same, D8 | decided; Q2 |
-| `on006126` #1 | keys removed 3 to 93 (blocking before and after) | the same, D8 | decided; Q2 |
-| `on004745` #1 | keys removed **10 to 1** (blocking before and after) | nine keys `x1` to `x10` (without the `x`) under one `Levels` object, each with a value unique in its parent, are now `json_key_renamed`: the `strip` arm of the relabel rule (section 4.7) accepts a one-letter prefix with no digit in the gap, which the prototype's rename (case and punctuation only) lacked. They are shown exactly in complete classes, so nothing is hidden; the key of a `Levels` map is the coded value, so a person may still want the rename confirmed | decided; named in Q2 |
 | `on002181` #1, `on005545` #1, `on005628` #1, `on006910` #1, `on006914` #1, `on007353` #1 | prototype `new_readIncomplete` 1, real 0 | the prototype folded a cut listing (these six are list cut) into `readIncomplete`; truncated is identical | definition |
 | `on003620` #1, `on003195` #1, `on004588` #1, `on006233` #2 | `summarized` 92 to 48, 22 to 21, 87 to 86, 347 to 0 | the prototype counted every candidate; the real `summarized` plus `refused` equals it, and accounted for is equal | definition |
 
 Relocation and move counts are identical in all 86 pull requests; no cap binds; no summary is abandoned.
 With `--without-summary` (the pass as it was before the summary existed) 31 pull requests have content not read in full and 32 are truncated, which is the 31 of section 1.1.
 
-**Owner questions this run puts, with the data.**
-Neither changes a rule in Phase 6.
+**Owner decisions on the two questions this run put (2026-10-22).**
 
-- **Q1 (D14, digits in a relabel).**
-  Three pull requests carry a bulk relabel that adds digits to a name (`on005415` #1: 2,744 rows, now a platform blocker).
-  (a) Keep: a person confirms these; the author can split the pull request or say so in CHANGES. No code. **Recommended**: three of 86, and the cases the rule refuses (`A1` to `A10`, `Cz` to `FCz`) are the ones a quiet acceptance would hide.
-  (b) Widen D14 for the `wrap` and `strip` rules only, when the gap is identical for every pair of the class in every file, joined to the kept text by a non-digit, and no key of either table equals the gap's letters and digits (so `A1` to `A1-A2` stays a removal and an addition).
-  (c) The author splits the pull request.
-- **Q2 (D8, unique value).**
-  D8 as written defeats the case that motivated rename detection: `MiscChannelCount` to `MISCChannelCount` (value `0` beside other counts of `0`) is the lesson of section 1.1, and under D8 it is 72 removed keys in `on005420`, 20 in `on003195`, 29 in `on003194` and 93 in `on006126` (3 before): four of 86 pull requests, so likely common in the fleet.
-  (a) Keep D8: each is a platform blocker and a person confirms. No code.
-  (b) **Recommended.** Narrow D8: the shared value must be unique among the parent's removed leaves and among its added leaves, and only for names equal after folding case and punctuation. `MiscChannelCount` to `MISCChannelCount` is then a rename (the siblings with `0` are neither removed nor added), `go` and `go2` with `go3` added stays a removal and an addition, and the nine `x1` to `1` renames of `on004745` #1 return to removed keys (the safer direction; one pull request).
-  (c) The author splits the pull request.
-  It would be one small change to `relabelRule` and the JSON pairing with its tests, and a fresh run of this baseline.
+- **Q1 (D14, digits in a relabel): keep.**
+  Three pull requests carry a bulk relabel that adds digits to a name (`on005415` #1: 2,744 rows, a platform blocker; `on003876` #3 and `on003374` #1 gain 787 and 22 removed rows).
+  The rule stays: the cases it refuses (`A1` to `A10`, `Cz` to `FCz`) are the ones a quiet acceptance would hide; the author splits the pull request or a person confirms.
+  Not chosen: widening D14 for the `wrap` and `strip` rules only, when the gap is identical for every pair of the class in every file, joined to the kept text by a non-digit, and no key of either table equals the gap's letters and digits.
+- **Q2 (D8, unique value): narrow.**
+  D8 as first written defeated the case that motivated rename detection (section 1.1).
+  Section 4.7 now says what was built in #1879: the value is unique among the parent's removed leaves and among its added leaves, and only case and punctuation make a respelling a rename.
+  Measured on set A after the change: blocking loss 18 (was 20).
+  Two of the four pull requests above (`on005420` #1, `on003195` #1) no longer block.
+  `on003194` #1 and `on006126` #1 lose the renamed keys (29 to 0, 93 to 3) and keep a platform finding for another removal, as in the prototype.
+  `on004745` #1 is back to 10 removed keys, nine of them `x1` to `x10` without the `x`, shown exactly.
+  Accounted for and truncated do not move.
+  Two reviews of the change found that the fold was too wide (it also removed signs, symbols and combining marks, and a bare number could pair with a decorated one, so `-1` to `1`, `<5` to `>5`, `5%` to `5` and `-1 ` to `1` read as renames) and that the number test could backtrack on long names.
+  It now removes punctuation and separators only, compares a number literal as written and only with another number literal (section 4.7), and set A does not move.
+  Not chosen: keeping D8, so that each of the four stays a platform blocker.
 
 **Removals in a file the summary refused.**
 Four pull requests have a refused file that deletes a line: `on006233` #2 (1 file shown, 346 incomplete, its listing is cut too), `on003620` #1 (43 shown, 1 incomplete), `on004588` #1 (1 incomplete), `on003195` #1 (1 shown).
@@ -1270,7 +1285,7 @@ HIDDEN is a tripwire, not an expected outcome: a refused file with a deleted lin
 A file counts as shown only when its patch is not cut and holds at least as many `-` lines as git's own count of deleted lines (a binary file never does).
 HIDDEN appears when the pass counts such a file as read without all of them in the patch, which is how the binary-diff hole would have shown up.
 The run fixes the git configuration for every git it starts (no global or system configuration), so a setting such as `diff.algorithm` in an operator's `~/.gitconfig` cannot make git's count and the patch disagree.
-`on004588` #1 is the label template's case of a removal only the model can see, and `on003620` #1 and `on003195` #1 are in its blocking group.
+`on004588` #1 and `on003195` #1 are the label template's cases of a removal only the model can see (the second is shown in full), and `on003620` #1 is in its blocking group.
 
 **Set B, the hostile set.**
 24 synthetic pull requests (22 cases; 16 and 21 are split in two) built by `test/fixtures/pr-review-hostile/build.ts`, each a real repository read by the real passes.
@@ -1281,7 +1296,7 @@ The first fix has a side effect worth stating: a modified or removed binary file
 A 2,000-file partial clone (1,000 relabeled tables, 500 sidecars with a changed value, 500 ragged tables, 300 copies) reads in about 4 s.
 
 **The model calibration is the owner's step.**
-`test/fixtures/pr-review-canary/model-labels.template.txt` lists 40 reviews (9 newly complete without a loss fact, 20 with a blocking loss, 10 small, 1 removal in a refused file); the 3 pull requests of the platform's own account are left out.
+`test/fixtures/pr-review-canary/model-labels.template.txt` lists 40 reviews (10 newly complete without a loss fact, 18 with a blocking loss, 10 small, 2 with a removal in a refused file); the 3 pull requests of the platform's own account are left out.
 It calls the Anthropic API with the operator's key, so neither CI nor an agent runs it.
 
 ---

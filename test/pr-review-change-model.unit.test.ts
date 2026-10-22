@@ -4123,12 +4123,52 @@ describe("diffJson: renamed keys", () => {
     ]);
   });
 
-  test("a key renamed by a relabel rule is a rename", () => {
+  test("a key respelled by a prefix, a suffix or a digit is a removal and an addition, not a rename", () => {
+    // Only case and punctuation make a respelling a rename (owner decision on question Q2, design
+    // 12.4): a name gaining a prefix, losing a letter or changing a digit is a different key.
     expect(jsonLines('{"Fz": 1}', '{"EEG_Fz": 1}')).toEqual([
-      expect.stringContaining('detail="Fz -> EEG_Fz"'),
+      'json_key_removed | field= | before="1" | detail="Fz"',
+      'json_key_added | field= | after="1" | detail="EEG_Fz"',
     ]);
     expect(jsonLines('{"EEG_Fz": 1}', '{"Fz": 1}')).toEqual([
-      expect.stringContaining('detail="EEG_Fz -> Fz"'),
+      'json_key_removed | field= | before="1" | detail="EEG_Fz"',
+      'json_key_added | field= | after="1" | detail="Fz"',
+    ]);
+    // The coded keys of a Levels map: x1 to 1 changes the code, so a person looks.
+    expect(
+      jsonLines(
+        '{"value": {"Levels": {"x1": "Left", "x2": "Right"}}}',
+        '{"value": {"Levels": {"1": "Left", "2": "Right"}}}',
+      ),
+    ).toEqual([
+      'json_key_removed | field=.value.Levels | before="\\"Left\\"" | detail="x1"',
+      'json_key_removed | field=.value.Levels | before="\\"Right\\"" | detail="x2"',
+      'json_key_added | field=.value.Levels | after="\\"Left\\"" | detail="1"',
+      'json_key_added | field=.value.Levels | after="\\"Right\\"" | detail="2"',
+    ]);
+    // go and go3 do not fold alike (a digit is part of the name), so go removed and go3 added are a
+    // removal and an addition, even with no other removed or added key holding the value.
+    expect(
+      jsonLines(
+        '{"trial_type": {"Levels": {"go": "Go", "go2": "Go"}}}',
+        '{"trial_type": {"Levels": {"go2": "Go", "go3": "Go"}}}',
+      ),
+    ).toEqual([
+      'json_key_removed | field=.trial_type.Levels | before="\\"Go\\"" | detail="go"',
+      'json_key_added | field=.trial_type.Levels | after="\\"Go\\"" | detail="go3"',
+    ]);
+  });
+
+  test("an unchanged sibling that holds the same value does not stop a rename", () => {
+    // The case that motivated rename detection: MiscChannelCount beside other counts of 0.
+    const siblings = '"EOGChannelCount": 0, "ECGChannelCount": 0, "EEGChannelCount": 64';
+    expect(
+      jsonLines(`{"MiscChannelCount": 0, ${siblings}}`, `{"MISCChannelCount": 0, ${siblings}}`),
+    ).toEqual([expect.stringContaining('detail="MiscChannelCount -> MISCChannelCount"')]);
+    // A sibling that CHANGED to the value is paired at its own path first and does not count either.
+    expect(jsonLines('{"Foo": 0, "Bar": 1}', '{"FOO": 0, "Bar": 0}')).toEqual([
+      expect.stringContaining('detail="Foo -> FOO"'),
+      expect.stringContaining("json_value_changed | field=.Bar"),
     ]);
   });
 
@@ -4160,6 +4200,11 @@ describe("diffJson: renamed keys", () => {
       'json_key_removed | field=.Levels | before="\\"half\\"" | detail="0.5"',
       'json_key_added | field=.Levels | after="\\"half\\"" | detail="05"',
     ]);
+    // A name that is not a number keeps a point between two digits too: v1.2 is not v12.
+    expect(jsonLines('{"Levels": {"v1.2": "x"}}', '{"Levels": {"v12": "x"}}')).toEqual([
+      'json_key_removed | field=.Levels | before="\\"x\\"" | detail="v1.2"',
+      'json_key_added | field=.Levels | after="\\"x\\"" | detail="v12"',
+    ]);
     // Punctuation next to only one digit is still punctuation.
     expect(jsonLines('{"Channel_1": 3}', '{"channel1": 3}')).toEqual([
       expect.stringContaining('detail="Channel_1 -> channel1"'),
@@ -4167,6 +4212,90 @@ describe("diffJson: renamed keys", () => {
     expect(jsonLines('{"Run1_Onset": 3}', '{"run1onset": 3}')).toEqual([
       expect.stringContaining('detail="Run1_Onset -> run1onset"'),
     ]);
+  });
+
+  /** The atoms of one key of a Levels map respelled from `was` to `now`, beside a key that stays. */
+  const levelKey = (was: string, now: string) =>
+    diffJsonText(
+      "task-x_events.json",
+      JSON.stringify({ Levels: { [was]: "Left", x: "Right" } }),
+      JSON.stringify({ Levels: { [now]: "Left", x: "Right" } }),
+    ).atoms.map((a) => [a.kind, a.field, a.detail]);
+
+  // A sign, a point, an exponent, a percent, a symbol or a combining mark changes a code as much as
+  // x1 to 1 does (issue #1879), so a person looks; a name of punctuation alone folds to nothing.
+  test.each([
+    ["-1 to 1", "-1", "1"],
+    ["+ to -", "+", "-"],
+    ["<5 to >5", "<5", ">5"],
+    [".5 to 5", ".5", "5"],
+    ["1e-3 to 1e3", "1e-3", "1e3"],
+    ["5% to 5", "5%", "5"],
+    ["cafe with a combining acute, to cafe", "cafe\u0301", "cafe"],
+    ["- to _ (punctuation alone)", "-", "_"],
+  ])("%s, either way, is a removed key and an added key, not a rename", (_label, was, now) => {
+    expect(levelKey(was, now)).toEqual([
+      ["json_key_removed", ".Levels", was],
+      ["json_key_added", ".Levels", now],
+    ]);
+    expect(levelKey(now, was)).toEqual([
+      ["json_key_removed", ".Levels", now],
+      ["json_key_added", ".Levels", was],
+    ]);
+  });
+
+  // A number pairs only with a number (issue #1879): a name that is not one but folds to one, by a
+  // space, a bracket, a quote, an underscore, another dash or another percent, is a different key.
+  test.each([
+    ["-1 with a space after it, to 1", "-1 ", "1"],
+    ["-1 with a space before it, to 1", " -1", "1"],
+    ["- 1 (a space after the sign), to 1", "- 1", "1"],
+    ["(-1) to 1", "(-1)", "1"],
+    ["'-1' to 1", "'-1'", "1"],
+    ["-1_ to 1", "-1_", "1"],
+    ["-0.5 with a space after it, to 0.5", "-0.5 ", "0.5"],
+    ["1e-3 with a space after it, to 1e3", "1e-3 ", "1e3"],
+    [".5_ to 5", ".5_", "5"],
+    ["an en dash and 1, to 1", "–1", "1"],
+    ["a hyphen (U+2010) and 1, to 1", "‐1", "1"],
+    ["a fullwidth hyphen-minus and 1, to 1", "－1", "1"],
+    ["a small hyphen-minus and 1, to 1", "﹣1", "1"],
+    ["5 % (a space before the percent), to 5", "5 %", "5"],
+    ["5 and two percent signs, to 5", "5%%", "5"],
+    ["a percent sign and 5, to 5", "%5", "5"],
+    ["5 and a fullwidth percent sign, to 5", "5％", "5"],
+    ["5 and a per mille sign, to 5", "5‰", "5"],
+    ["5 and a prime, to 5", "5′", "5"],
+    ["#1 to 1", "#1", "1"],
+    ["1* to 1", "1*", "1"],
+    ["1? to 1", "1?", "1"],
+    ["1.2_ to 1.2 (refused although harmless: more change shown)", "1.2_", "1.2"],
+  ])(
+    "%s, either way, is a removed key and an added key: a number pairs only with a number",
+    (_label, was, now) => {
+      expect(levelKey(was, now)).toEqual([
+        ["json_key_removed", ".Levels", was],
+        ["json_key_added", ".Levels", now],
+      ]);
+      expect(levelKey(now, was)).toEqual([
+        ["json_key_removed", ".Levels", now],
+        ["json_key_added", ".Levels", was],
+      ]);
+    },
+  );
+
+  test.each([
+    ["1E3", "1e3"],
+    ["Level_1", "LEVEL1"],
+    ["MISC_Channel-Count", "MiscChannelCount"],
+    ["my-key-2", "my_key_2"],
+    // A sign inside a longer name is punctuation and folds: a known limit, accepted.
+    ["Level -1", "Level 1"],
+    // Both are numbers once trimmed, and the same number.
+    [" 1", "1"],
+  ])("%j to %j, either way, is still a rename", (was, now) => {
+    expect(levelKey(was, now)).toEqual([["json_key_renamed", ".Levels", `${was} -> ${now}`]]);
+    expect(levelKey(now, was)).toEqual([["json_key_renamed", ".Levels", `${now} -> ${was}`]]);
   });
 
   test("two names that are not one name respelled are not a rename", () => {
@@ -4180,17 +4309,7 @@ describe("diffJson: renamed keys", () => {
     ]);
   });
 
-  test("a shared value is no evidence of a rename: the value must be the only one of its parent on each side", () => {
-    // go2 holds the same value as go, so go removed and go3 added are a removal and an addition.
-    expect(
-      jsonLines(
-        '{"trial_type": {"Levels": {"go": "Go", "go2": "Go"}}}',
-        '{"trial_type": {"Levels": {"go2": "Go", "go3": "Go"}}}',
-      ),
-    ).toEqual([
-      'json_key_removed | field=.trial_type.Levels | before="\\"Go\\"" | detail="go"',
-      'json_key_added | field=.trial_type.Levels | after="\\"Go\\"" | detail="go3"',
-    ]);
+  test("a shared value is no evidence of a rename: the value must be the only one among the removed keys and among the added keys of its parent", () => {
     // Two old names that both fold to the new one: neither is the rename.
     expect(jsonLines('{"a_b": 1, "A-B": 1}', '{"AB": 1}')).toEqual([
       'json_key_removed | field= | before="1" | detail="a_b"',
@@ -4203,10 +4322,18 @@ describe("diffJson: renamed keys", () => {
       'json_key_added | field= | after="1" | detail="X"',
       'json_key_added | field= | after="1" | detail="x_"',
     ]);
-    // A value repeated under ANOTHER parent does not count against a rename.
-    expect(
-      jsonLines('{"a": {"Key": 1}, "b": {"z": 1}}', '{"a": {"KEY": 1}, "b": {"z": 1}}'),
-    ).toEqual([expect.stringContaining('detail="Key -> KEY"')]);
+    // A value removed, or added, under ANOTHER parent does not count against a rename: the value is
+    // unique among the removed and the added keys of each parent, not of the document.
+    expect(jsonLines('{"a": {"Key": 1}, "b": {"z": 1}}', '{"a": {"KEY": 1}, "b": {}}')).toEqual([
+      'json_key_renamed | field=.a | before="1" | after="1" | detail="Key -> KEY"',
+      'json_key_removed | field=.b | before="1" | detail="z"',
+      'json_key_added | field= | after="{}" | detail="b"',
+    ]);
+    expect(jsonLines('{"a": {"Key": 1}, "b": {}}', '{"a": {"KEY": 1}, "b": {"z": 1}}')).toEqual([
+      'json_key_renamed | field=.a | before="1" | after="1" | detail="Key -> KEY"',
+      'json_empty_key_removed | field= | before="{}" | detail="b"',
+      'json_key_added | field=.b | after="1" | detail="z"',
+    ]);
   });
 
   test("several keys renamed at once, each with its own value, are each a rename", () => {
@@ -4286,6 +4413,24 @@ describe("diffJson: renamed keys", () => {
     const unmatched = diffJsonText("a.json", shared("key"), shared("KEY"));
     expect(unmatched.counts).toMatchObject({ renamed: 0, removed: n, added: n });
     expect(performance.now() - started).toBeLessThan(3000);
+  });
+
+  test("a key of a long run of digits and then a letter is folded in linear time: 3,000 such keys respelled are 3,000 renames", () => {
+    // Whether a name is a number is asked of every key on both sides; a test that backtracks over
+    // a run of digits is quadratic in the name, and 3,000 names of 990 digits then took seconds.
+    const n = 3000;
+    const digits = "1".repeat(990);
+    const doc = (letter: string) =>
+      JSON.stringify(
+        Object.fromEntries(Array.from({ length: n }, (_, i) => [`${digits}${letter}${i}`, i])),
+      );
+    const before = doc("a");
+    const after = doc("A");
+    const started = performance.now();
+    const diff = diffJsonText("a.json", before, after);
+    const elapsed = performance.now() - started;
+    expect(diff.counts).toMatchObject({ renamed: n, removed: 0, added: 0 });
+    expect(elapsed).toBeLessThan(2000);
   });
 });
 
@@ -4708,6 +4853,20 @@ describe("diffJson: moved keys", () => {
       [pooled("task-x_eeg.json", null, '{"Manufacturer": "BioSemi"}')],
     );
     expect(diff.atoms.map((a) => a.kind)).toEqual(["json_key_renamed"]);
+  });
+
+  test("a leaf that step 1 left unpaired counts for uniqueness even when a later pass moves it", () => {
+    // Bar moved to a sidecar, and Foo was respelled FOO with the same value. The rename pass runs
+    // before the move pass, so Bar still shares Foo's value there and Foo is not renamed: more
+    // change shown (a blocking removal), never less.
+    const diff = diffJsonText(target, '{"Foo": 1, "Bar": 1}', '{"FOO": 1}', [
+      pooled("task-x_eeg.json", null, '{"Bar": 1}'),
+    ]);
+    expect(diff.atoms.map(line)).toEqual([
+      'json_key_removed | field= | before="1" | detail="Foo"',
+      'json_key_moved | field= | before="1" | detail="Bar"',
+      'json_key_added | field= | after="1" | detail="FOO"',
+    ]);
   });
 });
 
@@ -6117,22 +6276,55 @@ function oracleMissing(v: Plain): boolean {
   if (typeof v === "object") return Object.keys(v).length === 0;
   return false;
 }
-/** Case and punctuation folded, except punctuation with a digit on both sides (design section 4.7). */
+/** A name in lower case without white space at either end, as the oracle reads it. */
+const oracleTrimmed = (name: string): string => name.toLowerCase().replace(/^\s+|\s+$/gu, "");
+
+/**
+ * A name as the oracle folds it (design section 4.7, issue #1879), in lower case and trimmed. A
+ * name that is a number (a sign, digits with at most one point, an exponent, a percent) is kept as
+ * written. Any other name loses each punctuation or separator character, unless the nearest
+ * characters on both sides that are not punctuation or separators are digits, and keeps everything
+ * else: letters, digits, symbols and combining marks.
+ */
 function oracleFold(name: string): string {
-  const chars = [...name.toLowerCase()];
-  const word = (c: string | undefined): boolean => c !== undefined && /[\p{L}\p{N}]/u.test(c);
+  const lower = oracleTrimmed(name);
+  if (oracleIsNumber(lower)) return lower;
+  const chars = [...lower];
+  const gap = (c: string | undefined): boolean => c !== undefined && /[\p{P}\p{Z}\s]/u.test(c);
   const digit = (c: string | undefined): boolean => c !== undefined && /\p{N}/u.test(c);
   return chars
     .filter((ch, i) => {
-      if (word(ch)) return true;
+      if (!gap(ch)) return true;
       let before = i - 1;
-      while (before >= 0 && !word(chars[before])) before--;
+      while (before >= 0 && gap(chars[before])) before--;
       let after = i + 1;
-      while (after < chars.length && !word(chars[after])) after++;
+      while (after < chars.length && gap(chars[after])) after++;
       return digit(chars[before]) && digit(chars[after]);
     })
     .join("");
 }
+
+/** Whether a lower-case name reads as a number: `-1`, `+3`, `.5`, `1.`, `1.2`, `1e-3`, `5%`. */
+function oracleIsNumber(text: string): boolean {
+  const digits = (s: string): boolean => [...s].every((c) => /\p{N}/u.test(c));
+  const unsigned = (s: string): string => (s.startsWith("+") || s.startsWith("-") ? s.slice(1) : s);
+  const parts = (text.endsWith("%") ? text.slice(0, -1) : text).split("e");
+  if (parts.length > 2) return false;
+  const [whole, fraction, ...more] = unsigned(parts[0] as string).split(".");
+  if (more.length > 0 || !digits(whole as string) || !digits(fraction ?? "")) return false;
+  if (`${whole}${fraction ?? ""}` === "") return false;
+  const exponent = parts[1] === undefined ? undefined : unsigned(parts[1]);
+  return exponent === undefined || (exponent !== "" && digits(exponent));
+}
+
+/**
+ * Two key names are one name respelled: they fold alike, to something, and both are numbers or
+ * neither is (a number is never respelled into a name that only folds to it).
+ */
+const oracleRespelled = (was: string, now: string): boolean =>
+  oracleFold(was) !== "" &&
+  oracleFold(was) === oracleFold(now) &&
+  oracleIsNumber(oracleTrimmed(was)) === oracleIsNumber(oracleTrimmed(now));
 const typeWord = (v: Plain): string => (v === null ? "null" : Array.isArray(v) ? "arr" : typeof v);
 
 /** The JSON files a generated case may put moved keys in, and whether each applies to which file. */
@@ -6208,14 +6400,15 @@ function jsonViolations(
         rebuilt.delete(np);
         if (rebuilt.has(op)) out.push("renamed_over");
         rebuilt.set(op, x.before as string);
-        const shared = (leaves: Map<string, OracleLeaf>) =>
-          [...leaves.values()].filter((l) => l.parent === x.field && l.value === x.before).length;
-        if (shared(bl) !== 1 || shared(al) !== 1) out.push("renamed_shared_value");
-        if (
-          oracleFold(oldName) !== oracleFold(newName) &&
-          relabelRule(oldName, newName, { chars: false }) === null
-        )
-          out.push("renamed_unrelated_names");
+        // The value is unique among the leaves of its parent that the other side does not have at
+        // the same path (an unchanged sibling is not a candidate), and only case and punctuation
+        // set the two names apart.
+        const unpaired = (mine: Map<string, OracleLeaf>, other: Map<string, OracleLeaf>) =>
+          [...mine].filter(
+            ([leafPath, l]) => !other.has(leafPath) && l.parent === x.field && l.value === x.before,
+          ).length;
+        if (unpaired(bl, al) !== 1 || unpaired(al, bl) !== 1) out.push("renamed_shared_value");
+        if (!oracleRespelled(oldName, newName)) out.push("renamed_unrelated_names");
         break;
       }
       case "json_key_removed":
@@ -6268,6 +6461,28 @@ function jsonViolations(
   const same =
     rebuilt.size === bl.size && [...bl].every(([p, leaf]) => rebuilt.get(p) === leaf.value);
   if (!same) out.push("not_reconstructible");
+  // Completeness of renames: the one unpaired before key and the one unpaired after key that share
+  // a parent and a value, and whose names fold alike, ARE a rename. (Names shaped like an index are
+  // left out: whether such a name is a key or an array element is not told by its text. The root is
+  // left out too: it is no key, whatever the other side holds.)
+  const indexShaped = (name: string): boolean => /^\[[0-9]+\]$/.test(name);
+  for (const [leafPath, leaf] of bl) {
+    if (leafPath === "" || al.has(leafPath) || indexShaped(leaf.name)) continue;
+    const sameValue = (l: OracleLeaf) => l.parent === leaf.parent && l.value === leaf.value;
+    if ([...bl].filter(([q, l]) => !al.has(q) && sameValue(l)).length !== 1) continue;
+    const candidates = [...al].filter(([q, l]) => !bl.has(q) && sameValue(l));
+    const [onlyPath, only] = candidates[0] ?? [];
+    if (candidates.length !== 1 || only === undefined || onlyPath === "" || indexShaped(only.name))
+      continue;
+    if (!oracleRespelled(leaf.name, only.name)) continue;
+    const wanted = `${leaf.name} -> ${only.name}`;
+    if (
+      !atoms.some(
+        (x) => x.kind === "json_key_renamed" && x.detail === wanted && x.field === leaf.parent,
+      )
+    )
+      out.push(`rename_missed ${wanted}`);
+  }
   return out;
 }
 
@@ -6288,7 +6503,51 @@ const ORACLE_JSON_KEYS = [
   "a.b",
   "0",
   "[0]",
+  "1.2",
+  "12",
+  "v1.2",
+  "v12",
+  "-1",
+  "1",
+  "<5",
+  ">5",
+  "-",
+  "_",
 ];
+/**
+ * Keys of ORACLE_JSON_KEYS that a respelling may turn into one another although they are not one
+ * name respelled: a point between two digits, a sign, a symbol, or a name of punctuation alone.
+ */
+const ORACLE_JSON_LOOKALIKES: Record<string, string> = {
+  "1.2": "12",
+  "12": "1.2",
+  "v1.2": "v12",
+  v12: "v1.2",
+  "-1": "1",
+  "1": "-1",
+  "<5": ">5",
+  ">5": "<5",
+  "-": "_",
+  _: "-",
+};
+/** The value walks no further: what the oracle reads as one leaf (see {@link oracleLeaves}). */
+const oracleIsLeaf = (v: Plain): boolean =>
+  Array.isArray(v)
+    ? !v.some((x) => x !== null && typeof x === "object")
+    : v === null || typeof v !== "object" || Object.keys(v).length === 0;
+/**
+ * The respellings of a key by case or punctuation alone that `doc` does not hold yet. A space at
+ * the end is the one respelling a number has: `1 ` is still the number 1.
+ */
+const oracleRespellings = (key: string, doc: { [key: string]: Plain }): string[] =>
+  [
+    key.toUpperCase(),
+    key.toLowerCase(),
+    `${key}_`,
+    `_${key}`,
+    `${key.slice(0, 1)}_${key.slice(1)}`,
+    `${key} `,
+  ].filter((c) => c !== key && !(c in doc) && oracleRespelled(key, c));
 const ORACLE_JSON_SCALARS: Plain[] = [0, false, "None", null, "n/a", "", "x", 1, "1", " ", "Go"];
 
 function oracleValue(random: () => number, depth: number): Plain {
@@ -6310,6 +6569,22 @@ function oracleObject(random: () => number, depth: number): { [key: string]: Pla
 }
 
 describe("reconstruction oracle: JSON", () => {
+  test("the oracle asks no rename of the document root: a scalar root that became a key, or the reverse, is no rename", () => {
+    // Belt and suspenders: the empty-fold refusal alone already clears the root (its name is "").
+    const pool = buildPools([]).json;
+    for (const [before, after] of [
+      [1, { _: 1 }],
+      [{ _: 1 }, 1],
+      [{ "": 1 }, 1],
+      [[1, 2], { "-": [1, 2] }],
+    ] as [Plain, Plain][]) {
+      const result = diffJson("a.json", json(textOf(before)), json(textOf(after)), pool);
+      if (!result.ok) throw new Error(`diff refused: ${result.refusal}`);
+      expect(result.value.atoms.map((a) => a.kind)).not.toContain("json_key_renamed");
+      expect(jsonViolations("a.json", before, after, result.value.atoms, [])).toEqual([]);
+    }
+  });
+
   test("6,000 generated cases: the before leaves are recovered from the after leaves and the atoms, and every rename and move stands", () => {
     const random = seeded(4242);
     const { pick, chance, int } = toolkit(random);
@@ -6336,11 +6611,41 @@ describe("reconstruction oracle: JSON", () => {
             : [pick(ORACLE_JSON_SCALARS), oracleObject(random, 1)];
           note("non_object_root");
         } else before = oracleObject(random, 0);
+        // A respelled key beside an unchanged look-alike: a new key, left alone below, that holds the
+        // same leaf as a key that is then respelled by case or punctuation.
+        let twin: string | null = null;
+        let source: string | null = null;
+        if (
+          before !== null &&
+          typeof before === "object" &&
+          !Array.isArray(before) &&
+          chance(0.2)
+        ) {
+          const doc = before;
+          const sources = Object.keys(doc).filter(
+            (k) => oracleIsLeaf(doc[k] as Plain) && oracleRespellings(k, doc).length > 0,
+          );
+          const twins = ORACLE_JSON_KEYS.filter((k) => !(k in doc));
+          if (sources.length > 0 && twins.length > 0) {
+            source = pick(sources);
+            twin = pick(twins);
+            doc[twin] = doc[source] as Plain;
+          }
+        }
         let after: Plain = JSON.parse(JSON.stringify(before)) as Plain;
         if (after !== null && typeof after === "object" && !Array.isArray(after)) {
           const doc = after;
           let renames = 0;
           for (const key of Object.keys(doc)) {
+            if (key === twin) continue;
+            const respellings = key === source ? oracleRespellings(key, doc) : [];
+            if (respellings.length > 0) {
+              const value = doc[key] as Plain;
+              delete doc[key];
+              doc[pick(respellings)] = value;
+              renames++;
+              continue;
+            }
             const op = random();
             if (op < 0.15) {
               delete doc[key];
@@ -6350,7 +6655,11 @@ describe("reconstruction oracle: JSON", () => {
                 `${key}_`,
                 `EEG_${key}`,
                 key.replace(/-/g, ""),
+                key.toLowerCase(),
+                `${key.slice(0, 1)}_${key.slice(1)}`,
                 pick(ORACLE_JSON_KEYS),
+                ORACLE_JSON_LOOKALIKES[key] ?? pick(ORACLE_JSON_KEYS),
+                ` ${key}`,
               ]);
               if (respelled !== key && !(respelled in doc)) {
                 const value = doc[key] as Plain;
@@ -6402,6 +6711,27 @@ describe("reconstruction oracle: JSON", () => {
               note("shared_value");
             }
           }
+          // One key below the root respelled by case or punctuation, so renames under a parent other
+          // than the root are found complete by the oracle and not by hand tests alone.
+          const nested: [{ [key: string]: Plain }, string][] = [];
+          const collect = (v: Plain, depth: number): void => {
+            if (Array.isArray(v)) for (const x of v) collect(x, depth + 1);
+            else if (v !== null && typeof v === "object") {
+              for (const k of Object.keys(v)) {
+                const child = v[k] as Plain;
+                if (depth > 0 && oracleIsLeaf(child) && oracleRespellings(k, v).length > 0)
+                  nested.push([v, k]);
+                collect(child, depth + 1);
+              }
+            }
+          };
+          collect(doc, 0);
+          if (nested.length > 0) {
+            const [parent, key] = pick(nested);
+            const value = parent[key] as Plain;
+            delete parent[key];
+            parent[pick(oracleRespellings(key, parent))] = value;
+          }
         } else {
           after = chance(0.5) ? oracleObject(random, 0) : oracleValue(random, 1);
         }
@@ -6439,8 +6769,19 @@ describe("reconstruction oracle: JSON", () => {
         diffs++;
         const atoms = result.value.atoms;
         for (const atom of atoms) seen.add(atom.kind);
-        if (atoms.filter((x) => x.kind === "json_key_renamed").length > 1)
-          note("several_renames_found");
+        const renames = atoms.filter((x) => x.kind === "json_key_renamed");
+        if (renames.length > 1) note("several_renames_found");
+        if (renames.some((x) => x.field !== "")) note("nested_rename_found");
+        // The case the rename rule keeps a rename for: a sibling that is unchanged (the same path and
+        // value on both sides) holds the renamed key's value.
+        const bLeaves = oracleLeaves(c.before);
+        const aLeaves = oracleLeaves(c.after);
+        const besideLookalike = (x: Atom): boolean =>
+          [...bLeaves].some(
+            ([p, l]) =>
+              l.parent === x.field && l.value === x.before && aLeaves.get(p)?.value === l.value,
+          );
+        if (renames.some(besideLookalike)) note("rename_beside_unchanged_lookalike");
         if (atoms.some((x) => x.field?.includes("[") ?? false)) note("array_paths");
         if (!verifyJsonCounts(result.value)) violations.push(`case ${n}: counts`);
         for (const v of jsonViolations(c.path, c.before, c.after, atoms, sidecars))
@@ -6477,11 +6818,13 @@ describe("reconstruction oracle: JSON", () => {
       ["non_object_root", 300],
       ["root_type_changed", 150],
       ["several_renames", 200],
-      ["several_renames_found", 40],
+      ["several_renames_found", 230],
+      ["nested_rename_found", 840],
       ["moved_whole", 1000],
       ["nested_move_shadowed", 300],
       ["nearer_sets_moved_key", 200],
       ["shared_value", 500],
+      ["rename_beside_unchanged_lookalike", 500],
       ["emptied", 500],
       ["value_changed", 1000],
       ["array_paths", 300],

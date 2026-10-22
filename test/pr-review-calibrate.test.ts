@@ -2189,6 +2189,27 @@ describe("the frozen set A and the label template", () => {
     expect(requests).toHaveLength(0);
   });
 
+  test("the label template's blocking group is exactly the set A pull requests with a platform finding", () => {
+    // A group is a block of the template between blank lines that holds entries; its heading is the
+    // block's first comment line.
+    const groups = fixture("model-labels.template.txt")
+      .split(/\n[ \t]*\n/)
+      .map((block) => ({
+        heading: block.trimStart().split("\n")[0] as string,
+        prs: entriesOf(block).map((l) => l.split(" ")[0] as string),
+      }))
+      .filter((g) => g.prs.length > 0);
+    expect(groups.map((g) => g.prs.length)).toEqual([10, 18, 10, 2]);
+    const blocking = groups[1];
+    expect(blocking?.heading.startsWith("# A blocking loss")).toBe(true);
+    const rows = JSON.parse(fixture("set-a-evidence.json")) as EvidenceRow[];
+    const withFinding = rows
+      .filter((r) => (r.evidence?.platformFindings ?? 0) > 0)
+      .map((r) => r.pr)
+      .sort();
+    expect([...(blocking?.prs ?? [])].sort()).toEqual(withFinding);
+  });
+
   test("the set A baseline holds only pull request names, closed words, numbers and booleans", () => {
     const text = fixture("set-a-evidence.json");
     expect(text).not.toContain("@");
@@ -2235,7 +2256,7 @@ describe("the frozen set A and the label template", () => {
     expect(count((x) => x.listCut)).toBe(7);
     expect(count((x) => x.readIncomplete)).toBe(9);
     expect(count((x) => x.summaryAbandoned)).toBe(0);
-    expect(count((x) => x.platformFindings > 0)).toBe(20);
+    expect(count((x) => x.platformFindings > 0)).toBe(18);
     expect(count((x) => x.cut > 0)).toBe(0);
     const refusedBy: Record<string, number> = {};
     for (const r of rows) {

@@ -1728,25 +1728,19 @@
       "accounted": 31,
       "classes": 9,
       "cut": 0,
-      "summaryChars": 1901,
+      "summaryChars": 1899,
       "rowsRemoved": 1,
       "rowsRemovedFiles": 1,
       "rowsRelocated": 0,
       "columnsRemoved": 0,
-      "keysRemoved": 29,
-      "keysRemovedFiles": 29,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
       "keysMoved": 0,
       "valuesEmptied": 0,
-      "platformFindings": 2
+      "platformFindings": 1
     },
     "refusedBy": {},
     "classes": [
-      {
-        "kind": "json_key_removed",
-        "items": 29,
-        "files": 29,
-        "complete": true
-      },
       {
         "kind": "row_removed",
         "items": 1,
@@ -1760,33 +1754,39 @@
         "complete": true
       },
       {
-        "kind": "format",
-        "items": 1,
-        "files": 1,
-        "complete": true
-      },
-      {
-        "kind": "format",
-        "items": 1,
-        "files": 1,
-        "complete": true
-      },
-      {
-        "kind": "json_value_changed",
-        "items": 1,
-        "files": 1,
-        "complete": true
-      },
-      {
-        "kind": "json_value_changed",
-        "items": 1,
-        "files": 1,
-        "complete": true
-      },
-      {
-        "kind": "json_key_added",
+        "kind": "json_key_renamed",
         "items": 29,
         "files": 29,
+        "complete": true
+      },
+      {
+        "kind": "json_keys_reordered",
+        "items": 29,
+        "files": 29,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "format",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
+        "complete": true
+      },
+      {
+        "kind": "json_value_changed",
+        "items": 1,
+        "files": 1,
         "complete": true
       },
       {
@@ -1821,29 +1821,35 @@
       "accounted": 21,
       "classes": 7,
       "cut": 0,
-      "summaryChars": 1528,
+      "summaryChars": 1526,
       "rowsRemoved": 0,
       "rowsRemovedFiles": 0,
       "rowsRelocated": 0,
       "columnsRemoved": 0,
-      "keysRemoved": 20,
-      "keysRemovedFiles": 20,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
       "keysMoved": 0,
       "valuesEmptied": 0,
-      "platformFindings": 1
+      "platformFindings": 0
     },
     "refusedBy": {
       "empty_column_name": 1
     },
     "classes": [
       {
-        "kind": "json_key_removed",
+        "kind": "format",
         "items": 20,
         "files": 20,
         "complete": true
       },
       {
-        "kind": "format",
+        "kind": "json_key_renamed",
+        "items": 20,
+        "files": 20,
+        "complete": true
+      },
+      {
+        "kind": "json_keys_reordered",
         "items": 20,
         "files": 20,
         "complete": true
@@ -1864,12 +1870,6 @@
         "kind": "json_value_changed",
         "items": 1,
         "files": 1,
-        "complete": true
-      },
-      {
-        "kind": "json_key_added",
-        "items": 20,
-        "files": 20,
         "complete": true
       },
       {
@@ -3281,14 +3281,14 @@
       "summarized": 8,
       "refused": 0,
       "accounted": 8,
-      "classes": 22,
+      "classes": 14,
       "cut": 0,
-      "summaryChars": 3087,
+      "summaryChars": 2685,
       "rowsRemoved": 0,
       "rowsRemovedFiles": 0,
       "rowsRelocated": 0,
       "columnsRemoved": 0,
-      "keysRemoved": 1,
+      "keysRemoved": 10,
       "keysRemovedFiles": 1,
       "keysMoved": 0,
       "valuesEmptied": 0,
@@ -3296,6 +3296,12 @@
     },
     "refusedBy": {},
     "classes": [
+      {
+        "kind": "json_key_removed",
+        "items": 9,
+        "files": 1,
+        "complete": true
+      },
       {
         "kind": "json_key_removed",
         "items": 1,
@@ -3321,66 +3327,6 @@
         "complete": true
       },
       {
-        "kind": "json_key_renamed",
-        "items": 1,
-        "files": 1,
-        "complete": true
-      },
-      {
-        "kind": "json_key_renamed",
-        "items": 1,
-        "files": 1,
-        "complete": true
-      },
-      {
-        "kind": "json_key_renamed",
-        "items": 1,
-        "files": 1,
-        "complete": true
-      },
-      {
-        "kind": "json_key_renamed",
-        "items": 1,
-        "files": 1,
-        "complete": true
-      },
-      {
-        "kind": "json_key_renamed",
-        "items": 1,
-        "files": 1,
-        "complete": true
-      },
-      {
-        "kind": "json_key_renamed",
-        "items": 1,
-        "files": 1,
-        "complete": true
-      },
-      {
-        "kind": "json_key_renamed",
-        "items": 1,
-        "files": 1,
-        "complete": true
-      },
-      {
-        "kind": "json_key_renamed",
-        "items": 1,
-        "files": 1,
-        "complete": true
-      },
-      {
-        "kind": "json_key_renamed",
-        "items": 1,
-        "files": 1,
-        "complete": true
-      },
-      {
-        "kind": "json_keys_reordered",
-        "items": 1,
-        "files": 1,
-        "complete": true
-      },
-      {
         "kind": "json_value_changed",
         "items": 1,
         "files": 1,
@@ -3420,6 +3366,12 @@
         "kind": "cell_filled",
         "items": 48,
         "files": 6,
+        "complete": true
+      },
+      {
+        "kind": "json_key_added",
+        "items": 9,
+        "files": 1,
         "complete": true
       },
       {
@@ -4551,21 +4503,27 @@
       "accounted": 74,
       "classes": 6,
       "cut": 0,
-      "summaryChars": 1043,
+      "summaryChars": 1041,
       "rowsRemoved": 0,
       "rowsRemovedFiles": 0,
       "rowsRelocated": 0,
       "columnsRemoved": 0,
-      "keysRemoved": 72,
-      "keysRemovedFiles": 72,
+      "keysRemoved": 0,
+      "keysRemovedFiles": 0,
       "keysMoved": 0,
       "valuesEmptied": 0,
-      "platformFindings": 1
+      "platformFindings": 0
     },
     "refusedBy": {},
     "classes": [
       {
-        "kind": "json_key_removed",
+        "kind": "json_key_renamed",
+        "items": 72,
+        "files": 72,
+        "complete": true
+      },
+      {
+        "kind": "json_keys_reordered",
         "items": 72,
         "files": 72,
         "complete": true
@@ -4592,12 +4550,6 @@
         "kind": "json_value_changed",
         "items": 1,
         "files": 1,
-        "complete": true
-      },
-      {
-        "kind": "json_key_added",
-        "items": 72,
-        "files": 72,
         "complete": true
       }
     ],
@@ -5208,25 +5160,19 @@
       "accounted": 118,
       "classes": 17,
       "cut": 0,
-      "summaryChars": 3317,
+      "summaryChars": 3315,
       "rowsRemoved": 1,
       "rowsRemovedFiles": 1,
       "rowsRelocated": 0,
       "columnsRemoved": 0,
-      "keysRemoved": 93,
-      "keysRemovedFiles": 92,
+      "keysRemoved": 3,
+      "keysRemovedFiles": 2,
       "keysMoved": 0,
       "valuesEmptied": 1,
       "platformFindings": 2
     },
     "refusedBy": {},
     "classes": [
-      {
-        "kind": "json_key_removed",
-        "items": 90,
-        "files": 90,
-        "complete": true
-      },
       {
         "kind": "json_key_removed",
         "items": 2,
@@ -5247,6 +5193,18 @@
       },
       {
         "kind": "format",
+        "items": 90,
+        "files": 90,
+        "complete": true
+      },
+      {
+        "kind": "json_key_renamed",
+        "items": 90,
+        "files": 90,
+        "complete": true
+      },
+      {
+        "kind": "json_keys_reordered",
         "items": 90,
         "files": 90,
         "complete": true
@@ -5297,12 +5255,6 @@
         "kind": "json_value_changed",
         "items": 1,
         "files": 1,
-        "complete": true
-      },
-      {
-        "kind": "json_key_added",
-        "items": 90,
-        "files": 90,
         "complete": true
       },
       {
