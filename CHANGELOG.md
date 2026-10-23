@@ -13,6 +13,41 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
+## 0.10.23 - 2026-10-24
+
+The dataset pull request review now reads a large change as an exact summary the platform computes, and protects what the original authors published.
+This release has no migration, sets no new Worker secret or variable, and changes no workflow or Worker configuration; the review check is still not required (`PR_REVIEW_AUTO_REQUIRE` stays unset).
+The review scripts run from `main`, so reviews dispatched after the merge run the new scripts while the Worker deploys; the Worker's only change is rendering one paragraph, and an older Worker renders the same reports without it.
+The review prompt changed and the model calibration of ADR 0107 on the new prompt is not done; that is acceptable only while the check is not required.
+
+### Changed
+
+- **A modified table or sidecar counts as read when an exact change summary accounts for it (epic #1851, Part A).**
+  The summary parses tables and JSON documents strictly, pairs rows, keys and renames by exact rules, and reports what changed as a few classes with counts, so a bulk pull request such as 125 tables with one edit no longer fills the model's context with 114 diffs.
+  The model reads the summary beside the diffs it still needs, and a file counts as read only when every class in it that is not additive was shown completely.
+  An unrelocated or unkept removal (rows, columns with values, or keys with values that the pull request keeps nowhere else) is a platform blocker on `no_degradation`, placed first in the findings; it can only lower a verdict, and a model cannot raise it.
+- **The review protects what the original authors published (Part B).**
+  A README or CHANGES line altered beyond a minor edit, moved or removed, a line put inside an original paragraph, an author-owned `dataset_description.json` field altered or removed, or a participant value changed fails `no_degradation`, with the codes `original_text_altered` and `original_field_altered` that 0.10.22 made the Worker accept.
+  A replaced recording, a comparison that could not be made and an abandoned pass are `unknown` (`recording_replaced`, `evidence_incomplete`), never clean.
+  Minor edits, text added after the dataset's first version, line endings, added fields and moved pointers are information for the model.
+  The README is compared with the one at the dataset's first version tag (one `git ls-remote --tags origin` per review of a pull request that changes a README); when the lookup fails, finds no tag or finds no ancestor tag, every line at the merge base is protected.
+  The check shows one paragraph under the findings of a report that has one of the two failing codes: contributors add to what the original authors published, describe the change in CHANGES, put new information in a new section, and ask an administrator to correct what the authors wrote.
+- **The review prompt gained the change summary and the `original_content` facts.**
+  The system prompt grows by about 4,000 characters, the longest message stays under the 300,000-character cap, and the model, effort and token ceilings are unchanged.
+
+### Production behavior changes
+
+- **The check of an open pull request changes the next time it is reviewed**, on a push, an edit, a reopen, a ready-for-review or an administrator start; nothing changes retroactively.
+  Of the 129 dataset pull requests open on 2026-10-23, 107 are on public datasets, the only ones the Worker dispatches: measured with the real tag lookup, 79 read clear, 20 fail (three of them the platform account's own `Name` changes, which the Worker exempts), 5 are `unknown` only and 3 carry information.
+  Merging a pull request that fails needs an administrator's `--force` in `nemar admin pr-reviews`, as for any failing review.
+- **Contributors who rewrite original content now read "Needs changes".**
+  An author who reworded or expanded original README lines, edited a participant value or changed a dataset name sees the failing finding and the paragraph above on the check.
+
+### Not in this release
+
+- The 400-name cut (#1861) and the small evidence additions (#1862) follow separately.
+- The calibration tool cannot fetch private datasets online (#1884), the unit-pure job flakes on 5-second timeouts of unrelated backend tests (#1885), CI lint covers only `src/` (#1890), and two GitHub-view-only gaps of the hiding tripwire (#1883) are filed.
+
 ## 0.10.22 - 2026-10-21
 
 The Worker's report parser now accepts three finding codes that nothing emits yet.
