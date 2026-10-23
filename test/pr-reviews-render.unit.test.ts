@@ -696,7 +696,7 @@ describe("a version 2 report on the terminal", () => {
   });
 
   /** A full report: the screen let the pull request through, and the review read the files and answered. */
-  const full = (criteriaOver: Record<string, string> = {}) =>
+  const full = (criteriaOver: Record<string, string> = {}, findings: unknown[] = []) =>
     parsePrReviewReport({
       v: 2,
       stage: "full",
@@ -710,7 +710,7 @@ describe("a version 2 report on the terminal", () => {
         description_not_misleading: "pass",
         ...criteriaOver,
       },
-      findings: [],
+      findings,
       summary: "Adds a subject.",
       steering: false,
       evidence: evidence({ files_read: 1, truncated: false, changelog_entry: "added" }),
@@ -719,6 +719,43 @@ describe("a version 2 report on the terminal", () => {
         review: { input_tokens: 5000, output_tokens: 700 },
       },
     });
+
+  test("what to do instead of changing the original authors' content ends the findings, once, and only for them", () => {
+    const paragraph =
+      "Contributors add to what the original authors published and do not change it. Describe your change in the CHANGES entry for the new version. Put new information in a new, clearly separate section of the README. If something the authors wrote is wrong, open an issue for the NEMAR administrators, who can correct it; an administrator can also review this pull request by hand.";
+    const filed = (...codes: string[]) =>
+      brief(
+        full(
+          { no_degradation: "fail" },
+          codes.map((code) => ({
+            criterion: "no_degradation",
+            severity: "blocker",
+            code,
+            path: null,
+            note: "A fixed note.",
+          })),
+        ),
+      );
+    for (const codes of [
+      ["original_text_altered"],
+      ["original_field_altered"],
+      ["original_text_altered", "original_field_altered"],
+    ]) {
+      const lines = filed(...codes);
+      expect(
+        lines.filter((l) => l === paragraph),
+        codes.join(),
+      ).toHaveLength(1);
+      // The last two lines of the card: a blank line, then the paragraph.
+      expect(lines.slice(-2), codes.join()).toEqual(["", paragraph]);
+      expect(lines).toContain("Findings:");
+    }
+    // Recorded data that changed is a question for a person, and this paragraph does not answer it.
+    for (const other of [["recording_replaced"], ["data_removed"]]) {
+      expect(filed(...other).join("\n"), other.join()).not.toContain("Contributors add");
+    }
+    expect(brief(full()).join("\n")).not.toContain("Contributors add");
+  });
 
   test("a screen report and a full report keep their own words", () => {
     const stopped = brief(screen());

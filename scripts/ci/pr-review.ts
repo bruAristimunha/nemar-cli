@@ -50,12 +50,14 @@ import { namingProblemOf } from "../../shared/naming-rule";
 import {
   type PrReviewReport,
   PrReviewReportError,
+  type ReviewEvidence,
   type RunError,
   type StageTokens,
 } from "../../shared/pr-review";
 import { tidy } from "../../shared/untrusted-text";
 import {
   EvidenceError,
+  type GitFacts,
   type Listing,
   SHA40,
   type TextFacts,
@@ -74,6 +76,10 @@ import {
   assembleReport,
   buildReviewMessages,
   buildScreenMessages,
+  originalContentBlock,
+  originalLowersToFail,
+  originalVerdict,
+  platformFindings,
   readScreenAnswer,
 } from "./pr-review-prompt";
 
@@ -271,6 +277,163 @@ export interface StageObservation {
 
 export type StageObserver = (o: StageObservation) => void;
 
+/**
+ * What the content pass came to, for an observer: the calibration's evidence columns. Numbers and
+ * booleans only, counted by the platform, so printing them quotes nothing of the pull request; the
+ * summary's first path with a removal is the one fact about it that is text, and it is left out.
+ *
+ *  - `files` changed in all, `wanted` of them in the areas the review reads (every path shape
+ *    listed and the files of those not listed), `cosmetic` proven cosmetic, `read` counted as read
+ *    (`files_read`), `unread` the modified and removed ones not covered (`readIncomplete` is
+ *    `unread > 0`), and `patches` diffs shown; `listCut`, `readIncomplete` and `truncated` as the
+ *    evidence says (`truncated` is either of the other two).
+ *  - The change summary: whether it was `summaryAbandoned`, the files it `summarized`, `refused`
+ *    and `accounted` for, the `classes` it showed and the ones it `cut`, the characters of its
+ *    block (`summaryChars`), its loss facts, and how many `platformFindings` they make. That is
+ *    Part A's count alone: the findings about the original authors' content are `originalFindings`.
+ *  - What the pull request changed of the content its original authors published (Part B), read
+ *    from the facts the review is sent (`original_content`) and from the verdict the review is held
+ *    or failed by, so the two cannot differ: whether the pass was `originalAbandoned`, whether the
+ *    README was compared with the README at a version tag (`anchorFromTag`), the README lines
+ *    altered, the runs of new lines put inside an original paragraph, the minor edits and the
+ *    later text altered, the CHANGES lines altered, the author fields altered and the ones edited
+ *    slightly, the participant values altered (0 when they could not be counted), the data files
+ *    replaced, moved and not read; which parts were not decided (`readmeNotDecided`,
+ *    `changesNotDecided`, `authorFieldsNotDecided`, `participantsNotDecided`), whether any part
+ *    could not be compared or carries markup that can hide text (`originalUndecided`); and what the
+ *    platform did about it: `originalFindings` findings, `originalFails` 1 when `no_degradation`
+ *    fails whatever the review says, else 0.
+ *  - How long each evidence pass took, whole, in milliseconds: `listingMs` and `contentMs` (the
+ *    content pass includes its one batched prefetch of the blobs, which on a blob-less clone is the
+ *    fetch).
+ */
+export interface EvidenceStats {
+  files: number;
+  wanted: number;
+  cosmetic: number;
+  read: number;
+  unread: number;
+  patches: number;
+  listCut: boolean;
+  readIncomplete: boolean;
+  truncated: boolean;
+  summaryAbandoned: boolean;
+  summarized: number;
+  refused: number;
+  accounted: number;
+  classes: number;
+  cut: number;
+  summaryChars: number;
+  rowsRemoved: number;
+  rowsRemovedFiles: number;
+  rowsRelocated: number;
+  columnsRemoved: number;
+  keysRemoved: number;
+  keysRemovedFiles: number;
+  keysMoved: number;
+  valuesEmptied: number;
+  platformFindings: number;
+  originalAbandoned: boolean;
+  anchorFromTag: boolean;
+  readmeAlteredLines: number;
+  readmeInsideParagraph: number;
+  readmeMinorEdits: number;
+  readmeLaterAltered: number;
+  readmeNotDecided: boolean;
+  changesAlteredLines: number;
+  changesNotDecided: boolean;
+  authorFieldsAltered: number;
+  authorFieldsEdited: number;
+  authorFieldsNotDecided: boolean;
+  participantValuesAltered: number;
+  participantsNotDecided: boolean;
+  recordingsReplaced: number;
+  recordingsMoved: number;
+  recordingsUnread: number;
+  originalUndecided: boolean;
+  originalFindings: number;
+  originalFails: number;
+  listingMs: number;
+  contentMs: number;
+}
+
+export type EvidenceObserver = (s: EvidenceStats) => void;
+
+/** How long the two evidence passes took, in whole milliseconds. */
+export interface PassTimes {
+  listingMs: number;
+  contentMs: number;
+}
+
+/** The {@link EvidenceStats} of a content pass, the evidence built from it, and the passes' times. */
+export function evidenceStats(
+  facts: GitFacts,
+  evidence: ReviewEvidence,
+  ms: PassTimes,
+): EvidenceStats {
+  const { summary, original } = facts;
+  const loss = summary.loss;
+  const block = originalContentBlock(original);
+  const verdict = originalVerdict(original);
+  const partA = platformFindings(summary).length;
+  return {
+    files: evidence.files_changed,
+    wanted: facts.groups.reduce((n, g) => n + g.files, 0) + facts.groupsOmittedFiles,
+    cosmetic: facts.cosmeticOnlyFiles,
+    read: evidence.files_read,
+    unread: facts.unreadFiles,
+    patches: facts.patches.length,
+    listCut: facts.listCut,
+    readIncomplete: facts.readIncomplete,
+    truncated: evidence.truncated,
+    summaryAbandoned: summary.abandoned,
+    summarized: summary.facts.files_summarized,
+    refused: summary.facts.files_not_summarized,
+    accounted: summary.facts.files_accounted_for,
+    classes: summary.facts.classes_shown,
+    cut: summary.facts.classes_cut,
+    summaryChars: summary.text.length,
+    rowsRemoved: loss.rowsRemoved,
+    rowsRemovedFiles: loss.rowsRemovedFiles,
+    rowsRelocated: loss.rowsRelocated,
+    columnsRemoved: loss.columnsRemoved,
+    keysRemoved: loss.keysRemoved,
+    keysRemovedFiles: loss.keysRemovedFiles,
+    keysMoved: loss.keysMoved,
+    valuesEmptied: loss.valuesEmptied,
+    platformFindings: partA,
+    originalAbandoned: block.abandoned,
+    anchorFromTag: block.anchor === "first_version_tag",
+    readmeAlteredLines: block.readme_original_lines_altered,
+    readmeInsideParagraph: block.readme_lines_put_inside_original_paragraphs,
+    readmeMinorEdits: block.readme_minor_edits,
+    readmeLaterAltered: block.readme_later_text_altered,
+    readmeNotDecided: block.readme === "not_decided",
+    changesAlteredLines: block.changes_lines_altered,
+    changesNotDecided: block.changes === "not_decided",
+    authorFieldsAltered: block.author_fields_altered.length,
+    authorFieldsEdited: block.author_fields_edited_slightly.length,
+    authorFieldsNotDecided: block.author_fields === "not_decided",
+    participantValuesAltered: block.participant_values_altered ?? 0,
+    participantsNotDecided: block.participant_values_altered === null,
+    recordingsReplaced: block.recordings_replaced,
+    recordingsMoved: block.recordings_moved,
+    recordingsUnread: block.recordings_not_read,
+    originalUndecided: verdict.undecided === "other" || verdict.undecided === "markup",
+    originalFindings: platformFindings(summary, original).length - partA,
+    originalFails: verdict.lowersToFail ? 1 : 0,
+    listingMs: ms.listingMs,
+    contentMs: ms.contentMs,
+  };
+}
+
+/** What `pass` returns, and how long it took in whole milliseconds. */
+export function timed<T>(pass: () => T): { value: T; ms: number } {
+  const started = performance.now();
+  const value = pass();
+  return { value, ms: Math.round(performance.now() - started) };
+}
+
 /** What a stage answered: the model's JSON, and what it cost. */
 export interface StageAnswer {
   output: unknown;
@@ -453,6 +616,12 @@ export interface PullRequestUnderReview {
   /** The pull request as the API returns it: its title and its description. */
   pr: { title?: unknown; body?: unknown };
   fromFork: boolean;
+  /**
+   * Whether the content pass may list the origin's version tags to find the README's anchor
+   * (`ContentOptions.versionTags`). The review leaves it unset, which allows it; a run that must
+   * not reach a remote sets it false.
+   */
+  versionTags?: boolean;
 }
 
 /**
@@ -461,16 +630,23 @@ export interface PullRequestUnderReview {
  * when the screen let it through. Throws what it meets; {@link
  * runReview} turns that into a fixed word. The calibration runs exactly this, on pull requests that
  * are no longer open, which is why the dispatch's own checks are not part of it.
+ *
+ * `observe` is told about each model call; `observeEvidence` is told once what the content pass
+ * came to ({@link EvidenceStats}), after the content was read and before the review is asked, and
+ * not at all when the review ended at the facts or at the screen, which read no content. Both are
+ * for the calibration, and neither may throw: a throw ends the run like any error.
  */
 export async function reviewPullRequest(
   input: PullRequestUnderReview,
   observe?: StageObserver,
+  observeEvidence?: EvidenceObserver,
 ): Promise<PrReviewReport> {
   const { repoDir, base, head, pr, fromFork } = input;
   const text = { title: pr.title, body: pr.body };
 
-  // What the screen is shown, with no file's content read but dataset_description.json's.
-  const listing = gatherListing(repoDir, base, head);
+  // What the screen is shown, with no file's content read but dataset_description.json's. Each pass
+  // is timed whole, for the evidence observer only.
+  const { value: listing, ms: listingMs } = timed(() => gatherListing(repoDir, base, head));
   if (listing.changes.length > MAX_REVIEWABLE_FILES) throw new RunFailure("too_large");
   // The facts, before any model call.
   const facts = textFactsOf(pr, listing);
@@ -502,8 +678,18 @@ export async function reviewPullRequest(
     });
   }
 
-  const all = { ...listing, ...gatherContent(repoDir, listing) };
+  const { value: content, ms: contentMs } = timed(() =>
+    gatherContent(repoDir, listing, { versionTags: input.versionTags }),
+  );
+  const all = { ...listing, ...content };
   const evidence = buildEvidence(all, facts);
+  // The removals the change summary found and nothing in the pull request keeps, and what the
+  // pull request changed of the original authors' content: the platform's own findings, decided
+  // from git before the review is asked, which can only lower its answer. An alteration of that
+  // content fails `no_degradation` whatever the review says.
+  const platform = platformFindings(all.summary, all.original);
+  const lowerToFail = originalLowersToFail(all.original);
+  observeEvidence?.(evidenceStats(all, evidence, { listingMs, contentMs }));
   const reviewMessages = buildReviewMessages({
     facts: all,
     evidence,
@@ -518,10 +704,14 @@ export async function reviewPullRequest(
     observe,
     client,
   );
-  return assembleReport(screen.output, review.output, evidence, {
-    screen: screen.usage,
-    review: review.usage,
-  });
+  return assembleReport(
+    screen.output,
+    review.output,
+    evidence,
+    { screen: screen.usage, review: review.usage },
+    platform,
+    lowerToFail,
+  );
 }
 
 /** Review one pull request. Never throws: every failure is a fixed word. */

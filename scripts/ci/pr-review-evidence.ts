@@ -15,8 +15,11 @@
  * **Two passes, for the two stages.** {@link gatherListing} reads what the screen is shown: the
  * change list, the version and name in `dataset_description.json` (the one file whose content it
  * reads), the subject counts and the commit subjects. {@link gatherContent} reads what only the
- * full review is shown: the cosmetic checks, the diffs and the change log. A pull request the
- * screen stops never has a file's content read beyond `dataset_description.json`.
+ * full review is shown: the cosmetic checks, the change summary, the facts about the original
+ * authors' content (Part B, whose search for the README's anchor is the one call that asks the
+ * origin for anything but objects: its version tags), the diffs and the change log. A pull request
+ * the screen stops never has a file's content read beyond `dataset_description.json`, and never
+ * has the origin's tags listed.
  *
  * The output has two halves with different trust. {@link buildEvidence} is the deterministic
  * account (counts per area, versions, subjects, a file list) that goes into the report whatever
@@ -29,7 +32,10 @@
  * `truncated`, which stops a clean pass about nothing being lost. An unread ADDED file does not:
  * a new file cannot remove anything. Nor does a MODIFIED `.json` or `.tsv` file whose change the
  * platform itself proved cosmetic (see {@link GitFacts.cosmeticOnlyFiles}); such a file is not
- * shown either, because there is nothing in it to read.
+ * shown either, because there is nothing in it to read. Nor does a MODIFIED `.json` or `.tsv` file
+ * the change summary accounted for (see {@link ContentFacts.summary}): the platform parsed both
+ * sides and accounted for every change in it as a class, so the file counts as read without its
+ * diff; a few such files are still shown as diffs, after the ones the summary did not cover.
  *
  * **One change repeated across many files is read once.** A bulk edit often makes the same change in
  * every subject's sidecar. A file whose diff is exactly one already shown, line for line (see
@@ -38,7 +44,7 @@
  * that diff was shown in full. The match is exact, so a change that differs in one byte is shown.
  */
 
-import { execFileSync } from "node:child_process";
+import { type ExecFileSyncOptions, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { hasVisibleText } from "../../shared/naming-rule";
 import {
@@ -56,6 +62,32 @@ import {
   SEMVER,
 } from "../../shared/pr-review";
 import { shouldAnnex } from "../../src/lib/git-annex/policy";
+import {
+  type AnchorLookup,
+  type DescriptionSide,
+  type DocumentKind,
+  type DocumentPart,
+  ORIGINAL_ABANDONED,
+  ORIGINAL_LIMITS,
+  type OriginalContentFacts,
+  type PointerProbe,
+  type RecordingChange,
+  chooseAnchor,
+  inReviewedScope,
+  isDocumentName,
+  originalContentFacts,
+  parseVersionTags,
+} from "./pr-review-original";
+import {
+  ABANDONED_SUMMARY,
+  type ChangeSummary,
+  EMPTY_SUMMARY,
+  type PoolFile,
+  SUMMARY_LIMITS,
+  type SummaryCandidate,
+  poolFileMatters,
+  summarizeChanges,
+} from "./pr-review-summary";
 
 export { MAX_MODEL_FILES };
 export type { ChangelogEntry };
@@ -231,10 +263,19 @@ export interface ContentFacts {
   patches: Patch[];
   /**
    * True when a MODIFIED or REMOVED metadata file with a real change was not shown in full: it did
-   * not fit the file or character budget, its diff was cut, or reading it failed. A file the
-   * platform proved cosmetic-only ({@link cosmeticOnlyFiles}) is not counted.
+   * not fit the file or character budget, its diff was cut, reading it failed, or git wrote its diff
+   * as binary, which shows none of its content. A file the platform proved cosmetic-only
+   * ({@link cosmeticOnlyFiles}) is not counted, and neither is one the change summary accounted for
+   * ({@link summary}).
    */
   readIncomplete: boolean;
+  /**
+   * How many files made {@link readIncomplete} true: the modified and removed metadata files that
+   * are not cosmetic-only, not accounted for by the summary and not shown in full. Counted with the
+   * one predicate `readIncomplete` is decided by, which is exactly `unreadFiles > 0`, so the two
+   * cannot disagree. For the calibration's numbers: neither the report nor the prompt carries it.
+   */
+  unreadFiles: number;
   /**
    * How many MODIFIED metadata files the platform proved differ only cosmetically. Decided from
    * the two blobs, not by the model, and only for a regular file whose mode did not change:
@@ -261,6 +302,22 @@ export interface ContentFacts {
    * as `changelog_entry`, and a version without an entry cannot advance the revision.
    */
   changelogEntry: ChangelogEntry;
+  /**
+   * The change summary of the modified `.tsv` and `.json` files (`pr-review-summary.ts`): what each
+   * changed, as exact classes, and the files it accounts for, which count as read. `EMPTY_SUMMARY`
+   * when there was nothing to summarize; abandoned, and accounting for nothing, when the pass had
+   * too little time left to start it or to finish it, or could not read the blobs it needs, which
+   * leaves everything else exactly as it is without a summary.
+   */
+  summary: ChangeSummary;
+  /**
+   * What the pull request changed of the content its original authors published (Part B: the
+   * README, CHANGES, the author fields of `dataset_description.json`, participant values and
+   * annexed recordings; `pr-review-original.ts`). All or nothing, like the summary:
+   * `ORIGINAL_ABANDONED` when the pass had too little time left to start it or could not read what
+   * it needs, never a part of the facts.
+   */
+  original: OriginalContentFacts;
 }
 
 /** Everything the full review is shown: the listing and the content pass together. */
@@ -295,6 +352,8 @@ export interface PathGroup {
   shown: number;
   /** How many of the group's files differ only cosmetically. */
   cosmeticOnly: number;
+  /** How many of the group's files the change summary accounted for (a file can also be shown). */
+  summarized: number;
 }
 
 /** The most path shapes reported, largest first within a status; the files of any others are counted in `groupsOmittedFiles`. */
@@ -365,17 +424,71 @@ export function childEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEn
   return { ...kept, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0" };
 }
 
+/** The most output one git call may produce unless it says otherwise. */
+const MAX_GIT_OUTPUT = 256 * 1024 * 1024;
+
+/** What one git call may add to the pass's bounds (see {@link runGit}). */
+interface GitCallOptions {
+  /** Bytes written to the call's standard input; without them its input is closed. */
+  input?: Buffer;
+  /**
+   * When this one call must be over (epoch ms), on top of the pass's budget. A call past it is
+   * {@link CallExpired}, never `timed_out`: the pass itself still has time.
+   */
+  deadline?: number;
+  /** The most output the call may produce; {@link MAX_GIT_OUTPUT} unless given. */
+  maxBuffer?: number;
+  /**
+   * Variables set for this one call, over {@link childEnv}: `GIT_NO_LAZY_FETCH=1` keeps a call in a
+   * partial clone from fetching an object the clone does not hold.
+   */
+  env?: Readonly<Record<string, string>>;
+}
+
 /**
- * One git call, bounded by what is left of the pass's budget. Running out, before the call or
- * during it, is {@link EvidenceError} `timed_out`, which no caller swallows; any other failure is
- * thrown as git's own error, for the caller to turn into its word.
+ * A call reached its own deadline ({@link GitCallOptions.deadline}) before the pass's budget ran
+ * out. Not an {@link EvidenceError}: what an expired call means is its caller's to say, and
+ * {@link tryGit} and {@link tryGitBytes} turn it into null like any other failure.
  */
-function runGit(dir: string, args: string[], encoding: "utf8" | "latin1"): string {
-  let timeout: number | undefined;
-  if (gitDeadline !== null) {
-    timeout = gitDeadline - Date.now();
-    if (timeout <= 0) throw new EvidenceError("timed_out");
-  }
+class CallExpired extends Error {}
+
+/**
+ * One git call, bounded by what is left of the pass's budget and by its own deadline, if it has
+ * one. Running out of the pass's budget, before the call or during it, is {@link EvidenceError}
+ * `timed_out`, which no caller swallows; running out of the call's own deadline first is
+ * {@link CallExpired}; any other failure is thrown as git's own error, for the caller to turn into
+ * its word.
+ */
+function runGit(
+  dir: string,
+  args: string[],
+  encoding: "utf8" | "latin1",
+  call?: GitCallOptions,
+): string;
+function runGit(dir: string, args: string[], encoding: "buffer", call?: GitCallOptions): Buffer;
+function runGit(
+  dir: string,
+  args: string[],
+  encoding: "utf8" | "latin1" | "buffer",
+  call: GitCallOptions = {},
+): string | Buffer {
+  const started = Date.now();
+  const passLeft = gitDeadline === null ? Number.POSITIVE_INFINITY : gitDeadline - started;
+  const callLeft = call.deadline === undefined ? Number.POSITIVE_INFINITY : call.deadline - started;
+  if (passLeft <= 0) throw new EvidenceError("timed_out");
+  // For a call with no time left at all: a timeout of 0 means no timeout to `execFileSync`, so the
+  // call would run unbounded and the pass's own deadline would be ignored with it. A negative one
+  // is refused by the runtime anyway, so the zero is what this guard is for.
+  if (callLeft <= 0) throw new CallExpired();
+  const timeout = Math.min(passLeft, callLeft);
+  const options: ExecFileSyncOptions = {
+    encoding,
+    maxBuffer: call.maxBuffer ?? MAX_GIT_OUTPUT,
+    env: call.env === undefined ? childEnv() : { ...childEnv(), ...call.env },
+    stdio: [call.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+    ...(call.input === undefined ? {} : { input: call.input }),
+    ...(Number.isFinite(timeout) ? { timeout } : {}),
+  };
   try {
     return execFileSync(
       "git",
@@ -391,16 +504,12 @@ function runGit(dir: string, args: string[], encoding: "utf8" | "latin1"): strin
         "protocol.ext.allow=never",
         ...args,
       ],
-      {
-        encoding,
-        maxBuffer: 256 * 1024 * 1024,
-        env: childEnv(),
-        stdio: ["ignore", "pipe", "pipe"],
-        ...(timeout === undefined ? {} : { timeout }),
-      },
+      options,
     );
   } catch (e) {
-    if ((e as { code?: unknown }).code === "ETIMEDOUT") throw new EvidenceError("timed_out");
+    if ((e as { code?: unknown }).code === "ETIMEDOUT") {
+      throw callLeft < passLeft ? new CallExpired() : new EvidenceError("timed_out");
+    }
     throw e;
   }
 }
@@ -421,12 +530,27 @@ function tryGitBytes(dir: string, args: string[]): string | null {
 }
 
 /** A git call whose failure is null, for the caller to name; running out of time is thrown. */
-function tryGit(dir: string, args: string[]): string | null {
+function tryGit(dir: string, args: string[], call?: GitCallOptions): string | null {
   try {
-    return runGit(dir, args, "utf8");
+    return runGit(dir, args, "utf8", call);
   } catch (e) {
     if (e instanceof EvidenceError) throw e;
     return null;
+  }
+}
+
+/**
+ * The exit status of a git call that answers by it, as `merge-base --is-ancestor` does: 0 or 1, and
+ * null for anything else (another status, a signal, output past its bound, a call past its own
+ * deadline), which is "git could not say". Running out of the pass's budget is still thrown.
+ */
+function gitStatus(dir: string, args: string[], call: GitCallOptions = {}): 0 | 1 | null {
+  try {
+    runGit(dir, args, "utf8", call);
+    return 0;
+  } catch (e) {
+    if (e instanceof EvidenceError) throw e;
+    return (e as { status?: unknown }).status === 1 ? 1 : null;
   }
 }
 
@@ -525,25 +649,191 @@ export function pathPattern(path: string): string {
 /** A regular file: the only kind whose text can be compared for a cosmetic change. */
 const REGULAR_FILE_MODES: ReadonlySet<string> = new Set(["100644", "100755"]);
 
+/** The object id git writes for the side of a change that does not exist. */
+const ZERO_OID = "0".repeat(40);
+
+/** The mode of a submodule: a commit of another repository, with no blob to read. */
+const SUBMODULE_MODE = "160000";
+
 /**
- * The modes of every changed path, old and new, from `git diff --raw`. Null when git could not
- * say, in which case no file is treated as cosmetic.
+ * One changed path as `git diff --raw` names it: its status, the mode and the object id on each
+ * side (`000000` and {@link ZERO_OID} for a side that does not exist). A type change (`T`: a
+ * regular file to a symlink, say) is its own status here, though the change list calls it
+ * modified. A submodule keeps its mode, `160000`.
  */
-function modesByPath(
-  dir: string,
-  mergeBase: string,
-  headSha: string,
-): Map<string, { before: string; after: string }> | null {
-  const raw = tryGit(dir, ["diff", "--raw", "-z", "--no-renames", mergeBase, headSha]);
-  if (raw === null) return null;
-  const parts = raw.split("\0");
-  const out = new Map<string, { before: string; after: string }>();
-  for (let i = 0; i + 1 < parts.length; i += 2) {
-    const meta = parts[i]?.match(/^:(\d{6}) (\d{6}) /);
-    const path = parts[i + 1];
-    if (meta?.[1] && meta[2] && path) out.set(path, { before: meta[1], after: meta[2] });
+export interface RawEntry {
+  status: "added" | "modified" | "removed" | "typechange";
+  modeBefore: string;
+  modeAfter: string;
+  oidBefore: string;
+  oidAfter: string;
+  path: string;
+}
+
+/** One meta token of `git diff --raw -z --no-abbrev`: two modes, two full ids, one status. */
+const RAW_META = /^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40}) ([0-9a-f]{40}) ([AMDT])$/;
+const RAW_STATUS: Readonly<Record<string, RawEntry["status"]>> = {
+  A: "added",
+  M: "modified",
+  D: "removed",
+  T: "typechange",
+};
+
+/**
+ * Parse `git diff --raw -z --no-renames --no-abbrev` output, by path. Null when any of it is not
+ * what that command writes: a meta token of another shape (an abbreviated or a 64-hex id, a status
+ * other than A, M, D or T), an empty path, a path given twice, or a token with no path after it.
+ * Null is "git could not say", which its caller treats as knowing no mode and no id at all.
+ */
+export function parseRawEntries(raw: string): Map<string, RawEntry> | null {
+  const out = new Map<string, RawEntry>();
+  if (raw === "") return out;
+  if (!raw.endsWith("\0")) return null;
+  const parts = raw.slice(0, -1).split("\0");
+  if (parts.length % 2 !== 0) return null;
+  for (let i = 0; i < parts.length; i += 2) {
+    const m = RAW_META.exec(parts[i] as string);
+    const path = parts[i + 1] as string;
+    if (m === null || path === "" || out.has(path)) return null;
+    out.set(path, {
+      status: RAW_STATUS[m[5] as string] as RawEntry["status"],
+      modeBefore: m[1] as string,
+      modeAfter: m[2] as string,
+      oidBefore: m[3] as string,
+      oidAfter: m[4] as string,
+      path,
+    });
   }
   return out;
+}
+
+/**
+ * The status, modes and object ids of every changed path (see {@link parseRawEntries}). Full ids,
+ * never abbreviations, so a repository whose ids are not 40-hex fails the parse instead of handing
+ * out ids that name nothing. Null when git could not say, in which case no file is proven cosmetic.
+ */
+function rawEntries(dir: string, mergeBase: string, head: string): Map<string, RawEntry> | null {
+  const raw = tryGit(dir, ["diff", "--raw", "-z", "--no-renames", "--no-abbrev", mergeBase, head]);
+  return raw === null ? null : parseRawEntries(raw);
+}
+
+/**
+ * Read blobs by their ids with two processes: `git cat-file --batch-check` for every id's type and
+ * size (no content), then `git cat-file --batch` for the blobs within the caps. Only full ids are
+ * asked about: an id that is not 40 lowercase hex, and the zero id, are dropped before any process
+ * starts, so no name a revision could resolve (`HEAD`, `rev:path`) ever reaches git's input. Ids
+ * are taken once each, in the order first given.
+ *
+ * A blob over `maxBytes` is left out, and so is every id from the first blob that would bring the
+ * total past `maxTotalBytes`, a smaller later one included (the prefix rule the summary keeps for
+ * its own bytes). An id git says is `missing`, or names a tree, a commit or a tag, is left out too.
+ * Left out is never an empty buffer: its caller reads it as a file it could not read.
+ *
+ * Null when the answer cannot be trusted or was not had: output of another shape, a call that
+ * failed, or one past `deadline` (its own, on top of the pass's budget). Null is "could not say",
+ * which is not "every blob was missing". Running out of the pass's budget is still
+ * {@link EvidenceError} `timed_out`, thrown.
+ */
+export function readBlobs(
+  dir: string,
+  oids: readonly string[],
+  caps: { maxBytes: number; maxTotalBytes: number },
+  deadline?: number,
+): Map<string, Buffer> | null {
+  return readBlobsSized(dir, oids, caps, deadline)?.blobs ?? null;
+}
+
+/** What {@link readBlobsSized} read: the blobs, and the size of every blob it was asked about. */
+export interface SizedBlobs {
+  blobs: Map<string, Buffer>;
+  /**
+   * The size git gave for each id it holds as a blob, read or left out by a cap. An id with no size
+   * here is one git said is missing, or names a tree, a commit or a tag, or was never asked about
+   * (not a full id, or the zero id). A size is a fact about the blob, so a caller can tell a blob too
+   * large to read from one that could not be read at all.
+   */
+  sizes: Map<string, number>;
+}
+
+/**
+ * {@link readBlobs}, with the size of every blob asked about kept beside the blobs read, and with
+ * `maxBytes` either one bound for every id or a bound per id (so one call can read a document whole
+ * and only the first kilobyte's worth of a pointer). Every rule of {@link readBlobs} holds: the
+ * ids, the prefix rule of `maxTotalBytes`, what is left out, and when the answer is null. A blob
+ * past the total keeps its size.
+ */
+export function readBlobsSized(
+  dir: string,
+  oids: readonly string[],
+  caps: { maxBytes: number | ((oid: string) => number); maxTotalBytes: number },
+  deadline?: number,
+): SizedBlobs | null {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const oid of oids) {
+    if (!SHA40.test(oid) || oid === ZERO_OID || seen.has(oid)) continue;
+    seen.add(oid);
+    ids.push(oid);
+  }
+  const blobs = new Map<string, Buffer>();
+  const sizes = new Map<string, number>();
+  if (ids.length === 0) return { blobs, sizes };
+  const maxBytes = caps.maxBytes;
+  const capOf = typeof maxBytes === "number" ? () => maxBytes : maxBytes;
+  const bound = deadline === undefined ? {} : { deadline };
+  try {
+    const answer = runGit(dir, ["cat-file", "--batch-check"], "utf8", {
+      ...bound,
+      input: Buffer.from(`${ids.join("\n")}\n`),
+    });
+    // The checks on what git answers here and below (the number of lines, the shape of each line,
+    // the header of each blob, the LF after it and the end of the output) guard against output only
+    // a fake or a broken git could produce. Real git cannot be made to, and fakes are not used
+    // (.rules/testing.md), so these branches are not tested.
+    const lines = answer.split("\n");
+    if (lines.pop() !== "" || lines.length !== ids.length) return null;
+    const selected: { id: string; size: number }[] = [];
+    let total = 0;
+    let exhausted = false;
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i] as string;
+      const line = lines[i] as string;
+      if (line === `${id} missing`) continue;
+      const m = /^([0-9a-f]{40}) (blob|tree|commit|tag) (0|[1-9][0-9]*)$/.exec(line);
+      if (m === null || m[1] !== id) return null;
+      if (m[2] !== "blob") continue;
+      const size = Number(m[3]);
+      sizes.set(id, size);
+      if (exhausted || size > capOf(id)) continue;
+      if (total + size > caps.maxTotalBytes) {
+        exhausted = true;
+        continue;
+      }
+      total += size;
+      selected.push({ id, size });
+    }
+    if (selected.length === 0) return { blobs, sizes };
+    const out = runGit(dir, ["cat-file", "--batch"], "buffer", {
+      ...bound,
+      input: Buffer.from(`${selected.map((s) => s.id).join("\n")}\n`),
+      maxBuffer: total + selected.length * 128 + 65_536,
+    });
+    let at = 0;
+    for (const { id, size } of selected) {
+      const nl = out.indexOf(0x0a, at);
+      if (nl < 0 || out.toString("latin1", at, nl) !== `${id} blob ${size}`) return null;
+      const end = nl + 1 + size;
+      if (end >= out.length || out[end] !== 0x0a) return null;
+      blobs.set(id, out.subarray(nl + 1, end));
+      at = end + 1;
+    }
+    return at === out.length ? { blobs, sizes } : null;
+  } catch (e) {
+    // Swallowing this too would give the same result for the pass: its budget is spent, so the next
+    // git call throws `timed_out` again at once. It is rethrown so the code says what happens.
+    if (e instanceof EvidenceError) throw e;
+    return null;
+  }
 }
 
 /** JSON text with the whitespace outside strings removed: two texts that agree are the same token stream. */
@@ -770,16 +1060,463 @@ function readListing(dir: string, baseSha: string, headSha: string): Listing {
 }
 
 /**
- * Read what only the full review is shown, for a listing {@link gatherListing} made: the cosmetic
- * proofs, the diffs of the changed metadata files that fit the budget, and the change log. Called
- * only when the screen let the pull request through, and bounded by its share of
- * {@link EVIDENCE_BUDGET_MS}.
+ * At most this many files the change summary accounted for are also shown as a diff, after every
+ * file it did not account for and only while there is room: an illustration of what the summary
+ * says, whose cut or absence changes nothing about what was read.
  */
-export function gatherContent(dir: string, listing: Listing): ContentFacts {
-  return withinBudget("content", () => readContent(dir, listing));
+export const MAX_ILLUSTRATION_PATCHES = 3;
+
+/** The after side a pool file is given when its blob could not be read: no parser accepts it. */
+const EMPTY_BYTES = new Uint8Array(0);
+
+/**
+ * The line git writes in place of a diff it takes for binary: a file with a NUL byte in either
+ * version, a `.tsv` or a `.json` among them. It names the file and shows none of its content, so a
+ * row removed from such a table is in no line the reviewer could read. Such a diff makes no patch:
+ * the file stays unread (a modified or removed one keeps the content incomplete) and takes no slot.
+ * A change of mode alone prints no such line, because the content is the same, and stays shown.
+ *
+ * Matched only as a whole line between line feeds (or the start or end of the output), the way
+ * git writes it: git ends every line it writes with a line feed, every line of a text diff's
+ * content starts with a space, `+`, `-`, `@` or `\`, and a path with a line break or another
+ * control character in it is quoted. A carriage return is not a line break here: a cell that holds
+ * a bare carriage return followed by these words is still inside one diff line that starts with a
+ * space, `+` or `-`, so it cannot forge this line (a match that took a carriage return for the
+ * start of a line, as the `m` flag does, would leave such a text table unread).
+ */
+const BINARY_DIFF = /(?:^|\n)Binary files [^\n]* differ(?:\n|$)/;
+
+/** What a caller may set for one content pass; the review passes nothing. */
+export interface ContentOptions {
+  /**
+   * The clock the change summary is started and stopped by, and Part B is started by: `Date.now`
+   * unless given. Only those two read it; every git call's timeout and the search for repeats keep
+   * the real clock.
+   */
+  now?: () => number;
+  /**
+   * Whether Part B lists the origin's version tags (`git ls-remote`) to find the README's anchor.
+   * True unless given. A run that must not reach a remote (the calibration's `--offline`, whose
+   * frozen clones still name GitHub as their origin) passes false, and the README is then
+   * protected from the merge base, the stricter side.
+   */
+  versionTags?: boolean;
+  /**
+   * When given, set to the most Part B's one batch of blobs may read in all ({@link partBBytesLeft}
+   * of what the cosmetic proofs and the summary's pool read), for a test to see the bound applied.
+   */
+  partBMeter?: { maxTotalBytes: number };
 }
 
-function readContent(dir: string, listing: Listing): ContentFacts {
+/**
+ * Read what only the full review is shown, for a listing {@link gatherListing} made: the cosmetic
+ * proofs, the change summary, the diffs of the changed metadata files that fit the budget, and the
+ * change log. Called only when the screen let the pull request through, and bounded by its share of
+ * {@link EVIDENCE_BUDGET_MS}.
+ */
+export function gatherContent(
+  dir: string,
+  listing: Listing,
+  options: ContentOptions = {},
+): ContentFacts {
+  return withinBudget("content", () => readContent(dir, listing, options));
+}
+
+/**
+ * The change summary of the candidates: the modified `.tsv` and `.json` files that were compared
+ * for a cosmetic change, are not cosmetic, and are not the README or the change log. Every other
+ * outcome is a summary that accounts for nothing, so the raw diffs read the pull request exactly as
+ * they would without one:
+ *
+ * - no candidate: {@link EMPTY_SUMMARY};
+ * - less than `timeReserveMs` of the pass left: {@link ABANDONED_SUMMARY}, and nothing more is
+ *   read. The reserve is the raw diffs' and the change log's, so the summary never costs them their
+ *   time;
+ * - the pool's blobs could not be read, or not before the summary's deadline:
+ *   {@link ABANDONED_SUMMARY}, and the pass goes on;
+ * - past its deadline while it runs: abandoned by {@link summarizeChanges} itself.
+ *
+ * The pool is every added or modified `.tsv` and `.json` file, in path order, that a candidate can
+ * consult ({@link poolFileMatters}): a table at `sourcedata/<D>/<a candidate's path>`, where a
+ * removed row may have been kept, and a sidecar that applies to a candidate, which a moved key may
+ * have reached or which may stop a move past it. No other file can change what the summary says,
+ * so its blobs are not read at all; `summarizeChanges` prunes with the same predicate. A JSON path
+ * whose blob is not a regular file at the head (a type change, a symlink, a submodule), or could
+ * not be read, is in the pool as a document that cannot be read, so it still stops a key from
+ * being read as moved past it. A table that cannot be read is left out, so nothing can be found
+ * kept in it. A side that could not be read is never handed on as a missing one, which would say
+ * the file was added.
+ *
+ * Beside the summary it hands on what its pool read that Part B may need again, so no blob is read
+ * twice in one pass: the blobs of at most `pointerMaxBytes` (a pointer probe's whole bytes) and the
+ * bytes read in all, which count toward the pass's bound.
+ */
+function changeSummary(
+  dir: string,
+  entries: ReadonlyMap<string, RawEntry> | null,
+  checkedBlobs: ReadonlyMap<string, Buffer>,
+  candidates: readonly SummaryCandidate[],
+  now: () => number,
+): PooledSummary {
+  const unpooled = (summary: ChangeSummary): PooledSummary => ({
+    summary,
+    small: new Map(),
+    bytes: 0,
+  });
+  if (entries === null || candidates.length === 0) return unpooled(EMPTY_SUMMARY);
+  const deadline = gitDeadline === null ? null : gitDeadline - SUMMARY_LIMITS.timeReserveMs;
+  if (deadline !== null && now() >= deadline) return unpooled(ABANDONED_SUMMARY);
+
+  const matters = poolFileMatters(candidates.map((c) => c.path));
+  const sides: { entry: RawEntry; regular: boolean }[] = [];
+  for (const entry of [...entries.values()].sort((a, b) => codeUnitOrder(a.path, b.path))) {
+    const json = entry.path.endsWith(".json");
+    if (entry.status === "removed" || (!json && !entry.path.endsWith(".tsv"))) continue;
+    if (!matters(entry.path)) continue;
+    const regular =
+      (entry.status === "added" || entry.status === "modified") &&
+      REGULAR_FILE_MODES.has(entry.modeAfter);
+    if (regular || json) sides.push({ entry, regular });
+  }
+  // The blobs the cosmetic proofs already read are not read again, and count toward the bound.
+  // The subtraction binds only when those blobs and the pool's pass `maxTotalBytes` (256 MiB) in
+  // all; no test builds that much data, so it is read, not run.
+  let held = 0;
+  for (const blob of checkedBlobs.values()) held += blob.length;
+  const poolBlobs = readBlobs(
+    dir,
+    sides
+      .filter((side) => side.regular)
+      .flatMap(({ entry }) =>
+        entry.status === "modified" ? [entry.oidBefore, entry.oidAfter] : [entry.oidAfter],
+      )
+      .filter((id) => !checkedBlobs.has(id)),
+    { maxBytes: SUMMARY_LIMITS.maxBlobBytes, maxTotalBytes: SUMMARY_LIMITS.maxTotalBytes - held },
+    deadline ?? undefined,
+  );
+  if (poolBlobs === null) return unpooled(ABANDONED_SUMMARY);
+  const small = new Map<string, Buffer>();
+  let bytes = 0;
+  for (const [id, blob] of poolBlobs) {
+    bytes += blob.length;
+    if (blob.length <= ORIGINAL_LIMITS.pointerMaxBytes) small.set(id, blob);
+  }
+  const blobOf = (id: string): Buffer | undefined => checkedBlobs.get(id) ?? poolBlobs.get(id);
+  const pool: PoolFile[] = [];
+  for (const { entry, regular } of sides) {
+    const after = regular ? blobOf(entry.oidAfter) : undefined;
+    const before = entry.status === "modified" ? blobOf(entry.oidBefore) : null;
+    if (after === undefined || before === undefined) {
+      if (entry.path.endsWith(".json")) {
+        pool.push({ path: entry.path, before: null, after: EMPTY_BYTES });
+      }
+      continue;
+    }
+    pool.push({ path: entry.path, before, after });
+  }
+  return { summary: summarizeChanges({ candidates, pool, deadline, now }), small, bytes };
+}
+
+/** The change summary of a pass, and what its pool read (see {@link changeSummary}). */
+interface PooledSummary {
+  summary: ChangeSummary;
+  /** The pool's blobs of at most `pointerMaxBytes`, by id. */
+  small: ReadonlyMap<string, Buffer>;
+  /** The bytes the pool read, every blob together. */
+  bytes: number;
+}
+
+/**
+ * What the search for the README's anchor may spend: the listing of the origin's tags and the
+ * anchor's README each at most 15 seconds, every ancestor check together at most 5, and each answer
+ * a bound on its size. All of it inside Part B's own line, which comes first when it is nearer.
+ */
+const TAG_LOOKUP = {
+  listMs: 15_000,
+  listMaxBytes: 1024 * 1024,
+  ancestorMs: 5_000,
+  treeMaxBytes: 16 * 1024 * 1024,
+  anchorReadMs: 15_000,
+} as const;
+
+/**
+ * For a call that must not fetch what the clone lacks. The review reads a partial clone, where
+ * asking about a missing object fetches it from the origin: a tag commit the clone does not hold
+ * would otherwise be fetched by the check that asks whether it is an ancestor.
+ */
+const NO_LAZY_FETCH = { GIT_NO_LAZY_FETCH: "1" } as const;
+
+/** One entry of a commit's root tree. */
+interface RootEntry {
+  mode: string;
+  type: "blob" | "tree" | "commit";
+  oid: string;
+  name: string;
+}
+
+/**
+ * The entries of a commit's root tree (`ls-tree -z`, not recursive), or null when git could not
+ * list them, or wrote anything but entries of that shape, or named one entry twice (which no tree
+ * git writes holds, and which would make one document two).
+ */
+function rootTree(dir: string, rev: string, call: GitCallOptions): RootEntry[] | null {
+  const listing = tryGit(dir, ["ls-tree", "-z", rev], call);
+  if (listing === null) return null;
+  const entries: RootEntry[] = [];
+  const names = new Set<string>();
+  for (const record of listing.split("\0")) {
+    if (record === "") continue;
+    const m = /^([0-7]{6}) (blob|tree|commit) ([0-9a-f]{40})\t(.+)$/s.exec(record);
+    if (m === null || names.has(m[4] as string)) return null;
+    names.add(m[4] as string);
+    entries.push({
+      mode: m[1] as string,
+      type: m[2] as RootEntry["type"],
+      oid: m[3] as string,
+      name: m[4] as string,
+    });
+  }
+  return entries;
+}
+
+/** The parts of a document in a root tree, each with its bytes or `unreadable`. */
+function documentParts(
+  document: DocumentKind,
+  tree: readonly RootEntry[],
+  bytesOf: (oid: string) => Buffer | undefined,
+): DocumentPart[] {
+  return tree
+    .filter((entry) => isDocumentName(document, entry.name))
+    .map((entry) => ({
+      name: entry.name,
+      mode: entry.mode,
+      oid: entry.oid,
+      content: (entry.type === "blob" ? bytesOf(entry.oid) : undefined) ?? "unreadable",
+    }));
+}
+
+/**
+ * The README at the first version tag that is an ancestor of the merge base (design B3, as built),
+ * or the reason there is none. Every step that cannot be answered stops the search, and the README
+ * is then protected from the merge base, the stricter side:
+ *
+ * 1. the origin's `v*` tags, listed with `git ls-remote` (the repository's own configuration
+ *    authenticates it, and nothing can prompt); a failure, a timeout or an answer past
+ *    `listMaxBytes` is `lookup_failed`;
+ * 2. the lowest tag whose commit is an ancestor of the merge base ({@link chooseAnchor}), each
+ *    check with lazy fetching off, so a tag commit the clone does not hold cannot be fetched by
+ *    asking about it: git says it is no valid commit, and that check failed (`check_failed`), which
+ *    stops the search rather than moving on to a higher tag;
+ * 3. the tag commit's root tree, also with lazy fetching off (it is local: `main` is fetched with
+ *    its whole history, blob-less); a failure is `tag_tree_unreadable`;
+ * 4. the README parts there, read by their own call so that a fetch that fails costs the anchor and
+ *    never the rest of Part B. A part already read in this pass is not read again; a part that
+ *    could not be read leaves the anchor unreadable, and `proseFacts` then protects every
+ *    merge-base line.
+ */
+function tagAnchor(
+  dir: string,
+  mergeBase: string,
+  line: number | null,
+  bytesOf: (oid: string) => Buffer | undefined,
+): { lookup: AnchorLookup; anchor: DocumentPart[] | null } {
+  const within = (ms: number): number =>
+    Math.min(Date.now() + ms, line ?? Number.POSITIVE_INFINITY);
+  const listed = tryGit(dir, ["ls-remote", "--tags", "origin", "refs/tags/v*"], {
+    deadline: within(TAG_LOOKUP.listMs),
+    maxBuffer: TAG_LOOKUP.listMaxBytes,
+  });
+  if (listed === null) return { lookup: "lookup_failed", anchor: null };
+  // One deadline for every check together: a repository of many tags costs at most 5 seconds.
+  const checks = within(TAG_LOOKUP.ancestorMs);
+  const choice = chooseAnchor(parseVersionTags(listed), (commit) => {
+    const status = gitStatus(dir, ["merge-base", "--is-ancestor", commit, mergeBase], {
+      deadline: checks,
+      env: NO_LAZY_FETCH,
+    });
+    return status === null ? null : status === 0;
+  });
+  if (choice.anchor === "merge_base") return { lookup: choice.reason, anchor: null };
+  const tree = rootTree(dir, choice.commit, {
+    ...(line === null ? {} : { deadline: line }),
+    env: NO_LAZY_FETCH,
+    maxBuffer: TAG_LOOKUP.treeMaxBytes,
+  });
+  if (tree === null) return { lookup: "tag_tree_unreadable", anchor: null };
+  const unread = tree
+    .filter((entry) => entry.type === "blob" && isDocumentName("readme", entry.name))
+    .map((entry) => entry.oid)
+    .filter((oid) => bytesOf(oid) === undefined);
+  // Parts past the bound make the anchor too large to read whole, which also leaves no anchor.
+  const read = readBlobs(
+    dir,
+    unread,
+    { maxBytes: ORIGINAL_LIMITS.maxDocumentBytes, maxTotalBytes: ORIGINAL_LIMITS.maxDocumentBytes },
+    within(TAG_LOOKUP.anchorReadMs),
+  );
+  const anchor = documentParts("readme", tree, (oid) => bytesOf(oid) ?? read?.get(oid));
+  return { lookup: "first_version_tag", anchor };
+}
+
+/**
+ * The bytes Part B's batch may still read: what the pass's `maxTotalBytes` (256 MiB) leaves after
+ * the blobs the cosmetic proofs read (`checked`) and the bytes the summary's pool read
+ * (`pooledBytes`), and never less than none. One number for the whole pass, so Part B cannot read
+ * past what the summary was allowed.
+ */
+export function partBBytesLeft(checked: ReadonlyMap<string, Buffer>, pooledBytes: number): number {
+  let held = pooledBytes;
+  for (const blob of checked.values()) held += blob.length;
+  return Math.max(0, SUMMARY_LIMITS.maxTotalBytes - held);
+}
+
+/**
+ * Part B of the content pass: what the pull request changed of the content its original authors
+ * published, read from git and handed to `originalContentFacts` (`pr-review-original.ts`), which
+ * decides everything from the bytes. Run after the change summary and before the raw diffs, under
+ * the summary's line (the pass's deadline less `timeReserveMs`), so it never costs the raw diffs
+ * and the change log their reserve. All or nothing: {@link ORIGINAL_ABANDONED} when
+ *
+ * - the clock the pass was given says the line has passed before it starts;
+ * - git could not say what changed (`rawEntries` null), or list either root tree;
+ * - the one batch of blobs could not be read, or not before the line.
+ *
+ * The batch reads, in this order and each id once: both sides' parts of each changed document (a
+ * document is changed when any changed path is one of its parts, and then every part of it is read,
+ * changed or not), both sides of `dataset_description.json` when it changed, and every side of
+ * every changed path but a submodule's, for its pointer probe: its size, and its bytes when it is
+ * no longer than `pointerMaxBytes`. A blob the cosmetic proofs or the summary's pool already read
+ * is taken from them and not read again, and what they read counts toward the pass's
+ * `maxTotalBytes`. A blob the batch leaves out (missing, past a cap) is a part or a side that
+ * could not be read, which the facts report as not decided, never as clean.
+ *
+ * The anchor is looked for only when a root README part changed, and only when the caller allows
+ * the version tags to be listed ({@link ContentOptions.versionTags}); see {@link tagAnchor}.
+ * Running out of the pass's own budget is still `timed_out`, thrown, as for every call of the pass.
+ */
+function originalContent(
+  dir: string,
+  listing: Listing,
+  entries: ReadonlyMap<string, RawEntry> | null,
+  read: { checked: ReadonlyMap<string, Buffer>; pooled: PooledSummary },
+  cosmetic: ReadonlySet<string>,
+  options: { now: () => number; versionTags: boolean; meter?: { maxTotalBytes: number } },
+): OriginalContentFacts {
+  const line = gitDeadline === null ? null : gitDeadline - SUMMARY_LIMITS.timeReserveMs;
+  if (line !== null && options.now() >= line) return ORIGINAL_ABANDONED;
+  if (entries === null) return ORIGINAL_ABANDONED;
+  const bound = line === null ? {} : { deadline: line };
+  const baseTree = rootTree(dir, listing.mergeBase, bound);
+  if (baseTree === null) return ORIGINAL_ABANDONED;
+  const headTree = rootTree(dir, listing.head, bound);
+  if (headTree === null) return ORIGINAL_ABANDONED;
+
+  const changed = [...entries.values()];
+  const documents = (["readme", "changes"] as const).filter((document) =>
+    changed.some((entry) => isDocumentName(document, entry.path)),
+  );
+  const descriptionChanged = entries.has("dataset_description.json");
+  const descriptionIn = (tree: readonly RootEntry[]): RootEntry | undefined =>
+    tree.find((entry) => entry.name === "dataset_description.json");
+  const held = (oid: string): Buffer | undefined =>
+    read.checked.get(oid) ?? read.pooled.small.get(oid);
+  // Each id the batch asks for, with the most it reads of it: a document part whole (to the
+  // document's bound), the description to the summary's per-file bound, a probe to a pointer's.
+  // A part or a description past its bound is left out, and so refused as unreadable or unparsed
+  // rather than as too large: undecided either way, which is all a refusal says.
+  const wanted = new Map<string, number>();
+  const want = (oid: string, maxBytes: number): void => {
+    if (held(oid) === undefined) wanted.set(oid, Math.max(wanted.get(oid) ?? 0, maxBytes));
+  };
+  for (const document of documents) {
+    for (const tree of [baseTree, headTree]) {
+      for (const entry of tree) {
+        if (entry.type === "blob" && isDocumentName(document, entry.name)) {
+          want(entry.oid, ORIGINAL_LIMITS.maxDocumentBytes);
+        }
+      }
+    }
+  }
+  if (descriptionChanged) {
+    for (const tree of [baseTree, headTree]) {
+      const entry = descriptionIn(tree);
+      if (entry?.type === "blob") want(entry.oid, SUMMARY_LIMITS.maxBlobBytes);
+    }
+  }
+  for (const entry of changed) {
+    if (entry.status !== "added" && entry.modeBefore !== SUBMODULE_MODE) {
+      want(entry.oidBefore, ORIGINAL_LIMITS.pointerMaxBytes);
+    }
+    if (entry.status !== "removed" && entry.modeAfter !== SUBMODULE_MODE) {
+      want(entry.oidAfter, ORIGINAL_LIMITS.pointerMaxBytes);
+    }
+  }
+  const maxTotalBytes = partBBytesLeft(read.checked, read.pooled.bytes);
+  if (options.meter) options.meter.maxTotalBytes = maxTotalBytes;
+  const batch = readBlobsSized(
+    dir,
+    [...wanted.keys()],
+    { maxBytes: (oid) => wanted.get(oid) ?? 0, maxTotalBytes },
+    line ?? undefined,
+  );
+  if (batch === null) return ORIGINAL_ABANDONED;
+
+  const bytesOf = (oid: string): Buffer | undefined => held(oid) ?? batch.blobs.get(oid);
+  const probe = (mode: string, oid: string): PointerProbe => {
+    // A submodule has no blob, and what it is does not depend on the probe.
+    if (mode === SUBMODULE_MODE) return "unreadable";
+    const size = held(oid)?.length ?? batch.sizes.get(oid);
+    if (size === undefined) return "unreadable";
+    if (size > ORIGINAL_LIMITS.pointerMaxBytes) return "large";
+    return bytesOf(oid) ?? "unreadable";
+  };
+  const recordings: RecordingChange[] = changed.map((entry) => ({
+    path: entry.path,
+    status: entry.status,
+    modeBefore: entry.modeBefore,
+    modeAfter: entry.modeAfter,
+    oidBefore: entry.oidBefore,
+    oidAfter: entry.oidAfter,
+    recordingArea: classifyPath(entry.path) === "recordings",
+    inReviewedScope: inReviewedScope(entry.path),
+    before: entry.status === "added" ? null : probe(entry.modeBefore, entry.oidBefore),
+    after: entry.status === "removed" ? null : probe(entry.modeAfter, entry.oidAfter),
+  }));
+  const side = (tree: readonly RootEntry[]): DescriptionSide => {
+    const entry = descriptionIn(tree);
+    if (entry === undefined) return "absent";
+    return (entry.type === "blob" ? bytesOf(entry.oid) : undefined) ?? "unreadable";
+  };
+  const sides = (document: DocumentKind) =>
+    documents.includes(document)
+      ? {
+          base: documentParts(document, baseTree, bytesOf),
+          head: documentParts(document, headTree, bytesOf),
+        }
+      : { base: [], head: [] };
+
+  let anchorLookup: AnchorLookup = "not_needed";
+  let anchor: DocumentPart[] | null = null;
+  if (documents.includes("readme")) {
+    if (options.versionTags) {
+      ({ lookup: anchorLookup, anchor } = tagAnchor(dir, listing.mergeBase, line, bytesOf));
+    } else anchorLookup = "not_looked_up";
+  }
+  return originalContentFacts({
+    changes: changed.map(({ path, status }) => ({ path, status })),
+    documents: { readme: sides("readme"), changes: sides("changes") },
+    anchor,
+    anchorLookup,
+    description: descriptionChanged
+      ? { before: side(baseTree), after: side(headTree) }
+      : { before: "absent", after: "absent" },
+    recordings,
+    summary: read.pooled.summary,
+    cosmetic,
+  });
+}
+
+function readContent(dir: string, listing: Listing, options: ContentOptions): ContentFacts {
   const { mergeBase } = listing;
   const headSha = listing.head;
   const wanted = readableChanges(listing.changes);
@@ -800,43 +1537,75 @@ function readContent(dir: string, listing: Listing): ContentFacts {
     mergeBase,
     headSha,
   ]);
-  const modes = modesByPath(dir, mergeBase, headSha);
-  let cosmeticChecks = 0;
-  const cosmeticOnly = new Set<string>();
+  const entries = rawEntries(dir, mergeBase, headSha);
+  // The files whose two blobs are compared: modified on both lists, a regular file on both sides
+  // with the same mode, a `.json` or a `.tsv`, at most MAX_COSMETIC_CHECKS of them in review order.
+  const checked: { path: string; entry: RawEntry }[] = [];
   for (const c of wanted) {
-    if (c.status !== "modified" || modes === null) continue;
+    if (entries === null || checked.length >= MAX_COSMETIC_CHECKS) break;
+    if (c.status !== "modified") continue;
     if (!c.path.endsWith(".json") && !c.path.endsWith(".tsv")) continue;
-    const m = modes.get(c.path);
-    if (!m || m.before !== m.after || !REGULAR_FILE_MODES.has(m.before)) continue;
-    if (cosmeticChecks >= MAX_COSMETIC_CHECKS) continue;
-    cosmeticChecks++;
-    const before = tryGitBytes(dir, ["show", `${mergeBase}:${c.path}`]);
-    const after = tryGitBytes(dir, ["show", `${headSha}:${c.path}`]);
-    if (before !== null && after !== null && isCosmeticChange(c.path, before, after)) {
-      cosmeticOnly.add(c.path);
+    const entry = entries.get(c.path);
+    if (
+      entry === undefined ||
+      entry.status !== "modified" ||
+      entry.modeBefore !== entry.modeAfter ||
+      !REGULAR_FILE_MODES.has(entry.modeBefore)
+    ) {
+      continue;
+    }
+    checked.push({ path: c.path, entry });
+  }
+  // Both sides of every checked file in one batch, two processes in all instead of two per file.
+  // No deadline of its own: a read that stalls here stalls the pass, which is `timed_out`, as a
+  // stalled `git show` was. Each blob may be as large as the whole bound, so a proof never depends
+  // on the summary's per-file cap; a blob that cannot be read leaves its file unproven.
+  const checkedBlobs =
+    readBlobs(
+      dir,
+      checked.flatMap((f) => [f.entry.oidBefore, f.entry.oidAfter]),
+      { maxBytes: SUMMARY_LIMITS.maxTotalBytes, maxTotalBytes: SUMMARY_LIMITS.maxTotalBytes },
+    ) ?? new Map<string, Buffer>();
+  const cosmeticOnly = new Set<string>();
+  const candidates: SummaryCandidate[] = [];
+  for (const { path, entry } of checked) {
+    const before = checkedBlobs.get(entry.oidBefore);
+    const after = checkedBlobs.get(entry.oidAfter);
+    if (before === undefined || after === undefined) continue;
+    // As latin1, so bytes that are not valid UTF-8 still differ (see tryGitBytes).
+    if (isCosmeticChange(path, before.toString("latin1"), after.toString("latin1"))) {
+      cosmeticOnly.add(path);
+    } else if (classifyPath(path) !== "readme_and_changes") {
+      // The README and the change log are prose, read as diffs, never as tables or documents.
+      candidates.push({ path, before, after });
     }
   }
+  const now = options.now ?? Date.now;
+  const pooled = changeSummary(dir, entries, checkedBlobs, candidates, now);
+  const { summary } = pooled;
+  const accounted = summary.accounted;
+  const original = originalContent(
+    dir,
+    listing,
+    entries,
+    { checked: checkedBlobs, pooled },
+    cosmeticOnly,
+    { now, versionTags: options.versionTags ?? true, meter: options.partBMeter },
+  );
 
   const patches: Patch[] = [];
   const read = new Map<string, Patch>();
   // The patch that already shows a change, by status and the hash of its diff's signature.
   const shownBy = new Map<string, Patch>();
   let budget = MAX_PATCH_TOTAL_CHARS;
-  // The read budget goes to files that are not cosmetic-only, and to each DISTINCT change once: a
-  // file whose diff is exactly one already shown is covered by it and costs nothing.
-  const toRead = wanted.filter((c) => !cosmeticOnly.has(c.path));
-  for (const c of toRead.slice(0, MAX_DIFFS_EXAMINED)) {
-    // The search for repeats is optional, the first diffs are not: once the patches are full, the
-    // search goes on only while time is left. When little is, the files not yet examined stay unread
-    // (which fails closed, as always) instead of the pass running out of time and the whole review
-    // with it.
-    if (
-      (patches.length >= MAX_PATCH_FILES || budget <= 0) &&
-      gitDeadline !== null &&
-      gitDeadline - Date.now() < FOLD_TIME_RESERVE_MS
-    ) {
-      break;
-    }
+  const full = (): boolean => patches.length >= MAX_PATCH_FILES || budget <= 0;
+  const late = (): boolean =>
+    gitDeadline !== null && gitDeadline - Date.now() < FOLD_TIME_RESERVE_MS;
+  /**
+   * Read one file's diff: fold it onto the patch that already shows it, or show it if there is
+   * room. A diff git wrote as binary is no read at all: see {@link BINARY_DIFF}.
+   */
+  const showDiff = (c: RawChange): void => {
     const bytes = tryGitBytes(dir, [
       "diff",
       "-U2",
@@ -848,7 +1617,7 @@ function readContent(dir: string, listing: Listing): ContentFacts {
       "--",
       c.path,
     ]);
-    if (bytes === null || bytes === "") continue;
+    if (bytes === null || bytes === "" || BINARY_DIFF.test(bytes)) return;
     const signature = diffSignature(bytes);
     // What the model reads is the text, as before: the same bytes decoded as UTF-8.
     const diff = Buffer.from(bytes, "latin1").toString("utf8");
@@ -860,23 +1629,61 @@ function readContent(dir: string, listing: Listing): ContentFacts {
     if (same !== undefined) {
       same.same.push(c.path);
       read.set(c.path, same);
-      continue;
+      return;
     }
-    if (patches.length >= MAX_PATCH_FILES || budget <= 0) continue;
+    if (full()) return;
     const { text, truncated } = clip(diff, Math.min(MAX_PATCH_FILE_CHARS, budget));
     budget -= text.length;
     const patch: Patch = { path: c.path, text, truncated, same: [] };
     patches.push(patch);
     read.set(c.path, patch);
     if (key !== null) shownBy.set(key, patch);
+  };
+  // The read budget goes to files that are not cosmetic-only, and to each DISTINCT change once: a
+  // file whose diff is exactly one already shown is covered by it and costs nothing. It goes first
+  // to the removed and modified files the summary did not account for, which nothing else covers;
+  // then to a few it did, as illustrations; then to the added files. With nothing accounted for,
+  // that is the files in review order, read exactly as they were before the summary existed.
+  const toRead = wanted.filter((c) => !cosmeticOnly.has(c.path));
+  const first = toRead.filter((c) => c.status !== "added" && !accounted.has(c.path));
+  const illustrations = toRead
+    .filter((c) => c.status !== "added" && accounted.has(c.path))
+    .slice(0, MAX_ILLUSTRATION_PATCHES);
+  const added = toRead.filter((c) => c.status === "added");
+  // The search for repeats is optional, the first diffs are not: once the patches are full, the
+  // search goes on only while time is left. When little is, the files not yet examined stay unread
+  // (which fails closed, as always) instead of the pass running out of time and the whole review
+  // with it. At most MAX_DIFFS_EXAMINED files are examined, the illustrations not counted.
+  let examined = 0;
+  const goOn = (): boolean => examined < MAX_DIFFS_EXAMINED && !(full() && late());
+  for (const c of first) {
+    if (!goOn()) break;
+    examined++;
+    showDiff(c);
+  }
+  // An illustration is shown only into room that is left, never in place of a file that needed
+  // reading, and only while the pass is not short of time; one that repeats a change already shown
+  // folds onto it as any diff does.
+  for (const c of illustrations) {
+    if (full() || late()) break;
+    showDiff(c);
+  }
+  for (const c of added) {
+    if (!goOn()) break;
+    examined++;
+    showDiff(c);
   }
 
-  const readIncomplete = wanted.some((c) => {
+  // Covered: added, cosmetic, accounted for by the summary, or shown in full. One predicate counts
+  // the files that are not and decides whether any is, so the count and the flag cannot drift.
+  const unreadFiles = wanted.filter((c) => {
     if (c.status === "added") return false;
     if (cosmeticOnly.has(c.path)) return false;
+    if (accounted.has(c.path)) return false;
     const patch = read.get(c.path);
     return patch === undefined || patch.truncated;
-  });
+  }).length;
+  const readIncomplete = unreadFiles > 0;
 
   const groupMap = new Map<string, PathGroup>();
   for (const c of wanted) {
@@ -888,11 +1695,13 @@ function readContent(dir: string, listing: Listing): ContentFacts {
       files: 0,
       shown: 0,
       cosmeticOnly: 0,
+      summarized: 0,
     };
     g.files++;
     const patch = read.get(c.path);
     if (patch !== undefined && !patch.truncated) g.shown++;
     if (cosmeticOnly.has(c.path)) g.cosmeticOnly++;
+    if (accounted.has(c.path)) g.summarized++;
     groupMap.set(key, g);
   }
   // Removed shapes first: that is where a loss hides, and the cut must never take them.
@@ -901,10 +1710,13 @@ function readContent(dir: string, listing: Listing): ContentFacts {
   return {
     patches,
     readIncomplete,
+    unreadFiles,
     cosmeticOnlyFiles: cosmeticOnly.size,
     groups: ordered.slice(0, MAX_GROUPS),
     groupsOmittedFiles: ordered.slice(MAX_GROUPS).reduce((n, g) => n + g.files, 0),
     changelogEntry: changelogEntryFor(dir, mergeBase, headSha, listing.versionAfter),
+    summary,
+    original,
   };
 }
 
@@ -953,12 +1765,26 @@ function listedEvidence(listing: Listing, text: TextFacts) {
 export function buildEvidence(facts: GitFacts, text: TextFacts): ReviewEvidence {
   return {
     ...listedEvidence(facts, text),
-    // Each file a diff stands for counts as read, the file it was shown for and the ones it repeats;
-    // a diff that was cut stands for no other file.
-    files_read: facts.patches.reduce((n, p) => n + (p.truncated ? 1 : 1 + p.same.length), 0),
+    files_read: filesRead(facts),
     truncated: facts.listCut || facts.readIncomplete,
     changelog_entry: facts.changelogEntry,
   };
+}
+
+/**
+ * How many changed files were read: the files the change summary accounted for, the file each diff
+ * was shown for, and the files a diff shown in full repeats in (a diff that was cut stands for no
+ * other file, though its own file still counts). A set, so a file that was both accounted for and
+ * shown counts once. Every member is a path of the change list, so the count never exceeds
+ * `files_changed`; with nothing accounted for it is the count of the diffs and their repeats.
+ */
+function filesRead(facts: ContentFacts): number {
+  const read = new Set<string>(facts.summary.accounted);
+  for (const patch of facts.patches) {
+    read.add(patch.path);
+    if (!patch.truncated) for (const path of patch.same) read.add(path);
+  }
+  return read.size;
 }
 
 /**

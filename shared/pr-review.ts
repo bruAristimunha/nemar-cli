@@ -143,8 +143,9 @@ export const FINDING_CODES = [
   // The pull request changes dataset_description.json and its new name could not be read.
   "name_unchecked",
   // What the original authors published was changed or what was recorded was replaced (epic #1851,
-  // Part B). The script decides these from platform facts and never a model, and they are accepted
-  // here before anything emits them, because the review script runs from `main` as soon as it is
+  // Part B). The review script decides these from platform facts and never a model, and has
+  // emitted them since Part B was integrated into the review. They have been accepted here since
+  // v0.10.22, a release earlier, because the review script runs from `main` as soon as it is
   // released while the Worker deploys separately.
   "original_text_altered",
   "original_field_altered",
@@ -1428,9 +1429,29 @@ function listChangedFiles(e: ReviewEvidenceV1): string {
 }
 
 /**
+ * The findings that say a contributor changed what the original authors published (epic #1851,
+ * Part B). A moved or replaced recording is not one of them: that is a question for a person, and
+ * the paragraph below does not answer it.
+ */
+export const ORIGINAL_ALTERED_CODES: readonly FindingCode[] = [
+  "original_text_altered",
+  "original_field_altered",
+];
+
+/**
+ * What the contributor does instead, said once under the findings of a report that has one of
+ * {@link ORIGINAL_ALTERED_CODES}. It is one line so a check, a comment and a terminal show it
+ * unbroken, and its own words are fixed: the Worker and the CLI render it from here.
+ */
+export const ORIGINAL_CONTENT_PARAGRAPH =
+  "Contributors add to what the original authors published and do not change it. Describe your change in the CHANGES entry for the new version. Put new information in a new, clearly separate section of the README. If something the authors wrote is wrong, open an issue for the NEMAR administrators, who can correct it; an administrator can also review this pull request by hand.";
+
+/**
  * What a reader should look at before approving: a steering attempt, each finding, the facts
  * that no finding already states, and a warning when the reviewer did not see everything. Empty
- * when there is nothing to say. One bullet per line, in markdown.
+ * when there is nothing to say. One bullet per line, in markdown, then (when a finding says the
+ * original authors' content was changed) a blank line and one paragraph on what to do instead, so
+ * the bullets stay one list.
  */
 export function findingLines(report: PrReviewReport): string[] {
   // A code newer than this build (the CLI ships apart from the Worker) is named, not "undefined".
@@ -1461,6 +1482,11 @@ export function findingLines(report: PrReviewReport): string[] {
     details.push(
       "- Some changed files were not shown to the reviewer in full, so a clean result is not claimed.",
     );
+  }
+  // Last, and once however many findings qualify: the findings and the facts above stay one list,
+  // and the Worker clips a long check from its end, which reaches the changed-files list first.
+  if (report.findings.some((f) => ORIGINAL_ALTERED_CODES.includes(f.code))) {
+    details.push("", ORIGINAL_CONTENT_PARAGRAPH);
   }
   return details;
 }
