@@ -1313,16 +1313,12 @@ function documentParts(
  *    never the rest of Part B. A part already read in this pass is not read again; a part that
  *    could not be read leaves the anchor unreadable, and `proseFacts` then protects every
  *    merge-base line.
- *
- * With `readme` false (CHANGES changed and the README did not) the search stops at step 2: what
- * it found says whether the dataset was ever published (`no_tag`), and no README is read.
  */
 function tagAnchor(
   dir: string,
   mergeBase: string,
   line: number | null,
   bytesOf: (oid: string) => Buffer | undefined,
-  readme: boolean,
 ): { lookup: AnchorLookup; anchor: DocumentPart[] | null } {
   const within = (ms: number): number =>
     Math.min(Date.now() + ms, line ?? Number.POSITIVE_INFINITY);
@@ -1341,7 +1337,6 @@ function tagAnchor(
     return status === null ? null : status === 0;
   });
   if (choice.anchor === "merge_base") return { lookup: choice.reason, anchor: null };
-  if (!readme) return { lookup: "first_version_tag", anchor: null };
   const tree = rootTree(dir, choice.commit, {
     ...(line === null ? {} : { deadline: line }),
     env: NO_LAZY_FETCH,
@@ -1395,9 +1390,8 @@ export function partBBytesLeft(checked: ReadonlyMap<string, Buffer>, pooledBytes
  * `maxTotalBytes`. A blob the batch leaves out (missing, past a cap) is a part or a side that
  * could not be read, which the facts report as not decided, never as clean.
  *
- * The version tags are listed only when a root README or CHANGES part changed, and only when the
- * caller allows it ({@link ContentOptions.versionTags}); see {@link tagAnchor}. They give the
- * README its anchor, and say for both documents whether the dataset was ever published.
+ * The anchor is looked for only when a root README part changed, and only when the caller allows
+ * the version tags to be listed ({@link ContentOptions.versionTags}); see {@link tagAnchor}.
  * Running out of the pass's own budget is still `timed_out`, thrown, as for every call of the pass.
  */
 function originalContent(
@@ -1503,15 +1497,9 @@ function originalContent(
 
   let anchorLookup: AnchorLookup = "not_needed";
   let anchor: DocumentPart[] | null = null;
-  if (documents.length > 0) {
+  if (documents.includes("readme")) {
     if (options.versionTags) {
-      ({ lookup: anchorLookup, anchor } = tagAnchor(
-        dir,
-        listing.mergeBase,
-        line,
-        bytesOf,
-        documents.includes("readme"),
-      ));
+      ({ lookup: anchorLookup, anchor } = tagAnchor(dir, listing.mergeBase, line, bytesOf));
     } else anchorLookup = "not_looked_up";
   }
   return originalContentFacts({

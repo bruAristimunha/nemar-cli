@@ -31,6 +31,8 @@
     "test/pr-review-hostile.test.ts",
     "test/pr-review-evidence-scale.test.ts",
     "test/pr-review-change-summarize.unit.test.ts",
+    "test/pr-review-change-model.unit.test.ts",
+    "test/pr-review-change-summary.unit.test.ts",
     "test/pr-review-original.unit.test.ts",
     "test/fixtures/pr-review-hostile/*.ts",
     "test/fixtures/pr-review-canary/*.ts",

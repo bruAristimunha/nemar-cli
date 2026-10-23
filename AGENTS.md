@@ -182,8 +182,11 @@ must set it from its own `CF-Connecting-IP` and never pass a visitor's header th
 Cloudflare account is the trust boundary),
 0099 (counters are fixed windows and a refusal writes nothing),
 0109 (a modified table or sidecar counts as read when the exact change summary accounts for it;
-an unrelocated or unkept removal is then a platform blocker that only lowers, placed first; the facts
-carry only class words and counts).
+an unrelocated or unkept removal is then a platform blocker that only lowers, placed first; the
+original authors' content is protected by facts the platform computes: a README or CHANGES line
+altered beyond a minor edit, an author-owned field or a participant value changed fails, a replaced
+recording or an undecidable comparison holds the pull request, and the README is compared with the
+one at the first version tag, else with the merge base; the facts carry only class words and counts).
 
 **Account copy and the profile-gap matrix are declared once, in
 [`shared/contract/account-copy.ts`](shared/contract/account-copy.ts) and

@@ -33,7 +33,7 @@ export interface ShimRule {
   /**
    * Wait this many seconds before running the real Git executable: a fetch that stalls. The wait
    * holds none of the call's pipes, so a caller that kills the call on a timeout is not kept
-   * waiting for it.
+   * waiting for it, and it ends with the call, so no sleep is left running after a test.
    */
   sleepSeconds?: number;
   /**
@@ -97,7 +97,15 @@ export function installGitShim(root: string, rules: ShimRule[]): () => void {
       );
     }
     if (rule.sleepSeconds !== undefined) {
-      lines.push(`  sleep ${Number(rule.sleepSeconds)} </dev/null >/dev/null 2>&1`);
+      // In the background and waited for, so a signal that ends the call reaches the trap at once,
+      // which ends the sleep with it: a sleep in the foreground outlives a killed call as an orphan.
+      lines.push(
+        `  sleep ${Number(rule.sleepSeconds)} </dev/null >/dev/null 2>&1 &`,
+        "  sleeper=$!",
+        `  trap 'kill "$sleeper" 2>/dev/null; exit 143' HUP INT TERM`,
+        '  wait "$sleeper"',
+        "  trap - HUP INT TERM",
+      );
     }
     if (rule.fromCall !== undefined) {
       const counter = quote(join(dir, `calls-${index}`));

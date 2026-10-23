@@ -20,7 +20,8 @@
 # own account are left out of every group). 40 reviews, one after another.
 #
 # Part B (the original authors' content) fails or holds nine of the 40 whatever the model says, so
-# none of the nine can pass: it fails on002578#2, on006126#1, on004588#1, nm000501#3 and
+# none of the nine can pass when this set is run offline (the merge-base anchor; with the real tag
+# on002578#2 is information and left to the model): it fails on002578#2, on006126#1, on004588#1, nm000501#3 and
 # on005420#1, and holds on003029#1, on003620#1, on003195#1 and on003343#3 for a person. The group
 # comments below name the ones in each.
 

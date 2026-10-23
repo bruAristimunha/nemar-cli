@@ -23,8 +23,7 @@
  * strict side): the version tags are not read.
  *
  * A row holds the pull request's name, counts, booleans, the module's closed words and closed key
- * names. Never a line of a README, an example, a path or a tag: the examples the module returns are
- * dropped here, before a row exists.
+ * names. Never a line of a README, a path or a tag: the module's facts hold none.
  */
 
 import { execFileSync } from "node:child_process";
@@ -80,10 +79,10 @@ export const ORIGINAL_ROW_ERRORS = [
 ] as const;
 export type OriginalRowError = (typeof ORIGINAL_ROW_ERRORS)[number];
 
-/** One document of a row: refused in a closed word, or its facts without the example lines. */
+/** One document of a row: refused in a closed word, or its facts. */
 export type DocumentRow =
   | { refusal: ProseRefusal }
-  | ({ refusal: null; proseAltered: boolean } & Omit<ProseFacts, "examples">);
+  | ({ refusal: null; proseAltered: boolean } & ProseFacts);
 
 /** What one pull request did to the original authors' content, in numbers and closed words. */
 export interface OriginalRow {
@@ -188,7 +187,7 @@ function partsOf(
     }));
 }
 
-/** A document's row, the examples dropped. */
+/** A document's row. */
 function documentRow(
   document: DocumentKind,
   base: readonly TreeEntry[],
@@ -202,8 +201,7 @@ function documentRow(
     anchor: null,
   });
   if (!result.ok) return { refusal: result.refusal };
-  const { examples: _examples, ...facts } = result.facts;
-  return { refusal: null, proseAltered: proseAltered(result.facts), ...facts };
+  return { refusal: null, proseAltered: proseAltered(result.facts), ...result.facts };
 }
 
 /** One side of the dataset description in a root tree. */

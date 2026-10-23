@@ -143,8 +143,9 @@ export const FINDING_CODES = [
   // The pull request changes dataset_description.json and its new name could not be read.
   "name_unchecked",
   // What the original authors published was changed or what was recorded was replaced (epic #1851,
-  // Part B). The script decides these from platform facts and never a model, and they are accepted
-  // here before anything emits them, because the review script runs from `main` as soon as it is
+  // Part B). The review script decides these from platform facts and never a model, and has
+  // emitted them since Part B was integrated into the review. They have been accepted here since
+  // v0.10.22, a release earlier, because the review script runs from `main` as soon as it is
   // released while the Worker deploys separately.
   "original_text_altered",
   "original_field_altered",

@@ -66,7 +66,6 @@ import {
   type ClassKind,
   EMPTY_SUMMARY,
   ROLE_OF,
-  SUMMARY_LIMITS,
   summarizeChanges,
 } from "../scripts/ci/pr-review-summary";
 
@@ -135,7 +134,6 @@ describe("the limits and the refusal words", () => {
       maxMinorPairCodePoints: 4 * 1024 * 1024,
       minorFloor: 3,
       minorCeiling: 20,
-      maxExamples: 3,
       pointerMaxBytes: 1_023,
       maxTagsTried: 32,
     });
@@ -1023,7 +1021,6 @@ function untouched(protectedLines: number, overrides: Partial<ProseFacts> = {}):
     partsAfter: 1,
     hidingMarkupInserted: 0,
     shownPartReplaced: false,
-    examples: [],
     ...overrides,
   };
 }
@@ -1387,14 +1384,13 @@ describe("proseFacts: the cases of design B7", () => {
     expect(proseAltered(facts)).toBe(false);
   });
 
-  test("removing an original paragraph is an alteration, with the removed lines as examples", () => {
+  test("removing an original paragraph is an alteration", () => {
     const head = edited((lines) => lines.splice(7, 3));
     const facts = readme({ "README.md": ORIGINAL }, { "README.md": head });
     expect(facts).toEqual(
       untouched(ORIGINAL_PROTECTED, {
         preserved: false,
         protectedAltered: 2,
-        examples: [ORIGINAL_LINES[7] as string, ORIGINAL_LINES[8] as string],
       }),
     );
     expect(proseAltered(facts)).toBe(true);
@@ -1430,10 +1426,6 @@ describe("proseFacts: the cases of design B7", () => {
     expect(facts.protectedLines).toBe(ORIGINAL_PROTECTED + 3);
     expect(facts.protectedAltered).toBe(2);
     expect(facts.laterAltered).toBe(0);
-    expect(facts.examples).toEqual([
-      "- Events were re-aligned to the photodiode.",
-      "- Channel labels were made BIDS compliant.",
-    ]);
     expect(proseAltered(facts)).toBe(true);
   });
 
@@ -1478,7 +1470,6 @@ describe("proseFacts: the cases of design B7", () => {
         protectedAltered: 1,
         joinedInsertedRuns: 1,
         insertedLines: 1,
-        examples: [ORIGINAL_LINES[7] as string],
       }),
     );
     expect(proseAltered(facts)).toBe(true);
@@ -1562,7 +1553,6 @@ describe("proseFacts: the cases of design B7", () => {
         protectedAltered: 1,
         joinedInsertedRuns: 1,
         insertedLines: 2,
-        examples: [ORIGINAL_LINES[7] as string],
       }),
     );
   });
@@ -1579,7 +1569,6 @@ describe("proseFacts: the cases of design B7", () => {
         moved: true,
         movedLines: 2,
         insertedLines: 2,
-        examples: [ORIGINAL_LINES[10] as string, ORIGINAL_LINES[12] as string],
       }),
     );
     expect(proseAltered(facts)).toBe(true);
@@ -1595,7 +1584,6 @@ describe("proseFacts: the cases of design B7", () => {
         moved: true,
         movedLines: 1,
         insertedLines: 1,
-        examples: [ORIGINAL_LINES[0] as string],
       }),
     );
     expect(proseAltered(facts)).toBe(true);
@@ -1666,7 +1654,6 @@ describe("proseFacts: the cases of design B7", () => {
         // The edited entry is a list item: a block of its own, joined to no paragraph.
         joinedInsertedRuns: 0,
         insertedLines: 1,
-        examples: ["  - Fixed event onsets."],
       }),
     );
     expect(proseAltered(typo)).toBe(true);
@@ -1918,7 +1905,6 @@ describe("proseFacts: the adversarial cases of design B6", () => {
     const facts = readme({ "README.md": ORIGINAL }, {});
     expect(facts.protectedAltered).toBe(ORIGINAL_PROTECTED);
     expect(facts.partsAfter).toBe(0);
-    expect(facts.examples.length).toBe(ORIGINAL_LIMITS.maxExamples);
     expect(proseAltered(facts)).toBe(true);
   });
 
@@ -1955,11 +1941,6 @@ describe("proseFacts: the adversarial cases of design B6", () => {
     const facts = readme({ "README.md": twice }, { "README.md": head });
     expect(facts.movedLines).toBe(1);
     expect(facts.protectedAltered).toBe(2);
-    expect(facts.examples).toEqual([
-      "## Notes",
-      ORIGINAL_LINES[2] as string,
-      ORIGINAL_LINES[2] as string,
-    ]);
     expect(proseAltered(facts)).toBe(true);
   });
 
@@ -2636,15 +2617,6 @@ describe("proseFacts: bounds and refusals", () => {
       anchor: null,
     });
     expect(link).toEqual({ ok: false, refusal: "not_regular" });
-  });
-
-  test("an example is cut after 301 code points, never inside a surrogate pair", () => {
-    const long = "x".repeat(1_000);
-    const astral = "\u{1F600}".repeat(400);
-    const facts = readme({ "README.md": `${long}\n\n${astral}\n` }, { "README.md": "" });
-    const max = SUMMARY_LIMITS.maxValueChars + 1;
-    expect(facts.examples).toEqual(["x".repeat(max), "\u{1F600}".repeat(max)]);
-    expect(Array.from(facts.examples[1] as string).length).toBe(max);
   });
 });
 
@@ -4815,8 +4787,8 @@ describe("originalContentFacts: the documents", () => {
       protectedAltered: 1,
     });
     // With no anchor the same README removal is original text.
-    const strict = originalContentFacts({ ...input, anchor: null, anchorLookup: "no_ancestor" });
-    expect(strict.anchorLookup).toBe("no_ancestor");
+    const strict = originalContentFacts({ ...input, anchor: null, anchorLookup: "no_tag" });
+    expect(strict.anchorLookup).toBe("no_tag");
     expect(comparedFacts(strict.readme)).toMatchObject({
       anchor: "merge_base",
       protectedAltered: 2,
@@ -4861,89 +4833,28 @@ describe("originalContentFacts: the documents", () => {
   });
 });
 
-describe("originalContentFacts: no protection before publication", () => {
-  const base = parts({ "README.md": ORIGINAL });
-  const removed = parts({ "README.md": edited((lines) => lines.splice(7, 2)) });
-  const changesBase = parts({ CHANGES: "1.1.0\n - Added sub-03\n1.0.0\n - Initial release\n" });
-  const changesHead = parts({ CHANGES: "1.1.0\n - Added sub-03\n1.0.0\n - First release\n" });
-  const texts = contentInput({
-    changes: [modified("README.md"), modified("CHANGES")],
-    documents: {
-      readme: { base, head: removed },
-      changes: { base: changesBase, head: changesHead },
-    },
-  });
-
-  test("when the lookup found no version tag, a changed README or CHANGES is unpublished and not compared", () => {
-    const facts = originalContentFacts({ ...texts, anchorLookup: "no_tag" });
-    expect(facts.anchorLookup).toBe("no_tag");
-    expect(facts.readme).toEqual({ status: "unpublished" });
-    expect(facts.changes).toEqual({ status: "unpublished" });
-    expect(Object.isFrozen(facts.readme)).toBe(true);
-    // Not compared at all: parts that would be refused are not refused either.
-    const unreadable: DocumentPart[] = [
-      { name: "README.md", mode: "100644", oid: "a".repeat(40), content: "unreadable" },
-    ];
-    const refusedIfRead = originalContentFacts({
-      ...texts,
+describe("originalContentFacts: every lookup word protects", () => {
+  test("whatever the tag lookup came to, a changed README and CHANGES are compared from the merge base when there is no anchor", () => {
+    const base = parts({ "README.md": ORIGINAL });
+    const removed = parts({ "README.md": edited((lines) => lines.splice(7, 2)) });
+    const changesBase = parts({ CHANGES: "1.1.0\n - Added sub-03\n1.0.0\n - Initial release\n" });
+    const changesHead = parts({ CHANGES: "1.1.0\n - Added sub-03\n1.0.0\n - First release\n" });
+    const texts = contentInput({
+      changes: [modified("README.md"), modified("CHANGES")],
       documents: {
-        readme: { base: unreadable, head: unreadable },
-        changes: texts.documents.changes,
+        readme: { base, head: removed },
+        changes: { base: changesBase, head: changesHead },
       },
-      anchorLookup: "no_tag",
     });
-    expect(refusedIfRead.readme).toEqual({ status: "unpublished" });
-    // A document no part of which changed stays unchanged.
-    const readmeOnly = originalContentFacts({
-      ...texts,
-      changes: [modified("README.md")],
-      anchorLookup: "no_tag",
-    });
-    expect([readmeOnly.readme.status, readmeOnly.changes.status]).toEqual([
-      "unpublished",
-      "unchanged",
-    ]);
-  });
-
-  test("every other lookup word compares both documents: only an answer of no tag lifts the protection", () => {
+    // A lookup that found no tag at all is no exception: no word lifts the protection.
     for (const word of ANCHOR_LOOKUPS) {
-      if (word === "no_tag") continue;
       const facts = originalContentFacts({ ...texts, anchorLookup: word });
       expect([facts.readme.status, facts.changes.status], word).toEqual(["compared", "compared"]);
-      if (facts.readme.status === "compared") {
-        expect(facts.readme.facts.protectedAltered, word).toBe(2);
-      }
-    }
-  });
-
-  test("the author fields, the participant values and the recordings are decided whatever the lookup found", () => {
-    const edit: Edit = {
-      path: PARTICIPANTS_TSV,
-      before: sexTable("None", "M"),
-      after: sexTable("F", "M"),
-    };
-    const recordings = [
-      recording("sub-01/eeg/sub-01_task-x_eeg.edf", locked(keyOf(1)), locked(keyOf(2)), true),
-    ];
-    const everything = contentInput({
-      ...texts,
-      changes: [
-        ...texts.changes,
-        modified("dataset_description.json"),
-        modified(PARTICIPANTS_TSV),
-        ...recordings.map(({ path, status }) => ({ path, status })),
-      ],
-      description: { before: description(DESCRIPTION), after: changed({ Name: "A new name" }) },
-      summary: summaryOf([edit]),
-      recordings,
-    });
-    const strict = originalContentFacts({ ...everything, anchorLookup: "lookup_failed" });
-    const unpublished = originalContentFacts({ ...everything, anchorLookup: "no_tag" });
-    expect(unpublished.authorFields).toEqual(noFieldChange({ altered: ["Name"] }));
-    expect(unpublished.participantValues).toBe(1);
-    expect(unpublished.recordings).toEqual(noRecordingChange({ replaced: 1 }));
-    for (const key of ["authorFields", "participantValues", "recordings", "paths"] as const) {
-      expect(unpublished[key], key).toEqual(strict[key]);
+      expect(comparedFacts(facts.readme), word).toMatchObject({
+        anchor: "merge_base",
+        protectedAltered: 2,
+      });
+      expect(comparedFacts(facts.changes).protectedAltered, word).toBe(1);
     }
   });
 });

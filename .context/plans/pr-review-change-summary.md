@@ -1602,11 +1602,10 @@ Where the text above, the Phase 7 note and this note differ, this note is what w
 - A Part B step follows the change summary in the content pass and precedes the raw diffs.
   It is all-or-nothing and shares the pass's time and byte budgets: it starts only if the summary's clock has `timeReserveMs` left, and a failed tree listing, a batch that cannot be trusted, or running out of time gives an abandoned result, which is `unknown`.
   The facts stage and the listing pass are unchanged, so a spam-stopped or naming-ended review starts no Part B work.
-- The tag lookup is in the content pass, only when a root README or CHANGES part changed and the caller allows it (`versionTags`, off for `--offline` calibration, whose clones point at GitHub).
+- The tag lookup is in the content pass, only when a root README part changed and the caller allows it (`versionTags`, off for `--offline` calibration, whose clones point at GitHub).
   `git ls-remote --tags origin refs/tags/v*` (15 s, 1 MiB), then `chooseAnchor` with `git merge-base --is-ancestor` under `GIT_NO_LAZY_FETCH=1` (5 s over at most 32 tags), then `git ls-tree -z` of the chosen tag's commit under `GIT_NO_LAZY_FETCH=1`, then the anchor's README blobs in a read of their own (4 MiB), so a failed lazy fetch gives the stricter anchor and does not abandon Part B.
-  A lookup that succeeds and finds no `v*` tag is `no_tag`: the dataset has published nothing, so its README and CHANGES text is information only (`unpublished`; the owner's decision of 2026-10-23).
-  The accepted consequence is that a published dataset that somehow lost its tags would silently lose that protection.
-  Every other failure falls back to the merge base, recorded as `lookup_failed`, `no_ancestor`, `check_failed` (a tag commit the clone does not hold is this), `too_many_tags` or `tag_tree_unreadable`; with only CHANGES changed the lookup stops after the ancestor checks and reads no README.
+  Every lookup that does not end at an ancestor tag falls back to the merge base, so every README and CHANGES merge-base line is protected: `lookup_failed`, `no_tag` (the lookup succeeded and found no `v*` tag), `no_ancestor`, `check_failed` (a tag commit the clone does not hold is this), `too_many_tags` or `tag_tree_unreadable`.
+  An owner decision of 2026-10-23 to read `no_tag` as an unpublished dataset (README and CHANGES text information only) was reverted the same day: the Worker dispatches only public, first-published datasets (ADR 0092), which all carry a version tag, so the pull requests on private datasets without tags are never reviewed and the rule could only have fired on a published dataset that lost its tags, silently dropping the protection.
   A found tag whose README cannot be read keeps `first_version_tag` as the lookup word and reads the README facts against the merge base.
 - One sized batch reads the README and CHANGES parts of both sides, the description sides and every probe side of the changed paths that no earlier read took (probes: no size is `unreadable`, above 1,023 bytes is `large`), within what is left of the 256 MiB; the summary's pool hands on its small blobs so nothing is read twice.
 - The verdict (`originalVerdict`) is one pure function: a README or CHANGES line altered or moved, a line put inside an original paragraph, an author-owned field altered or removed and a participant value changed are a fail (the script lowers `no_degradation` to `fail` before the report is parsed, `lowerToFail`, and only for a valid model answer); a replaced or retyped recording, a participants table that could not be counted, an unparsed description, an unread side, any refusal (the edit-distance cap included), hiding markup and a lost or shadowed shown README are `unknown`; the abandoned pass is `unknown` and nothing else of Part B is used; the rest (minor edits, later text, line endings, a final newline, added or grown fields, moved pointers, joined runs) is information.
@@ -1616,7 +1615,7 @@ Where the text above, the Phase 7 note and this note differ, this note is what w
   The recordings note says "data files", because a plain-git file in the recordings area counts too.
   A finding's path is the README part shown at the merge base (else the first README document part, else the first CHANGES part), the description, or the participants file whose class was counted, recorded on the facts.
   Recordings and undecided facts have no path.
-- The model is told by an `original_content` block of the facts, placed immediately before `change_summary` (its `readme` and `changes` words are `unchanged`, `kept`, `altered`, `not_decided` or `unpublished`), and one system-prompt paragraph; the README and CHANGES counts are zero unless that document was compared, an abandoned pass says `not_decided` everywhere, and no text of a file ever enters the block.
+- The model is told by an `original_content` block of the facts, placed immediately before `change_summary` (its `readme` and `changes` words are `unchanged`, `kept`, `altered` or `not_decided`), and one system-prompt paragraph; the README and CHANGES counts are zero unless that document was compared, an abandoned pass says `not_decided` everywhere, and no text of a file ever enters the block.
 - A model finding that carries a code only the script may emit (the original-content codes, `recording_replaced`, and the other codes outside the review's schema) makes the answer `model_invalid`, so a model that escapes its schema cannot make the check show the original-content paragraph.
 - The check shows the B4 paragraph once, only when a finding is `original_text_altered` or `original_field_altered`.
 - Calibration prints a `PART-B` word and `B t/f/p/r` per pull request and a totals line from the same verdict the review uses; `--offline` never lists tags in either mode; `--without-summary` leaves Part B abandoned by its own start check.
@@ -1630,13 +1629,13 @@ Every earlier number is unchanged: 5,482 files accounted for, 15 truncated, 18 w
 - The plan expected 7 or 8 fails; `on005628` #1 is the ninth, and `on003195` #1 the fifth unknown, both from the approved participant-value rule (any change of a non-missing participant value fails, including text in `participants.json`).
 
 **Measured online on the pull requests open on 2026-10-23** (129 open: the 86 of set A and 43 new; tag lookup on; counts only).
-- Outcomes: 101 clear, 20 fail, 3 information, 5 `unknown` only, none abandoned, no fetch errors.
-  The tag anchor was used in 76 rows; the 22 pull requests on the 20 datasets that have no version tag (all private, never published) are all clear under the owner's rule, where 15 of them failed before it.
-- The 20 fails are 13 README rows (35 altered lines) and 4 author-field or participant-value rows on tagged datasets, plus the three `Name` rows of the platform's own account.
+- The Worker dispatches only public, first-published datasets (ADR 0092), and all of them carry a version tag: 107 of the 129 are on such datasets, and these are the ones the production review sees.
+  Their outcomes are 79 clear, 20 fail, 5 `unknown` only and 3 information, none abandoned and no fetch errors; the 20 fails are 13 README rows (35 altered lines), 4 author-field or participant-value rows, and the three `Name` changes of the platform's own account, which the Worker exempts in production, so about 17 pull requests would newly read as failing.
+- The other 22 are on 20 private, never-published datasets that the Worker never dispatches (15 of them would fail under the merge-base fallback).
   The README fails are one contributor account's campaign of independent paragraph-level rewordings and expansions (no two share a replacement line, none is near the minor-edit bound), which is what the rule exists to stop.
 - On the 86 of set A the only change from the offline result is `on002578` #2: with the real tag its 21 lines are later text and it is information.
   On a tagged dataset the tag's README was byte-identical to the merge-base README in all 14 README fails examined, so the tag changes the result only for text added after the first version.
-- The tag lookup ran for 125 of 129 rows; the slowest content pass was 8.5 s and the sum of passes grew by about a third with the 27 extra lookups for CHANGES-only edits.
+- The tag lookup ran for the rows with a changed root README; the slowest content pass was about 8.5 s with it on.
 
 **Decided as built.**
 - The facts record the three paths (README part, CHANGES part, participants file) so a finding names a file the builder, not the verdict, chose.
@@ -1649,12 +1648,14 @@ Every earlier number is unchanged: 5,482 files accounted for, 15 truncated, 18 w
 - B4's author-field note (210 characters with three names) cannot hold nine names; the count form does.
 - B4's "recording files" is "data files" (`on004703`'s are sidecars); "first published" is true only of the README (the other parts are compared with the merge base); `readme_preserved` is not a fact (false on minor edits).
 - B3 step 1 and slice 2 step 2 put the lookup in the listing pass; it is in the content pass because the facts stage may read only trees, commits, names and the description, and a spam-stopped review should not pay for it.
-- B1 and B3 say a missing tag falls back to the merge base; as built that holds for a lookup that failed, while a successful lookup that finds no tag is `unpublished` for README and CHANGES text.
 - B3 step 3 and B5 say the anchor blobs join the batch; they have a read of their own, because the batch is all-or-nothing.
 - B2.4 says no blob is read beyond the pointers; every changed side needs a size check.
 - 10.3 and B4 give `platformFindings(summary, original)` and `assembleReport(..., lowerToFail)`; both are as built, with `original` defaulting to null.
 - B4's `on004588` #1 outcome is a fail from five participant values; its table parses.
 - `classifyPath` places `CHANGELOG*` in "other", so the model never sees its diff, while Part B protects it.
+
+- Part B's CPU work (the alignment and the minor-edit pairing) is bounded by its caps, not by the deadline, which is checked once at the start of the step; a hostile README that runs past the content pass's reserve ends the pass `timed_out`, so the review reads as `evidence_unavailable` (it fails closed) and not as an abandoned Part B.
+- The lookup word (`anchorLookup`) is in no stored report, evidence field or log line: the stats stay numbers and booleans, so the first README review after the release is checked by hand against the online calibration.
 
 **Left to the owner.**
 - The model calibration of ADR 0107 on the changed prompt (`model-labels.template.txt`, 40 reviews; it costs money and needs labels), before the review check is required.

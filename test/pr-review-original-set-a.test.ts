@@ -41,7 +41,7 @@ const where = (holds: (r: OriginalRow) => boolean): string[] =>
     .map((r) => r.pr)
     .sort();
 
-/** The keys a document's facts have in a row: the module's facts, the examples dropped. */
+/** The keys a document's facts have in a row: the module's facts. */
 const DOCUMENT_KEYS = [
   "anchor",
   "document",
