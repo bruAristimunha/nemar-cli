@@ -78,7 +78,8 @@ The paragraph says that only the files the summary summarized are counted in the
 - A5: the 400-name cut keeps truncating; it is argued in its own phase.
 - A6: the relabel rules (prefix and suffix, zero padding, case, letters and digits in order) are exact descriptions of a renamed table key (a JSON key is renamed by case and punctuation alone, design section 4.7).
 
-Part B, what a contributor may change of the original authors' content (questions B1 to B7), was answered with the design's defaults the same day and is built in later phases.
+Part B, what a contributor may change of the original authors' content (questions B1 to B7), was answered with the design's defaults the same day.
+Its facts are computed by a pure module (design, "As built (Phase 7)"); the platform findings, the prompt sentence and the check text that act on them come in a later phase.
 Until then only its three finding codes are in force: the Worker accepts them, and nothing emits them.
 
 ### Release order
@@ -109,6 +110,10 @@ No new budget enters the job: ADR 0107's 45.4 minutes are unchanged.
   Symbols and combining marks must match, a hyphen or dash inside a longer name is punctuation, and a bare number such as `-1` or `5%` is compared as written and pairs only with another bare number.
   The value must be unique among the parent's removed and among its added leaves (design 4.7).
   A change to either rule moves the baseline test (it runs where the frozen clones exist, not in CI), which then fails until the baseline is recorded again.
+- The Part B facts are measured on the same 86 pull requests with the strict merge-base anchor: 27 of the 29 READMEs that show deleted lines are only line-ending, final-newline or trailing-whitespace artifacts and are not alterations, and the two real ones are flagged.
+  Three facts the design did not have are measured there: markup that hides original text and a README that shadows or loses the shown one are zero, and new lines that join an original paragraph occur in two pull requests (one altered anyway, one a CHANGES entry).
+  The module refuses an alignment past an edit distance of 2,000 instead of counting every protected line as altered, so a very large README rewrite will be `unknown` and a person looks.
+  The facts are tripwires and not a proof against hostile Markdown; the raw diff and the model stay in the loop.
 - A diff git writes as binary (a NUL byte in a table) is no read at all: the file stays unread and a removed row in it keeps the content incomplete.
   So does a modified or removed binary file in a read area (a `README.pdf`), whose one-line `Binary files differ` diff used to count as read; the pull request cannot pass on it and a person looks.
 
