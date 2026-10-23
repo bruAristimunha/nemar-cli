@@ -48,6 +48,7 @@ import {
   runReview,
   textFactsOf,
 } from "../scripts/ci/pr-review";
+import { partBWord, renderEvidenceTable } from "../scripts/ci/pr-review-calibrate";
 import {
   type ContentOptions,
   EVIDENCE_BUDGET_MS,
@@ -70,12 +71,23 @@ import {
   gatherListing,
   parseNameStatus,
   parseRawEntries,
+  partBBytesLeft,
   pathPattern,
   readBlobs,
+  readBlobsSized,
 } from "../scripts/ci/pr-review-evidence";
+import {
+  AUTHOR_OWNED_KEYS,
+  type AuthorFieldFacts,
+  ORIGINAL_ABANDONED,
+  type OriginalContentFacts,
+  type ProseFacts,
+} from "../scripts/ci/pr-review-original";
 import {
   MAX_BODY_CHARS,
   MAX_PLATFORM_FINDINGS,
+  type OriginalContentBlock,
+  REVIEW_FINDING_CODES,
   REVIEW_OUTPUT_SCHEMA,
   REVIEW_SYSTEM_PROMPT,
   SCREEN_OUTPUT_SCHEMA,
@@ -86,6 +98,9 @@ import {
   buildReviewMessages,
   buildScreenMessages,
   fence,
+  originalContentBlock,
+  originalLowersToFail,
+  originalVerdict,
   platformFindings,
   tidy,
 } from "../scripts/ci/pr-review-prompt";
@@ -102,10 +117,12 @@ import {
   FINDING_CODES,
   MAX_FINDINGS,
   NOTE_MAX,
+  ORIGINAL_CONTENT_PARAGRAPH,
   type PrReviewReport,
   PrReviewReportError,
   type ReviewFinding,
   factsOf,
+  findingLines,
   parseCallbackOutcome,
   parsePrReviewReport,
   parseStoredPrReviewReport,
@@ -194,6 +211,15 @@ function newDataset(name: string): string {
   return dir;
 }
 
+/**
+ * A new section after the README, past a blank line: what a contributor may add without changing a
+ * line the original authors published.
+ */
+function appendSection(dir: string, title = "Edited"): void {
+  const readme = join(dir, "README.md");
+  writeFileSync(readme, `${readFileSync(readme, "utf8")}\n## ${title}\n\nA new section.\n`);
+}
+
 /** Branch from main, apply `edit`, commit, return the base (main tip) and head. */
 function branch(dir: string, edit: () => void, branchName = "contrib"): Repo {
   const base = git(dir, "rev-parse", "main");
@@ -209,9 +235,11 @@ function branch(dir: string, edit: () => void, branchName = "contrib"): Repo {
 beforeAll(() => {
   root = mkdtempSync(join(tmpdir(), "pr-review-"));
 });
+// Removing every repository the tests made takes seconds on a loaded runner, past the default
+// 5 s of a hook, so the hook gets room of its own.
 afterAll(() => {
   rmSync(root, { recursive: true, force: true });
-});
+}, 120_000);
 
 // ---------------------------------------------------------------------------------------------
 // A stand-in for api.anthropic.com, spoken to by the real SDK
@@ -263,14 +291,15 @@ const USAGE = {
 /**
  * A full report from a review answer, the way the job assembles one after the screen let the pull
  * request through. `answer` is the review's output (three questions and four judgments), and
- * `platform` the platform's own findings, which the job passes beside it.
+ * `platform` the platform's own findings, which the job passes beside it with `lowerToFail`.
  */
 function full(
   answer: unknown,
   e: ReturnType<typeof buildEvidence>,
   platform: readonly ReviewFinding[] = [],
+  lowerToFail = false,
 ): PrReviewReport {
-  return assembleReport(PROCEED, answer, e, USAGE, platform);
+  return assembleReport(PROCEED, answer, e, USAGE, platform, lowerToFail);
 }
 
 /** A Messages API reply whose one text block holds `text`, streamed when the request streams. */
@@ -625,6 +654,18 @@ function callLog(name: string): string {
 }
 
 describe("readBlobs and rawEntries", () => {
+  test("Part B's batch may read what the pass's 256 MiB leaves after the proofs and the pool", () => {
+    const MiB = 1024 * 1024;
+    expect(partBBytesLeft(new Map(), 0)).toBe(256 * MiB);
+    const checked = new Map([
+      ["a", Buffer.alloc(3 * MiB)],
+      ["b", Buffer.alloc(MiB)],
+    ]);
+    expect(partBBytesLeft(checked, 10 * MiB)).toBe(242 * MiB);
+    expect(partBBytesLeft(new Map(), 256 * MiB)).toBe(0);
+    expect(partBBytesLeft(checked, 300 * MiB)).toBe(0);
+  });
+
   const ZERO = "0".repeat(40);
   const CAPS = { maxBytes: 1024, maxTotalBytes: 1024 * 1024 };
 
@@ -692,6 +733,54 @@ describe("readBlobs and rawEntries", () => {
     const a = id("a.txt");
     const blobs = readBlobs(dir, [a, a, a, id("b.txt"), a], { maxBytes: 100, maxTotalBytes: 10 });
     expect(texts(blobs)).toEqual({ [a]: "aaaaa", [id("b.txt")]: "bbbbb" });
+  });
+
+  test("readBlobsSized keeps the size of every blob asked about: read, over its cap, or past the total", () => {
+    const { id, dir } = blobRepo("blobs-sized", {
+      "a.txt": "aaaa",
+      "big.txt": "0123456789A",
+      "b.txt": "bbbb",
+      "c.txt": "cc",
+      "d/e.txt": "e",
+    });
+    const tree = git(dir, "rev-parse", "HEAD:d");
+    const nobody = "1234567890abcdef1234567890abcdef12345678";
+    const order = [id("a.txt"), id("big.txt"), id("b.txt"), id("c.txt"), tree, nobody, ZERO];
+    const sized = readBlobsSized(dir, order, { maxBytes: 10, maxTotalBytes: 9 });
+    // Read: a and b; big is over its cap; c would pass the total. Each has its size.
+    expect(texts(sized?.blobs ?? null)).toEqual({ [id("a.txt")]: "aaaa", [id("b.txt")]: "bbbb" });
+    expect(Object.fromEntries(sized?.sizes ?? [])).toEqual({
+      [id("a.txt")]: 4,
+      [id("big.txt")]: 11,
+      [id("b.txt")]: 4,
+      [id("c.txt")]: 2,
+    });
+    // The blobs are exactly what readBlobs reads with the same caps.
+    expect(texts(readBlobs(dir, order, { maxBytes: 10, maxTotalBytes: 9 }))).toEqual(
+      texts(sized?.blobs ?? null),
+    );
+  });
+
+  test("readBlobsSized takes a bound per id: each blob is read to its own", () => {
+    const { id, dir } = blobRepo("blobs-sized-per-id", {
+      "doc.md": "a document of some length\n",
+      pointer: "/annex/objects/KEY\n",
+      "big.bin": "x".repeat(64),
+    });
+    const bounds = new Map([
+      [id("doc.md"), 1024],
+      [id("pointer"), 20],
+      [id("big.bin"), 20],
+    ]);
+    const sized = readBlobsSized(dir, [...bounds.keys()], {
+      maxBytes: (oid) => bounds.get(oid) ?? 0,
+      maxTotalBytes: 1024,
+    });
+    expect(texts(sized?.blobs ?? null)).toEqual({
+      [id("doc.md")]: "a document of some length\n",
+      [id("pointer")]: "/annex/objects/KEY\n",
+    });
+    expect(sized?.sizes.get(id("big.bin"))).toBe(64);
   });
 
   test("the zero id, a short or upper-case id, HEAD and a rev:path are never asked: no cat-file starts", () => {
@@ -1107,7 +1196,7 @@ describe("runReview: the job around the model call", () => {
     const dir = newDataset(name);
     const r = branch(dir, () => {
       release(dir);
-      write(dir, "README.md", "# Edited\n");
+      appendSection(dir);
     });
     return r;
   }
@@ -2304,6 +2393,63 @@ describe("renames, and the edges of what the model is shown", () => {
     expect(listedRows).toHaveLength(MAX_MODEL_FILES);
   });
 
+  test("a review finding with a code only the script may give is an invalid answer, kept or cut", () => {
+    const dir = newDataset("script-codes");
+    const r = branch(dir, () => appendSection(dir));
+    const e = buildEvidence(gatherGitFacts(r.dir, r.base, r.head), NO_TEXT_PROBLEMS);
+    const finding = (code: string, i = 0) => ({
+      criterion: "no_degradation",
+      severity: "note",
+      code,
+      path: null,
+      note: `finding ${i}`,
+    });
+    const scriptOnly = FINDING_CODES.filter((c) => !REVIEW_FINDING_CODES.includes(c));
+    expect(scriptOnly).toContain("original_text_altered");
+    expect(scriptOnly).toContain("original_field_altered");
+    expect(scriptOnly).toContain("recording_replaced");
+    expect(scriptOnly).toHaveLength(13);
+    const others = Array.from({ length: 8 }, (_, i) => finding("other", i));
+    for (const code of scriptOnly) {
+      let thrown: unknown = null;
+      try {
+        full({ ...allPass, findings: [finding(code)] }, e);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown instanceof PrReviewReportError ? thrown.code : thrown, code).toBe(
+        "bad_findings",
+      );
+      expect(mapError(thrown), code).toBe("model_invalid");
+      // As the ninth finding, which the room would cut, it is still no valid answer.
+      expect(
+        reportErrorOf(() => full({ ...allPass, findings: [...others, finding(code)] }, e)),
+        code,
+      ).toBe("bad_findings");
+    }
+    // Every code the review is offered is still taken.
+    for (const code of REVIEW_FINDING_CODES) {
+      expect(
+        reportErrorOf(() => full({ ...allPass, findings: [finding(code)] }, e)),
+        code,
+      ).toBe("no error");
+    }
+    // The platform's own finding with such a code is the report's, and a stored report holding it
+    // still parses.
+    const platform: ReviewFinding[] = [
+      {
+        criterion: "no_degradation",
+        severity: "blocker",
+        code: "original_text_altered",
+        path: "README.md",
+        note: "1 line the original authors published in README was removed, reworded or moved.",
+      },
+    ];
+    const report = full(allPass, e, platform, true);
+    expect(report.criteria.no_degradation).toBe("fail");
+    expect(parseStoredPrReviewReport(JSON.parse(JSON.stringify(report)))).toEqual(report);
+  });
+
   test("a ninth finding is dropped, not a reason to refuse the whole answer", () => {
     const dir = newDataset("nine");
     const r = branch(dir, () => write(dir, "README.md", "# E\n"));
@@ -3380,6 +3526,7 @@ describe("what the model is told, and where path text may and may not appear", (
       "version_before",
       "version_after",
       "change_summary",
+      "original_content",
       "files_with_content_shown",
     ]) {
       expect(REVIEW_SYSTEM_PROMPT).toContain(named);
@@ -3903,7 +4050,7 @@ describe("the facts come before any model, and fail the verdict whatever it says
     },
   );
 
-  test("a changed dataset_description.json with a new, readable, fine name keeps the review as it was", async () => {
+  test("a changed dataset_description.json with a new, readable, fine name passes the naming rule, and the platform fails the changed Name", async () => {
     const report = await reviewWith("facts-name-fine", (dir) =>
       write(
         dir,
@@ -3911,8 +4058,19 @@ describe("the facts come before any model, and fail the verdict whatever it says
         desc("1.1.0", { Name: "Resting EEG of volunteers, with eyes closed" }),
       ),
     );
+    // The naming rule finds nothing, and the review goes on to both models as it did.
     expect(report.evidence.name_problem).toBeNull();
-    expect(verdictOf(report)).toBe("pass");
+    expect(report.stage).toBe("full");
+    expect(modelRequests).toHaveLength(2);
+    expect(factsOf(report).notes.map((n) => n.code)).toEqual([]);
+    // The name is the original authors' all the same: the platform fails the change itself, with a
+    // finding that names the field, whatever the review said.
+    expect(report.findings.map((f) => [f.code, f.path])).toEqual([
+      ["original_field_altered", "dataset_description.json"],
+    ]);
+    expect(report.findings[0]?.note).toContain("The dataset description's Name changed.");
+    expect(report.criteria.no_degradation).toBe("fail");
+    expect(verdictOf(report)).toBe("fail");
   });
 
   test("a dataset_description.json the pull request does not touch is not asked about, readable or not", async () => {
@@ -3994,7 +4152,11 @@ describe("the facts come before any model, and fail the verdict whatever it says
     git(dir, "commit", "-q", "-m", "an old name");
     const r = branch(dir, () => {
       write(dir, "dataset_description.json", desc("1.1.0", { Name: "Lee2019 Motor Imagery" }));
-      write(dir, "CHANGES", "1.1.0 2026-10-16\n - Fixed units\n1.0.0 2026-01-01\n - Initial\n");
+      write(
+        dir,
+        "CHANGES",
+        "1.1.0 2026-10-16\n - Fixed units\n1.0.0 2026-01-01\n - Initial release\n",
+      );
     });
     const res = await runReview({
       repoDir: r.dir,
@@ -4695,14 +4857,31 @@ describe("the change summary", () => {
         );
       }
     };
+    // What the cosmetic proofs and the summary's pool asked about (the first four cat-file
+    // processes), apart from what Part B read after them, which probes every changed side: the size
+    // of each, and the bytes of the ones short enough to be an annex pointer.
     const read = (r: Repo) => {
       const listing = gatherListing(r.dir, r.base, r.head);
       const log = callLog("cs-unconsulted");
-      const restore = installGitShim(root, [{ match: " cat-file ", stdinLog: log }]);
+      const partB = callLog("cs-unconsulted-part-b");
+      const partBBytes = callLog("cs-unconsulted-part-b-bytes");
+      const restore = installGitShim(root, [
+        { match: " cat-file ", stdinLog: log },
+        { match: " cat-file ", stdinLog: partB, fromCall: 5 },
+        { match: " cat-file --batch ", stdinLog: partBBytes, fromCall: 3 },
+      ]);
       try {
         const content = gatherContent(r.dir, listing);
         const evidence = buildEvidence({ ...listing, ...content }, NO_TEXT_PROBLEMS);
-        return { content, evidence, asked: new Set(loggedCalls(log)) };
+        const all = loggedCalls(log);
+        const later = loggedCalls(partB);
+        return {
+          content,
+          evidence,
+          asked: new Set(all.slice(0, all.length - later.length)),
+          partBAsked: new Set(later),
+          partBRead: new Set(loggedCalls(partBBytes)),
+        };
       } finally {
         restore();
       }
@@ -4724,6 +4903,12 @@ describe("the change summary", () => {
     expect(withOthers.asked).toContain(id(crowded, copy));
     for (const path of unconsulted) expect(withOthers.asked, path).not.toContain(id(crowded, path));
     expect([...withOthers.asked].sort()).toEqual([...without.asked].sort());
+    // Part B asked for the size of every one of them, and read none of the long documents.
+    for (const path of unconsulted)
+      expect(withOthers.partBAsked, path).toContain(id(crowded, path));
+    for (const path of unconsulted.filter((p) => p.endsWith(".json"))) {
+      expect(withOthers.partBRead, path).not.toContain(id(crowded, path));
+    }
   });
 
   test("a pool table whose earlier version cannot be read lends no copies", () => {
@@ -4835,7 +5020,8 @@ describe("the change summary keeps to its deadline, and leaves the raw path as i
     expect(late.catFile).toEqual(COSMETIC_READS);
     expectRaw(late.content, late.listing);
     // The same through the clock alone, with the real budget: the start is decided by the clock
-    // the summary is given, read once, and nothing of the summary is read once it says too late.
+    // the summary is given, read once by the summary and once by Part B, which starts by the same
+    // line; nothing of either is read once it says too late.
     let reads = 0;
     const clocked = read(null, {
       now: () => {
@@ -4843,7 +5029,8 @@ describe("the change summary keeps to its deadline, and leaves the raw path as i
         return Number.MAX_SAFE_INTEGER;
       },
     });
-    expect(reads).toBe(1);
+    expect(reads).toBe(2);
+    expect(clocked.content.original).toBe(ORIGINAL_ABANDONED);
     expect(clocked.content.summary).toBe(ABANDONED_SUMMARY);
     expect(clocked.catFile).toEqual(COSMETIC_READS);
     expectRaw(clocked.content, clocked.listing);
@@ -5891,6 +6078,536 @@ describe("the platform's findings from the change summary", () => {
 });
 
 // ---------------------------------------------------------------------------------------------
+// The original authors' content: the verdict, its findings and the fail no review can raise
+// ---------------------------------------------------------------------------------------------
+
+/** The facts of a compared document that changed nothing, for tests to override. */
+function proseOf(over: Partial<ProseFacts> = {}): ProseFacts {
+  return {
+    document: "readme",
+    anchor: "merge_base",
+    preserved: true,
+    protectedLines: 4,
+    protectedAltered: 0,
+    minorEdits: 0,
+    laterAltered: 0,
+    moved: false,
+    movedLines: 0,
+    insertedInsideParagraph: 0,
+    joinedInsertedRuns: 0,
+    insertedLines: 0,
+    lineEndingsChanged: false,
+    finalNewlineAdded: false,
+    notUtf8: false,
+    partsBefore: 1,
+    partsAfter: 1,
+    hidingMarkupInserted: 0,
+    shownPartReplaced: false,
+    examples: [],
+    ...over,
+  };
+}
+
+const compared = (over: Partial<ProseFacts> = {}) => ({
+  status: "compared" as const,
+  facts: proseOf(over),
+});
+const changesCompared = (over: Partial<ProseFacts> = {}) =>
+  compared({ document: "changes", ...over });
+
+/** Author-field facts with nothing changed, for tests to override. */
+function fieldsOf(over: Partial<AuthorFieldFacts> = {}): AuthorFieldFacts {
+  return { altered: [], removed: [], minor: [], grown: [], added: [], unparsed: false, ...over };
+}
+
+/** The facts of a pass that compared what changed and found nothing, for tests to override. */
+function originalOf(over: Partial<OriginalContentFacts> = {}): OriginalContentFacts {
+  return {
+    abandoned: false,
+    anchorLookup: "not_needed",
+    readme: { status: "unchanged" },
+    changes: { status: "unchanged" },
+    authorFields: null,
+    participantValues: 0,
+    recordings: { replaced: 0, typeChanged: 0, moved: 0, unread: 0 },
+    paths: { readme: "README.md", changes: "CHANGES", participants: "participants.tsv" },
+    ...over,
+  };
+}
+
+/** What a verdict decides, without the paths: the candidates and the fail. */
+const decided = (o: OriginalContentFacts | null) => {
+  const { paths: _paths, ...rest } = originalVerdict(o);
+  return rest;
+};
+const NOTHING = {
+  text: null,
+  fields: null,
+  recordings: null,
+  undecided: null,
+  lowersToFail: false,
+};
+
+describe("the verdict of the original content", () => {
+  test("no facts and nothing found decide nothing", () => {
+    expect(decided(null)).toEqual(NOTHING);
+    expect(decided(originalOf())).toEqual(NOTHING);
+    expect(originalLowersToFail(null)).toBe(false);
+  });
+
+  test("an abandoned pass is undecided and nothing else, whatever it holds", () => {
+    expect(decided(ORIGINAL_ABANDONED)).toEqual({ ...NOTHING, undecided: "abandoned" });
+    // Facts an abandoned pass cannot have had are not read: it is never a fail and never clean.
+    const loud = originalOf({
+      abandoned: true,
+      readme: compared({ protectedAltered: 3 }),
+      authorFields: fieldsOf({ altered: ["Name"] }),
+      participantValues: null,
+      recordings: { replaced: 2, typeChanged: 0, moved: 0, unread: 1 },
+    });
+    expect(decided(loud)).toEqual({ ...NOTHING, undecided: "abandoned" });
+    expect(originalLowersToFail(loud)).toBe(false);
+  });
+
+  test("README lines altered or moved, or put inside an original paragraph, fail as text", () => {
+    expect(decided(originalOf({ readme: compared({ protectedAltered: 2 }) }))).toEqual({
+      ...NOTHING,
+      text: { readmeLines: 2, readmeInside: 0, changesLines: 0 },
+      lowersToFail: true,
+    });
+    expect(
+      originalVerdict(originalOf({ readme: compared({ moved: true, movedLines: 3 }) })).text,
+    ).toEqual({ readmeLines: 3, readmeInside: 0, changesLines: 0 });
+    expect(
+      originalVerdict(originalOf({ readme: compared({ insertedInsideParagraph: 1 }) })).text,
+    ).toEqual({ readmeLines: 0, readmeInside: 1, changesLines: 0 });
+  });
+
+  test("existing CHANGES lines altered or moved fail as text; a new line anywhere in CHANGES does not", () => {
+    expect(
+      originalVerdict(originalOf({ changes: changesCompared({ protectedAltered: 1 }) })).text,
+    ).toEqual({ readmeLines: 0, readmeInside: 0, changesLines: 1 });
+    expect(
+      originalVerdict(originalOf({ changes: changesCompared({ moved: true, movedLines: 2 }) }))
+        .text,
+    ).toEqual({ readmeLines: 0, readmeInside: 0, changesLines: 2 });
+    expect(
+      decided(originalOf({ changes: changesCompared({ insertedInsideParagraph: 4 }) })),
+    ).toEqual(NOTHING);
+  });
+
+  test("an author field altered or removed, or a participant value changed, fails as fields", () => {
+    // The keys come in the closed list's order, whichever list holds them.
+    const keys = originalVerdict(
+      originalOf({ authorFields: fieldsOf({ altered: ["License"], removed: ["Name"] }) }),
+    );
+    expect(keys.fields).toEqual({ keys: ["Name", "License"], participants: 0 });
+    expect(keys.lowersToFail).toBe(true);
+    expect(decided(originalOf({ participantValues: 37 }))).toEqual({
+      ...NOTHING,
+      fields: { keys: [], participants: 37 },
+      lowersToFail: true,
+    });
+  });
+
+  test("a recording replaced or turned into a git file is unknown, never a fail", () => {
+    const facts = originalOf({ recordings: { replaced: 2, typeChanged: 3, moved: 0, unread: 0 } });
+    expect(decided(facts)).toEqual({ ...NOTHING, recordings: 5 });
+  });
+
+  test("what could not be compared is undecided, never clean and never a fail", () => {
+    const other: OriginalContentFacts[] = [
+      originalOf({ participantValues: null }),
+      originalOf({ authorFields: fieldsOf({ unparsed: true }) }),
+      originalOf({ recordings: { replaced: 0, typeChanged: 0, moved: 0, unread: 1 } }),
+      originalOf({ readme: { status: "refused", refusal: "edit_distance_cap" } }),
+      originalOf({ changes: { status: "refused", refusal: "binary" } }),
+    ];
+    for (const o of other) expect(decided(o)).toEqual({ ...NOTHING, undecided: "other" });
+    const markup: OriginalContentFacts[] = [
+      originalOf({ readme: compared({ hidingMarkupInserted: 1 }) }),
+      originalOf({ readme: compared({ shownPartReplaced: true }) }),
+      originalOf({ changes: changesCompared({ hidingMarkupInserted: 2 }) }),
+    ];
+    for (const o of markup) expect(decided(o)).toEqual({ ...NOTHING, undecided: "markup" });
+    // Something not compared outranks markup: the note says the larger gap.
+    expect(
+      originalVerdict(
+        originalOf({ readme: compared({ hidingMarkupInserted: 1 }), participantValues: null }),
+      ).undecided,
+    ).toBe("other");
+  });
+
+  test("what the model may judge is information only", () => {
+    const information: OriginalContentFacts[] = [
+      originalOf({ readme: compared({ joinedInsertedRuns: 2, insertedLines: 3 }) }),
+      originalOf({ changes: changesCompared({ joinedInsertedRuns: 1 }) }),
+      originalOf({ readme: compared({ minorEdits: 2, preserved: false }) }),
+      originalOf({ readme: compared({ laterAltered: 5, anchor: "first_version_tag" }) }),
+      originalOf({ readme: compared({ lineEndingsChanged: true, finalNewlineAdded: true }) }),
+      originalOf({ readme: compared({ notUtf8: true }) }),
+      originalOf({
+        authorFields: fieldsOf({ minor: ["Funding"], grown: ["Authors"], added: ["License"] }),
+      }),
+      originalOf({ recordings: { replaced: 0, typeChanged: 0, moved: 15, unread: 0 } }),
+    ];
+    for (const o of information) expect(decided(o)).toEqual(NOTHING);
+  });
+
+  test("a README or CHANGES of a dataset never published is information; its fields, values and recordings are not", () => {
+    const unpublished = {
+      anchorLookup: "no_tag" as const,
+      readme: { status: "unpublished" as const },
+      changes: { status: "unpublished" as const },
+    };
+    expect(decided(originalOf(unpublished))).toEqual(NOTHING);
+    expect(platformFindings(EMPTY_SUMMARY, originalOf(unpublished))).toEqual([]);
+    expect(
+      decided(
+        originalOf({
+          ...unpublished,
+          authorFields: fieldsOf({ altered: ["Name"] }),
+          participantValues: 2,
+          recordings: { replaced: 1, typeChanged: 0, moved: 0, unread: 0 },
+        }),
+      ),
+    ).toEqual({
+      ...NOTHING,
+      fields: { keys: ["Name"], participants: 2 },
+      recordings: 1,
+      lowersToFail: true,
+    });
+  });
+
+  test("a finding points at the README the platform showed, the CHANGES part, or the file of the fields", () => {
+    const paths = (o: OriginalContentFacts) => originalVerdict(o).paths;
+    expect(paths(originalOf({ readme: compared({ protectedAltered: 1 }) })).text).toBe("README.md");
+    expect(paths(originalOf({ changes: changesCompared({ protectedAltered: 1 }) })).text).toBe(
+      "CHANGES",
+    );
+    // Both: the README's. No README the platform showed: CHANGES, if it changed.
+    const both = {
+      readme: compared({ protectedAltered: 1 }),
+      changes: changesCompared({ protectedAltered: 1 }),
+    };
+    expect(paths(originalOf(both)).text).toBe("README.md");
+    expect(
+      paths(
+        originalOf({ ...both, paths: { readme: null, changes: "CHANGES", participants: null } }),
+      ).text,
+    ).toBe("CHANGES");
+    expect(paths(originalOf({ authorFields: fieldsOf({ removed: ["Funding"] }) })).fields).toBe(
+      "dataset_description.json",
+    );
+    expect(paths(originalOf({ participantValues: 2 })).fields).toBe("participants.tsv");
+  });
+});
+
+describe("the platform's findings from the original content", () => {
+  const N = 9_999_999;
+  const T = { readme: compared({ protectedAltered: 2 }) };
+  const F = { authorFields: fieldsOf({ altered: ["Name"] }) };
+  const R = { recordings: { replaced: 3, typeChanged: 0, moved: 0, unread: 0 } };
+  const U = { participantValues: null };
+  const partB = { T, F, R, U } as const;
+  const PART_A: [string, ChangeSummary][] = [
+    ["none", EMPTY_SUMMARY],
+    ["rows", summaryLosing({ rowsRemoved: 1, rowsRemovedFiles: 1 })],
+    ["keys", summaryLosing({ keysRemoved: 1, keysRemovedFiles: 1 })],
+    [
+      "both",
+      summaryLosing({ rowsRemoved: 1, rowsRemovedFiles: 1, keysRemoved: 1, keysRemovedFiles: 1 }),
+    ],
+  ];
+  /** The Part B findings of `o` alone, with every place left for them. */
+  const only = (o: OriginalContentFacts) => platformFindings(EMPTY_SUMMARY, o);
+  const notesOf = (o: OriginalContentFacts) => only(o).map((f) => f.note);
+  /** A pull request that changed nothing worth a fact: a clean release, read once. */
+  let cleanRepo: Repo | null = null;
+  const clean = () => {
+    cleanRepo ??= releaseChanging("ob-clean", {}, () => {});
+    return buildEvidence(
+      gatherGitFacts(cleanRepo.dir, cleanRepo.base, cleanRepo.head),
+      NO_TEXT_PROBLEMS,
+    );
+  };
+
+  test("each note is fixed words over counts, the singular for one", () => {
+    expect(notesOf(originalOf({ readme: compared({ protectedAltered: 1 }) }))).toEqual([
+      "1 line the original authors published in README was removed, reworded or moved. Keep it; put your account in CHANGES or a new section, or ask a NEMAR administrator to correct one.",
+    ]);
+    expect(
+      notesOf(
+        originalOf({ readme: compared({ protectedAltered: 2, moved: true, movedLines: 1 }) }),
+      ),
+    ).toEqual([
+      "3 lines the original authors published in README were removed, reworded or moved. Keep them; put your account in CHANGES or a new section, or ask a NEMAR administrator to correct one.",
+    ]);
+    expect(notesOf(originalOf({ readme: compared({ insertedInsideParagraph: 2 }) }))).toEqual([
+      "New lines were put inside 2 paragraphs the original authors published in README. Add text between paragraphs instead, or ask a NEMAR administrator to change one.",
+    ]);
+    expect(notesOf(originalOf({ changes: changesCompared({ protectedAltered: 1 }) }))).toEqual([
+      "1 existing line of CHANGES was removed, edited or moved. CHANGES keeps its history: add a new entry for this version instead.",
+    ]);
+    expect(
+      notesOf(
+        originalOf({
+          readme: compared({ protectedAltered: 4 }),
+          changes: changesCompared({ protectedAltered: 2 }),
+        }),
+      ),
+    ).toEqual([
+      "4 lines the original authors published in README and 2 existing lines of CHANGES were removed, reworded or moved. Keep them; add a new CHANGES entry, or ask a NEMAR administrator.",
+    ]);
+    const keys = (altered: AuthorFieldFacts["altered"], participants = 0) =>
+      notesOf(originalOf({ authorFields: fieldsOf({ altered }), participantValues: participants }));
+    expect(keys(["Name"])).toEqual([
+      "The dataset description's Name changed. Keep what the authors published: add new information, or ask a NEMAR administrator to correct a field.",
+    ]);
+    expect(keys(["Name", "License"])).toEqual([
+      "The dataset description's Name and License changed. Keep what the authors published: add new information, or ask a NEMAR administrator to correct a field.",
+    ]);
+    expect(keys(["Name", "Authors", "License"])).toEqual([
+      "The dataset description's Name, Authors and License changed. Keep what the authors published: add new information, or ask a NEMAR administrator to correct a field.",
+    ]);
+    expect(keys(["Name", "Authors", "License", "Funding"])).toEqual([
+      "4 fields of the dataset description changed. Keep what the authors published: add new information, or ask a NEMAR administrator to correct it.",
+    ]);
+    expect(keys(["Name"], 1)).toEqual([
+      "1 field of the dataset description and 1 participant value changed. Keep what the authors published: add new information, or ask a NEMAR administrator to correct it.",
+    ]);
+    expect(keys([], 37)).toEqual([
+      "37 participant values changed. Keep the values the authors recorded: add new information, or ask a NEMAR administrator to correct a value.",
+    ]);
+    expect(
+      notesOf(originalOf({ recordings: { replaced: 1, typeChanged: 0, moved: 0, unread: 0 } })),
+    ).toEqual([
+      "1 data file has new content, or moved in or out of the annex. A NEMAR administrator confirms a change to recorded data; describe it in CHANGES.",
+    ]);
+    expect(
+      notesOf(originalOf({ recordings: { replaced: 59, typeChanged: 41, moved: 0, unread: 0 } })),
+    ).toEqual([
+      "100 data files have new content, or moved in or out of the annex. A NEMAR administrator confirms a change to recorded data; describe it in CHANGES.",
+    ]);
+    expect(notesOf(ORIGINAL_ABANDONED)).toEqual([
+      "The platform could not finish comparing this pull request with what the authors published. A person looks.",
+    ]);
+    expect(notesOf(originalOf(U))).toEqual([
+      "Part of this pull request could not be compared with what the original authors published, such as a file too large or unreadable to compare. A person looks.",
+    ]);
+    expect(notesOf(originalOf({ readme: compared({ hidingMarkupInserted: 1 }) }))).toEqual([
+      "New README or CHANGES markup can hide text the original authors published, or the README shown is no longer theirs. A person looks.",
+    ]);
+    // One place left for the text and the fields: one finding that counts both.
+    const merged = platformFindings(
+      PART_A[3]?.[1] as ChangeSummary,
+      originalOf({ ...T, ...F, participantValues: 2 }),
+    );
+    expect(merged[2]).toEqual({
+      criterion: "no_degradation",
+      severity: "blocker",
+      code: "original_text_altered",
+      path: "README.md",
+      note: "2 lines of README or CHANGES and 3 fields or participant values the original authors published were changed. Keep them, add a CHANGES entry, or ask a NEMAR administrator.",
+    });
+  });
+
+  test("at a count of one, each note is in the singular", () => {
+    expect(
+      notesOf(
+        originalOf({
+          readme: compared({ protectedAltered: 1 }),
+          changes: changesCompared({ protectedAltered: 1 }),
+        }),
+      ),
+    ).toEqual([
+      "1 line the original authors published in README and 1 existing line of CHANGES were removed, reworded or moved. Keep them; add a new CHANGES entry, or ask a NEMAR administrator.",
+    ]);
+    expect(notesOf(originalOf({ readme: compared({ insertedInsideParagraph: 1 }) }))).toEqual([
+      "New lines were put inside 1 paragraph the original authors published in README. Add text between paragraphs instead, or ask a NEMAR administrator to change one.",
+    ]);
+    expect(notesOf(originalOf({ changes: changesCompared({ hidingMarkupInserted: 1 }) }))).toEqual([
+      "New README or CHANGES markup can hide text the original authors published, or the README shown is no longer theirs. A person looks.",
+    ]);
+  });
+
+  test("the merged note counts README lines, CHANGES lines and runs put inside a paragraph", () => {
+    const merged = platformFindings(
+      PART_A[3]?.[1] as ChangeSummary,
+      originalOf({
+        readme: compared({ protectedAltered: 2, insertedInsideParagraph: 1 }),
+        changes: changesCompared({ protectedAltered: 3 }),
+        ...F,
+      }),
+    );
+    expect(merged).toHaveLength(3);
+    expect(merged[2]?.note).toBe(
+      "6 lines of README or CHANGES and 1 field or participant value the original authors published were changed. Keep them, add a CHANGES entry, or ask a NEMAR administrator.",
+    );
+  });
+
+  test("every note at seven-digit counts and with any of the nine key names fits NOTE_MAX and is shown as made", () => {
+    const facts: OriginalContentFacts[] = [
+      originalOf({ readme: compared({ protectedAltered: N }) }),
+      originalOf({ readme: compared({ insertedInsideParagraph: N }) }),
+      originalOf({ changes: changesCompared({ protectedAltered: N }) }),
+      originalOf({
+        readme: compared({ protectedAltered: N }),
+        changes: changesCompared({ protectedAltered: N }),
+      }),
+      originalOf({ participantValues: N }),
+      originalOf({ recordings: { replaced: N, typeChanged: 0, moved: 0, unread: 0 } }),
+      ORIGINAL_ABANDONED,
+      originalOf(U),
+      originalOf({ readme: compared({ shownPartReplaced: true }) }),
+    ];
+    for (let mask = 1; mask < 1 << AUTHOR_OWNED_KEYS.length; mask++) {
+      const altered = AUTHOR_OWNED_KEYS.filter((_, i) => (mask & (1 << i)) !== 0);
+      for (const participants of [0, N]) {
+        facts.push(
+          originalOf({ authorFields: fieldsOf({ altered }), participantValues: participants }),
+        );
+        // With one place left, the same fields merged with text at seven digits.
+        facts.push(
+          originalOf({
+            ...T,
+            readme: compared({ protectedAltered: N }),
+            authorFields: fieldsOf({ altered }),
+            participantValues: participants,
+          }),
+        );
+      }
+    }
+    expect(facts.length).toBe(9 + 511 * 4);
+    let longest = 0;
+    for (const o of facts) {
+      for (const summary of [EMPTY_SUMMARY, PART_A[3]?.[1] as ChangeSummary]) {
+        for (const f of platformFindings(summary, o)) {
+          longest = Math.max(longest, f.note.length);
+          expect(f.note.length, f.note).toBeLessThanOrEqual(NOTE_MAX);
+          expect(f.note, f.note).toMatch(/^[A-Za-z0-9 ,.;:']+$/);
+          expect(sanitizeNote(f.note, NOTE_MAX)).toBe(f.note);
+        }
+      }
+    }
+    // The bound is near: a longer template would show here first.
+    expect(longest).toBeGreaterThan(190);
+  });
+
+  test("every slot combination: Part A first and whole, at most three, the fail explained, the undecided stated, and the stored report re-derives it", () => {
+    const e = clean();
+    expect(verdictOf(full(allPass, e))).toBe("pass");
+    let combinations = 0;
+    for (const [aName, summary] of PART_A) {
+      const partA = platformFindings(summary);
+      for (let mask = 0; mask < 16; mask++) {
+        const present = (["T", "F", "R", "U"] as const).filter((_, i) => (mask & (1 << i)) !== 0);
+        const o = originalOf(Object.assign({}, ...present.map((k) => partB[k])));
+        const platform = platformFindings(summary, o);
+        const lowerToFail = originalLowersToFail(o);
+        const name = `${aName} ${present.join("") || "-"}`;
+        combinations++;
+        expect(platform.length, name).toBeLessThanOrEqual(MAX_PLATFORM_FINDINGS);
+        expect(platform.slice(0, partA.length), name).toEqual(partA);
+        const ours = platform.slice(partA.length).map((f) => f.code);
+        // The places left, in the order text, fields, recordings, undecided; one place for both
+        // the text and the fields holds them together.
+        const places = MAX_PLATFORM_FINDINGS - partA.length;
+        const order = [
+          present.includes("T") && "original_text_altered",
+          present.includes("F") && "original_field_altered",
+          present.includes("R") && "recording_replaced",
+          present.includes("U") && "evidence_incomplete",
+        ].filter((c): c is ReviewFinding["code"] => c !== false);
+        const expected =
+          places === 1 && present.includes("T") && present.includes("F")
+            ? ["original_text_altered"]
+            : order.slice(0, places);
+        expect(ours, name).toEqual(expected);
+        // One place for both: the one finding counts the text and the fields together.
+        if (places === 1 && present.includes("T") && present.includes("F")) {
+          expect(platform.at(-1)?.note, name).toContain("of README or CHANGES and 1 field");
+        }
+        expect(lowerToFail, name).toBe(present.includes("T") || present.includes("F"));
+        if (lowerToFail) {
+          expect(
+            ours.some((c) => c === "original_text_altered" || c === "original_field_altered"),
+            name,
+          ).toBe(true);
+        }
+        if (present.length > 0) expect(ours.length, name).toBeGreaterThan(0);
+        for (const f of platform) {
+          expect([f.criterion, f.severity], name).toEqual(["no_degradation", "blocker"]);
+        }
+        // Through the report the job posts and the row the Worker stores.
+        const report = full(allPass, e, platform, lowerToFail);
+        const stored = parseStoredPrReviewReport(JSON.parse(JSON.stringify(report)));
+        expect(stored, name).toEqual(report);
+        const verdict = lowerToFail ? "fail" : platform.length > 0 ? "uncertain" : "pass";
+        expect([verdictOf(report), verdictOf(stored)], name).toEqual([verdict, verdict]);
+        expect(report.findings.slice(0, platform.length), name).toEqual(platform);
+      }
+    }
+    expect(combinations).toBe(64);
+  });
+
+  test("lowerToFail fails a valid answer of the review, and only a full report with the finding that explains it", () => {
+    const e = clean();
+    const altered = originalOf(T);
+    const platform = platformFindings(EMPTY_SUMMARY, altered);
+    for (const answer of ["pass", "unknown", "fail"]) {
+      const said = reviewOutput({
+        criteria: {
+          no_degradation: answer,
+          advances_revision: "pass",
+          material_improvement: "pass",
+        },
+      });
+      const report = full(said, e, platform, true);
+      expect(report.criteria.no_degradation, answer).toBe("fail");
+      expect(verdictOf(report), answer).toBe("fail");
+      // Without the flag the same finding only lowers a pass.
+      expect(full(said, e, platform).criteria.no_degradation, answer).toBe(
+        answer === "pass" ? "unknown" : answer,
+      );
+    }
+    // The check says what to do instead, once.
+    const lines = findingLines(full(allPass, e, platform, true));
+    expect(lines.filter((l) => l === ORIGINAL_CONTENT_PARAGRAPH)).toHaveLength(1);
+    // A review that gave no valid answer stays an invalid review: the fail lowers an answer, it
+    // does not stand in for one.
+    for (const invalid of ["maybe", undefined, 3]) {
+      const said = reviewOutput({
+        criteria: {
+          no_degradation: invalid,
+          advances_revision: "pass",
+          material_improvement: "pass",
+        },
+      });
+      expect(
+        reportErrorOf(() => full(said, e, platform, true)),
+        String(invalid),
+      ).toBe("bad_criteria");
+    }
+    // A screen report carries no content facts: the flag is refused like a platform finding.
+    const screenUsage = { screen: USAGE.screen, review: null };
+    expect(reportErrorOf(() => assembleReport(REJECT, null, e, screenUsage, [], true))).toBe(
+      "bad_stage",
+    );
+    // The flag with no finding that says why is the script's own error, never the model's.
+    for (const without of [
+      [],
+      platformFindings(PART_A[1]?.[1] as ChangeSummary),
+      platformFindings(EMPTY_SUMMARY, originalOf({ ...R, ...U })),
+    ]) {
+      expect(reportErrorOf(() => full(allPass, e, without, true))).toBe(
+        "not a PrReviewReportError",
+      );
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
 // The change summary in the prompt: its facts, its block and the groups' column
 // ---------------------------------------------------------------------------------------------
 
@@ -6250,6 +6967,571 @@ describe("the change summary in the prompt", () => {
   }, 30_000);
 });
 
+// ---------------------------------------------------------------------------------------------
+// The original content in the prompt: the `original_content` facts and the paragraph about them
+// ---------------------------------------------------------------------------------------------
+
+/** The keys of the block, in the order the model reads them. */
+const ORIGINAL_BLOCK_KEYS = [
+  "abandoned",
+  "anchor",
+  "readme",
+  "readme_original_lines_altered",
+  "readme_lines_put_inside_original_paragraphs",
+  "readme_minor_edits",
+  "readme_later_text_altered",
+  "readme_new_lines",
+  "readme_line_endings_changed",
+  "readme_final_newline_added",
+  "changes",
+  "changes_lines_altered",
+  "author_fields",
+  "author_fields_altered",
+  "author_fields_edited_slightly",
+  "author_fields_added_or_grown",
+  "participant_values_altered",
+  "recordings_replaced",
+  "recordings_moved",
+  "recordings_not_read",
+] as const;
+
+/** The block of a pull request that changed nothing of what the original authors published. */
+const UNCHANGED_BLOCK: OriginalContentBlock = {
+  abandoned: false,
+  anchor: "merge_base",
+  readme: "unchanged",
+  readme_original_lines_altered: 0,
+  readme_lines_put_inside_original_paragraphs: 0,
+  readme_minor_edits: 0,
+  readme_later_text_altered: 0,
+  readme_new_lines: 0,
+  readme_line_endings_changed: false,
+  readme_final_newline_added: false,
+  changes: "unchanged",
+  changes_lines_altered: 0,
+  author_fields: "unchanged",
+  author_fields_altered: [],
+  author_fields_edited_slightly: [],
+  author_fields_added_or_grown: [],
+  participant_values_altered: 0,
+  recordings_replaced: 0,
+  recordings_moved: 0,
+  recordings_not_read: 0,
+};
+
+/** The block of an abandoned pass: nothing compared, and no number a claim that nothing changed. */
+const ABANDONED_BLOCK: OriginalContentBlock = {
+  ...UNCHANGED_BLOCK,
+  abandoned: true,
+  readme: "not_decided",
+  changes: "not_decided",
+  author_fields: "not_decided",
+  participant_values_altered: null,
+};
+
+/** Every string a block may hold: the words of its parts, the anchor and the nine key names. */
+const BLOCK_WORDS: ReadonlySet<string> = new Set([
+  "first_version_tag",
+  "merge_base",
+  "unchanged",
+  "unpublished",
+  "kept",
+  "altered",
+  "not_decided",
+  "compared",
+]);
+
+/** What a block holds of each key, by the type the prompt promises. */
+function blockShape(block: Record<string, unknown>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(block).map(([key, value]) => [
+      key,
+      Array.isArray(value) ? "array" : value === null ? "null" : typeof value,
+    ]),
+  );
+}
+
+/** The messages for facts read from real git, with the version tags not listed. */
+function originalPrompt(r: Repo, options: ContentOptions = { versionTags: false }) {
+  const listing = gatherListing(r.dir, r.base, r.head);
+  return reviewPrompt({ ...listing, ...gatherContent(r.dir, listing, options) });
+}
+
+/** The `original_content` facts the review is sent for a pull request read from real git. */
+const sentBlock = (r: Repo, options?: ContentOptions) =>
+  originalPrompt(r, options).facts.original_content as OriginalContentBlock;
+
+describe("the original content in the prompt", () => {
+  const OPEN = [
+    "# Resting EEG",
+    "",
+    "Two volunteers rested.",
+    "",
+    "Each recording lasted ten minutes.",
+    "",
+    "Data were recorded at 500 Hz.",
+    "",
+  ].join("\n");
+  const SECTION = "\n## Added\n\nA new section.\n";
+  const annexKey = (n: number) => `SHA256E-s${100 + n}--${String(n).padStart(8, "0")}.edf`;
+  const recordingOf = (s: string) => `${s}/eeg/${s}_task-rest_eeg.edf`;
+  const annexLink = (dir: string, s: string, n: number) => {
+    const path = join(dir, recordingOf(s));
+    mkdirSync(dirname(path), { recursive: true });
+    symlinkSync(`../../.git/annex/objects/Xj/9P/${annexKey(n)}/${annexKey(n)}`, path);
+  };
+
+  test("a pull request that changed nothing the authors published says so in every part", () => {
+    const r = changed("ocp-unchanged", { "notes.txt": "a\n" }, (dir) =>
+      write(dir, "notes.txt", "a\nb\n"),
+    );
+    expect(sentBlock(r)).toEqual(UNCHANGED_BLOCK);
+  });
+
+  test("text added and information-only edits are kept: new lines, a final newline, a grown list, a pointer moved", () => {
+    const base = {
+      "README.md": OPEN.trimEnd(),
+      CHANGES: "1.0.0 2026-01-01\n - Initial release\n",
+      "dataset_description.json": desc("1.0.0", {
+        Authors: ["Ada Lovelace"],
+        Funding: ["Grant 12345"],
+      }),
+    };
+    const dir = join(root, "ocp-kept");
+    mkdirSync(dir, { recursive: true });
+    git(dir, "init", "-q", "-b", "main");
+    for (const [rel, text] of Object.entries(base)) write(dir, rel, text);
+    annexLink(dir, "sub-01", 1);
+    git(dir, "add", "-A");
+    git(dir, "commit", "-q", "-m", "initial");
+    const r = branch(dir, () => {
+      write(dir, "README.md", `${OPEN.trimEnd()}\n${SECTION}`);
+      write(
+        dir,
+        "CHANGES",
+        "1.1.0 2026-02-01\n - Fixed a channel\n\n1.0.0 2026-01-01\n - Initial release\n",
+      );
+      write(
+        dir,
+        "dataset_description.json",
+        desc("1.1.0", {
+          Authors: ["Ada Lovelace", "Alan Turing"],
+          Funding: ["Grant 12346"],
+          License: "CC0",
+        }),
+      );
+      unlinkSync(join(dir, recordingOf("sub-01")));
+      annexLink(dir, "sub-02", 1);
+    });
+    expect(sentBlock(r)).toEqual({
+      ...UNCHANGED_BLOCK,
+      readme: "kept",
+      readme_new_lines: 2,
+      readme_final_newline_added: true,
+      changes: "kept",
+      author_fields: "compared",
+      author_fields_edited_slightly: ["Funding"],
+      author_fields_added_or_grown: ["Authors", "License"],
+      recordings_moved: 1,
+    });
+  });
+
+  test("every kind of alteration is counted in its own key", () => {
+    const base = {
+      "README.md": OPEN,
+      CHANGES: "1.0.0 2026-01-01\n - Initial release\n",
+      "dataset_description.json": desc("1.0.0", {
+        Authors: ["Ada Lovelace"],
+        Funding: ["Grant 12345"],
+      }),
+      "participants.tsv": "participant_id\tsex\nsub-01\tM\nsub-02\tF\n",
+    };
+    const dir = join(root, "ocp-altered");
+    mkdirSync(dir, { recursive: true });
+    git(dir, "init", "-q", "-b", "main");
+    for (const [rel, text] of Object.entries(base)) write(dir, rel, text);
+    for (const [s, n] of [
+      ["sub-01", 1],
+      ["sub-02", 2],
+      ["sub-03", 3],
+    ] as const) {
+      annexLink(dir, s, n);
+    }
+    git(dir, "add", "-A");
+    git(dir, "commit", "-q", "-m", "initial");
+    const r = branch(dir, () => {
+      // One original line removed, one reworded by a typo fix, and two new lines.
+      write(
+        dir,
+        "README.md",
+        `${OPEN.replace("\nEach recording lasted ten minutes.\n", "").replace("volunteers", "volunters")}${SECTION}`,
+      );
+      write(dir, "CHANGES", "1.0.0 2026-01-01\n - First release\n");
+      write(
+        dir,
+        "dataset_description.json",
+        desc("1.1.0", {
+          Name: "Another dataset",
+          Authors: ["Ada Lovelace", "Alan Turing"],
+          Funding: ["Grant 12346"],
+        }),
+      );
+      write(dir, "participants.tsv", "participant_id\tsex\nsub-01\tF\nsub-02\tF\n");
+      // A key replaced, an annexed file made a git file, and a pointer moved with its key.
+      unlinkSync(join(dir, recordingOf("sub-01")));
+      annexLink(dir, "sub-01", 11);
+      unlinkSync(join(dir, recordingOf("sub-02")));
+      write(dir, recordingOf("sub-02"), "the recording itself\n");
+      unlinkSync(join(dir, recordingOf("sub-03")));
+      annexLink(dir, "sub-04", 3);
+    });
+    expect(sentBlock(r)).toEqual({
+      ...UNCHANGED_BLOCK,
+      readme: "altered",
+      readme_original_lines_altered: 1,
+      readme_minor_edits: 1,
+      readme_new_lines: 2,
+      changes: "altered",
+      changes_lines_altered: 1,
+      author_fields: "compared",
+      author_fields_altered: ["Name"],
+      author_fields_edited_slightly: ["Funding"],
+      author_fields_added_or_grown: ["Authors"],
+      participant_values_altered: 1,
+      recordings_replaced: 2,
+      recordings_moved: 1,
+    });
+  });
+
+  test("a part the platform could not compare is not_decided, and its numbers are 0 or null", () => {
+    const r = changed(
+      "ocp-refused",
+      {
+        "README.md": OPEN,
+        CHANGES: "1.0.0 2026-01-01\n - Initial release\n",
+        "dataset_description.json": desc("1.0.0"),
+        "participants.tsv": "participant_id\tsex\nsub-01\tM\n",
+      },
+      (dir) => {
+        // A README with a NUL byte is binary, a description that is not JSON cannot be compared,
+        // and a participants table with a ragged row has no values to count.
+        write(dir, "README.md", Buffer.from(`${OPEN}\0`));
+        write(dir, "dataset_description.json", "{ not json");
+        write(dir, "participants.tsv", "participant_id\tsex\nsub-01\tM\textra\n");
+      },
+    );
+    expect(sentBlock(r)).toEqual({
+      ...UNCHANGED_BLOCK,
+      readme: "not_decided",
+      author_fields: "not_decided",
+      participant_values_altered: null,
+    });
+  });
+
+  test("an abandoned pass holds no number, read from git or handed to the builder", () => {
+    const r = changed("ocp-abandoned", { "README.md": OPEN }, (dir) =>
+      write(dir, "README.md", OPEN.replace("Two volunteers rested.\n", "")),
+    );
+    // The clock is past the line when Part B would start.
+    const read = sentBlock(r, { versionTags: false, now: () => Number.POSITIVE_INFINITY });
+    expect(read).toEqual(ABANDONED_BLOCK);
+    // Facts an abandoned pass cannot have had are not read, whatever they hold.
+    const loud = originalOf({
+      abandoned: true,
+      anchorLookup: "first_version_tag",
+      readme: compared({ protectedAltered: 3, anchor: "first_version_tag", minorEdits: 2 }),
+      changes: changesCompared({ protectedAltered: 1 }),
+      authorFields: fieldsOf({ altered: ["Name"], minor: ["Funding"], added: ["License"] }),
+      participantValues: 9,
+      recordings: { replaced: 2, typeChanged: 1, moved: 4, unread: 5 },
+    });
+    expect(originalContentBlock(loud)).toEqual(ABANDONED_BLOCK);
+    expect(originalContentBlock(ORIGINAL_ABANDONED)).toEqual(ABANDONED_BLOCK);
+  });
+
+  test("facts that are not there make no block", () => {
+    expect(originalContentBlock(null)).toBeNull();
+  });
+
+  test("the keys, their order and their types are the same for every kind of input", () => {
+    const refused = changed("ocp-shape", { "README.md": OPEN }, (dir) =>
+      write(dir, "README.md", Buffer.from(`${OPEN}\0`)),
+    );
+    for (const block of [
+      UNCHANGED_BLOCK,
+      ABANDONED_BLOCK,
+      sentBlock(refused),
+      originalContentBlock(originalOf({ readme: compared({ protectedAltered: 2 }) })),
+      originalContentBlock(originalOf({ authorFields: fieldsOf({ altered: ["Name"] }) })),
+    ] as OriginalContentBlock[]) {
+      expect(Object.keys(block)).toEqual([...ORIGINAL_BLOCK_KEYS]);
+    }
+    const shapes = (b: OriginalContentBlock) => blockShape(b as unknown as Record<string, unknown>);
+    const full = shapes(UNCHANGED_BLOCK);
+    expect(full).toEqual({
+      abandoned: "boolean",
+      anchor: "string",
+      readme: "string",
+      readme_original_lines_altered: "number",
+      readme_lines_put_inside_original_paragraphs: "number",
+      readme_minor_edits: "number",
+      readme_later_text_altered: "number",
+      readme_new_lines: "number",
+      readme_line_endings_changed: "boolean",
+      readme_final_newline_added: "boolean",
+      changes: "string",
+      changes_lines_altered: "number",
+      author_fields: "string",
+      author_fields_altered: "array",
+      author_fields_edited_slightly: "array",
+      author_fields_added_or_grown: "array",
+      participant_values_altered: "number",
+      recordings_replaced: "number",
+      recordings_moved: "number",
+      recordings_not_read: "number",
+    });
+    // Only the participant count may be something else, and only null.
+    expect(shapes(ABANDONED_BLOCK)).toEqual({ ...full, participant_values_altered: "null" });
+  });
+
+  test("a part is kept, altered or not decided by the one rule the verdict uses", () => {
+    const word = (over: Partial<OriginalContentFacts>) => originalContentBlock(originalOf(over));
+    // Minor edits, later text, new lines joined to a paragraph and the tripwires do not alter.
+    expect(word({ readme: compared({ minorEdits: 2, preserved: false }) })?.readme).toBe("kept");
+    expect(word({ readme: compared({ joinedInsertedRuns: 3, laterAltered: 2 }) })?.readme).toBe(
+      "kept",
+    );
+    // A run of new lines inside an original paragraph alters the README and not CHANGES.
+    const inside = word({
+      readme: compared({ insertedInsideParagraph: 2 }),
+      changes: changesCompared({ insertedInsideParagraph: 2 }),
+    });
+    expect([inside?.readme, inside?.changes]).toEqual(["altered", "kept"]);
+    expect(inside?.readme_lines_put_inside_original_paragraphs).toBe(2);
+    expect(inside?.readme_original_lines_altered).toBe(0);
+    // A line moved counts as altered, with the lines it moved.
+    const moved = word({
+      changes: changesCompared({ moved: true, movedLines: 3, protectedAltered: 1 }),
+    });
+    expect([moved?.changes, moved?.changes_lines_altered]).toEqual(["altered", 4]);
+    // A document the platform refused is not decided, whatever its facts would have said.
+    for (const refusal of ["binary", "edit_distance_cap", "unreadable"] as const) {
+      const refused = word({
+        readme: { status: "refused", refusal },
+        changes: { status: "refused", refusal },
+      });
+      expect([refused?.readme, refused?.changes]).toEqual(["not_decided", "not_decided"]);
+      expect(refused?.readme_new_lines).toBe(0);
+    }
+  });
+
+  test("new README lines are the inserted ones that are not a minor edit's new text, never below 0", () => {
+    const lines = (over: Partial<ProseFacts>) =>
+      originalContentBlock(originalOf({ readme: compared(over) }))?.readme_new_lines;
+    expect(lines({ insertedLines: 5, minorEdits: 2 })).toBe(3);
+    expect(lines({ insertedLines: 1, minorEdits: 3 })).toBe(0);
+    expect(lines({ insertedLines: 0, minorEdits: 0 })).toBe(0);
+  });
+
+  test("the README is compared with a version tag only when that is what protected its lines", () => {
+    const anchor = (o: OriginalContentFacts) => originalContentBlock(o)?.anchor;
+    expect(anchor(originalOf({ readme: compared({ anchor: "first_version_tag" }) }))).toBe(
+      "first_version_tag",
+    );
+    expect(anchor(originalOf({ readme: compared({ anchor: "merge_base" }) }))).toBe("merge_base");
+    // A tag was found and its README could not be read: every merge-base line protected the README.
+    expect(
+      anchor(
+        originalOf({
+          anchorLookup: "first_version_tag",
+          readme: compared({ anchor: "merge_base" }),
+        }),
+      ),
+    ).toBe("merge_base");
+    // A README that was not compared was not anchored to anything.
+    expect(anchor(originalOf({ anchorLookup: "first_version_tag" }))).toBe("merge_base");
+    expect(anchor(originalOf({ readme: { status: "refused", refusal: "binary" } }))).toBe(
+      "merge_base",
+    );
+  });
+
+  test("the author keys come in the closed list's order, once each, whichever list held them", () => {
+    const fields = (over: Partial<AuthorFieldFacts>) =>
+      originalContentBlock(originalOf({ authorFields: fieldsOf(over) }));
+    const altered = fields({ altered: ["License", "DatasetDOI"], removed: ["Name", "License"] });
+    expect(altered?.author_fields_altered).toEqual(["Name", "License", "DatasetDOI"]);
+    const grown = fields({
+      added: ["License"],
+      grown: ["Authors", "Funding"],
+      minor: ["EthicsApprovals"],
+    });
+    expect(grown?.author_fields_added_or_grown).toEqual(["Authors", "License", "Funding"]);
+    expect(grown?.author_fields_edited_slightly).toEqual(["EthicsApprovals"]);
+    // Every key a list can hold is one of the nine names.
+    const all = fields({ altered: [...AUTHOR_OWNED_KEYS] });
+    expect(all?.author_fields_altered).toEqual([...AUTHOR_OWNED_KEYS]);
+    // A description that could not be read has no field to name, and the part is not decided.
+    const unparsed = fields({ unparsed: true, altered: ["Name"] });
+    expect([unparsed?.author_fields, unparsed?.author_fields_altered]).toEqual(["not_decided", []]);
+  });
+
+  test("a string in the block is one of the closed words or a key name, whatever the pull request wrote", () => {
+    const secret = "ZEBRA-RECORDING-LINE";
+    const r = changed(
+      "ocp-hostile",
+      {
+        "README.md": `# ${secret}\n\n${secret} keeps one line.\n\nA second paragraph.\n`,
+        "dataset_description.json": desc("1.0.0", { Name: secret, Authors: [secret] }),
+        CHANGES: `1.0.0 2026-01-01\n - ${secret}\n`,
+      },
+      (dir) => {
+        write(dir, "README.md", "# Another\n\nA second paragraph.\n\n## Added\n\nNew.\n");
+        write(dir, "dataset_description.json", desc("1.1.0", { Name: "Other", Authors: [] }));
+        write(dir, "CHANGES", "1.1.0 2026-02-01\n - New\n");
+      },
+    );
+    const { user, facts, outside } = originalPrompt(r);
+    const block = facts.original_content as OriginalContentBlock;
+    // The text did reach the model, in the diffs and the fences, so the checks below are a test.
+    expect(user).toContain(secret);
+    expect(block.readme).toBe("altered");
+    expect(block.author_fields_altered).toEqual(["Name", "Authors"]);
+    expect(JSON.stringify(facts)).not.toContain(secret);
+    expect(outside).not.toContain(secret);
+    const strings: string[] = [];
+    for (const value of Object.values(block)) {
+      if (typeof value === "string") strings.push(value);
+      if (Array.isArray(value)) {
+        for (const key of value) expect(AUTHOR_OWNED_KEYS as readonly string[]).toContain(key);
+      }
+    }
+    expect(strings.length).toBe(4);
+    for (const s of strings) expect(BLOCK_WORDS.has(s), s).toBe(true);
+  });
+
+  test("the block sits in the trusted facts immediately before the change summary, which stays last", () => {
+    const r = changed("ocp-order", { "notes.txt": "a\n" }, (dir) => write(dir, "notes.txt", "b\n"));
+    const { facts, user } = originalPrompt(r);
+    expect(Object.keys(facts)).toEqual([
+      "files_changed",
+      "files_with_content_shown",
+      "change_list_cut_short",
+      "changed_metadata_not_shown_in_full",
+      "cosmetic_only_files",
+      "changelog_file_changed",
+      "changelog_entry",
+      "groups_omitted_files",
+      "version_before",
+      "version_after",
+      "subjects_before",
+      "subjects_after",
+      "opened_from_a_fork",
+      "changed_per_area",
+      "original_content",
+      "change_summary",
+    ]);
+    expect(Object.keys(facts).at(-1)).toBe("change_summary");
+    expect(Object.keys(facts).at(-2)).toBe("original_content");
+    expect(user.indexOf('"original_content"')).toBeLessThan(user.indexOf('"change_summary"'));
+    expect(user.match(/"original_content"/g)).toHaveLength(1);
+    // Four fences and nothing else is new: the block is the platform's, outside every fence.
+    expect(originalPrompt(r).opens).toBe(4);
+  });
+
+  test("a README or CHANGES of a dataset never published is unpublished, with every count of it 0", () => {
+    const block = originalContentBlock(
+      originalOf({
+        anchorLookup: "no_tag",
+        readme: { status: "unpublished" },
+        changes: { status: "unpublished" },
+        authorFields: fieldsOf({ altered: ["Name"], grown: ["Authors"] }),
+        participantValues: 2,
+        recordings: { replaced: 1, typeChanged: 0, moved: 3, unread: 0 },
+      }),
+    );
+    expect(block).toEqual({
+      abandoned: false,
+      anchor: "merge_base",
+      readme: "unpublished",
+      readme_original_lines_altered: 0,
+      readme_lines_put_inside_original_paragraphs: 0,
+      readme_minor_edits: 0,
+      readme_later_text_altered: 0,
+      readme_new_lines: 0,
+      readme_line_endings_changed: false,
+      readme_final_newline_added: false,
+      changes: "unpublished",
+      changes_lines_altered: 0,
+      // What is not text is compared and counted as on any dataset.
+      author_fields: "compared",
+      author_fields_altered: ["Name"],
+      author_fields_edited_slightly: [],
+      author_fields_added_or_grown: ["Authors"],
+      participant_values_altered: 2,
+      recordings_replaced: 1,
+      recordings_moved: 3,
+      recordings_not_read: 0,
+    });
+    // An unchanged document of the same dataset keeps its own word.
+    expect(
+      originalContentBlock(
+        originalOf({ anchorLookup: "no_tag", changes: { status: "unpublished" } }),
+      ).readme,
+    ).toBe("unchanged");
+  });
+
+  test("the system prompt has one paragraph about it, after the change summary and before the output rule", () => {
+    const at = (text: string) => {
+      const i = REVIEW_SYSTEM_PROMPT.indexOf(text);
+      expect(i, text).toBeGreaterThanOrEqual(0);
+      return i;
+    };
+    expect(at("A summary marked abandoned was not used.")).toBeLessThan(
+      at("\n\nThe original authors' content. "),
+    );
+    expect(at("\n\nThe original authors' content. ")).toBeLessThan(
+      at("\n\nOutput only the JSON object"),
+    );
+    expect(REVIEW_SYSTEM_PROMPT.split("The original authors' content.")).toHaveLength(2);
+    const paragraph =
+      REVIEW_SYSTEM_PROMPT.split("\n\n").find((p) =>
+        p.startsWith("The original authors' content."),
+      ) ?? "";
+    expect(paragraph.length).toBeGreaterThan(600);
+    expect(paragraph.length).toBeLessThanOrEqual(1_600);
+    for (const phrase of [
+      "The original_content facts compare this pull request with what the original authors published:",
+      "the README with the README at the dataset's first version tag when anchor is first_version_tag, otherwise every README line at the merge base;",
+      "and, with the merge base, CHANGES, the author fields of dataset_description.json (",
+      "the participant values and the data files.",
+      "A contributor may add to this content but not alter it.",
+      "When readme or changes is unpublished, the dataset has no first version tag, so nothing has been published to protect and the README or CHANGES changes are yours to judge from the diffs as usual.",
+      "The platform has already acted on every alteration counted there and on every part marked not_decided, so do not repeat those as findings.",
+      "Minor edits of original README lines, edits of README text added after the anchor and author fields edited slightly are yours to judge from the diffs:",
+      "they are allowed when they are straightforward corrections that the CHANGES entry describes.",
+      "When readme is kept and readme_line_endings_changed or readme_final_newline_added is true, lines a README diff shows as removed are no alteration,",
+      "except lines the diff shows changed in other ways, such as minor edits or edits of later text, which are yours to judge.",
+      "The participant values counted are the change summary's classes for participants.tsv and participants.json.",
+      "When abandoned is true the comparison was not made.",
+    ]) {
+      expect(paragraph, phrase).toContain(phrase);
+    }
+    // The nine fields it names are the nine the platform compares.
+    for (const key of AUTHOR_OWNED_KEYS) expect(paragraph).toContain(key);
+    // Every key or word it names from the facts is one the block carries.
+    const named = (paragraph.match(/\b[a-z]+(?:_[a-z]+)+\b/g) ?? []).filter(
+      (w) => w !== "dataset_description" && w !== "original_content",
+    );
+    expect(paragraph).toContain("original_content");
+    expect(named.length).toBeGreaterThan(3);
+    for (const w of named) {
+      expect((ORIGINAL_BLOCK_KEYS as readonly string[]).includes(w) || BLOCK_WORDS.has(w), w).toBe(
+        true,
+      );
+    }
+  });
+});
+
 describe("the evidence observer", () => {
   /**
    * A release that removes a row and a key in sub-01, and changes a cell and a value in sub-02,
@@ -6319,6 +7601,28 @@ describe("the evidence observer", () => {
       keysMoved: 0,
       valuesEmptied: 0,
       platformFindings: 2,
+      // The release touches the description (the version) and CHANGES (the entry) and nothing the
+      // original authors published: Part B compared both and found nothing.
+      originalAbandoned: false,
+      anchorFromTag: false,
+      readmeAlteredLines: 0,
+      readmeInsideParagraph: 0,
+      readmeMinorEdits: 0,
+      readmeLaterAltered: 0,
+      readmeNotDecided: false,
+      changesAlteredLines: 0,
+      changesNotDecided: false,
+      authorFieldsAltered: 0,
+      authorFieldsEdited: 0,
+      authorFieldsNotDecided: false,
+      participantValuesAltered: 0,
+      participantsNotDecided: false,
+      recordingsReplaced: 0,
+      recordingsMoved: 0,
+      recordingsUnread: 0,
+      originalUndecided: false,
+      originalFindings: 0,
+      originalFails: 0,
       listingMs: expect.any(Number),
       contentMs: expect.any(Number),
     });
@@ -6375,6 +7679,31 @@ describe("the evidence observer", () => {
       },
       text: "x".repeat(151),
     };
+    // Part B: every count a different number too, from facts built by hand. The README alters 5 lines
+    // and moves 8, CHANGES alters 7 and moves 9, three author keys are altered or removed, five are
+    // edited slightly and two are added or grown.
+    const partB = originalOf({
+      anchorLookup: "first_version_tag",
+      readme: compared({
+        anchor: "first_version_tag",
+        protectedAltered: 5,
+        moved: true,
+        movedLines: 8,
+        insertedInsideParagraph: 17,
+        minorEdits: 19,
+        laterAltered: 23,
+      }),
+      changes: changesCompared({ protectedAltered: 7, moved: true, movedLines: 9 }),
+      authorFields: fieldsOf({
+        altered: ["Name"],
+        removed: ["Authors", "Funding"],
+        minor: ["License", "DatasetDOI", "EthicsApprovals", "HowToAcknowledge", "Acknowledgements"],
+        added: ["ReferencesAndLinks"],
+        grown: ["Authors"],
+      }),
+      participantValues: 181,
+      recordings: { replaced: 22, typeChanged: 6, moved: 191, unread: 193 },
+    });
     const facts = {
       ...real,
       groups: [29, 31].map((files) => ({ ...group, files })),
@@ -6382,6 +7711,7 @@ describe("the evidence observer", () => {
       cosmeticOnlyFiles: 41,
       unreadFiles: 157,
       summary,
+      original: partB,
     };
     const evidence = {
       ...buildEvidence(real, NO_TEXT_PROBLEMS),
@@ -6425,15 +7755,113 @@ describe("the evidence observer", () => {
       valuesEmptied: 149,
       // One finding for the rows and columns, one for the keys.
       platformFindings: 2,
+      originalAbandoned: false,
+      anchorFromTag: true,
+      readmeAlteredLines: 5 + 8,
+      readmeInsideParagraph: 17,
+      readmeMinorEdits: 19,
+      readmeLaterAltered: 23,
+      readmeNotDecided: false,
+      changesAlteredLines: 7 + 9,
+      changesNotDecided: false,
+      authorFieldsAltered: 3,
+      authorFieldsEdited: 5,
+      authorFieldsNotDecided: false,
+      participantValuesAltered: 181,
+      participantsNotDecided: false,
+      recordingsReplaced: 22 + 6,
+      recordingsMoved: 191,
+      recordingsUnread: 193,
+      originalUndecided: true,
+      // Part A fills two of the three places; the text and the fields share the one left, and the
+      // fail is the platform's whatever the review says.
+      originalFindings: 1,
+      originalFails: 1,
       listingMs: 163,
       contentMs: 167,
     });
     expect(stat(true, false, false)).toEqual({ ...stated, readIncomplete: true, truncated: false });
     expect(stat(false, false, true)).toEqual({ ...stated, listCut: true, truncated: false });
-    // The fixture does its job only while no two counts are alike.
-    const counts = Object.values(stated).filter((v) => typeof v === "number");
+    // The fixture does its job only while no two counts are alike, the two that are 0 or 1 by their
+    // nature aside.
+    const counts = Object.values(stated).filter((v) => typeof v === "number" && v > 1);
     expect(new Set(counts).size).toBe(counts.length);
-    expect(counts).toHaveLength(23);
+    expect(counts).toHaveLength(34);
+  });
+
+  test("each part of Part B that is not decided is told apart in the stats", () => {
+    const real = gatherGitFacts(stats().dir, stats().base, stats().head);
+    const evidence = buildEvidence(real, NO_TEXT_PROBLEMS);
+    const of = (original: OriginalContentFacts) =>
+      evidenceStats({ ...real, original }, evidence, { listingMs: 1, contentMs: 2 });
+    const flags = (s: EvidenceStats) => ({
+      originalAbandoned: s.originalAbandoned,
+      readmeNotDecided: s.readmeNotDecided,
+      changesNotDecided: s.changesNotDecided,
+      authorFieldsNotDecided: s.authorFieldsNotDecided,
+      participantsNotDecided: s.participantsNotDecided,
+      originalUndecided: s.originalUndecided,
+    });
+    const none = {
+      originalAbandoned: false,
+      readmeNotDecided: false,
+      changesNotDecided: false,
+      authorFieldsNotDecided: false,
+      participantsNotDecided: false,
+      originalUndecided: false,
+    };
+    expect(flags(of(originalOf()))).toEqual(none);
+    const refused = { status: "refused", refusal: "binary" } as const;
+    expect(flags(of(originalOf({ readme: refused })))).toEqual({
+      ...none,
+      readmeNotDecided: true,
+      originalUndecided: true,
+    });
+    expect(flags(of(originalOf({ changes: refused })))).toEqual({
+      ...none,
+      changesNotDecided: true,
+      originalUndecided: true,
+    });
+    expect(flags(of(originalOf({ authorFields: fieldsOf({ unparsed: true }) })))).toEqual({
+      ...none,
+      authorFieldsNotDecided: true,
+      originalUndecided: true,
+    });
+    expect(flags(of(originalOf({ participantValues: null })))).toEqual({
+      ...none,
+      participantsNotDecided: true,
+      originalUndecided: true,
+    });
+    // Annexed files that could not be read are undecided without a part of their own.
+    expect(
+      flags(of(originalOf({ recordings: { replaced: 0, typeChanged: 0, moved: 0, unread: 1 } }))),
+    ).toEqual({ ...none, originalUndecided: true });
+    // Markup that can hide text is undecided too, and no part is named for it.
+    expect(flags(of(originalOf({ readme: compared({ hidingMarkupInserted: 1 }) })))).toEqual({
+      ...none,
+      originalUndecided: true,
+    });
+    // An abandoned pass: every part is not decided, and the pass is told apart from them.
+    expect(flags(of(ORIGINAL_ABANDONED))).toEqual({
+      originalAbandoned: true,
+      readmeNotDecided: true,
+      changesNotDecided: true,
+      authorFieldsNotDecided: true,
+      participantsNotDecided: true,
+      originalUndecided: false,
+    });
+    expect(of(ORIGINAL_ABANDONED)).toMatchObject({ originalFindings: 1, originalFails: 0 });
+    // The fail is the verdict's: an abandoned pass is never one, an alteration always is.
+    expect(of(originalOf({ participantValues: 1 }))).toMatchObject({
+      originalFindings: 1,
+      originalFails: 1,
+    });
+    expect(
+      of(originalOf({ recordings: { replaced: 1, typeChanged: 0, moved: 0, unread: 0 } })),
+    ).toMatchObject({
+      originalFindings: 1,
+      originalFails: 0,
+    });
   });
 
   test("unreadFiles counts exactly the wanted files that are not covered, and readIncomplete is unreadFiles > 0", () => {
@@ -6542,48 +7970,49 @@ describe("the evidence observer", () => {
   });
 });
 
+/**
+ * A clone made as the review job makes one: a bare origin that allows blob-less fetches, a
+ * promisor remote, and one fetch of the base and the head with `--filter=blob:none`, no checkout.
+ */
+function blobLessClone(name: string, origin: Repo): string {
+  const bare = join(root, `${name}-origin.git`);
+  execFileSync("git", ["clone", "-q", "--bare", origin.dir, bare], { env: GIT_ENV });
+  git(bare, "config", "uploadpack.allowFilter", "true");
+  git(bare, "config", "uploadpack.allowAnySHA1InWant", "true");
+  const clone = join(root, name);
+  mkdirSync(clone, { recursive: true });
+  git(clone, "init", "-q", "-b", "main");
+  git(clone, "config", "extensions.partialClone", "origin");
+  git(clone, "remote", "add", "origin", `file://${bare}`);
+  git(
+    clone,
+    "fetch",
+    "-q",
+    "--no-tags",
+    "--filter=blob:none",
+    "origin",
+    "+refs/heads/main:refs/remotes/origin/main",
+    "+refs/heads/contrib:refs/remotes/pr/head",
+  );
+  return clone;
+}
+
+/** Whether the clone holds the object, asked so that asking cannot fetch it. */
+function holds(clone: string, oid: string): boolean {
+  try {
+    execFileSync("git", ["-C", clone, "cat-file", "-e", oid], {
+      env: { ...GIT_ENV, GIT_NO_LAZY_FETCH: "1" },
+      stdio: "ignore",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const NO_LAZY_FETCH = { GIT_NO_LAZY_FETCH: "1" };
+
 describe("the content pass on the job's blob-less clone", () => {
-  /**
-   * A clone made as the review job makes one: a bare origin that allows blob-less fetches, a
-   * promisor remote, and one fetch of the base and the head with `--filter=blob:none`, no checkout.
-   */
-  function blobLessClone(name: string, origin: Repo): string {
-    const bare = join(root, `${name}-origin.git`);
-    execFileSync("git", ["clone", "-q", "--bare", origin.dir, bare], { env: GIT_ENV });
-    git(bare, "config", "uploadpack.allowFilter", "true");
-    git(bare, "config", "uploadpack.allowAnySHA1InWant", "true");
-    const clone = join(root, name);
-    mkdirSync(clone, { recursive: true });
-    git(clone, "init", "-q", "-b", "main");
-    git(clone, "config", "extensions.partialClone", "origin");
-    git(clone, "remote", "add", "origin", `file://${bare}`);
-    git(
-      clone,
-      "fetch",
-      "-q",
-      "--no-tags",
-      "--filter=blob:none",
-      "origin",
-      "+refs/heads/main:refs/remotes/origin/main",
-      "+refs/heads/contrib:refs/remotes/pr/head",
-    );
-    return clone;
-  }
-
-  /** Whether the clone holds the object, asked so that asking cannot fetch it. */
-  function holds(clone: string, oid: string): boolean {
-    try {
-      execFileSync("git", ["-C", clone, "cat-file", "-e", oid], {
-        env: { ...GIT_ENV, GIT_NO_LAZY_FETCH: "1" },
-        stdio: "ignore",
-      });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  const NO_LAZY_FETCH = { GIT_NO_LAZY_FETCH: "1" };
   /** Twenty tables of the bulk relabel and one sidecar reindented, which is cosmetic. */
   const origin = () =>
     bulkRelabel(`clone-source-${Math.random().toString(36).slice(2)}`, {
@@ -6594,6 +8023,8 @@ describe("the content pass on the job's blob-less clone", () => {
 
   test("one prefetch brings every blob: the cosmetic proof and the summary read them with no fetch of their own", () => {
     const r = origin();
+    // A published dataset: its first version is the merge base, whose README Part B already reads.
+    git(r.dir, "tag", "-a", "v1.0.0", "-m", "v1.0.0", r.base);
     const clone = blobLessClone("clone-lazy", r);
     const before = git(r.dir, "rev-parse", `${r.base}:${bulkTable(1)}`);
     const after = git(r.dir, "rev-parse", `${r.head}:${bulkTable(1)}`);
@@ -6623,12 +8054,26 @@ describe("the content pass on the job's blob-less clone", () => {
     );
     expect(calls.filter((c) => c.startsWith("diff --numstat"))).toHaveLength(1);
     expect(calls.filter((c) => c.startsWith("diff --raw"))).toHaveLength(1);
-    // Two processes for the cosmetic proofs, two for the summary's pool: no more, no fewer.
+    // Two processes for the cosmetic proofs, two for the summary's pool, and two for Part B's one
+    // batch: no more, no fewer.
     expect(calls.filter((c) => c.startsWith("cat-file"))).toEqual([
       "cat-file --batch-check",
       "cat-file --batch",
       "cat-file --batch-check",
       "cat-file --batch",
+      "cat-file --batch-check",
+      "cat-file --batch",
+    ]);
+    // Part B compared the README and CHANGES from the prefetched blobs too, and listed the origin's
+    // tags once: v1.0.0 anchors the README, whose blob at the tag is the one already read.
+    expect(content.original.abandoned).toBe(false);
+    expect([content.original.readme.status, content.original.changes.status]).toEqual([
+      "compared",
+      "compared",
+    ]);
+    expect(content.original.anchorLookup).toBe("first_version_tag");
+    expect(calls.filter((c) => c.startsWith("ls-remote"))).toEqual([
+      "ls-remote --tags origin refs/tags/v*",
     ]);
     expect(calls.filter((c) => /^show \S+\.(json|tsv)$/.test(c))).toEqual([]);
     // The README and CHANGES, which nothing else covers, and three illustrations.
@@ -6653,6 +8098,1339 @@ describe("the content pass on the job's blob-less clone", () => {
     expect(content.summary.accounted.size).toBe(0);
     expect(content.summary).toBe(EMPTY_SUMMARY);
   }, 30_000);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Part B: what a pull request changed of the content its original authors published
+// ---------------------------------------------------------------------------------------------
+
+describe("original content", () => {
+  /** The README the original authors published at v1.0.0: a title and one paragraph. */
+  const FIRST =
+    "# Resting EEG\n\nTwo volunteers rested with their eyes closed.\nEach recording lasted ten minutes.\n";
+  /** The README at v1.1.0: the platform's curation added a section after the first version. */
+  const CURATED = `${FIRST}\n## Curation\n\nCurated by the NEMAR team in 2026.\n`;
+  /** A pull request that removes a line the original authors published. */
+  const ORIGINAL_REMOVED = CURATED.replace("Each recording lasted ten minutes.\n", "");
+  /** A pull request that rewords only the curation added after v1.0.0. */
+  const CURATION_REWORDED = `${FIRST}\n## Curation\n\nMaintained by the archive since the first release.\n`;
+
+  /**
+   * A dataset whose `main` holds the README at v1.0.0 and then at v1.1.0, each version tagged with
+   * the annotated tags `tags` names for it (none, to test a repository without tags), and a pull
+   * request on `contrib` that applies `edit`.
+   */
+  function taggedDataset(
+    name: string,
+    edit: (dir: string) => void,
+    tags: { first?: string[]; curated?: string[] } = { first: ["v1.0.0"], curated: ["v1.1.0"] },
+    setUp: (dir: string) => void = () => {},
+  ): Repo {
+    const dir = join(root, name);
+    mkdirSync(dir, { recursive: true });
+    git(dir, "init", "-q", "-b", "main");
+    write(dir, "dataset_description.json", desc("1.0.0"));
+    write(dir, "CHANGES", "1.0.0 2026-01-01\n - Initial release\n");
+    write(dir, "README.md", FIRST);
+    setUp(dir);
+    git(dir, "add", "-A");
+    git(dir, "commit", "-q", "-m", "first version");
+    for (const tag of tags.first ?? []) git(dir, "tag", "-a", tag, "-m", tag);
+    write(dir, "README.md", CURATED);
+    git(dir, "commit", "-q", "-am", "curation");
+    for (const tag of tags.curated ?? []) git(dir, "tag", "-a", tag, "-m", tag);
+    return branch(dir, () => edit(dir));
+  }
+
+  const writeReadme = (text: string) => (dir: string) => write(dir, "README.md", text);
+
+  /**
+   * The Part B facts of a pull request, read from a blob-less clone of it as the review job reads
+   * one, with the shim's `rules` around the content pass.
+   */
+  function fromClone(name: string, r: Repo, options: ContentOptions = {}, rules: ShimRule[] = []) {
+    const clone = blobLessClone(name, r);
+    const listing = gatherListing(clone, r.base, r.head);
+    const restore = installGitShim(root, rules);
+    try {
+      return { clone, original: gatherContent(clone, listing, options).original };
+    } finally {
+      restore();
+    }
+  }
+
+  /** The Part B facts of a pull request read in place, its version tags not listed. */
+  function inPlace(r: Repo, options: ContentOptions = { versionTags: false }) {
+    return gatherContent(r.dir, gatherListing(r.dir, r.base, r.head), options).original;
+  }
+
+  /** The facts of a compared document, or a failed expectation naming what it was instead. */
+  function compared(result: OriginalContentFacts["readme"]): ProseFacts {
+    if (result.status !== "compared") throw new Error(`not compared: ${JSON.stringify(result)}`);
+    return result.facts;
+  }
+
+  describe("the anchor: the README at the first version tag", () => {
+    test("an original line held at v1.0.0 and removed is altered, under that tag's anchor", () => {
+      const r = taggedDataset("oc-removed-source", writeReadme(ORIGINAL_REMOVED));
+      const { original } = fromClone("oc-removed", r);
+      expect(original.abandoned).toBe(false);
+      expect(original.anchorLookup).toBe("first_version_tag");
+      expect(compared(original.readme)).toMatchObject({
+        anchor: "first_version_tag",
+        protectedAltered: 1,
+        laterAltered: 0,
+      });
+    });
+
+    test("rewording text added after v1.0.0 is later text, not the original authors'", () => {
+      const r = taggedDataset("oc-later-source", writeReadme(CURATION_REWORDED));
+      const { original } = fromClone("oc-later", r);
+      expect(original.anchorLookup).toBe("first_version_tag");
+      // The lowest tag anchors: under v1.1.0 the curation line would be protected too.
+      expect(compared(original.readme)).toMatchObject({
+        anchor: "first_version_tag",
+        protectedAltered: 0,
+        laterAltered: 1,
+      });
+    });
+
+    test("a typo merged after the tag still protects its line: a later rewrite of it is altered", () => {
+      const dir = join(root, "oc-two-step-source");
+      mkdirSync(dir, { recursive: true });
+      git(dir, "init", "-q", "-b", "main");
+      write(dir, "dataset_description.json", desc("1.0.0"));
+      write(dir, "CHANGES", "1.0.0 2026-01-01\n - Initial release\n");
+      write(dir, "README.md", FIRST);
+      git(dir, "add", "-A");
+      git(dir, "commit", "-q", "-m", "first version");
+      git(dir, "tag", "-a", "v1.0.0", "-m", "v1.0.0");
+      // Step one, merged after the tag: a minor edit, which was information.
+      write(dir, "README.md", FIRST.replace("recording", "recordng"));
+      git(dir, "commit", "-q", "-am", "a typo");
+      // Step two: the pull request rewrites the line the typo touched.
+      const r = branch(dir, () =>
+        write(
+          dir,
+          "README.md",
+          FIRST.replace(
+            "Each recording lasted ten minutes.",
+            "Recordings were of variable length.",
+          ),
+        ),
+      );
+      const { original } = fromClone("oc-two-step", r);
+      expect(original.anchorLookup).toBe("first_version_tag");
+      expect(compared(original.readme)).toMatchObject({
+        anchor: "first_version_tag",
+        protectedAltered: 1,
+        laterAltered: 0,
+      });
+    });
+
+    test("a typo and a new line beside it, merged after the tag, still protect the line", () => {
+      const dir = join(root, "oc-three-step-source");
+      mkdirSync(dir, { recursive: true });
+      git(dir, "init", "-q", "-b", "main");
+      write(dir, "dataset_description.json", desc("1.0.0"));
+      write(dir, "CHANGES", "1.0.0 2026-01-01\n - Initial release\n");
+      write(dir, "README.md", FIRST);
+      git(dir, "add", "-A");
+      git(dir, "commit", "-q", "-m", "first version");
+      git(dir, "tag", "-a", "v1.0.0", "-m", "v1.0.0");
+      // Step one, merged: a typo in the line.
+      const typo = FIRST.replace("recording", "recordng");
+      write(dir, "README.md", typo);
+      git(dir, "commit", "-q", "-am", "a typo");
+      // Step two, merged: a new sentence right above it, in the same hunk against the tag.
+      const added = typo.replace("Each recordng", "The room was kept dark.\nEach recordng");
+      write(dir, "README.md", added);
+      git(dir, "commit", "-q", "-am", "a sentence");
+      // Step three, the pull request: the line rewritten.
+      const r = branch(dir, () =>
+        write(
+          dir,
+          "README.md",
+          added.replace("Each recordng lasted ten minutes.", "Recordings were of variable length."),
+        ),
+      );
+      const { original } = fromClone("oc-three-step", r);
+      expect(original.anchorLookup).toBe("first_version_tag");
+      expect(compared(original.readme)).toMatchObject({
+        anchor: "first_version_tag",
+        protectedAltered: 1,
+        laterAltered: 0,
+      });
+    });
+
+    test("a lightweight tag anchors like an annotated one", () => {
+      const r = taggedDataset("oc-light-source", writeReadme(ORIGINAL_REMOVED), {});
+      // `git tag` with no -a: a ref straight at the first version's commit, no tag object.
+      git(r.dir, "tag", "v1.0.0", "main~1");
+      expect(git(r.dir, "cat-file", "-t", "v1.0.0")).toBe("commit");
+      const { original } = fromClone("oc-light", r);
+      expect(original.anchorLookup).toBe("first_version_tag");
+      expect(compared(original.readme)).toMatchObject({
+        anchor: "first_version_tag",
+        protectedAltered: 1,
+      });
+    });
+
+    test("the tag commit's tree is listed with lazy fetching off, and a tree the clone lacks is not fetched", () => {
+      const r = taggedDataset("oc-tag-tree-source", writeReadme(CURATION_REWORDED));
+      const tagCommit = git(r.dir, "rev-parse", "v1.0.0^{commit}");
+      const tagTree = git(r.dir, "rev-parse", "v1.0.0^{tree}");
+      const envLog = callLog("oc-tag-tree");
+      const { original } = fromClone("oc-tag-tree", r, {}, [
+        { match: ` ls-tree -z ${tagCommit}`, envLog },
+      ]);
+      expect(original.anchorLookup).toBe("first_version_tag");
+      const calls = readEnvLog(envLog);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.env.GIT_NO_LAZY_FETCH).toBe("1");
+      // A clone that fetched no tree it did not need: the first version's tree is not in it, so
+      // the lookup stops at the merge base, and the tree is still not in it afterwards.
+      const bare = join(root, "oc-tag-tree-cut-origin.git");
+      execFileSync("git", ["clone", "-q", "--bare", r.dir, bare], { env: GIT_ENV });
+      git(bare, "config", "uploadpack.allowFilter", "true");
+      git(bare, "config", "uploadpack.allowAnySHA1InWant", "true");
+      const clone = join(root, "oc-tag-tree-cut");
+      mkdirSync(clone, { recursive: true });
+      git(clone, "init", "-q", "-b", "main");
+      git(clone, "config", "extensions.partialClone", "origin");
+      git(clone, "remote", "add", "origin", `file://${bare}`);
+      git(
+        clone,
+        "fetch",
+        "-q",
+        "--no-tags",
+        "--filter=tree:0",
+        "origin",
+        "+refs/heads/main:refs/remotes/origin/main",
+        "+refs/heads/contrib:refs/remotes/pr/head",
+      );
+      expect(holds(clone, tagTree)).toBe(false);
+      const original2 = gatherContent(clone, gatherListing(clone, r.base, r.head)).original;
+      expect(original2.anchorLookup).toBe("tag_tree_unreadable");
+      expect(compared(original2.readme)).toMatchObject({
+        anchor: "merge_base",
+        protectedAltered: 1,
+      });
+      expect(holds(clone, tagTree)).toBe(false);
+    });
+
+    test("with no version tag at all the dataset was never published: the README is unpublished, not compared", () => {
+      const r = taggedDataset("oc-no-tag-source", writeReadme(CURATION_REWORDED), {});
+      const { original } = fromClone("oc-no-tag", r);
+      expect(original.anchorLookup).toBe("no_tag");
+      expect(original.readme).toEqual({ status: "unpublished" });
+      // The same pull request read where the tags cannot be listed is protected from the merge base.
+      expect(compared(inPlace(r, {}).readme)).toMatchObject({
+        anchor: "merge_base",
+        protectedAltered: 1,
+        laterAltered: 0,
+      });
+    });
+
+    test("a lower tag whose commit is not an ancestor of the merge base is skipped, and the next one anchors", () => {
+      const r = taggedDataset("oc-not-ancestor-source", writeReadme(ORIGINAL_REMOVED));
+      // On the pull request's own commit, which the clone holds: below v1.0.0, and no ancestor.
+      git(r.dir, "tag", "-a", "v0.1.0", "-m", "v0.1.0", r.head);
+      const log = callLog("oc-not-ancestor");
+      const { original } = fromClone("oc-not-ancestor", r, {}, [{ match: " --is-ancestor ", log }]);
+      expect(original.anchorLookup).toBe("first_version_tag");
+      // Under v0.1.0, the pull request's own README, the removed line would be no original line.
+      expect(compared(original.readme)).toMatchObject({
+        anchor: "first_version_tag",
+        protectedAltered: 1,
+      });
+      expect(loggedCalls(log)).toHaveLength(2);
+    });
+
+    test("a tag commit the clone does not hold stops the search at the merge base, and nothing is fetched", () => {
+      const r = taggedDataset("oc-missing-source", writeReadme(CURATION_REWORDED));
+      // A commit on a branch the job never fetches, tagged below v1.0.0; the branch is then gone.
+      git(r.dir, "checkout", "-q", "-b", "side", "main~1");
+      write(r.dir, "side.txt", "never fetched\n");
+      git(r.dir, "add", "-A");
+      git(r.dir, "commit", "-q", "-m", "side");
+      git(r.dir, "tag", "-a", "v0.9.0", "-m", "v0.9.0");
+      git(r.dir, "checkout", "-q", "main");
+      git(r.dir, "branch", "-q", "-D", "side");
+      const side = git(r.dir, "rev-parse", "v0.9.0^{commit}");
+      const { clone, original } = fromClone("oc-missing", r);
+      expect(original.anchorLookup).toBe("check_failed");
+      expect(compared(original.readme)).toMatchObject({
+        anchor: "merge_base",
+        protectedAltered: 1,
+        laterAltered: 0,
+      });
+      // Asking about it did not fetch it: had it been fetched, it would be found no ancestor and
+      // v1.0.0 would anchor.
+      expect(holds(clone, side)).toBe(false);
+    });
+
+    test("a tag listing that fails leaves the merge base: lookup_failed", () => {
+      // Read in place: the repository has its tags but no origin to list them from.
+      const r = taggedDataset("oc-no-origin", writeReadme(CURATION_REWORDED));
+      const original = inPlace(r, {});
+      expect(original.anchorLookup).toBe("lookup_failed");
+      expect(compared(original.readme)).toMatchObject({
+        anchor: "merge_base",
+        protectedAltered: 1,
+        laterAltered: 0,
+      });
+    });
+
+    test("the anchor's README is read once, by its own call, and with lazy fetching off the merge base protects", () => {
+      const r = taggedDataset("oc-anchor-once-source", writeReadme(CURATION_REWORDED));
+      const anchorBlob = git(r.dir, "rev-parse", "v1.0.0:README.md");
+      const log = callLog("oc-anchor-once");
+      const { clone, original } = fromClone("oc-anchor-once", r, {}, [
+        { match: " cat-file --batch ", stdinLog: log },
+      ]);
+      expect(original.anchorLookup).toBe("first_version_tag");
+      expect(compared(original.readme)).toMatchObject({ protectedAltered: 0, laterAltered: 1 });
+      const read = loggedCalls(log);
+      expect(read.filter((id) => id === anchorBlob)).toHaveLength(1);
+      expect(new Set(read).size).toBe(read.length);
+      expect(holds(clone, anchorBlob)).toBe(true);
+      // The blob is in no side of the pull request's diff, so the clone holds it only by fetching
+      // it. Kept from fetching, the anchor cannot be read: the tag is still found, and the README
+      // is protected from the merge base.
+      const cut = fromClone("oc-anchor-cut", r, {}, [{ match: " cat-file ", env: NO_LAZY_FETCH }]);
+      expect(holds(cut.clone, anchorBlob)).toBe(false);
+      expect(cut.original.anchorLookup).toBe("first_version_tag");
+      expect(compared(cut.original.readme)).toMatchObject({
+        anchor: "merge_base",
+        protectedAltered: 1,
+        laterAltered: 0,
+      });
+      // A tag on the merge base itself: its README is the one already read, and not read again.
+      const onBase = taggedDataset("oc-anchor-base-source", writeReadme(ORIGINAL_REMOVED), {
+        curated: ["v1.0.0"],
+      });
+      const again = callLog("oc-anchor-base");
+      const same = fromClone("oc-anchor-base", onBase, {}, [
+        { match: " cat-file --batch ", stdinLog: again },
+      ]);
+      expect(same.original.anchorLookup).toBe("first_version_tag");
+      const baseBlob = git(onBase.dir, "rev-parse", "v1.0.0:README.md");
+      expect(loggedCalls(again).filter((id) => id === baseBlob)).toHaveLength(1);
+    });
+
+    test("offline, the version tags are never listed, and the merge base protects", () => {
+      const r = taggedDataset("oc-offline-source", writeReadme(CURATION_REWORDED));
+      const log = callLog("oc-offline");
+      const offline = fromClone("oc-offline", r, { versionTags: false }, [
+        { match: " ls-remote ", log },
+      ]);
+      expect(loggedCalls(log)).toEqual([]);
+      expect(offline.original.anchorLookup).toBe("not_looked_up");
+      expect(compared(offline.original.readme)).toMatchObject({
+        anchor: "merge_base",
+        protectedAltered: 1,
+      });
+      // The control: the same pull request online lists them once.
+      const online = callLog("oc-online");
+      fromClone("oc-online", r, {}, [{ match: " ls-remote ", log: online }]);
+      expect(loggedCalls(online)).toHaveLength(1);
+    });
+
+    test("a pull request that changes neither README nor CHANGES never lists the tags", () => {
+      const r = taggedDataset("oc-no-documents-source", (dir) =>
+        write(dir, "task-rest_eeg.json", '{"TaskName":"rest"}'),
+      );
+      const log = callLog("oc-no-documents");
+      const { original } = fromClone("oc-no-documents", r, {}, [{ match: " ls-remote ", log }]);
+      expect(loggedCalls(log)).toEqual([]);
+      expect(original.anchorLookup).toBe("not_needed");
+      expect(original.readme).toEqual({ status: "unchanged" });
+      expect(original.changes).toEqual({ status: "unchanged" });
+    });
+
+    test("a pull request that changes CHANGES alone lists the tags once, to know the dataset was published, and reads no README at the tag", () => {
+      const r = taggedDataset("oc-no-readme-source", (dir) =>
+        write(dir, "CHANGES", "Unreleased\n - Fixed units\n1.0.0 2026-01-01\n - Initial release\n"),
+      );
+      const tagCommit = git(r.dir, "rev-parse", "v1.0.0^{commit}");
+      const log = callLog("oc-no-readme");
+      const trees = callLog("oc-no-readme-trees");
+      const { original } = fromClone("oc-no-readme", r, {}, [
+        { match: " ls-remote ", log },
+        { match: `ls-tree -z ${tagCommit}`, log: trees },
+      ]);
+      expect(loggedCalls(log)).toHaveLength(1);
+      expect(loggedCalls(trees)).toEqual([]);
+      expect(original.anchorLookup).toBe("first_version_tag");
+      expect(original.readme).toEqual({ status: "unchanged" });
+      expect(compared(original.changes)).toMatchObject({ protectedAltered: 0, insertedLines: 2 });
+    });
+
+    test("an origin that answers with megabytes of tags is cut off at its bound, and many tags cost at most 32 checks", () => {
+      const r = taggedDataset("oc-hostile-source", writeReadme(CURATION_REWORDED));
+      const clone = blobLessClone("oc-hostile", r);
+      const bare = join(root, "oc-hostile-origin.git");
+      const packedRefs = join(bare, "packed-refs");
+      // The refs the bare origin already has, its header left out (so git sorts what follows).
+      const kept = existsSync(packedRefs)
+        ? readFileSync(packedRefs, "utf8")
+            .split("\n")
+            .filter((line) => line !== "" && !line.startsWith("#"))
+        : [];
+      const listing = gatherListing(clone, r.base, r.head);
+      const withRefs = (refs: string[]) => {
+        writeFileSync(packedRefs, `${[...kept, ...refs].join("\n")}\n`);
+        const checks = callLog("oc-hostile-checks");
+        const restore = installGitShim(root, [{ match: " --is-ancestor ", log: checks }]);
+        const started = Date.now();
+        try {
+          const { original } = gatherContent(clone, listing);
+          return { original, elapsed: Date.now() - started, checks: loggedCalls(checks).length };
+        } finally {
+          restore();
+        }
+      };
+      // Every tag below v1.0.0 names the pull request's own commit: in the clone, no ancestor.
+      const tags = (n: number) =>
+        Array.from({ length: n }, (_, i) => `${r.head} refs/tags/v0.0.${i}`);
+      const many = withRefs(tags(10_000));
+      expect(many.original.anchorLookup).toBe("too_many_tags");
+      expect(many.checks).toBe(32);
+      // 100,000 tags, and 10 MB of names that are no version, are past the 1 MiB the listing may
+      // write: the listing is stopped, and no tag is checked.
+      const flood = withRefs(tags(100_000));
+      const garbage = withRefs(
+        Array.from({ length: 2_500 }, (_, i) => `${r.head} refs/tags/v${"9".repeat(4_000)}x${i}`),
+      );
+      for (const run of [flood, garbage]) {
+        expect(run.original.anchorLookup).toBe("lookup_failed");
+        expect(run.checks).toBe(0);
+      }
+      for (const run of [many, flood, garbage]) {
+        expect(compared(run.original.readme)).toMatchObject({
+          anchor: "merge_base",
+          protectedAltered: 1,
+        });
+        // Generous: the bound is what is tested, not the machine.
+        expect(run.elapsed).toBeLessThan(60_000);
+      }
+    }, 240_000);
+  });
+
+  describe("the facts of the content", () => {
+    const OPEN = "# Resting EEG\n\nTwo volunteers rested.\nEach recording lasted ten minutes.";
+    const SECTION = "\n\n## Added\n\nA new section.\n";
+
+    test("a README turned from CRLF to LF with a section appended says its line endings changed, and nothing is altered", () => {
+      const crlf = `${OPEN.replaceAll("\n", "\r\n")}\r\n`;
+      const r = changed("oc-crlf", { "README.md": crlf }, (dir) =>
+        write(dir, "README.md", `${OPEN}${SECTION}`),
+      );
+      expect(compared(inPlace(r).readme)).toMatchObject({
+        lineEndingsChanged: true,
+        finalNewlineAdded: false,
+        protectedAltered: 0,
+        laterAltered: 0,
+        minorEdits: 0,
+        moved: false,
+        insertedInsideParagraph: 0,
+        insertedLines: 2,
+      });
+    });
+
+    test("a final newline added with a section appended alters nothing", () => {
+      const r = changed("oc-final-newline", { "README.md": OPEN }, (dir) =>
+        write(dir, "README.md", `${OPEN}${SECTION}`),
+      );
+      expect(compared(inPlace(r).readme)).toMatchObject({
+        finalNewlineAdded: true,
+        lineEndingsChanged: false,
+        protectedAltered: 0,
+        preserved: true,
+      });
+    });
+
+    test("a typo fixed in an original line is a minor edit, not an alteration", () => {
+      const r = changed("oc-minor", { "README.md": `${OPEN}\n` }, (dir) =>
+        write(dir, "README.md", `${OPEN.replace("volunteers", "volunters")}\n`),
+      );
+      expect(compared(inPlace(r).readme)).toMatchObject({
+        minorEdits: 1,
+        protectedAltered: 0,
+        preserved: false,
+      });
+    });
+
+    test("the dataset's Name changed is an altered author field; an author appended has grown", () => {
+      const named = changed("oc-name", { "dataset_description.json": desc("1.0.0") }, (dir) =>
+        write(dir, "dataset_description.json", desc("1.0.0", { Name: "Another dataset" })),
+      );
+      expect(inPlace(named).authorFields).toEqual({
+        altered: ["Name"],
+        removed: [],
+        minor: [],
+        grown: [],
+        added: [],
+        unparsed: false,
+      });
+      const authors = changed(
+        "oc-authors",
+        { "dataset_description.json": desc("1.0.0", { Authors: ["Ada Lovelace"] }) },
+        (dir) =>
+          write(
+            dir,
+            "dataset_description.json",
+            desc("1.1.0", { Authors: ["Ada Lovelace", "Alan Turing"] }),
+          ),
+      );
+      expect(inPlace(authors).authorFields).toMatchObject({ altered: [], grown: ["Authors"] });
+      // A pull request that leaves the description alone compares no field.
+      const untouched = changed("oc-no-description", { "README.md": `${OPEN}\n` }, (dir) =>
+        write(dir, "README.md", `${OPEN}${SECTION}`),
+      );
+      expect(inPlace(untouched).authorFields).toBeNull();
+    });
+
+    test("participant values: one changed is counted, one filled is not, and a file that cannot be read is unknown", () => {
+      const table = (...rows: string[]) => `participant_id\tsex\n${rows.join("\n")}\n`;
+      const base = { "participants.tsv": table("sub-01\tM", "sub-02\tn/a") };
+      const changedValue = changed("oc-participant-changed", base, (dir) =>
+        write(dir, "participants.tsv", table("sub-01\tF", "sub-02\tn/a")),
+      );
+      expect(inPlace(changedValue).participantValues).toBe(1);
+      const filled = changed("oc-participant-filled", base, (dir) =>
+        write(dir, "participants.tsv", table("sub-01\tM", "sub-02\tF")),
+      );
+      expect(inPlace(filled).participantValues).toBe(0);
+      const ragged = changed("oc-participant-ragged", base, (dir) =>
+        write(dir, "participants.tsv", table("sub-01\tM\textra", "sub-02\tn/a")),
+      );
+      expect(inPlace(ragged).participantValues).toBeNull();
+      // Turned into a link: a type change, which the summary never reads.
+      const linked = changed("oc-participant-link", base, (dir) => {
+        unlinkSync(join(dir, "participants.tsv"));
+        symlinkSync("elsewhere.tsv", join(dir, "participants.tsv"));
+      });
+      expect(inPlace(linked).participantValues).toBeNull();
+    });
+
+    test("recordings: an annex key replaced, an annexed file turned into a git file, and a pointer moved", () => {
+      const key = (n: number) => `SHA256E-s${100 + n}--${String(n).padStart(8, "0")}.edf`;
+      const recordingOf = (s: string) => `${s}/eeg/${s}_task-rest_eeg.edf`;
+      const link = (dir: string, s: string, n: number) => {
+        const path = join(dir, recordingOf(s));
+        mkdirSync(dirname(path), { recursive: true });
+        symlinkSync(`../../.git/annex/objects/Xj/9P/${key(n)}/${key(n)}`, path);
+      };
+      const dir = join(root, "oc-annex");
+      mkdirSync(dir, { recursive: true });
+      git(dir, "init", "-q", "-b", "main");
+      for (const [s, n] of [
+        ["sub-01", 1],
+        ["sub-02", 2],
+        ["sub-03", 3],
+      ] as const) {
+        link(dir, s, n);
+      }
+      git(dir, "add", "-A");
+      git(dir, "commit", "-q", "-m", "recordings");
+      const r = branch(dir, () => {
+        unlinkSync(join(dir, recordingOf("sub-01")));
+        link(dir, "sub-01", 11);
+        unlinkSync(join(dir, recordingOf("sub-02")));
+        write(dir, recordingOf("sub-02"), "the recording itself\n");
+        unlinkSync(join(dir, recordingOf("sub-03")));
+        link(dir, "sub-04", 3);
+      });
+      expect(inPlace(r).recordings).toEqual({ replaced: 1, typeChanged: 1, moved: 1, unread: 0 });
+    });
+  });
+
+  describe("sizes, scope and trees", () => {
+    test("Part B's batch may read only what the proofs and the summary's pool left of the pass", () => {
+      const before = "participant_id\tsex\nsub-01\tM\nsub-02\tF\n";
+      const after = "participant_id\tsex\nsub-01\tF\nsub-02\tF\n";
+      const kept = `${before}sub-03\tM\n`;
+      // A sidecar only reformatted: the cosmetic proofs read both sides of it.
+      const sidecar = "task-rest_eeg.json";
+      const compact = JSON.stringify({ SamplingFrequency: 500, PowerLineFrequency: 60 });
+      const pretty = JSON.stringify(JSON.parse(compact), null, 2);
+      const r = changed(
+        "oc-meter",
+        { "participants.tsv": before, "README.md": "# Title\n\nText.\n", [sidecar]: compact },
+        (dir) => {
+          write(dir, "participants.tsv", after);
+          write(dir, "README.md", "# Title\n\nText.\n\nMore text.\n");
+          write(dir, sidecar, pretty);
+          // A table where a removed row may have been kept, added: only the summary's pool reads it.
+          write(dir, "sourcedata/raw/participants.tsv", kept);
+        },
+      );
+      const meter = { maxTotalBytes: -1 };
+      const listing = gatherListing(r.dir, r.base, r.head);
+      const content = gatherContent(r.dir, listing, { versionTags: false, partBMeter: meter });
+      expect(content.original.participantValues).toBe(1);
+      expect(compared(content.original.readme).insertedLines).toBe(1);
+      expect(content.cosmeticOnlyFiles).toBe(1);
+      // The proofs read both sides of the sidecar and of participants.tsv, the summary's pool the
+      // table under sourcedata: the batch may read that much less.
+      const held = compact.length + pretty.length + before.length + after.length + kept.length;
+      expect(meter.maxTotalBytes).toBe(SUMMARY_LIMITS.maxTotalBytes - held);
+    });
+
+    test("a recording git holds that is over 1,023 bytes is large, never unreadable, and its change is replaced", () => {
+      const path = "sub-01/eeg/sub-01_task-rest_eeg.edf";
+      const r = changed("oc-large-source", { [path]: "a".repeat(5_000) }, (dir) =>
+        write(dir, path, "b".repeat(5_000)),
+      );
+      const expected = { replaced: 1, typeChanged: 0, moved: 0, unread: 0 };
+      expect(inPlace(r).recordings).toEqual(expected);
+      // From a blob-less clone, where nothing else read the two blobs: sized by the batch, large.
+      expect(fromClone("oc-large", r).original.recordings).toEqual(expected);
+    });
+
+    test("a pointer of 1,023 bytes is read for its key; one of 1,024 is large", () => {
+      const path = "sub-01/eeg/sub-01_task-rest_eeg.edf";
+      const key = "SHA256E-s10--0000000000000001.edf";
+      // The same key on both sides, padded differently with lines that hold /annex/.
+      const pointer = (size: number, pad: string) => {
+        const start = `/annex/objects/${key}\n/annex/`;
+        return `${start}${pad.repeat(size - start.length - 1)}\n`;
+      };
+      const of = (size: number) => {
+        const before = pointer(size, "a");
+        const after = pointer(size, "b");
+        expect([before.length, after.length]).toEqual([size, size]);
+        return inPlace(
+          changed(`oc-pointer-${size}`, { [path]: before }, (dir) => write(dir, path, after)),
+        ).recordings;
+      };
+      // Read as pointers: one key, so nothing was replaced.
+      expect(of(1_023)).toEqual({ replaced: 0, typeChanged: 0, moved: 0, unread: 0 });
+      // Too large to be a pointer: a git file in the recordings area with new content.
+      expect(of(1_024)).toEqual({ replaced: 1, typeChanged: 0, moved: 0, unread: 0 });
+    });
+
+    test("an annexed file replaced under derivatives/, sourcedata/ or code/ is not counted; under sub-01/eeg/ it is", () => {
+      const key = (n: number) => `SHA256E-s${100 + n}--${String(n).padStart(8, "0")}.edf`;
+      const paths = [
+        "derivatives/pipeline/sub-01_eeg.edf",
+        "sourcedata/raw/sub-01_eeg.edf",
+        "code/fixtures/sub-01_eeg.edf",
+        "sub-01/eeg/sub-01_task-rest_eeg.edf",
+      ];
+      const link = (dir: string, path: string, n: number) => {
+        const at = join(dir, path);
+        mkdirSync(dirname(at), { recursive: true });
+        symlinkSync(
+          `${"../".repeat(path.split("/").length - 1)}.git/annex/objects/Xj/9P/${key(n)}/${key(n)}`,
+          at,
+        );
+      };
+      const dir = join(root, "oc-scope");
+      mkdirSync(dir, { recursive: true });
+      git(dir, "init", "-q", "-b", "main");
+      paths.forEach((path, i) => link(dir, path, i + 1));
+      git(dir, "add", "-A");
+      git(dir, "commit", "-q", "-m", "recordings");
+      const r = branch(dir, () => {
+        paths.forEach((path, i) => {
+          unlinkSync(join(dir, path));
+          link(dir, path, i + 11);
+        });
+      });
+      expect(inPlace(r).recordings).toEqual({ replaced: 1, typeChanged: 0, moved: 0, unread: 0 });
+    });
+
+    test("a root tree that names one entry twice abandons Part B", () => {
+      const r = changed("oc-duplicate", { "README.md": "# A\n\nB.\n", CHANGES: "1.0.0\n" }, (dir) =>
+        write(dir, "CHANGES", "1.0.1\n1.0.0\n"),
+      );
+      // Both commits rebuilt with a second README.md entry: git mktree writes it as given.
+      const copy = execFileSync("git", ["-C", r.dir, "hash-object", "-w", "--stdin"], {
+        input: "# A copy\n",
+        encoding: "utf8",
+        env: GIT_ENV,
+      }).trim();
+      const withDuplicate = (commit: string, parent: string | null): string => {
+        const entries = git(r.dir, "ls-tree", commit);
+        const tree = execFileSync("git", ["-C", r.dir, "mktree"], {
+          input: `${entries}\n100644 blob ${copy}\tREADME.md\n`,
+          encoding: "utf8",
+          env: GIT_ENV,
+        }).trim();
+        return git(
+          r.dir,
+          "commit-tree",
+          tree,
+          ...(parent === null ? [] : ["-p", parent]),
+          "-m",
+          "dup",
+        );
+      };
+      const base = withDuplicate(r.base, null);
+      const head = withDuplicate(r.head, base);
+      expect(
+        git(r.dir, "ls-tree", "--name-only", head)
+          .split("\n")
+          .filter((n) => n === "README.md"),
+      ).toHaveLength(2);
+      const listing = gatherListing(r.dir, base, head);
+      expect(gatherContent(r.dir, listing, { versionTags: false }).original).toBe(
+        ORIGINAL_ABANDONED,
+      );
+    });
+  });
+
+  describe("an abandoned pass", () => {
+    test("a clock past the line abandons Part B before it reads anything, and the pass goes on", () => {
+      const r = changed("oc-clock", { "README.md": "# A\n\nB.\n" }, (dir) =>
+        write(dir, "README.md", "# A\n\nC.\n"),
+      );
+      const listing = gatherListing(r.dir, r.base, r.head);
+      const log = callLog("oc-clock");
+      const restore = installGitShim(root, [{ match: " cat-file ", log }]);
+      let content: ReturnType<typeof gatherContent>;
+      try {
+        content = gatherContent(r.dir, listing, { now: () => Number.MAX_SAFE_INTEGER });
+      } finally {
+        restore();
+      }
+      expect(content.original).toBe(ORIGINAL_ABANDONED);
+      expect(loggedCalls(log)).toEqual([]);
+      expect(content.patches.map((p) => p.path)).toEqual(["README.md"]);
+      // The control: with the real clock the same pass compares the README.
+      expect(compared(inPlace(r).readme).minorEdits).toBe(1);
+    });
+
+    test("a Part B batch that stalls past the line abandons Part B, and the pass completes in its budget", () => {
+      const r = changed(
+        "oc-stall",
+        { [tableOf("sub-01")]: "name\ttype\nCz\tEEG\nPz\tEEG\n", "README.md": "# A\n\nB.\n" },
+        (dir) => {
+          write(dir, tableOf("sub-01"), "name\ttype\nCz\tEEG\n");
+          write(dir, "README.md", "# A\n\nC.\n");
+        },
+      );
+      const listing = gatherListing(r.dir, r.base, r.head);
+      const log = callLog("oc-stall");
+      // The first two processes are the cosmetic proof's; the third is Part B's, and it stalls.
+      const restore = installGitShim(root, [
+        { match: " cat-file ", log },
+        { match: " cat-file ", sleepSeconds: 120, fromCall: 3 },
+      ]);
+      // 47 seconds: Part B's line is 7 seconds in, the pass's own deadline 40 seconds after it.
+      __setEvidenceBudgetForTests({ content: 47_000 });
+      let content: ReturnType<typeof gatherContent>;
+      let elapsed = 0;
+      try {
+        const started = Date.now();
+        content = gatherContent(r.dir, listing);
+        elapsed = Date.now() - started;
+      } finally {
+        __setEvidenceBudgetForTests(null);
+        restore();
+      }
+      expect(loggedCalls(log).map((c) => c.split("never ")[1]?.trim())).toEqual([
+        "cat-file --batch-check",
+        "cat-file --batch",
+        "cat-file --batch-check",
+      ]);
+      expect(content.original).toBe(ORIGINAL_ABANDONED);
+      // Killed at Part B's line, 7 seconds in: far below the 120 seconds the call would stall,
+      // with room for a loaded machine.
+      expect(elapsed).toBeLessThan(60_000);
+      // The rest of the pass is as it was: the summary, the diffs and the change log.
+      expect(content.summary.accounted.has(tableOf("sub-01"))).toBe(true);
+      expect(content.patches.map((p) => p.path)).toContain("README.md");
+      expect(content.changelogEntry).toBe("unknown_version");
+    }, 200_000);
+
+    test("an abandoned summary with no participants file changed leaves the participant count at 0", () => {
+      const r = changed(
+        "oc-summary-abandoned",
+        { [tableOf("sub-01")]: "name\ttype\nCz\tEEG\nPz\tEEG\n", "README.md": "# A\n\nB.\n" },
+        (dir) => {
+          write(dir, tableOf("sub-01"), "name\ttype\nCz\tEEG\n");
+          write(dir, "README.md", "# A\n\nB.\n\nC.\n");
+        },
+      );
+      const listing = gatherListing(r.dir, r.base, r.head);
+      // The summary reads the clock first and finds it past; Part B reads the real time.
+      let reads = 0;
+      const content = gatherContent(r.dir, listing, {
+        versionTags: false,
+        now: () => (++reads === 1 ? Number.MAX_SAFE_INTEGER : Date.now()),
+      });
+      expect(content.summary).toBe(ABANDONED_SUMMARY);
+      expect(content.original.abandoned).toBe(false);
+      expect(content.original.participantValues).toBe(0);
+      expect(compared(content.original.readme).protectedAltered).toBe(0);
+    });
+  });
+
+  test("Part B reads no blob twice: what the cosmetic proofs and the summary's pool read is taken from them", () => {
+    const r = changed(
+      "oc-once",
+      {
+        "dataset_description.json": desc("1.0.0", { Authors: ["Ada Lovelace"] }),
+        "README.md": "# Resting EEG\n\nTwo volunteers rested.\n",
+        CHANGES: "1.0.0 2026-01-01\n - Initial release\n",
+        [sidecarOf("sub-01")]: '{"TaskName":"rest","PowerLineFrequency":60}',
+      },
+      (dir) => {
+        write(
+          dir,
+          "dataset_description.json",
+          desc("1.1.0", { Authors: ["Ada Lovelace", "Alan Turing"] }),
+        );
+        write(dir, "README.md", "# Resting EEG\n\nTwo volunteers rested.\n\n## Added\n\nMore.\n");
+        write(dir, "CHANGES", "1.1.0 2026-10-22\n - Added\n1.0.0 2026-01-01\n - Initial release\n");
+        write(dir, sidecarOf("sub-01"), '{"TaskName":"rest"}');
+        // Added, so the summary's pool reads it: the home of the key moved out of the sidecar.
+        write(dir, "sub-01/sub-01_task-rest_eeg.json", '{"PowerLineFrequency":60}');
+      },
+    );
+    const listing = gatherListing(r.dir, r.base, r.head);
+    const log = callLog("oc-once");
+    const restore = installGitShim(root, [{ match: " cat-file --batch ", stdinLog: log }]);
+    let content: ReturnType<typeof gatherContent>;
+    try {
+      content = gatherContent(r.dir, listing, { versionTags: false });
+    } finally {
+      restore();
+    }
+    expect(content.summary.loss.keysMoved).toBe(1);
+    expect(content.original.authorFields).toMatchObject({ altered: [], grown: ["Authors"] });
+    expect(compared(content.original.readme).protectedAltered).toBe(0);
+    expect(compared(content.original.changes).protectedAltered).toBe(0);
+    const read = loggedCalls(log);
+    expect(new Set(read).size).toBe(read.length);
+    // Each of these was read exactly once, by the step that needed it first.
+    const id = (rev: string, path: string) => git(r.dir, "rev-parse", `${rev}:${path}`);
+    for (const blob of [
+      id(r.base, "dataset_description.json"),
+      id(r.head, "dataset_description.json"),
+      id(r.head, "sub-01/sub-01_task-rest_eeg.json"),
+      id(r.base, "README.md"),
+      id(r.head, "README.md"),
+    ]) {
+      expect(read.filter((x) => x === blob)).toHaveLength(1);
+    }
+  });
+
+  describe("from git to the verdict: what the platform does with the facts", () => {
+    /**
+     * The report of an all-pass review of the pull request read in `dir` (a clone, or the source
+     * itself), the way the job assembles it: the content pass, the platform's findings from both
+     * parts, and the fail the original content may hold.
+     */
+    function reportOf(dir: string, r: Repo, options: ContentOptions = { versionTags: false }) {
+      const listing = gatherListing(dir, r.base, r.head);
+      const all = { ...listing, ...gatherContent(dir, listing, options) };
+      return full(
+        allPass,
+        buildEvidence(all, NO_TEXT_PROBLEMS),
+        platformFindings(all.summary, all.original),
+        originalLowersToFail(all.original),
+      );
+    }
+    const codes = (report: PrReviewReport) => report.findings.map((f) => f.code);
+    /** A release that also applies `edit`: version and CHANGES entry as a contributor writes them. */
+    const releasing = (edit: (dir: string) => void) => (dir: string) => {
+      release(dir);
+      edit(dir);
+    };
+
+    test("an original README line removed fails no_degradation with the README note, and the check says what to do instead", () => {
+      const r = taggedDataset("ov-removed-source", releasing(writeReadme(ORIGINAL_REMOVED)));
+      const report = reportOf(blobLessClone("ov-removed", r), r, {});
+      expect(report.findings).toEqual([
+        {
+          criterion: "no_degradation",
+          severity: "blocker",
+          code: "original_text_altered",
+          path: "README.md",
+          note: "1 line the original authors published in README was removed, reworded or moved. Keep it; put your account in CHANGES or a new section, or ask a NEMAR administrator to correct one.",
+        },
+      ]);
+      expect(report.criteria.no_degradation).toBe("fail");
+      expect(verdictOf(report)).toBe("fail");
+      expect(findingLines(report)).toContain(ORIGINAL_CONTENT_PARAGRAPH);
+    });
+
+    test("rewording text added after v1.0.0 is information: an all-pass review passes", () => {
+      const r = taggedDataset("ov-later-source", releasing(writeReadme(CURATION_REWORDED)));
+      const report = reportOf(blobLessClone("ov-later", r), r, {});
+      expect(report.findings).toEqual([]);
+      expect(verdictOf(report)).toBe("pass");
+    });
+
+    test("a tag lookup that fails falls back to the merge base, and the stricter rule fails the same edit", () => {
+      // In place: the tags are there, but there is no origin to list them from.
+      const r = taggedDataset("ov-no-origin", releasing(writeReadme(CURATION_REWORDED)));
+      const report = reportOf(r.dir, r, {});
+      expect(codes(report)).toEqual(["original_text_altered"]);
+      expect(verdictOf(report)).toBe("fail");
+    });
+
+    test("a README turned from CRLF to LF with a section appended is clean and passes", () => {
+      const original = "# Resting EEG\r\n\r\nTwo volunteers rested.\r\n";
+      const r = releaseChanging("ov-crlf", { "README.md": original }, (dir) =>
+        write(dir, "README.md", "# Resting EEG\n\nTwo volunteers rested.\n\n## Added\n\nMore.\n"),
+      );
+      const report = reportOf(r.dir, r);
+      expect(report.findings).toEqual([]);
+      expect(verdictOf(report)).toBe("pass");
+    });
+
+    test("a section set off by blank lines before a heading the README never separated passes the review", async () => {
+      // A README with no blank lines around its headings: at the base its last two sections read
+      // as one paragraph. A new section between them, set off by blank lines, adds and alters nothing.
+      const r = releaseChanging(
+        "ov-headings",
+        { "README.md": "## Methods\nEEG at 500 Hz.\n## License\nCC0\n" },
+        (dir) =>
+          write(
+            dir,
+            "README.md",
+            "## Methods\nEEG at 500 Hz.\n\n## Acknowledgments\n\nThanks to the lab.\n\n## License\nCC0\n",
+          ),
+      );
+      expect(reportOf(r.dir, r).findings).toEqual([]);
+      const report = await reviewPullRequest({
+        repoDir: r.dir,
+        base: r.base,
+        head: r.head,
+        pr: { title: "Acknowledge the lab", body: "Adds an acknowledgments section." },
+        fromFork: false,
+        versionTags: false,
+      });
+      expect(report.findings).toEqual([]);
+      expect(report.criteria.no_degradation).toBe("pass");
+      expect(verdictOf(report)).toBe("pass");
+      // The same section with no blank lines, as the README writes its own: each heading, and the
+      // line after it, start a block, so nothing lands inside an original paragraph.
+      const dense = releaseChanging(
+        "ov-headings-dense",
+        { "README.md": "## Methods\nEEG at 500 Hz.\n## License\nCC0\n" },
+        (dir) =>
+          write(
+            dir,
+            "README.md",
+            "## Methods\nEEG at 500 Hz.\n## Acknowledgments\nThanks to the lab.\n## License\nCC0\n",
+          ),
+      );
+      expect(reportOf(dense.dir, dense).findings).toEqual([]);
+    });
+
+    // Plain prose: no heading, no list marker, no blank line, so only the both-sides rule decides.
+    const PLAIN =
+      "Two volunteers rested with their eyes closed.\nEach recording lasted ten minutes.\nThe room was kept dark.\n";
+
+    test("in plain prose a sentence put between two original lines fails the review", () => {
+      const r = releaseChanging("ov-plain-inside", { "README.md": PLAIN }, (dir) =>
+        write(
+          dir,
+          "README.md",
+          PLAIN.replace("closed.\n", "closed.\nThe lab was quiet that week.\n"),
+        ),
+      );
+      const report = reportOf(r.dir, r);
+      expect(codes(report)).toEqual(["original_text_altered"]);
+      expect(verdictOf(report)).toBe("fail");
+    });
+
+    test("in plain prose a paragraph set off by blank lines between two original lines passes", () => {
+      const r = releaseChanging("ov-plain-apart", { "README.md": PLAIN }, (dir) =>
+        write(
+          dir,
+          "README.md",
+          PLAIN.replace("closed.\n", "closed.\n\nThe lab was quiet that week.\n\n"),
+        ),
+      );
+      const report = reportOf(r.dir, r);
+      expect(report.findings).toEqual([]);
+      expect(verdictOf(report)).toBe("pass");
+    });
+
+    test("a comment opened between escaped backticks around an original paragraph is not a pass", async () => {
+      // CommonMark reads `\`` as a literal backtick, so the comment is live and hides the paragraph.
+      const original =
+        "# Resting EEG\n\nTwo volunteers rested.\nEach recording lasted ten minutes.\n";
+      const wrapped =
+        "# Resting EEG\n\n\\` <!-- \\`\nTwo volunteers rested.\nEach recording lasted ten minutes.\n\\` --> \\`\n";
+      const r = releaseChanging("ov-backticks", { "README.md": original }, (dir) =>
+        write(dir, "README.md", wrapped),
+      );
+      const report = await reviewPullRequest({
+        repoDir: r.dir,
+        base: r.base,
+        head: r.head,
+        pr: { title: "Annotate the README", body: "Adds two notes to the README." },
+        fromFork: false,
+        versionTags: false,
+      });
+      expect(report.findings.map((f) => f.code)).toEqual(["evidence_incomplete"]);
+      expect(report.criteria.no_degradation).toBe("unknown");
+      expect(verdictOf(report)).toBe("uncertain");
+    });
+
+    test("an original paragraph wrapped in details or a comment is unknown: not a fail and not a pass", () => {
+      const original = "# Resting EEG\n\nTwo volunteers rested.\n";
+      for (const [name, wrapped] of [
+        ["ov-details", "# Resting EEG\n\n<details>\n\nTwo volunteers rested.\n\n</details>\n"],
+        ["ov-comment", "# Resting EEG\n\n<!--\nTwo volunteers rested.\n-->\n"],
+      ] as const) {
+        const r = releaseChanging(name, { "README.md": original }, (dir) =>
+          write(dir, "README.md", wrapped),
+        );
+        const report = reportOf(r.dir, r);
+        expect(
+          report.findings.map((f) => [f.code, f.note]),
+          name,
+        ).toEqual([
+          [
+            "evidence_incomplete",
+            "New README or CHANGES markup can hide text the original authors published, or the README shown is no longer theirs. A person looks.",
+          ],
+        ]);
+        expect(report.criteria.no_degradation, name).toBe("unknown");
+        expect(verdictOf(report), name).toBe("uncertain");
+      }
+    });
+
+    test("a changed Name fails as an original field; an author appended is information", () => {
+      const named = releaseChanging("ov-name", {}, (dir) =>
+        write(dir, "dataset_description.json", desc("1.1.0", { Name: "Another dataset" })),
+      );
+      const failed = reportOf(named.dir, named);
+      expect(failed.findings.map((f) => [f.code, f.path])).toEqual([
+        ["original_field_altered", "dataset_description.json"],
+      ]);
+      expect(verdictOf(failed)).toBe("fail");
+      const authors = releaseChanging(
+        "ov-authors",
+        { "dataset_description.json": desc("1.0.0", { Authors: ["Ada Lovelace"] }) },
+        (dir) =>
+          write(
+            dir,
+            "dataset_description.json",
+            desc("1.1.0", { Authors: ["Ada Lovelace", "Alan Turing"] }),
+          ),
+      );
+      const grown = reportOf(authors.dir, authors);
+      expect(grown.findings).toEqual([]);
+      expect(verdictOf(grown)).toBe("pass");
+    });
+
+    test("a participant value changed fails; a missing value filled is information", () => {
+      const table = (...rows: string[]) => `participant_id\tsex\n${rows.join("\n")}\n`;
+      const base = { "participants.tsv": table("sub-01\tM", "sub-02\tn/a") };
+      const changedValue = releaseChanging("ov-participant", base, (dir) =>
+        write(dir, "participants.tsv", table("sub-01\tF", "sub-02\tn/a")),
+      );
+      const failed = reportOf(changedValue.dir, changedValue);
+      expect(failed.findings.map((f) => [f.code, f.path, f.note])).toEqual([
+        [
+          "original_field_altered",
+          "participants.tsv",
+          "1 participant value changed. Keep the values the authors recorded: add new information, or ask a NEMAR administrator to correct a value.",
+        ],
+      ]);
+      expect(verdictOf(failed)).toBe("fail");
+      const filled = releaseChanging("ov-participant-filled", base, (dir) =>
+        write(dir, "participants.tsv", table("sub-01\tM", "sub-02\tF")),
+      );
+      expect(verdictOf(reportOf(filled.dir, filled))).toBe("pass");
+    });
+
+    test("a recording with a new annex key is unknown with recording_replaced, never a pass and never a fail", () => {
+      const key = (n: number) => `SHA256E-s${100 + n}--${String(n).padStart(8, "0")}.edf`;
+      const path = "sub-01/eeg/sub-01_task-rest_eeg.edf";
+      const link = (dir: string, n: number) => {
+        mkdirSync(join(dir, dirname(path)), { recursive: true });
+        symlinkSync(`../../.git/annex/objects/Xj/9P/${key(n)}/${key(n)}`, join(dir, path));
+      };
+      const dir = join(root, "ov-annex");
+      mkdirSync(dir, { recursive: true });
+      git(dir, "init", "-q", "-b", "main");
+      write(dir, "dataset_description.json", desc("1.0.0"));
+      write(dir, "CHANGES", "1.0.0 2026-01-01\n - Initial release\n");
+      link(dir, 1);
+      git(dir, "add", "-A");
+      git(dir, "commit", "-q", "-m", "a recording");
+      const r = branch(dir, () => {
+        release(dir);
+        unlinkSync(join(dir, path));
+        link(dir, 2);
+      });
+      const report = reportOf(r.dir, r);
+      expect(codes(report)).toEqual(["recording_replaced"]);
+      expect(report.criteria.no_degradation).toBe("unknown");
+      expect(verdictOf(report)).toBe("uncertain");
+      // Only the two codes for an alteration of what the authors wrote carry the paragraph.
+      expect(findingLines(report)).not.toContain(ORIGINAL_CONTENT_PARAGRAPH);
+    });
+
+    test("an abandoned Part B pass is unknown: not a pass, and not a fail even over an altered README", () => {
+      const r = taggedDataset("ov-abandoned", releasing(writeReadme(ORIGINAL_REMOVED)));
+      // The clock is past the line for the summary and for Part B; nothing of either is read.
+      const report = reportOf(r.dir, r, { versionTags: false, now: () => Number.MAX_SAFE_INTEGER });
+      expect(report.findings.map((f) => [f.code, f.note])).toEqual([
+        [
+          "evidence_incomplete",
+          "The platform could not finish comparing this pull request with what the authors published. A person looks.",
+        ],
+      ]);
+      expect(report.criteria.no_degradation).toBe("unknown");
+      expect(verdictOf(report)).toBe("uncertain");
+      // The control: the same pull request compared fails.
+      expect(verdictOf(reportOf(r.dir, r))).toBe("fail");
+    });
+
+    test("two Part A findings and an alteration: the alteration takes the third place, and the review fails", () => {
+      const r = releaseChanging(
+        "ov-three",
+        { ...TWO_SUBJECTS, "README.md": "# Resting EEG\n\nTwo volunteers.\n" },
+        (dir) => {
+          write(dir, tableOf("sub-01"), "name\ttype\nPz\tEEG\n");
+          write(dir, sidecarOf("sub-01"), '{"SamplingFrequency":500}');
+          write(dir, "README.md", "# Resting EEG\n\nThe recordings of two volunteers.\n");
+        },
+      );
+      const report = reportOf(r.dir, r);
+      expect(codes(report)).toEqual(["data_removed", "metadata_removed", "original_text_altered"]);
+      expect(verdictOf(report)).toBe("fail");
+      expect(verdictOf(parseStoredPrReviewReport(JSON.parse(JSON.stringify(report))))).toBe("fail");
+    });
+
+    test("reviewPullRequest fails an altered README though the review answers pass everywhere", async () => {
+      const dir = newDataset("ov-review");
+      const r = branch(dir, () => {
+        release(dir);
+        write(dir, "README.md", "# Resting EEG\n\nTwo volunteers, now documented.\n");
+      });
+      const report = await reviewPullRequest({
+        repoDir: r.dir,
+        base: r.base,
+        head: r.head,
+        pr: { title: "Document the volunteers", body: "Adds a line about the volunteers." },
+        fromFork: false,
+        versionTags: false,
+      });
+      // Both models were asked, and the review said pass to everything.
+      expect(modelRequests).toHaveLength(2);
+      expect(STAND_IN_OUTPUT.criteria).toEqual({
+        no_degradation: "pass",
+        advances_revision: "pass",
+        material_improvement: "pass",
+      });
+      expect(report.criteria.no_degradation).toBe("fail");
+      expect(codes(report)).toEqual(["original_text_altered"]);
+      expect(verdictOf(report)).toBe("fail");
+      // The same pull request with the README appended to, not changed: the review's pass stands.
+      const added = branch(
+        dir,
+        () => {
+          release(dir);
+          appendSection(dir);
+        },
+        "contrib-added",
+      );
+      const clean = await reviewPullRequest({
+        repoDir: added.dir,
+        base: added.base,
+        head: added.head,
+        pr: { title: "Document the volunteers", body: "Adds a section about the volunteers." },
+        fromFork: false,
+        versionTags: false,
+      });
+      expect(clean.findings).toEqual([]);
+      expect(verdictOf(clean)).toBe("pass");
+    });
+
+    describe("no protection before publication: a dataset with no version tag", () => {
+      /** CHANGES with the 1.0.0 entry reworded under the new one: an edit of an existing line. */
+      const CHANGES_EDITED =
+        "1.1.0 2026-10-16\n - Fixed units\n1.0.0 2026-01-01\n - First release\n";
+      const editTexts = (dir: string) => {
+        release(dir);
+        write(dir, "README.md", ORIGINAL_REMOVED);
+        write(dir, "CHANGES", CHANGES_EDITED);
+      };
+      const key = (n: number) => `SHA256E-s${100 + n}--${String(n).padStart(8, "0")}.edf`;
+      const RECORDING = "sub-01/eeg/sub-01_task-rest_eeg.edf";
+      const link = (dir: string, n: number) => {
+        mkdirSync(join(dir, dirname(RECORDING)), { recursive: true });
+        symlinkSync(`../../.git/annex/objects/Xj/9P/${key(n)}/${key(n)}`, join(dir, RECORDING));
+      };
+      const table = (...rows: string[]) => `participant_id\tsex\n${rows.join("\n")}\n`;
+      /** A participants table and an annexed recording at the merge base. */
+      const withData = (dir: string) => {
+        write(dir, "participants.tsv", table("sub-01\tM", "sub-02\tF"));
+        link(dir, 1);
+      };
+
+      test("a reworded README paragraph and an edited CHANGES line are information: no finding, and a pass stays a pass", () => {
+        const r = taggedDataset("ou-texts-source", editTexts, {});
+        const clone = blobLessClone("ou-texts", r);
+        const listing = gatherListing(clone, r.base, r.head);
+        const { original } = gatherContent(clone, listing);
+        // The origin was asked and has no version tag: nothing has been published.
+        expect(original.anchorLookup).toBe("no_tag");
+        expect(original.readme).toEqual({ status: "unpublished" });
+        expect(original.changes).toEqual({ status: "unpublished" });
+        const report = reportOf(clone, r, {});
+        expect(report.findings).toEqual([]);
+        expect(report.criteria.no_degradation).toBe("pass");
+        expect(verdictOf(report)).toBe("pass");
+        // The model is told the documents are unpublished, with no count of them.
+        const all = { ...listing, ...gatherContent(clone, listing) };
+        const sent = reviewPrompt(all).facts.original_content as OriginalContentBlock;
+        expect([sent.readme, sent.changes, sent.anchor]).toEqual([
+          "unpublished",
+          "unpublished",
+          "merge_base",
+        ]);
+        expect(sent.readme_original_lines_altered + sent.changes_lines_altered).toBe(0);
+        // The calibration's numbers come from the same facts: nothing for Part B to count.
+        const {
+          listingMs: _l,
+          contentMs: _c,
+          ...counts
+        } = evidenceStats(all, buildEvidence(all, NO_TEXT_PROBLEMS), {
+          listingMs: 0,
+          contentMs: 0,
+        });
+        expect(counts).toMatchObject({
+          readmeAlteredLines: 0,
+          changesAlteredLines: 0,
+          readmeNotDecided: false,
+          changesNotDecided: false,
+          originalFindings: 0,
+          originalFails: 0,
+        });
+        expect(partBWord(counts)).toBe("-");
+        const row = {
+          pr: "ou-texts#1",
+          error: null,
+          evidence: counts,
+          refusedBy: null,
+          classes: null,
+          refusedDeleted: null,
+          timings: { listingMs: 0, contentMs: 0 },
+        };
+        expect(renderEvidenceTable([row]).join("\n")).toContain(
+          "Part B: 0 fail (text 0, fields 0, participants 0), 0 unknown only",
+        );
+      });
+
+      test("on the same dataset a changed Name, a changed participant value and a replaced recording still fail and hold", () => {
+        const r = taggedDataset(
+          "ou-data-source",
+          (dir) => {
+            editTexts(dir);
+            write(dir, "dataset_description.json", desc("1.1.0", { Name: "Another dataset" }));
+            write(dir, "participants.tsv", table("sub-01\tF", "sub-02\tF"));
+            unlinkSync(join(dir, RECORDING));
+            link(dir, 2);
+          },
+          {},
+          withData,
+        );
+        const report = reportOf(blobLessClone("ou-data", r), r, {});
+        expect(report.findings.map((f) => [f.code, f.path])).toEqual([
+          ["original_field_altered", "dataset_description.json"],
+          ["recording_replaced", null],
+        ]);
+        expect(report.findings[0]?.note).toContain(
+          "1 field of the dataset description and 1 participant value changed.",
+        );
+        const clone = blobLessClone("ou-data-stats", r);
+        const listing = gatherListing(clone, r.base, r.head);
+        const all = { ...listing, ...gatherContent(clone, listing) };
+        const {
+          listingMs: _l,
+          contentMs: _c,
+          ...counts
+        } = evidenceStats(all, buildEvidence(all, NO_TEXT_PROBLEMS), {
+          listingMs: 0,
+          contentMs: 0,
+        });
+        expect(partBWord(counts)).toBe("fail");
+        expect([counts.readmeAlteredLines, counts.changesAlteredLines]).toEqual([0, 0]);
+        expect(report.criteria.no_degradation).toBe("fail");
+        expect(verdictOf(report)).toBe("fail");
+      });
+
+      test("a README the pull request did not change stays unchanged; CHANGES alone is listed once and no README is read", () => {
+        const r = taggedDataset(
+          "ou-changes-only-source",
+          (dir) => {
+            release(dir);
+            write(dir, "CHANGES", CHANGES_EDITED);
+          },
+          {},
+        );
+        const log = callLog("ou-changes-only");
+        const { original } = fromClone("ou-changes-only", r, {}, [{ match: " ls-remote ", log }]);
+        expect(loggedCalls(log)).toHaveLength(1);
+        expect(original.anchorLookup).toBe("no_tag");
+        expect(original.readme).toEqual({ status: "unchanged" });
+        expect(original.changes).toEqual({ status: "unpublished" });
+        expect(verdictOf(reportOf(blobLessClone("ou-changes-only-report", r), r, {}))).toBe("pass");
+      });
+
+      test("every lookup that could not answer keeps the merge base: the same edits fail with a tag, with no origin, with no ancestor tag and with an unreadable tag tree", () => {
+        const failsWith = (report: PrReviewReport) => {
+          expect(codes(report)).toEqual(["original_text_altered"]);
+          expect(verdictOf(report)).toBe("fail");
+        };
+        // A first version tag: the README line removed was published at v1.0.0.
+        const tagged = taggedDataset("ou-tagged-source", editTexts);
+        const clone = blobLessClone("ou-tagged", tagged);
+        const listing = gatherListing(clone, tagged.base, tagged.head);
+        expect(gatherContent(clone, listing).original.anchorLookup).toBe("first_version_tag");
+        failsWith(reportOf(clone, tagged, {}));
+        // No origin to list the tags from.
+        const local = taggedDataset("ou-no-origin", editTexts, {});
+        expect(
+          gatherContent(local.dir, gatherListing(local.dir, local.base, local.head)).original
+            .anchorLookup,
+        ).toBe("lookup_failed");
+        failsWith(reportOf(local.dir, local, {}));
+        // Only a tag on the pull request's own commit: listed, and no ancestor of the merge base.
+        const stray = taggedDataset("ou-no-ancestor-source", editTexts, {});
+        git(stray.dir, "tag", "-a", "v0.1.0", "-m", "v0.1.0", stray.head);
+        const strayClone = blobLessClone("ou-no-ancestor", stray);
+        const strayListing = gatherListing(strayClone, stray.base, stray.head);
+        expect(gatherContent(strayClone, strayListing).original.anchorLookup).toBe("no_ancestor");
+        failsWith(reportOf(strayClone, stray, {}));
+        // A tag whose tree git cannot list: its listing is pointed at an empty object store.
+        const unreadable = taggedDataset("ou-tag-tree-source", editTexts);
+        const tagCommit = git(unreadable.dir, "rev-parse", "v1.0.0^{commit}");
+        const empty = join(root, "ou-empty-objects");
+        mkdirSync(empty, { recursive: true });
+        const cut = blobLessClone("ou-tag-tree", unreadable);
+        const restore = installGitShim(root, [
+          { match: `ls-tree -z ${tagCommit}`, env: { GIT_OBJECT_DIRECTORY: empty } },
+        ]);
+        let cutReport: PrReviewReport;
+        let lookup: string;
+        try {
+          const cutListing = gatherListing(cut, unreadable.base, unreadable.head);
+          lookup = gatherContent(cut, cutListing).original.anchorLookup;
+          cutReport = reportOf(cut, unreadable, {});
+        } finally {
+          restore();
+        }
+        expect(lookup).toBe("tag_tree_unreadable");
+        failsWith(cutReport);
+      });
+    });
+  });
 });
 
 describe("the worst case fits", () => {
@@ -6719,6 +9497,28 @@ describe("the worst case fits", () => {
         ),
       },
     };
+    // And the most the original content adds: every count at ten digits, every flag set, and every
+    // list of author keys holding all nine names.
+    const nine = [...AUTHOR_OWNED_KEYS];
+    const worstOriginal = originalOf({
+      anchorLookup: "first_version_tag",
+      readme: compared({
+        anchor: "first_version_tag",
+        protectedAltered: most,
+        minorEdits: most,
+        laterAltered: most,
+        moved: true,
+        movedLines: most,
+        insertedInsideParagraph: most,
+        insertedLines: most,
+        lineEndingsChanged: true,
+        finalNewlineAdded: true,
+      }),
+      changes: changesCompared({ protectedAltered: most, moved: true, movedLines: most }),
+      authorFields: fieldsOf({ altered: nine, minor: nine, added: nine, grown: nine }),
+      participantValues: most,
+      recordings: { replaced: most, typeChanged: most, moved: most, unread: most },
+    });
     const facts = {
       ...listing,
       // The reader stops at MAX_PATCH_TOTAL_CHARS in all: six whole diffs and a cut seventh.
@@ -6742,6 +9542,7 @@ describe("the worst case fits", () => {
       groupsOmittedFiles: 1,
       changelogEntry: "added" as const,
       summary: worstSummary,
+      original: worstOriginal,
     };
     const review = buildReviewMessages({
       facts,
@@ -6763,6 +9564,11 @@ describe("the worst case fits", () => {
     expect(sent.change_summary.classes).toEqual(classLines);
     expect(review.user).toContain(JSON.stringify(classLines[0]));
     expect(review.user).toContain(JSON.stringify(classLines.at(-1)));
+    // The original content's block is in it, whole, with the largest numbers it can hold.
+    const worstBlock = originalContentBlock(worstOriginal) as OriginalContentBlock;
+    expect(worstBlock.author_fields_altered).toEqual(nine);
+    expect(worstBlock.readme_original_lines_altered).toBe(2 * most);
+    expect(sent.original_content).toEqual(worstBlock);
     expect(facts.patches.reduce((n, x) => n + x.text.length, 0)).toBe(MAX_PATCH_TOTAL_CHARS);
     expect(screen.user.length + SCREEN_SYSTEM_PROMPT.length).toBeLessThan(40_000);
     expect(review.user.length + REVIEW_SYSTEM_PROMPT.length).toBeLessThan(300_000);

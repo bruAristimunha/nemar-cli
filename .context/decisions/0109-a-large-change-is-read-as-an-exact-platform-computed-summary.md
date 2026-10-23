@@ -5,7 +5,7 @@
 **Owner:** Seyed Yahya Shirazi
 
 Amends [ADR 0107](0107-dataset-pull-requests-are-screened-on-content-owners-and-administrators-are-exempt-and-the-review-check-is-required.md) on what counts as read and on the review prompt, and [ADR 0092](0092-dataset-pull-requests-get-a-derived-verdict-from-a-worker-gated-model-review.md) on what the evidence's `files_read` counts.
-It records Part A of epic #1851; the design is `.context/plans/pr-review-change-summary.md`, whose owner questions were answered on 2026-10-20.
+It records Parts A and B of epic #1851; the design is `.context/plans/pr-review-change-summary.md`, whose owner questions were answered on 2026-10-20.
 Everything else in ADR 0107 stands: the two stages, the derived verdict, `V3_RULES`, no tools for the model, and its worst case of 45.4 minutes.
 
 ## Context
@@ -45,7 +45,7 @@ An unrelocated or unkept removal in a summarized file adds a platform finding: a
 
 A note holds only letters, digits, spaces, commas and full stops, is a fixed point of the report's sanitizer, and is at most 197 characters at ten-digit counts, under the 200 a note may have.
 The path is the summary's first file, in code-unit order, with a removal; it goes to the finding of its file's kind (a table's to the rows, a JSON document's to the keys), the other finding names none, and the report's parser checks it like any path.
-At most three platform findings exist (the third is kept for the original-content rules), and only a full report takes them: a screen report given one is refused.
+At most three platform findings exist: the summary's take up to two, the original-content rules take what is left (at least one), and only a full report takes them: a screen report given one is refused.
 
 They come first.
 The report's findings are the platform's, then the review's that fit, then the script's own findings for a failed text judgment, so no model output can push a platform finding out.
@@ -79,14 +79,18 @@ The paragraph says that only the files the summary summarized are counted in the
 - A6: the relabel rules (prefix and suffix, zero padding, case, letters and digits in order) are exact descriptions of a renamed table key (a JSON key is renamed by case and punctuation alone, design section 4.7).
 
 Part B, what a contributor may change of the original authors' content (questions B1 to B7), was answered with the design's defaults the same day.
-Its facts are computed by a pure module (design, "As built (Phase 7)"); the platform findings, the prompt sentence and the check text that act on them come in a later phase.
-Until then only its three finding codes are in force: the Worker accepts them, and nothing emits them.
+Its facts are computed by a pure module (design, "As built (Phase 7)") and acted on by the job (design, "As built (Phase 8)").
+A README line altered beyond a minor edit, moved or removed, a line put inside an original paragraph, a CHANGES line altered, moved or removed, an author-owned field altered or removed, or a changed participant value sets `no_degradation` to `fail` before the report is parsed, a lowering the script is allowed to make like every platform finding, and a model cannot raise it.
+A replaced recording, anything that could not be compared and an abandoned pass are `unknown`; the check then tells the author to use CHANGES, a new section or an administrator.
+The README is compared with the one at the dataset's first version tag when the job can list the tags and holds the tag's commit.
+A dataset with no version tag has published nothing, so its README and CHANGES text is information only (the owner's decision of 2026-10-23), and when the lookup fails or no tag is an ancestor every line at the merge base is protected, so a failed lookup is never leniency.
 
 ### Release order
 
 Whatever widens what counts as read ships in the same release as the finding that covers what it no longer shows.
 The evidence reader counted accounted files as read one phase before the prompt and the platform findings existed, and in that window an unrelocated or unkept removal in an accounted file read as complete with no finding.
 The window was never released: the summary, the coverage rule, the prompt and the platform findings reach `dev` together, when the epic merges.
+The same holds for Part B: its facts, its findings, its prompt paragraph and the calibration columns reach `main` in one release, because the prompt must not say the platform acted before it does and the findings must not ship without the paragraph; the three codes and the check paragraph need no ordering, since the Worker has accepted the codes since v0.10.22.
 
 ### Cost
 
@@ -101,7 +105,7 @@ No new budget enters the job: ADR 0107's 45.4 minutes are unchanged.
 - An unrelocated or unkept removal in a file the summary summarized is a platform blocker, at 3 files or at 3,000, whether or not that file was also shown as a diff.
   A removal in a file the summary did not summarize is read from its diff by the model, as before the summary existed, and when that diff is not shown in full the pull request is incomplete, as before.
 - The prompt is a calibrated one, changed: the model calibration of ADR 0107 is required again before the check is required.
-- The longest review message, system prompt included, grows to 258,381 characters, under the 300,000 a test holds it to.
+- The longest review message, system prompt included, grows to 261,332 characters (it was 258,381 before Part B), under the 300,000 a test holds it to.
 - Two values that the fence makes equal (a `<facts>` and a `</facts>`) used to show as equal text with no note on where they differ, because the note was computed before the fence.
   No loss could hide this way, since a removal is an atom of its own with a finding; the calibration phase fixed it (`fencedForm` in the summary module, held equal to the prompt's fence by a test over generated text).
 - Measured on the real code, not the prototype (design section 12.4, 86 frozen pull requests, no network, no model): 5,482 of 9,208 changed files are accounted for, 15 pull requests are truncated (7 of them by the 400-name cut), and 18 carry a platform blocker.
@@ -114,6 +118,10 @@ No new budget enters the job: ADR 0107's 45.4 minutes are unchanged.
   Three facts the design did not have are measured there: markup that hides original text and a README that shadows or loses the shown one are zero, and new lines that join an original paragraph occur in two pull requests (one altered anyway, one a CHANGES entry).
   The module refuses an alignment past an edit distance of 2,000 instead of counting every protected line as altered, so a very large README rewrite will be `unknown` and a person looks.
   The facts are tripwires and not a proof against hostile Markdown; the raw diff and the model stay in the loop.
+- Part B on set A (offline, so the merge-base anchor): 9 pull requests fail, 5 more are `unknown` only, 2 carry information and 70 are clear; every Part A number is unchanged.
+  On the 129 pull requests open on 2026-10-23, with the tag lookup on, 20 fail (17 on tagged datasets, 3 `Name` changes of the platform's own account), 5 are `unknown` only, 3 carry information and 101 are clear; datasets with no version tag are clear.
+  A contributor's `Name` change fails whatever the naming rule says, and the platform's own account is exempted by the Worker, not by the job.
+- The review runs `git ls-remote` against the dataset's repository in the content pass, once, when a README or CHANGES changed; its failure costs the stricter anchor and nothing else.
 - A diff git writes as binary (a NUL byte in a table) is no read at all: the file stays unread and a removed row in it keeps the content incomplete.
   So does a modified or removed binary file in a read area (a `README.pdf`), whose one-line `Binary files differ` diff used to count as read; the pull request cannot pass on it and a person looks.
 

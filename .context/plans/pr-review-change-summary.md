@@ -1543,22 +1543,31 @@ The facts are tripwires, not a proof: Markdown and HTML can be bent in more ways
 - *Normalization* (B2.1.2) removes more than the two artifacts named there: trailing spaces and tabs, a lone CR (a line break, as in CommonMark), a BOM, and blank lines, whose positions are first recorded as paragraph breaks.
   A non-UTF-8 side is read as ISO-8859-1 and sets `notUtf8`.
   Lines are counted while splitting and the work stops at the cap, so a flood of short lines costs about as much as its bytes.
-- *Protected lines* (B2.1.4): for a README, every base line whose text occurs anywhere in the anchor; for CHANGES every base line.
-  An anchor document with no lines at all counts as no anchor (every base line is protected), like a first version without a README.
+- *Protected lines* (B2.1.4): for a README, every base line whose text occurs anywhere in the anchor, and every base line that replaces an anchor line by a minor edit, so a typo fixed after the tag does not leave its line open to a rewrite; for CHANGES every base line.
+  The anchor is aligned with the base; in each hunk an inserted base line is protected when it is a minor edit of any removed anchor line of that hunk (every pair is tried up to 4,096 pairs and 4 MiB of shorter-line code points per run, beyond which the hunk is paired from its start and from its end, which errs strict).
+  An anchor document with no lines, and an alignment past the edit-distance cap, count as no anchor: every base line is protected and the facts report `merge_base`, like a first version without a README.
+  Edits that add up past the minor bound relative to the anchor stop protecting the line.
   Counting copies ("the first k occurrences") can protect the wrong copy of a duplicated line and call a deleted original clean, so a duplicate that was added later is protected too (a rare false fail).
 - *The edit-distance cap* (B2.1.3): past 2,000 the module refuses the pair (`edit_distance_cap`) instead of counting every protected line as altered, so Phase 8 maps it to `unknown`.
   A pure insertion or a pure removal is never capped.
   Limits: 4 MiB and 20,000 lines per side, 16 parts, 32 tags tried.
 - *Minor edits* pair the j-th removed line of a hunk (of any kind) with its j-th inserted line, and only a protected README line can be minor; CHANGES allows none.
   Whole-line moves are matched against the inserted lines that no minor edit took, and `movedLines` counts them (the B4 note needs a count).
+- *Paragraphs and lines put inside them*: blank lines separate paragraphs, and an ATX heading, the line after it and a list item each start one; fenced code, tables, setext headings and block quotes are not parsed, so plain lines are governed by blank lines alone.
+  A list item is a bullet or `1.`/`1)` with content at an indent of 0 to 3 spaces; any other ordered marker (`2.`, `2019.`) and an empty item start a paragraph only after a blank line, a heading or a list item, because CommonMark lets them interrupt nothing else.
+  A run of new lines is *inside* an original paragraph only when the head shows no blank line before it and none after it, between two kept original lines that were adjacent in one paragraph; a blank-separated section inserted into an unbroken README is not inside, and neither is a section or a list item added in a README without blank lines around its headings.
+  Known limits, all on the strict side: an insertion inside a nested list indented four spaces or more, next to a setext heading, a fence or a table is read as inside a paragraph and fails (5 of the 55 distinct set A base READMEs carry such a shape and none of the 86 open pull requests trips it), and the new text is told to go between paragraphs.
 - *Facts added to `ProseFacts`*: `protectedLines`, `movedLines`, `notUtf8`, `partsBefore`, `partsAfter`, and three tripwires that the design did not have, because without them every original line can survive verbatim while the rendered README no longer shows it.
   `hidingMarkupInserted` reads each run of new head lines as one text and counts the runs that open a comment or close one (`<!--`, `-->`), open a processing instruction, a `<!` declaration or CDATA, leave a tag or a quoted attribute open, or open a link reference definition whose title or destination stays open.
   It also counts a run that opens or closes one of 17 elements that hide or script text (`details`, `script`, `style`, `template`, `noscript`, `textarea`, `iframe`, `object`, `dialog`, `title`, `datalist`, `noembed`, `noframes`, `video`, `audio`, `canvas`, `map`), or carries a `hidden` attribute or `display:none`; an arrow written `-->` counts too.
-  A run that is attached to an original paragraph (see `joinedInsertedRuns`) is also counted when one of its lines is a complete link reference definition, a footnote definition or a standalone image, because such a line swallows the paragraph it touches; in a new paragraph of its own they are ordinary and are not counted.
+  A run that is attached to an original paragraph (see `joinedInsertedRuns`) is also counted when one of its lines is a footnote definition, which swallows the paragraph it touches, or leaves a link definition open.
+  A link definition (complete or not) also counts when the head line after it starts with a quote or a parenthesis, and so does a new line under a kept definition that starts one, because CommonMark takes that line as the definition's title and renders nothing.
+  A complete definition followed by anything else and an image line are ordinary (a reference appended to a reference block, a badge under the title).
+  Inline code is not exempt: markup inside backticks is read as markup, because a backslash, an attribute or a line break can make CommonMark read it as live HTML, so a stray `<` before a letter with no `>` in an added line (`a<b`) holds the pull request as `unknown` for a person; `p < 0.05` and closed tags such as `<label>` are not open tags and stay clean.
   The replacement text of a minor edit is counted when it is such a definition or image, or when it adds a `<`, `>`, `[` or `]` that the original line did not have (an added exclamation mark or comma is an ordinary typo fix).
   Strike-through (`<s>`, `<del>`, `~~`) is not counted: it renders visible and marked as deleted.
   `shownPartReplaced` is true when a protected line that is kept moves out of the README the platform shows into another root part (which also covers a new `README.md` shadowing the original `README`), or when the base had a shown README and the head has none (`README.md` renamed to `readme.md`).
-  `joinedInsertedRuns` counts the runs of new lines that sit in a head paragraph which also holds a kept original line, with no blank line between, which is how a line placed before or after a paragraph becomes part of it in the rendering.
+  `joinedInsertedRuns` counts the runs of new lines that sit in a head paragraph which also holds a kept original line, with no blank line between (a heading or a list item starts its own paragraph), which is how a line placed before or after a paragraph becomes part of it in the rendering.
   It is not part of `proseAltered`, because appending to a paragraph is permitted; Phase 8 decides what it means with the numbers above, and a new entry written without a blank line in CHANGES is ordinary and must not make a pull request unknown.
 - *Author fields* (B2.2): top-level keys only.
   A missing value (`isMissingJson`) on both sides is no change; value to missing is `removed`; value to value follows the key.
@@ -1582,6 +1591,76 @@ The facts are tripwires, not a proof: Markdown and HTML can be bent in more ways
 - A `moved` recording must not cancel Part A's removal count for the same path; a participant row relocated to `sourcedata/` is Part A's relocated role, not a Part B value change.
 
 B6.6 is milder than written: a heading converted from Markdown to RST is mostly a minor edit, and the reflowed lines are what fail.
+
+
+### As built (Phase 8: the integration)
+
+Part B is read in the content pass, acted on by the platform, and reported to the model as what the platform did.
+Where the text above, the Phase 7 note and this note differ, this note is what was built.
+
+**What runs.**
+- A Part B step follows the change summary in the content pass and precedes the raw diffs.
+  It is all-or-nothing and shares the pass's time and byte budgets: it starts only if the summary's clock has `timeReserveMs` left, and a failed tree listing, a batch that cannot be trusted, or running out of time gives an abandoned result, which is `unknown`.
+  The facts stage and the listing pass are unchanged, so a spam-stopped or naming-ended review starts no Part B work.
+- The tag lookup is in the content pass, only when a root README or CHANGES part changed and the caller allows it (`versionTags`, off for `--offline` calibration, whose clones point at GitHub).
+  `git ls-remote --tags origin refs/tags/v*` (15 s, 1 MiB), then `chooseAnchor` with `git merge-base --is-ancestor` under `GIT_NO_LAZY_FETCH=1` (5 s over at most 32 tags), then `git ls-tree -z` of the chosen tag's commit under `GIT_NO_LAZY_FETCH=1`, then the anchor's README blobs in a read of their own (4 MiB), so a failed lazy fetch gives the stricter anchor and does not abandon Part B.
+  A lookup that succeeds and finds no `v*` tag is `no_tag`: the dataset has published nothing, so its README and CHANGES text is information only (`unpublished`; the owner's decision of 2026-10-23).
+  The accepted consequence is that a published dataset that somehow lost its tags would silently lose that protection.
+  Every other failure falls back to the merge base, recorded as `lookup_failed`, `no_ancestor`, `check_failed` (a tag commit the clone does not hold is this), `too_many_tags` or `tag_tree_unreadable`; with only CHANGES changed the lookup stops after the ancestor checks and reads no README.
+  A found tag whose README cannot be read keeps `first_version_tag` as the lookup word and reads the README facts against the merge base.
+- One sized batch reads the README and CHANGES parts of both sides, the description sides and every probe side of the changed paths that no earlier read took (probes: no size is `unreadable`, above 1,023 bytes is `large`), within what is left of the 256 MiB; the summary's pool hands on its small blobs so nothing is read twice.
+- The verdict (`originalVerdict`) is one pure function: a README or CHANGES line altered or moved, a line put inside an original paragraph, an author-owned field altered or removed and a participant value changed are a fail (the script lowers `no_degradation` to `fail` before the report is parsed, `lowerToFail`, and only for a valid model answer); a replaced or retyped recording, a participants table that could not be counted, an unparsed description, an unread side, any refusal (the edit-distance cap included), hiding markup and a lost or shadowed shown README are `unknown`; the abandoned pass is `unknown` and nothing else of Part B is used; the rest (minor edits, later text, line endings, a final newline, added or grown fields, moved pointers, joined runs) is information.
+  A moved recording never cancels a removal fact of Part A.
+- Part B gets the platform-finding places that Part A leaves (`3 - Part A's`, at least one) in the order text, fields, recordings, undecided; with one place left, text and fields merge into one `original_text_altered` finding.
+  Notes are fixed templates of numbers and closed key names, at most 195 characters at seven-digit counts and over every subset of the nine key names, with singular forms for a count of one, and a count form for four or more keys.
+  The recordings note says "data files", because a plain-git file in the recordings area counts too.
+  A finding's path is the README part shown at the merge base (else the first README document part, else the first CHANGES part), the description, or the participants file whose class was counted, recorded on the facts.
+  Recordings and undecided facts have no path.
+- The model is told by an `original_content` block of the facts, placed immediately before `change_summary` (its `readme` and `changes` words are `unchanged`, `kept`, `altered`, `not_decided` or `unpublished`), and one system-prompt paragraph; the README and CHANGES counts are zero unless that document was compared, an abandoned pass says `not_decided` everywhere, and no text of a file ever enters the block.
+- A model finding that carries a code only the script may emit (the original-content codes, `recording_replaced`, and the other codes outside the review's schema) makes the answer `model_invalid`, so a model that escapes its schema cannot make the check show the original-content paragraph.
+- The check shows the B4 paragraph once, only when a finding is `original_text_altered` or `original_field_altered`.
+- Calibration prints a `PART-B` word and `B t/f/p/r` per pull request and a totals line from the same verdict the review uses; `--offline` never lists tags in either mode; `--without-summary` leaves Part B abandoned by its own start check.
+
+**Measured on set A** (86 frozen pull requests, offline, so the merge-base anchor; `set-a-evidence.json` re-recorded, and a test ties every row of it to `set-a-original.json`).
+Every earlier number is unchanged: 5,482 files accounted for, 15 truncated, 18 with a platform blocker of Part A, 0 abandoned, 0 hidden.
+- Part B fails 9 pull requests (text 2, fields 4, participants 3): `nm000501` #3 and `on002578` #2 (original README lines; the second only because there is no tag offline), `nm000424` #2, `nm000501` #2, `nm000513` #2 (`Name`, opened by the platform's own account, which the Worker exempts in production) and `on006126` #1 (`ReferencesAndLinks`), and `on005420` #1 (37 participant values), `on004588` #1 (5 re-padded ids), `on005628` #1 (2 values in `participants.json`).
+- 5 are `unknown` only: `on003343` #3, `on003029` #1 and `on004703` #1 (recordings), `on003620` #1 and `on003195` #1 (a participants table that could not be counted: a ragged row, an empty column name).
+- 2 are information (`on007353` #1, a minor `Funding` edit; `on004306` #1, moved pointers) and 70 are clear.
+  None of the three kinds that the design worried about is flagged by its own part: the 27 artifact READMEs, the 64 CHANGES changes and the eight empty-field pull requests (some of them are held or failed for another part, so they are not all among the 70).
+- The plan expected 7 or 8 fails; `on005628` #1 is the ninth, and `on003195` #1 the fifth unknown, both from the approved participant-value rule (any change of a non-missing participant value fails, including text in `participants.json`).
+
+**Measured online on the pull requests open on 2026-10-23** (129 open: the 86 of set A and 43 new; tag lookup on; counts only).
+- Outcomes: 101 clear, 20 fail, 3 information, 5 `unknown` only, none abandoned, no fetch errors.
+  The tag anchor was used in 76 rows; the 22 pull requests on the 20 datasets that have no version tag (all private, never published) are all clear under the owner's rule, where 15 of them failed before it.
+- The 20 fails are 13 README rows (35 altered lines) and 4 author-field or participant-value rows on tagged datasets, plus the three `Name` rows of the platform's own account.
+  The README fails are one contributor account's campaign of independent paragraph-level rewordings and expansions (no two share a replacement line, none is near the minor-edit bound), which is what the rule exists to stop.
+- On the 86 of set A the only change from the offline result is `on002578` #2: with the real tag its 21 lines are later text and it is information.
+  On a tagged dataset the tag's README was byte-identical to the merge-base README in all 14 README fails examined, so the tag changes the result only for text added after the first version.
+- The tag lookup ran for 125 of 129 rows; the slowest content pass was 8.5 s and the sum of passes grew by about a third with the 27 extra lookups for CHANGES-only edits.
+
+**Decided as built.**
+- The facts record the three paths (README part, CHANGES part, participants file) so a finding names a file the builder, not the verdict, chose.
+- A README with only lines put inside a paragraph, together with altered CHANGES lines, uses the README-paragraph note; the merged text-and-fields note counts README lines, CHANGES lines and inside-paragraph runs, and fields plus participant values.
+- Caps in the batch: 4 MiB for a document part, 8 MiB for a description side, 1,023 bytes for a probe; a part over its cap is `unreadable`, and a duplicated name in a root tree abandons Part B instead of throwing.
+- `EvidenceStats` gained the Part B numbers and `originalFindings` and `originalFails`; `platformFindings` stays Part A's count, so the label template's 18 holds.
+- The "pool files no candidate can consult are never read" pin was narrowed to the first four `cat-file` processes, because Part B probes every changed side.
+
+**Corrections to the text above.**
+- B4's author-field note (210 characters with three names) cannot hold nine names; the count form does.
+- B4's "recording files" is "data files" (`on004703`'s are sidecars); "first published" is true only of the README (the other parts are compared with the merge base); `readme_preserved` is not a fact (false on minor edits).
+- B3 step 1 and slice 2 step 2 put the lookup in the listing pass; it is in the content pass because the facts stage may read only trees, commits, names and the description, and a spam-stopped review should not pay for it.
+- B1 and B3 say a missing tag falls back to the merge base; as built that holds for a lookup that failed, while a successful lookup that finds no tag is `unpublished` for README and CHANGES text.
+- B3 step 3 and B5 say the anchor blobs join the batch; they have a read of their own, because the batch is all-or-nothing.
+- B2.4 says no blob is read beyond the pointers; every changed side needs a size check.
+- 10.3 and B4 give `platformFindings(summary, original)` and `assembleReport(..., lowerToFail)`; both are as built, with `original` defaulting to null.
+- B4's `on004588` #1 outcome is a fail from five participant values; its table parses.
+- `classifyPath` places `CHANGELOG*` in "other", so the model never sees its diff, while Part B protects it.
+
+**Left to the owner.**
+- The model calibration of ADR 0107 on the changed prompt (`model-labels.template.txt`, 40 reviews; it costs money and needs labels), before the review check is required.
+- An optional online run that measures the tag anchor on set A (`--evidence-only --clones DIR` without `--offline`; network, no money).
+- The facts, the findings, the prompt paragraph and the calibration reach `main` in one release (the prompt must not say the platform acted before it does); no workflow changes, so nothing to sync to `nemarDatasets/.github`.
+- Two older gaps of the hiding tripwire (an image alt text spanning a paragraph, a fence marker added by a minor edit) are filed as #1883; both affect only how GitHub renders a README.
 
 ---
 

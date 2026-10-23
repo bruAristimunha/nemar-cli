@@ -18,10 +18,20 @@
 #
 # The entries come from the evidence run of set A (86 pull requests; the 3 opened by the platform's
 # own account are left out of every group). 40 reviews, one after another.
+#
+# Part B (the original authors' content) fails or holds nine of the 40 whatever the model says, so
+# none of the nine can pass: it fails on002578#2, on006126#1, on004588#1, nm000501#3 and
+# on005420#1, and holds on003029#1, on003620#1, on003195#1 and on003343#3 for a person. The group
+# comments below name the ones in each.
 
 # Whole after the change summary, with no blocking loss (10). Their evidence was cut off without
 # the summary and the summary accounts for every changed file now. Label each by what a person
 # says of the pull request itself.
+# Three of them no longer end without a blocker: Part B compares a pull request with what the
+# original authors published, and it fails nm000501#3 (README lines the authors wrote were
+# altered) and on005420#1 (participant values were changed) on no_degradation, and holds
+# on003343#3 (annexed files were replaced) for a person, whatever the model says. None of the
+# three can pass, so a fail or a hold on one of them says nothing about the model.
 nm000501#3 ? 2fc6aa2068bcdf7edb75b0e3c59d5ead43d206de 894855b1a77e8f7c8c861b8482ff85b98b2a8a8c
 on003343#3 ? f4af2be7ef30a12e23589979c38a6e90187fd6d6 62cafea7e4d18222664d46e68ca15f4b4debf479
 on004194#1 ? 0cd159c6c99c4de4ecec61c646b6107e3b5d98d6 88d46544d05c6dd7e8d139b4f9b8b696ebbda868
@@ -38,6 +48,9 @@ on007120#1 ? 66296ebd70d90ff5257c67ee3c0005cc3ec335ac b65d6a415f854175f38e1c88ad
 # request itself: a loss the platform cannot tell from a rename (design section 12.4, question Q1,
 # kept by the owner) then shows as a false fail, which the gate counts. on003620#1 also carries a
 # removal in a file the summary refused.
+# Part B fails on002578#2 and on006126#1 (README lines and a link of the authors altered or
+# removed) and holds on003029#1 (annexed files turned into git files) and on003620#1 (participant
+# values it could not count), whatever the model says.
 on002181#1 ? 0bdf92e2adf5c833417ed8dc406534122c145e4f 158352035e0a5af77cb108745823a17e4dd44b26
 on002578#2 ? 5e5027e73a427b120e35de48856380f07dc938fd 67bbd7f6874d4641623f4fd867b6ec359883ea96
 on003029#1 ? 79b733ce62f787aaacac9efe6ff553b7421419ae ddece5f7cedd0f012443931b55ad601f76ee0d81
@@ -75,5 +88,7 @@ nm000157#4 ? 8a759d180e795a63c38ecbbca2740c113d1c4f33 ad373b0e4b9c9ec92fd60eaff6
 # cannot pass.
 # (on006233#2 also has such a removal, but its file listing is cut, so it cannot pass whatever the
 # model says, and it is left out.)
+# Part B fails on004588#1 (participant values changed) and holds on003195#1 (participant values it
+# could not count), whatever the model says.
 on003195#1 ? dea6fe72703cc54348a22e6d93aac795f0df74df 838d36bb5b8f0d7db46eb69da0fc6fd6a007a8e1
 on004588#1 ? 1b74c341388495242262bc2e6613242ed2b6859a 2c0e67fbef5fe835b92eee8cbccd6f97933920f9

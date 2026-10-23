@@ -28,7 +28,10 @@
  * prefetches (from the merge base to the head) is `objects_missing` before any pass runs, and any
  * other object the review reads and the clone lacks (an unchanged `dataset_description.json` the
  * listing reads, or a change log the content pass reads) is not fetched, so that pull request ends
- * as `evidence_unavailable`. It sets `GIT_NO_LAZY_FETCH` for the run and restores it after;
+ * as `evidence_unavailable`. It sets `GIT_NO_LAZY_FETCH` for the run and restores it after, and it
+ * keeps the content pass from asking the clone's origin for the dataset's version tags (the README's
+ * anchor, `FetchedPullRequest.offline`): a clone's origin is the public repository, and a frozen
+ * set is compared with every merge-base line, the stricter anchor, whatever GitHub holds today;
  * `--offline` changes only git, never the model calls. In every mode, the git a run starts reads
  * neither the operator's nor the system's git configuration, and no variable that would point it
  * at another repository (see {@link scopeRunEnvironment}), so its numbers do not depend on the
@@ -41,7 +44,9 @@
  * accounted for, left unread, what the summary's classes are (kind, counts, completeness), its loss
  * facts, and how long each pass took. A pinned pull request is fetched by its ids with no `gh`.
  * **`--without-summary`** (only with `--evidence-only`) never starts the change summary, so the
- * same passes read the pull request as they did before the summary existed. The normal mode prints
+ * same passes read the pull request as they did before the summary existed. Part B (the original
+ * authors' content) starts by the same clock check and is abandoned with it, so every row's PART-B
+ * column reads `abandoned`. The normal mode prints
  * the same evidence numbers in a second table under the first, for the pull requests whose content
  * the review read.
  *
@@ -109,6 +114,7 @@ import {
   timed,
 } from "./pr-review";
 import {
+  type ContentOptions,
   type GitFacts,
   type TextFacts,
   buildEvidence,
@@ -327,6 +333,12 @@ export interface FetchedPullRequest {
   base: string;
   head: string;
   pr: Record<string, unknown>;
+  /**
+   * Set by a reader of frozen clones that was asked for `--offline`: nothing about this pull
+   * request may be fetched or asked of a remote, so the content pass lists no version tags (its
+   * README is compared with every merge-base line, the stricter anchor). Unset: the pass may.
+   */
+  offline?: boolean;
 }
 
 /**
@@ -559,7 +571,7 @@ export function cloneReader(
         throw new CalibrationReadError("clone_missing");
       }
     }
-    return { dir, base: pin.base, head: pin.head, pr };
+    return { dir, base: pin.base, head: pin.head, pr, offline };
   };
 }
 
@@ -640,6 +652,7 @@ export async function calibrateOne(
         head: fetched.head,
         pr: fetched.pr,
         fromFork: isFromFork(fetched.pr),
+        versionTags: fetched.offline !== true,
       },
       observe,
       (s) => {
@@ -909,7 +922,10 @@ export function evidenceOne(
       row.error = "too_large";
       return row;
     }
-    const options = opts.withoutSummary ? { now: () => Number.POSITIVE_INFINITY } : {};
+    const options: ContentOptions = {
+      ...(opts.withoutSummary ? { now: () => Number.POSITIVE_INFINITY } : {}),
+      versionTags: fetched.offline !== true,
+    };
     const { value: content, ms: contentMs } = timed(() => gatherContent(dir, listing, options));
     const all: GitFacts = { ...listing, ...content };
     const stats = evidenceStats(all, buildEvidence(all, NEUTRAL_TEXT), { listingMs, contentMs });
@@ -967,13 +983,42 @@ function truncatedWord(e: EvidenceCounts): string {
 }
 
 /**
+ * What Part B (the original authors' content) did to a pull request, as the one word the table
+ * shows, from the numbers of {@link EvidenceStats}: `abandoned` (the pass was abandoned: a person
+ * looks), `fail` (`originalFails`: `no_degradation` fails whatever the review says), `unknown`
+ * (the platform has a finding and no fail: recordings replaced, or a part it could not compare),
+ * `info` (only what the model is left to judge: a minor edit, later text altered, an author field
+ * edited slightly, a recording moved with its key) or `-` (nothing). The fail and the findings are
+ * the review's own (`originalLowersToFail`, `platformFindings`), not a second reading of the facts.
+ */
+export function partBWord(e: EvidenceCounts): "abandoned" | "fail" | "unknown" | "info" | "-" {
+  if (e.originalAbandoned) return "abandoned";
+  if (e.originalFails > 0) return "fail";
+  if (e.originalFindings > 0) return "unknown";
+  const information =
+    e.readmeMinorEdits + e.readmeLaterAltered + e.authorFieldsEdited + e.recordingsMoved;
+  return information > 0 ? "info" : "-";
+}
+
+/**
+ * The lines of text a pull request altered, as the platform counts them for its note: README lines
+ * the original authors published that were altered or moved, runs of new lines put inside one of
+ * their paragraphs (each counts as one line), and existing CHANGES lines altered or moved.
+ */
+function textLinesAltered(e: EvidenceCounts): number {
+  return e.readmeAlteredLines + e.readmeInsideParagraph + e.changesAlteredLines;
+}
+
+/**
  * The evidence table, one pull request per line, with a header and totals. Pure; numbers and
  * closed words only. Columns: the files changed, wanted (in the areas the review reads), proven
  * cosmetic, summarized and refused by the summary, accounted for, the classes it showed and cut
  * and the characters of its block, the diffs shown, the files read and left unread, what made the
  * evidence truncated, the rows, columns and keys removed and not kept (LOSS r/c/k), the platform's
- * findings, the refused files that delete a line (shown/incomplete/hidden), and the two passes'
- * seconds. A cell the run did not count (the normal mode counts no refusal) is `-`.
+ * findings about the change summary, Part B's word ({@link partBWord}) and its numbers (B t/f/p/r:
+ * text lines altered, author fields altered, participant values altered, recordings replaced), the
+ * refused files that delete a line (shown/incomplete/hidden), and the two passes' seconds. A cell
+ * the run did not count (the normal mode counts no refusal) is `-`.
  */
 export function renderEvidenceTable(rows: readonly EvidenceRow[]): string[] {
   const cells = rows.map((r) => {
@@ -999,6 +1044,8 @@ export function renderEvidenceTable(rows: readonly EvidenceRow[]): string[] {
       truncatedWord(e),
       `${e.rowsRemoved}/${e.columnsRemoved}/${e.keysRemoved}`,
       String(e.platformFindings),
+      partBWord(e),
+      `${textLinesAltered(e)}/${e.authorFieldsAltered}/${e.participantValuesAltered}/${e.recordingsReplaced}`,
       d === null ? "-" : `${d.shown}/${d.incomplete}/${d.hidden}${d.hidden > 0 ? " HIDDEN" : ""}`,
       r.timings === null ? "-" : `${seconds(r.timings.listingMs)}|${seconds(r.timings.contentMs)}`,
     ];
@@ -1020,6 +1067,8 @@ export function renderEvidenceTable(rows: readonly EvidenceRow[]): string[] {
     "TRUNCATED",
     "LOSS r/c/k",
     "FINDINGS",
+    "PART-B",
+    "B t/f/p/r",
     "REFUSED-DELETED s/i/h",
     "SECONDS listing|content",
   ];
@@ -1078,17 +1127,29 @@ function evidenceTotals(rows: readonly EvidenceRow[]): string[] {
   );
   const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
   const notRead = rows.length - read.length;
+  // Part B: a fail is counted once and then by what it altered (a row may alter several kinds); the
+  // rest that the platform holds is unknown, with the pass that was abandoned counted apart from the
+  // parts it could not compare and the recordings it found replaced.
+  const failing = (f: (e: EvidenceCounts) => boolean) =>
+    count((e) => partBWord(e) === "fail" && f(e));
+  const holding = (f: (e: EvidenceCounts) => boolean) =>
+    count((e) => partBWord(e) === "unknown" && f(e));
+  const failed = count((e) => partBWord(e) === "fail");
+  const abandoned = count((e) => partBWord(e) === "abandoned");
+  const unknownOnly = count((e) => partBWord(e) === "unknown") + abandoned;
   return [
     `${plural(rows.length, "pull request", "pull requests")}, ${notRead} without evidence${
       errors.size > 0 ? ` (${[...errors.entries()].map(([w, n]) => `${w} ${n}`).join(", ")})` : ""
     }.`,
     `Files: ${total((e) => e.files)} changed, ${total((e) => e.wanted)} wanted, ${total((e) => e.cosmetic)} cosmetic, ${total((e) => e.summarized)} summarized, ${total((e) => e.refused)} refused${byReason}, ${total((e) => e.accounted)} accounted for, ${total((e) => e.read)} read, ${total((e) => e.unread)} unread.`,
     `Pull requests: ${count((e) => e.truncated)} truncated (${count((e) => e.listCut)} list cut, ${count((e) => e.readIncomplete)} content not read in full), ${count((e) => e.summaryAbandoned)} with the summary abandoned, ${count((e) => e.platformFindings > 0)} with a blocking loss (a platform finding), ${count((e) => e.cut > 0)} with a class cut.`,
+    `Part B: ${failed} fail (text ${failing((e) => textLinesAltered(e) > 0)}, fields ${failing((e) => e.authorFieldsAltered > 0)}, participants ${failing((e) => e.participantValuesAltered > 0)}), ${unknownOnly} unknown only (recordings ${holding((e) => e.recordingsReplaced > 0)}, not decided ${holding((e) => e.originalUndecided)}, abandoned ${abandoned}); anchor from a version tag in ${count((e) => e.anchorFromTag)}.`,
     deleted.length === 0
       ? "Removals in refused files: not counted in this mode."
       : `Removals in refused files: ${withDeleted.length} pull requests have a refused file that deletes a line; files shown ${sumDeleted("shown")}, incomplete ${sumDeleted("incomplete")}, HIDDEN ${sumDeleted("hidden")}.`,
     `Seconds: slowest listing ${slowest("listingMs")}, slowest content ${slowest("contentMs")}, all passes ${seconds(allMs)}.`,
     "LOSS r/c/k = rows, columns with values and keys removed and not kept elsewhere; REFUSED-DELETED s/i/h = files the summary refused that delete a line, shown in full, in a pull request whose content is incomplete, or HIDDEN (neither, exit 1); TRUNCATED says what made the evidence truncated.",
+    "PART-B = fail (the original authors' text, author fields or participant values were altered), unknown (recordings replaced, or a part not compared), abandoned (not compared at all), info (only edits the model judges) or - (nothing); B t/f/p/r = text lines altered, author fields altered, participant values altered, recordings replaced.",
   ];
 }
 
@@ -1216,7 +1277,9 @@ function usage(why: string): number {
       "                              [--evidence-only [--without-summary]] [--json]\n" +
       "       FILE: one pull request per line, optionally followed by pass, fail or uncertain,\n" +
       "       and optionally by its base and head commits (full ids), which need --clones\n" +
-      "       or --evidence-only",
+      "       or --evidence-only\n" +
+      "       --without-summary also abandons Part B (the original authors' content): the\n" +
+      "       PART-B column reads abandoned for every pull request",
   );
   return 2;
 }

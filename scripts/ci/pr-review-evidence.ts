@@ -15,8 +15,11 @@
  * **Two passes, for the two stages.** {@link gatherListing} reads what the screen is shown: the
  * change list, the version and name in `dataset_description.json` (the one file whose content it
  * reads), the subject counts and the commit subjects. {@link gatherContent} reads what only the
- * full review is shown: the cosmetic checks, the diffs and the change log. A pull request the
- * screen stops never has a file's content read beyond `dataset_description.json`.
+ * full review is shown: the cosmetic checks, the change summary, the facts about the original
+ * authors' content (Part B, whose search for the README's anchor is the one call that asks the
+ * origin for anything but objects: its version tags), the diffs and the change log. A pull request
+ * the screen stops never has a file's content read beyond `dataset_description.json`, and never
+ * has the origin's tags listed.
  *
  * The output has two halves with different trust. {@link buildEvidence} is the deterministic
  * account (counts per area, versions, subjects, a file list) that goes into the report whatever
@@ -59,6 +62,22 @@ import {
   SEMVER,
 } from "../../shared/pr-review";
 import { shouldAnnex } from "../../src/lib/git-annex/policy";
+import {
+  type AnchorLookup,
+  type DescriptionSide,
+  type DocumentKind,
+  type DocumentPart,
+  ORIGINAL_ABANDONED,
+  ORIGINAL_LIMITS,
+  type OriginalContentFacts,
+  type PointerProbe,
+  type RecordingChange,
+  chooseAnchor,
+  inReviewedScope,
+  isDocumentName,
+  originalContentFacts,
+  parseVersionTags,
+} from "./pr-review-original";
 import {
   ABANDONED_SUMMARY,
   type ChangeSummary,
@@ -291,6 +310,14 @@ export interface ContentFacts {
    * leaves everything else exactly as it is without a summary.
    */
   summary: ChangeSummary;
+  /**
+   * What the pull request changed of the content its original authors published (Part B: the
+   * README, CHANGES, the author fields of `dataset_description.json`, participant values and
+   * annexed recordings; `pr-review-original.ts`). All or nothing, like the summary:
+   * `ORIGINAL_ABANDONED` when the pass had too little time left to start it or could not read what
+   * it needs, never a part of the facts.
+   */
+  original: OriginalContentFacts;
 }
 
 /** Everything the full review is shown: the listing and the content pass together. */
@@ -411,6 +438,11 @@ interface GitCallOptions {
   deadline?: number;
   /** The most output the call may produce; {@link MAX_GIT_OUTPUT} unless given. */
   maxBuffer?: number;
+  /**
+   * Variables set for this one call, over {@link childEnv}: `GIT_NO_LAZY_FETCH=1` keeps a call in a
+   * partial clone from fetching an object the clone does not hold.
+   */
+  env?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -452,7 +484,7 @@ function runGit(
   const options: ExecFileSyncOptions = {
     encoding,
     maxBuffer: call.maxBuffer ?? MAX_GIT_OUTPUT,
-    env: childEnv(),
+    env: call.env === undefined ? childEnv() : { ...childEnv(), ...call.env },
     stdio: [call.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     ...(call.input === undefined ? {} : { input: call.input }),
     ...(Number.isFinite(timeout) ? { timeout } : {}),
@@ -498,12 +530,27 @@ function tryGitBytes(dir: string, args: string[]): string | null {
 }
 
 /** A git call whose failure is null, for the caller to name; running out of time is thrown. */
-function tryGit(dir: string, args: string[]): string | null {
+function tryGit(dir: string, args: string[], call?: GitCallOptions): string | null {
   try {
-    return runGit(dir, args, "utf8");
+    return runGit(dir, args, "utf8", call);
   } catch (e) {
     if (e instanceof EvidenceError) throw e;
     return null;
+  }
+}
+
+/**
+ * The exit status of a git call that answers by it, as `merge-base --is-ancestor` does: 0 or 1, and
+ * null for anything else (another status, a signal, output past its bound, a call past its own
+ * deadline), which is "git could not say". Running out of the pass's budget is still thrown.
+ */
+function gitStatus(dir: string, args: string[], call: GitCallOptions = {}): 0 | 1 | null {
+  try {
+    runGit(dir, args, "utf8", call);
+    return 0;
+  } catch (e) {
+    if (e instanceof EvidenceError) throw e;
+    return (e as { status?: unknown }).status === 1 ? 1 : null;
   }
 }
 
@@ -605,6 +652,9 @@ const REGULAR_FILE_MODES: ReadonlySet<string> = new Set(["100644", "100755"]);
 /** The object id git writes for the side of a change that does not exist. */
 const ZERO_OID = "0".repeat(40);
 
+/** The mode of a submodule: a commit of another repository, with no blob to read. */
+const SUBMODULE_MODE = "160000";
+
 /**
  * One changed path as `git diff --raw` names it: its status, the mode and the object id on each
  * side (`000000` and {@link ZERO_OID} for a side that does not exist). A type change (`T`: a
@@ -690,6 +740,34 @@ export function readBlobs(
   caps: { maxBytes: number; maxTotalBytes: number },
   deadline?: number,
 ): Map<string, Buffer> | null {
+  return readBlobsSized(dir, oids, caps, deadline)?.blobs ?? null;
+}
+
+/** What {@link readBlobsSized} read: the blobs, and the size of every blob it was asked about. */
+export interface SizedBlobs {
+  blobs: Map<string, Buffer>;
+  /**
+   * The size git gave for each id it holds as a blob, read or left out by a cap. An id with no size
+   * here is one git said is missing, or names a tree, a commit or a tag, or was never asked about
+   * (not a full id, or the zero id). A size is a fact about the blob, so a caller can tell a blob too
+   * large to read from one that could not be read at all.
+   */
+  sizes: Map<string, number>;
+}
+
+/**
+ * {@link readBlobs}, with the size of every blob asked about kept beside the blobs read, and with
+ * `maxBytes` either one bound for every id or a bound per id (so one call can read a document whole
+ * and only the first kilobyte's worth of a pointer). Every rule of {@link readBlobs} holds: the
+ * ids, the prefix rule of `maxTotalBytes`, what is left out, and when the answer is null. A blob
+ * past the total keeps its size.
+ */
+export function readBlobsSized(
+  dir: string,
+  oids: readonly string[],
+  caps: { maxBytes: number | ((oid: string) => number); maxTotalBytes: number },
+  deadline?: number,
+): SizedBlobs | null {
   const ids: string[] = [];
   const seen = new Set<string>();
   for (const oid of oids) {
@@ -698,7 +776,10 @@ export function readBlobs(
     ids.push(oid);
   }
   const blobs = new Map<string, Buffer>();
-  if (ids.length === 0) return blobs;
+  const sizes = new Map<string, number>();
+  if (ids.length === 0) return { blobs, sizes };
+  const maxBytes = caps.maxBytes;
+  const capOf = typeof maxBytes === "number" ? () => maxBytes : maxBytes;
   const bound = deadline === undefined ? {} : { deadline };
   try {
     const answer = runGit(dir, ["cat-file", "--batch-check"], "utf8", {
@@ -720,9 +801,10 @@ export function readBlobs(
       if (line === `${id} missing`) continue;
       const m = /^([0-9a-f]{40}) (blob|tree|commit|tag) (0|[1-9][0-9]*)$/.exec(line);
       if (m === null || m[1] !== id) return null;
-      if (m[2] !== "blob" || exhausted) continue;
+      if (m[2] !== "blob") continue;
       const size = Number(m[3]);
-      if (size > caps.maxBytes) continue;
+      sizes.set(id, size);
+      if (exhausted || size > capOf(id)) continue;
       if (total + size > caps.maxTotalBytes) {
         exhausted = true;
         continue;
@@ -730,7 +812,7 @@ export function readBlobs(
       total += size;
       selected.push({ id, size });
     }
-    if (selected.length === 0) return blobs;
+    if (selected.length === 0) return { blobs, sizes };
     const out = runGit(dir, ["cat-file", "--batch"], "buffer", {
       ...bound,
       input: Buffer.from(`${selected.map((s) => s.id).join("\n")}\n`),
@@ -745,7 +827,7 @@ export function readBlobs(
       blobs.set(id, out.subarray(nl + 1, end));
       at = end + 1;
     }
-    return at === out.length ? blobs : null;
+    return at === out.length ? { blobs, sizes } : null;
   } catch (e) {
     // Swallowing this too would give the same result for the pass: its budget is spent, so the next
     // git call throws `timed_out` again at once. It is rethrown so the code says what happens.
@@ -1004,13 +1086,26 @@ const EMPTY_BYTES = new Uint8Array(0);
  */
 const BINARY_DIFF = /(?:^|\n)Binary files [^\n]* differ(?:\n|$)/;
 
-/** What a test may set for one content pass; production passes nothing. */
+/** What a caller may set for one content pass; the review passes nothing. */
 export interface ContentOptions {
   /**
-   * The clock the change summary is started and stopped by: `Date.now` unless given. Only the
-   * summary reads it; every git call's timeout and the search for repeats keep the real clock.
+   * The clock the change summary is started and stopped by, and Part B is started by: `Date.now`
+   * unless given. Only those two read it; every git call's timeout and the search for repeats keep
+   * the real clock.
    */
   now?: () => number;
+  /**
+   * Whether Part B lists the origin's version tags (`git ls-remote`) to find the README's anchor.
+   * True unless given. A run that must not reach a remote (the calibration's `--offline`, whose
+   * frozen clones still name GitHub as their origin) passes false, and the README is then
+   * protected from the merge base, the stricter side.
+   */
+  versionTags?: boolean;
+  /**
+   * When given, set to the most Part B's one batch of blobs may read in all ({@link partBBytesLeft}
+   * of what the cosmetic proofs and the summary's pool read), for a test to see the bound applied.
+   */
+  partBMeter?: { maxTotalBytes: number };
 }
 
 /**
@@ -1051,6 +1146,10 @@ export function gatherContent(
  * being read as moved past it. A table that cannot be read is left out, so nothing can be found
  * kept in it. A side that could not be read is never handed on as a missing one, which would say
  * the file was added.
+ *
+ * Beside the summary it hands on what its pool read that Part B may need again, so no blob is read
+ * twice in one pass: the blobs of at most `pointerMaxBytes` (a pointer probe's whole bytes) and the
+ * bytes read in all, which count toward the pass's bound.
  */
 function changeSummary(
   dir: string,
@@ -1058,10 +1157,15 @@ function changeSummary(
   checkedBlobs: ReadonlyMap<string, Buffer>,
   candidates: readonly SummaryCandidate[],
   now: () => number,
-): ChangeSummary {
-  if (entries === null || candidates.length === 0) return EMPTY_SUMMARY;
+): PooledSummary {
+  const unpooled = (summary: ChangeSummary): PooledSummary => ({
+    summary,
+    small: new Map(),
+    bytes: 0,
+  });
+  if (entries === null || candidates.length === 0) return unpooled(EMPTY_SUMMARY);
   const deadline = gitDeadline === null ? null : gitDeadline - SUMMARY_LIMITS.timeReserveMs;
-  if (deadline !== null && now() >= deadline) return ABANDONED_SUMMARY;
+  if (deadline !== null && now() >= deadline) return unpooled(ABANDONED_SUMMARY);
 
   const matters = poolFileMatters(candidates.map((c) => c.path));
   const sides: { entry: RawEntry; regular: boolean }[] = [];
@@ -1090,7 +1194,13 @@ function changeSummary(
     { maxBytes: SUMMARY_LIMITS.maxBlobBytes, maxTotalBytes: SUMMARY_LIMITS.maxTotalBytes - held },
     deadline ?? undefined,
   );
-  if (poolBlobs === null) return ABANDONED_SUMMARY;
+  if (poolBlobs === null) return unpooled(ABANDONED_SUMMARY);
+  const small = new Map<string, Buffer>();
+  let bytes = 0;
+  for (const [id, blob] of poolBlobs) {
+    bytes += blob.length;
+    if (blob.length <= ORIGINAL_LIMITS.pointerMaxBytes) small.set(id, blob);
+  }
   const blobOf = (id: string): Buffer | undefined => checkedBlobs.get(id) ?? poolBlobs.get(id);
   const pool: PoolFile[] = [];
   for (const { entry, regular } of sides) {
@@ -1104,7 +1214,318 @@ function changeSummary(
     }
     pool.push({ path: entry.path, before, after });
   }
-  return summarizeChanges({ candidates, pool, deadline, now });
+  return { summary: summarizeChanges({ candidates, pool, deadline, now }), small, bytes };
+}
+
+/** The change summary of a pass, and what its pool read (see {@link changeSummary}). */
+interface PooledSummary {
+  summary: ChangeSummary;
+  /** The pool's blobs of at most `pointerMaxBytes`, by id. */
+  small: ReadonlyMap<string, Buffer>;
+  /** The bytes the pool read, every blob together. */
+  bytes: number;
+}
+
+/**
+ * What the search for the README's anchor may spend: the listing of the origin's tags and the
+ * anchor's README each at most 15 seconds, every ancestor check together at most 5, and each answer
+ * a bound on its size. All of it inside Part B's own line, which comes first when it is nearer.
+ */
+const TAG_LOOKUP = {
+  listMs: 15_000,
+  listMaxBytes: 1024 * 1024,
+  ancestorMs: 5_000,
+  treeMaxBytes: 16 * 1024 * 1024,
+  anchorReadMs: 15_000,
+} as const;
+
+/**
+ * For a call that must not fetch what the clone lacks. The review reads a partial clone, where
+ * asking about a missing object fetches it from the origin: a tag commit the clone does not hold
+ * would otherwise be fetched by the check that asks whether it is an ancestor.
+ */
+const NO_LAZY_FETCH = { GIT_NO_LAZY_FETCH: "1" } as const;
+
+/** One entry of a commit's root tree. */
+interface RootEntry {
+  mode: string;
+  type: "blob" | "tree" | "commit";
+  oid: string;
+  name: string;
+}
+
+/**
+ * The entries of a commit's root tree (`ls-tree -z`, not recursive), or null when git could not
+ * list them, or wrote anything but entries of that shape, or named one entry twice (which no tree
+ * git writes holds, and which would make one document two).
+ */
+function rootTree(dir: string, rev: string, call: GitCallOptions): RootEntry[] | null {
+  const listing = tryGit(dir, ["ls-tree", "-z", rev], call);
+  if (listing === null) return null;
+  const entries: RootEntry[] = [];
+  const names = new Set<string>();
+  for (const record of listing.split("\0")) {
+    if (record === "") continue;
+    const m = /^([0-7]{6}) (blob|tree|commit) ([0-9a-f]{40})\t(.+)$/s.exec(record);
+    if (m === null || names.has(m[4] as string)) return null;
+    names.add(m[4] as string);
+    entries.push({
+      mode: m[1] as string,
+      type: m[2] as RootEntry["type"],
+      oid: m[3] as string,
+      name: m[4] as string,
+    });
+  }
+  return entries;
+}
+
+/** The parts of a document in a root tree, each with its bytes or `unreadable`. */
+function documentParts(
+  document: DocumentKind,
+  tree: readonly RootEntry[],
+  bytesOf: (oid: string) => Buffer | undefined,
+): DocumentPart[] {
+  return tree
+    .filter((entry) => isDocumentName(document, entry.name))
+    .map((entry) => ({
+      name: entry.name,
+      mode: entry.mode,
+      oid: entry.oid,
+      content: (entry.type === "blob" ? bytesOf(entry.oid) : undefined) ?? "unreadable",
+    }));
+}
+
+/**
+ * The README at the first version tag that is an ancestor of the merge base (design B3, as built),
+ * or the reason there is none. Every step that cannot be answered stops the search, and the README
+ * is then protected from the merge base, the stricter side:
+ *
+ * 1. the origin's `v*` tags, listed with `git ls-remote` (the repository's own configuration
+ *    authenticates it, and nothing can prompt); a failure, a timeout or an answer past
+ *    `listMaxBytes` is `lookup_failed`;
+ * 2. the lowest tag whose commit is an ancestor of the merge base ({@link chooseAnchor}), each
+ *    check with lazy fetching off, so a tag commit the clone does not hold cannot be fetched by
+ *    asking about it: git says it is no valid commit, and that check failed (`check_failed`), which
+ *    stops the search rather than moving on to a higher tag;
+ * 3. the tag commit's root tree, also with lazy fetching off (it is local: `main` is fetched with
+ *    its whole history, blob-less); a failure is `tag_tree_unreadable`;
+ * 4. the README parts there, read by their own call so that a fetch that fails costs the anchor and
+ *    never the rest of Part B. A part already read in this pass is not read again; a part that
+ *    could not be read leaves the anchor unreadable, and `proseFacts` then protects every
+ *    merge-base line.
+ *
+ * With `readme` false (CHANGES changed and the README did not) the search stops at step 2: what
+ * it found says whether the dataset was ever published (`no_tag`), and no README is read.
+ */
+function tagAnchor(
+  dir: string,
+  mergeBase: string,
+  line: number | null,
+  bytesOf: (oid: string) => Buffer | undefined,
+  readme: boolean,
+): { lookup: AnchorLookup; anchor: DocumentPart[] | null } {
+  const within = (ms: number): number =>
+    Math.min(Date.now() + ms, line ?? Number.POSITIVE_INFINITY);
+  const listed = tryGit(dir, ["ls-remote", "--tags", "origin", "refs/tags/v*"], {
+    deadline: within(TAG_LOOKUP.listMs),
+    maxBuffer: TAG_LOOKUP.listMaxBytes,
+  });
+  if (listed === null) return { lookup: "lookup_failed", anchor: null };
+  // One deadline for every check together: a repository of many tags costs at most 5 seconds.
+  const checks = within(TAG_LOOKUP.ancestorMs);
+  const choice = chooseAnchor(parseVersionTags(listed), (commit) => {
+    const status = gitStatus(dir, ["merge-base", "--is-ancestor", commit, mergeBase], {
+      deadline: checks,
+      env: NO_LAZY_FETCH,
+    });
+    return status === null ? null : status === 0;
+  });
+  if (choice.anchor === "merge_base") return { lookup: choice.reason, anchor: null };
+  if (!readme) return { lookup: "first_version_tag", anchor: null };
+  const tree = rootTree(dir, choice.commit, {
+    ...(line === null ? {} : { deadline: line }),
+    env: NO_LAZY_FETCH,
+    maxBuffer: TAG_LOOKUP.treeMaxBytes,
+  });
+  if (tree === null) return { lookup: "tag_tree_unreadable", anchor: null };
+  const unread = tree
+    .filter((entry) => entry.type === "blob" && isDocumentName("readme", entry.name))
+    .map((entry) => entry.oid)
+    .filter((oid) => bytesOf(oid) === undefined);
+  // Parts past the bound make the anchor too large to read whole, which also leaves no anchor.
+  const read = readBlobs(
+    dir,
+    unread,
+    { maxBytes: ORIGINAL_LIMITS.maxDocumentBytes, maxTotalBytes: ORIGINAL_LIMITS.maxDocumentBytes },
+    within(TAG_LOOKUP.anchorReadMs),
+  );
+  const anchor = documentParts("readme", tree, (oid) => bytesOf(oid) ?? read?.get(oid));
+  return { lookup: "first_version_tag", anchor };
+}
+
+/**
+ * The bytes Part B's batch may still read: what the pass's `maxTotalBytes` (256 MiB) leaves after
+ * the blobs the cosmetic proofs read (`checked`) and the bytes the summary's pool read
+ * (`pooledBytes`), and never less than none. One number for the whole pass, so Part B cannot read
+ * past what the summary was allowed.
+ */
+export function partBBytesLeft(checked: ReadonlyMap<string, Buffer>, pooledBytes: number): number {
+  let held = pooledBytes;
+  for (const blob of checked.values()) held += blob.length;
+  return Math.max(0, SUMMARY_LIMITS.maxTotalBytes - held);
+}
+
+/**
+ * Part B of the content pass: what the pull request changed of the content its original authors
+ * published, read from git and handed to `originalContentFacts` (`pr-review-original.ts`), which
+ * decides everything from the bytes. Run after the change summary and before the raw diffs, under
+ * the summary's line (the pass's deadline less `timeReserveMs`), so it never costs the raw diffs
+ * and the change log their reserve. All or nothing: {@link ORIGINAL_ABANDONED} when
+ *
+ * - the clock the pass was given says the line has passed before it starts;
+ * - git could not say what changed (`rawEntries` null), or list either root tree;
+ * - the one batch of blobs could not be read, or not before the line.
+ *
+ * The batch reads, in this order and each id once: both sides' parts of each changed document (a
+ * document is changed when any changed path is one of its parts, and then every part of it is read,
+ * changed or not), both sides of `dataset_description.json` when it changed, and every side of
+ * every changed path but a submodule's, for its pointer probe: its size, and its bytes when it is
+ * no longer than `pointerMaxBytes`. A blob the cosmetic proofs or the summary's pool already read
+ * is taken from them and not read again, and what they read counts toward the pass's
+ * `maxTotalBytes`. A blob the batch leaves out (missing, past a cap) is a part or a side that
+ * could not be read, which the facts report as not decided, never as clean.
+ *
+ * The version tags are listed only when a root README or CHANGES part changed, and only when the
+ * caller allows it ({@link ContentOptions.versionTags}); see {@link tagAnchor}. They give the
+ * README its anchor, and say for both documents whether the dataset was ever published.
+ * Running out of the pass's own budget is still `timed_out`, thrown, as for every call of the pass.
+ */
+function originalContent(
+  dir: string,
+  listing: Listing,
+  entries: ReadonlyMap<string, RawEntry> | null,
+  read: { checked: ReadonlyMap<string, Buffer>; pooled: PooledSummary },
+  cosmetic: ReadonlySet<string>,
+  options: { now: () => number; versionTags: boolean; meter?: { maxTotalBytes: number } },
+): OriginalContentFacts {
+  const line = gitDeadline === null ? null : gitDeadline - SUMMARY_LIMITS.timeReserveMs;
+  if (line !== null && options.now() >= line) return ORIGINAL_ABANDONED;
+  if (entries === null) return ORIGINAL_ABANDONED;
+  const bound = line === null ? {} : { deadline: line };
+  const baseTree = rootTree(dir, listing.mergeBase, bound);
+  if (baseTree === null) return ORIGINAL_ABANDONED;
+  const headTree = rootTree(dir, listing.head, bound);
+  if (headTree === null) return ORIGINAL_ABANDONED;
+
+  const changed = [...entries.values()];
+  const documents = (["readme", "changes"] as const).filter((document) =>
+    changed.some((entry) => isDocumentName(document, entry.path)),
+  );
+  const descriptionChanged = entries.has("dataset_description.json");
+  const descriptionIn = (tree: readonly RootEntry[]): RootEntry | undefined =>
+    tree.find((entry) => entry.name === "dataset_description.json");
+  const held = (oid: string): Buffer | undefined =>
+    read.checked.get(oid) ?? read.pooled.small.get(oid);
+  // Each id the batch asks for, with the most it reads of it: a document part whole (to the
+  // document's bound), the description to the summary's per-file bound, a probe to a pointer's.
+  // A part or a description past its bound is left out, and so refused as unreadable or unparsed
+  // rather than as too large: undecided either way, which is all a refusal says.
+  const wanted = new Map<string, number>();
+  const want = (oid: string, maxBytes: number): void => {
+    if (held(oid) === undefined) wanted.set(oid, Math.max(wanted.get(oid) ?? 0, maxBytes));
+  };
+  for (const document of documents) {
+    for (const tree of [baseTree, headTree]) {
+      for (const entry of tree) {
+        if (entry.type === "blob" && isDocumentName(document, entry.name)) {
+          want(entry.oid, ORIGINAL_LIMITS.maxDocumentBytes);
+        }
+      }
+    }
+  }
+  if (descriptionChanged) {
+    for (const tree of [baseTree, headTree]) {
+      const entry = descriptionIn(tree);
+      if (entry?.type === "blob") want(entry.oid, SUMMARY_LIMITS.maxBlobBytes);
+    }
+  }
+  for (const entry of changed) {
+    if (entry.status !== "added" && entry.modeBefore !== SUBMODULE_MODE) {
+      want(entry.oidBefore, ORIGINAL_LIMITS.pointerMaxBytes);
+    }
+    if (entry.status !== "removed" && entry.modeAfter !== SUBMODULE_MODE) {
+      want(entry.oidAfter, ORIGINAL_LIMITS.pointerMaxBytes);
+    }
+  }
+  const maxTotalBytes = partBBytesLeft(read.checked, read.pooled.bytes);
+  if (options.meter) options.meter.maxTotalBytes = maxTotalBytes;
+  const batch = readBlobsSized(
+    dir,
+    [...wanted.keys()],
+    { maxBytes: (oid) => wanted.get(oid) ?? 0, maxTotalBytes },
+    line ?? undefined,
+  );
+  if (batch === null) return ORIGINAL_ABANDONED;
+
+  const bytesOf = (oid: string): Buffer | undefined => held(oid) ?? batch.blobs.get(oid);
+  const probe = (mode: string, oid: string): PointerProbe => {
+    // A submodule has no blob, and what it is does not depend on the probe.
+    if (mode === SUBMODULE_MODE) return "unreadable";
+    const size = held(oid)?.length ?? batch.sizes.get(oid);
+    if (size === undefined) return "unreadable";
+    if (size > ORIGINAL_LIMITS.pointerMaxBytes) return "large";
+    return bytesOf(oid) ?? "unreadable";
+  };
+  const recordings: RecordingChange[] = changed.map((entry) => ({
+    path: entry.path,
+    status: entry.status,
+    modeBefore: entry.modeBefore,
+    modeAfter: entry.modeAfter,
+    oidBefore: entry.oidBefore,
+    oidAfter: entry.oidAfter,
+    recordingArea: classifyPath(entry.path) === "recordings",
+    inReviewedScope: inReviewedScope(entry.path),
+    before: entry.status === "added" ? null : probe(entry.modeBefore, entry.oidBefore),
+    after: entry.status === "removed" ? null : probe(entry.modeAfter, entry.oidAfter),
+  }));
+  const side = (tree: readonly RootEntry[]): DescriptionSide => {
+    const entry = descriptionIn(tree);
+    if (entry === undefined) return "absent";
+    return (entry.type === "blob" ? bytesOf(entry.oid) : undefined) ?? "unreadable";
+  };
+  const sides = (document: DocumentKind) =>
+    documents.includes(document)
+      ? {
+          base: documentParts(document, baseTree, bytesOf),
+          head: documentParts(document, headTree, bytesOf),
+        }
+      : { base: [], head: [] };
+
+  let anchorLookup: AnchorLookup = "not_needed";
+  let anchor: DocumentPart[] | null = null;
+  if (documents.length > 0) {
+    if (options.versionTags) {
+      ({ lookup: anchorLookup, anchor } = tagAnchor(
+        dir,
+        listing.mergeBase,
+        line,
+        bytesOf,
+        documents.includes("readme"),
+      ));
+    } else anchorLookup = "not_looked_up";
+  }
+  return originalContentFacts({
+    changes: changed.map(({ path, status }) => ({ path, status })),
+    documents: { readme: sides("readme"), changes: sides("changes") },
+    anchor,
+    anchorLookup,
+    description: descriptionChanged
+      ? { before: side(baseTree), after: side(headTree) }
+      : { before: "absent", after: "absent" },
+    recordings,
+    summary: read.pooled.summary,
+    cosmetic,
+  });
 }
 
 function readContent(dir: string, listing: Listing, options: ContentOptions): ContentFacts {
@@ -1171,8 +1592,18 @@ function readContent(dir: string, listing: Listing, options: ContentOptions): Co
       candidates.push({ path, before, after });
     }
   }
-  const summary = changeSummary(dir, entries, checkedBlobs, candidates, options.now ?? Date.now);
+  const now = options.now ?? Date.now;
+  const pooled = changeSummary(dir, entries, checkedBlobs, candidates, now);
+  const { summary } = pooled;
   const accounted = summary.accounted;
+  const original = originalContent(
+    dir,
+    listing,
+    entries,
+    { checked: checkedBlobs, pooled },
+    cosmeticOnly,
+    { now, versionTags: options.versionTags ?? true, meter: options.partBMeter },
+  );
 
   const patches: Patch[] = [];
   const read = new Map<string, Patch>();
@@ -1297,6 +1728,7 @@ function readContent(dir: string, listing: Listing, options: ContentOptions): Co
     groupsOmittedFiles: ordered.slice(MAX_GROUPS).reduce((n, g) => n + g.files, 0),
     changelogEntry: changelogEntryFor(dir, mergeBase, headSha, listing.versionAfter),
     summary,
+    original,
   };
 }
 

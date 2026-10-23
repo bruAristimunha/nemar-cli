@@ -30,6 +30,7 @@ import {
   realpathSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -50,6 +51,7 @@ import {
   honorsNoLazyFetch,
   parseGitVersion,
   parseTarget,
+  partBWord,
   refusedDeletions,
   renderEvidenceTable,
   renderTable,
@@ -1417,6 +1419,7 @@ function localChange(
   name: string,
   base: Record<string, string>,
   edit: (dir: string) => void,
+  setup: (dir: string) => void = () => {},
 ): { dir: string; base: string; head: string; read: () => FetchedPullRequest } {
   const dir = join(root, name);
   mkdirSync(dir, { recursive: true });
@@ -1424,6 +1427,7 @@ function localChange(
   write(dir, "dataset_description.json", JSON.stringify({ Name: "Resting EEG", Version: "1.0.0" }));
   write(dir, "CHANGES", "1.0.0 2026-01-01\n - Initial release\n");
   for (const [rel, text] of Object.entries(base)) write(dir, rel, text);
+  setup(dir);
   git(dir, "add", "-A");
   git(dir, "commit", "-q", "-m", "initial");
   const b = git(dir, "rev-parse", "HEAD");
@@ -1487,12 +1491,12 @@ describe("--evidence-only: the review's evidence passes, and no model", () => {
     expect(requests).toHaveLength(0);
     const lines = r.out.split("\n");
     expect(lines[0]).toMatch(
-      /^PR +FILES +WANTED +COSMETIC +SUMMARIZED +REFUSED +ACCOUNTED +CLASSES +CUT +CHARS +PATCHES +READ +UNREAD +TRUNCATED +LOSS r\/c\/k +FINDINGS +REFUSED-DELETED s\/i\/h +SECONDS listing\|content$/,
+      /^PR +FILES +WANTED +COSMETIC +SUMMARIZED +REFUSED +ACCOUNTED +CLASSES +CUT +CHARS +PATCHES +READ +UNREAD +TRUNCATED +LOSS r\/c\/k +FINDINGS +PART-B +B t\/f\/p\/r +REFUSED-DELETED s\/i\/h +SECONDS listing\|content$/,
     );
     // Three files changed and read: the description and the sidecar accounted for by the summary
     // in two classes, CHANGES shown, and both accounted files shown as illustrations too.
     expect(lines[1]).toMatch(
-      /^nm000460#2 +3 +3 +0 +2 +0 +2 +2 +0 +\d+ +3 +3 +0 +no +0\/0\/0 +0 +0\/0\/0 +\d+\.\d\|\d+\.\d$/,
+      /^nm000460#2 +3 +3 +0 +2 +0 +2 +2 +0 +\d+ +3 +3 +0 +no +0\/0\/0 +0 +- +0\/0\/0\/0 +0\/0\/0 +\d+\.\d\|\d+\.\d$/,
     );
     expect(r.out).toContain("1 pull request, 0 without evidence.");
     expect(r.out).toContain("0 truncated (0 list cut, 0 content not read in full)");
@@ -2042,7 +2046,7 @@ describe("--evidence-only: the review's evidence passes, and no model", () => {
     expect(row.evidence).toMatchObject({ files: 3, wanted: 3, summarized: 2, accounted: 2 });
     const evidence = renderEvidenceTable([evidenceRowOf(row)]);
     expect(evidence[1]).toMatch(
-      /^nm000460#2 +3 +3 +0 +2 +0 +2 +2 +0 +\d+ +3 +3 +0 +no +0\/0\/0 +0 +- +\d+\.\d\|\d+\.\d$/,
+      /^nm000460#2 +3 +3 +0 +2 +0 +2 +2 +0 +\d+ +3 +3 +0 +no +0\/0\/0 +0 +- +0\/0\/0\/0 +- +\d+\.\d\|\d+\.\d$/,
     );
     expect(evidence.join("\n")).toContain("Removals in refused files: not counted in this mode.");
     // The review's own table is unchanged, and the evidence table follows it.
@@ -2064,6 +2068,285 @@ describe("--evidence-only: the review's evidence passes, and no model", () => {
     expect(reviewNote).toBeGreaterThan(0);
     expect(evidenceHeader).toBe(reviewNote + 2);
     expect(out[evidenceHeader + 1]).toMatch(/^nm000153#2 +no evidence \(gh_failed\)$/);
+  });
+});
+
+describe("Part B: its columns, its totals, and the offline runs", () => {
+  const README = "# Resting EEG\n\nTwo volunteers rested.\n\nEach recording lasted ten minutes.\n";
+  const PARTICIPANTS = (sex: string) => `participant_id\tsex\nsub-01\t${sex}\n`;
+  const DESCRIPTION = (over: Record<string, unknown> = {}) =>
+    JSON.stringify({ Name: "Resting EEG", Version: "1.1.0", ...over });
+  const annexKey = (n: number) => `SHA256E-s${100 + n}--${String(n).padStart(8, "0")}.edf`;
+  const recording = "sub-01/eeg/sub-01_task-rest_eeg.edf";
+  const annexLink = (dir: string, n: number) => {
+    mkdirSync(dirname(join(dir, recording)), { recursive: true });
+    symlinkSync(
+      `../../.git/annex/objects/Xj/9P/${annexKey(n)}/${annexKey(n)}`,
+      join(dir, recording),
+    );
+  };
+  /** What the review's stand-in is told about each pull request, so the review runs for real. */
+  const text = {
+    title: "Correct the sampling rate in the EEG sidecar",
+    body: "The sidecar said 256 Hz; the recording is 512 Hz.",
+    author_association: "NONE",
+    base: { repo: { full_name: "nemarDatasets/nm000460" } },
+    head: { repo: { full_name: "nemarDatasets/nm000460" } },
+  };
+
+  /**
+   * One pull request for each way Part B can end, with the word the table should give it, the
+   * numbers of its `B t/f/p/r` cell, and the verdict a review that says "pass" everywhere gets.
+   */
+  const makeCases = () => [
+    {
+      name: "section",
+      word: "-",
+      b: "0/0/0/0",
+      verdict: "pass",
+      pr: localChange("pb-section", { "README.md": README }, (dir) =>
+        write(dir, "README.md", `${README}\n## Added\n\nA new section.\n`),
+      ),
+    },
+    {
+      name: "text",
+      word: "fail",
+      b: "1/0/0/0",
+      verdict: "fail",
+      pr: localChange("pb-text", { "README.md": README }, (dir) =>
+        write(dir, "README.md", README.replace("\nEach recording lasted ten minutes.\n", "")),
+      ),
+    },
+    {
+      name: "fields",
+      word: "fail",
+      b: "0/1/0/0",
+      verdict: "fail",
+      pr: localChange("pb-fields", {}, (dir) =>
+        write(dir, "dataset_description.json", DESCRIPTION({ Name: "Another dataset" })),
+      ),
+    },
+    {
+      name: "participants",
+      word: "fail",
+      b: "0/0/1/0",
+      verdict: "fail",
+      pr: localChange("pb-participants", { "participants.tsv": PARTICIPANTS("M") }, (dir) =>
+        write(dir, "participants.tsv", PARTICIPANTS("F")),
+      ),
+    },
+    {
+      name: "recordings",
+      word: "unknown",
+      b: "0/0/0/1",
+      verdict: "uncertain",
+      pr: localChange(
+        "pb-recordings",
+        {},
+        (dir) => {
+          unlinkSync(join(dir, recording));
+          annexLink(dir, 2);
+        },
+        (dir) => annexLink(dir, 1),
+      ),
+    },
+    {
+      name: "undecided",
+      word: "unknown",
+      b: "0/0/0/0",
+      verdict: "uncertain",
+      pr: localChange("pb-undecided", { "README.md": README }, (dir) =>
+        write(dir, "README.md", `${README}\0`),
+      ),
+    },
+    {
+      name: "edited",
+      word: "info",
+      b: "0/0/0/0",
+      verdict: "pass",
+      pr: localChange(
+        "pb-edited",
+        {
+          "dataset_description.json": JSON.stringify({
+            Name: "Resting EEG",
+            Version: "1.0.0",
+            Funding: ["Grant 12345"],
+          }),
+        },
+        (dir) => write(dir, "dataset_description.json", DESCRIPTION({ Funding: ["Grant 12346"] })),
+      ),
+    },
+  ];
+  type PartBCase = ReturnType<typeof makeCases>[number];
+  // Built on first use: the repositories need the temporary directory the suite makes first.
+  let built: ReturnType<typeof makeCases> | null = null;
+  const cases = (): ReturnType<typeof makeCases> => {
+    built ??= makeCases();
+    return built;
+  };
+
+  test("each way Part B can end has its word and numbers in the evidence table", async () => {
+    const rows: EvidenceRow[] = [];
+    for (const c of cases()) {
+      const { code, rows: one } = await evidenceRows(c.pr.read);
+      expect(code, c.name).toBe(0);
+      rows.push({ ...(one[0] as EvidenceRow), pr: c.name });
+    }
+    const lines = renderEvidenceTable(rows);
+    for (const [i, c] of cases().entries()) {
+      const cells = (lines[i + 1] as string).split(/ {2,}/);
+      // The word is the column after FINDINGS, and the numbers the one after it.
+      expect([cells[0], cells[16], cells[17]], c.name).toEqual([c.name, c.word, c.b]);
+    }
+    expect(lines[0]).toMatch(/FINDINGS +PART-B +B t\/f\/p\/r +REFUSED-DELETED/);
+    // The same words are in the rows --json prints, as numbers and booleans.
+    expect(rows[1]?.evidence).toMatchObject({
+      originalAbandoned: false,
+      readmeAlteredLines: 1,
+      originalFindings: 1,
+      originalFails: 1,
+    });
+    expect(rows[4]?.evidence).toMatchObject({ recordingsReplaced: 1, originalFails: 0 });
+    expect(rows[5]?.evidence).toMatchObject({ readmeNotDecided: true, originalUndecided: true });
+    expect(rows[6]?.evidence).toMatchObject({ authorFieldsEdited: 1, originalFindings: 0 });
+  });
+
+  test("the totals count the fails by what they altered, and the unknowns by why", async () => {
+    const rows: EvidenceRow[] = [];
+    for (const c of cases()) {
+      rows.push((await evidenceRows(c.pr.read)).rows[0] as EvidenceRow);
+    }
+    // Without the summary the pass is abandoned by its own start check, whatever the pull request.
+    const abandoned = (await evidenceRows((cases()[0] as PartBCase).pr.read, ["--without-summary"]))
+      .rows[0];
+    expect(abandoned?.evidence).toMatchObject({ originalAbandoned: true, originalFails: 0 });
+    const table = renderEvidenceTable([...rows, abandoned as EvidenceRow]);
+    expect(table).toContain(
+      "Part B: 3 fail (text 1, fields 1, participants 1), 3 unknown only (recordings 1, not decided 1, abandoned 1); anchor from a version tag in 0.",
+    );
+    expect(table[table.length - 1]).toContain("PART-B = fail");
+    // The eighth row is the abandoned one.
+    expect(table[8]).toMatch(/ abandoned +0\/0\/0\/0 /);
+    // And a table of nothing read has nothing to count.
+    expect(renderEvidenceTable([])).toContain(
+      "Part B: 0 fail (text 0, fields 0, participants 0), 0 unknown only (recordings 0, not decided 0, abandoned 0); anchor from a version tag in 0.",
+    );
+  });
+
+  test("the word is the one the review's own verdict gives the same pull request", async () => {
+    for (const c of cases()) {
+      const { rows } = await evidenceRows(c.pr.read);
+      const e = (rows[0] as EvidenceRow).evidence as NonNullable<EvidenceRow["evidence"]>;
+      const row = await withStandIn(() =>
+        calibrateOne(target(), root, () => ({ ...c.pr.read(), pr: text })),
+      );
+      expect(row.error, c.name).toBeNull();
+      // The review said "pass" to everything; the platform lowered it as the word says.
+      expect(row.verdict, c.name).toBe(c.verdict);
+      expect(row.criteria?.no_degradation, c.name).toBe(
+        c.word === "fail" ? "fail" : c.word === "unknown" ? "unknown" : "pass",
+      );
+      // The table's word is what the review's own answer says: it fails the pull request, holds it
+      // for a person, or leaves the model's pass alone.
+      const word = partBWord(e);
+      expect(word === "fail", c.name).toBe(row.criteria?.no_degradation === "fail");
+      expect(word === "unknown", c.name).toBe(row.criteria?.no_degradation === "unknown");
+      expect(word, c.name).toBe(c.word);
+      // And the normal mode counts the same numbers the evidence mode does.
+      expect(row.evidence?.originalFails, c.name).toBe(e.originalFails);
+      expect(row.evidence?.originalFindings, c.name).toBe(e.originalFindings);
+      expect(
+        partBWord(evidenceRowOf(row).evidence as NonNullable<EvidenceRow["evidence"]>),
+        c.name,
+      ).toBe(partBWord(e));
+    }
+  });
+
+  test("--without-summary abandons Part B for every pull request, and the usage says so", async () => {
+    for (const c of cases()) {
+      const { rows } = await evidenceRows(c.pr.read, ["--without-summary"]);
+      const e = (rows[0] as EvidenceRow).evidence as NonNullable<EvidenceRow["evidence"]>;
+      expect(partBWord(e), c.name).toBe("abandoned");
+      expect(e.originalFails, c.name).toBe(0);
+    }
+    const r = await calibrate([]);
+    expect(r.code).toBe(2);
+    expect(r.said).toContain("--without-summary also abandons Part B");
+    expect(r.said).toContain("the\n       PART-B column reads abandoned for every pull request");
+  });
+
+  /**
+   * Frozen clones of one pull request that appends a section to the README: the only change of the
+   * one document whose anchor the content pass looks up, so the lookup is asked of the clone's
+   * origin unless it is switched off.
+   */
+  function readmeClones(name: string) {
+    const source = localChange(`${name}-source`, { "README.md": README }, (dir) =>
+      write(dir, "README.md", `${README}\n## Added\n\nA new section.\n`),
+    );
+    const clones = join(root, `${name}-clones`);
+    mkdirSync(clones, { recursive: true });
+    const clone = join(clones, "nm000460-2");
+    execFileSync("git", ["clone", "-q", "--no-checkout", source.dir, clone], { env: GIT_ENV });
+    writeFileSync(join(clones, "nm000460-2.shas"), `${source.base} ${source.head}\n`);
+    writeFileSync(join(clones, "nm000460-2.pr.json"), JSON.stringify(text));
+    return { clones, clone, ...source };
+  }
+
+  /** The calls to `git ls-remote` the git wrapper saw while `fn` ran; none when it saw none. */
+  async function lookups<T>(
+    name: string,
+    fn: () => Promise<T>,
+  ): Promise<{ saw: string[]; out: T }> {
+    const log = join(root, `${name}-ls-remote.log`);
+    const restore = installGitShim(root, [{ match: " ls-remote ", log }]);
+    try {
+      const out = await fn();
+      return {
+        saw: existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : [],
+        out,
+      };
+    } finally {
+      restore();
+    }
+  }
+
+  test("--offline asks no remote for the version tags in --evidence-only, and a run without it does", async () => {
+    const { clones } = readmeClones("offline-evidence");
+    const argv = ["--pr", "nm000460#2", "--clones", clones, "--evidence-only", "--json"];
+    const offline = await lookups("offline-evidence-on", () => calibrate([...argv, "--offline"]));
+    expect(offline.out.code).toBe(0);
+    expect(offline.saw).toEqual([]);
+    const row = (JSON.parse(offline.out.out) as EvidenceRow[])[0];
+    // The README was compared, with every merge-base line.
+    expect(row?.evidence).toMatchObject({
+      anchorFromTag: false,
+      readmeNotDecided: false,
+      originalAbandoned: false,
+    });
+    // The control: the wrapper does see the lookup when nothing switches it off.
+    const online = await lookups("offline-evidence-off", () => calibrate(argv));
+    expect(online.out.code).toBe(0);
+    expect(online.saw.length).toBeGreaterThan(0);
+    expect(online.saw[0]).toContain("ls-remote");
+    expect(online.saw[0]).toContain("--tags");
+  });
+
+  test("--offline asks no remote for the version tags in the normal mode either", async () => {
+    const { clone, base, head } = readmeClones("offline-normal");
+    const read = (offline: boolean) => () => ({ dir: clone, base, head, pr: text, offline });
+    const offline = await lookups("offline-normal-on", () =>
+      withStandIn(() => calibrateOne(target(), root, read(true))),
+    );
+    expect(offline.out.error).toBeNull();
+    expect(offline.out.stage).toBe("full");
+    expect(offline.out.evidence).toMatchObject({ anchorFromTag: false, originalAbandoned: false });
+    expect(offline.saw).toEqual([]);
+    const online = await lookups("offline-normal-off", () =>
+      withStandIn(() => calibrateOne(target(), root, read(false))),
+    );
+    expect(online.out.stage).toBe("full");
+    expect(online.saw.length).toBeGreaterThan(0);
   });
 });
 

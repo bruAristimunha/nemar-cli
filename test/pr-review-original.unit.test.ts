@@ -10,6 +10,7 @@ import { describe, expect, test } from "bun:test";
 import { classifyPath } from "../scripts/ci/pr-review-evidence";
 import {
   ALTERS_PARTICIPANT_VALUE,
+  ANCHOR_LOOKUPS,
   ARRAY_VALUED_KEYS,
   AUTHOR_OWNED_KEYS,
   type AlignOp,
@@ -18,14 +19,19 @@ import {
   type DescriptionSide,
   type DocumentKind,
   type DocumentPart,
+  type DocumentResult,
   MINOR_EDIT_KEYS,
+  ORIGINAL_ABANDONED,
   ORIGINAL_LIMITS,
+  type OriginalContentFacts,
+  type OriginalContentInput,
   PARTICIPANT_FILES,
   PROSE_REFUSALS,
   type PointerProbe,
   type ProseDocument,
   type ProseFacts,
   type ProseRead,
+  type ProseRefusal,
   REVIEW_LEFT_OUT_DIRS,
   type RecordingChange,
   type RecordingFacts,
@@ -45,6 +51,7 @@ import {
   minorBound,
   minorEditHides,
   normalizeProse,
+  originalContentFacts,
   parseVersionTags,
   participantValuesAltered,
   proseAltered,
@@ -87,6 +94,14 @@ function distinctLines(prefix: string, count: number): string[] {
   return Array.from({ length: count }, (_, i) => `${prefix} ${i}`);
 }
 
+/** `count` lines of `length` random letters from `seed`: no two are a minor edit of each other. */
+function farLines(count: number, length: number, seed: number): string[] {
+  const random = mulberry32(seed);
+  return Array.from({ length: count }, () =>
+    Array.from({ length }, () => String.fromCharCode(97 + Math.floor(random() * 26))).join(""),
+  );
+}
+
 /** The id git gives a blob of these bytes. */
 function gitOid(bytes: Uint8Array): string {
   const hasher = new Bun.CryptoHasher("sha1");
@@ -116,6 +131,8 @@ describe("the limits and the refusal words", () => {
       maxDocumentParts: 16,
       maxDocumentLines: 20_000,
       maxEditDistance: 2_000,
+      maxMinorPairs: 4_096,
+      maxMinorPairCodePoints: 4 * 1024 * 1024,
       minorFloor: 3,
       minorCeiling: 20,
       maxExamples: 3,
@@ -331,6 +348,102 @@ describe("normalizeProse", () => {
     const whole = { units: 0 };
     normalizeProse("a\nb\n", limit, whole);
     expect(whole.units).toBe(4);
+  });
+
+  test("a heading, the line after it and a list item start a paragraph; nothing else of Markdown is read", () => {
+    const flags = (text: string) => normalizeProse(text).lines.map((line) => line.paragraphStart);
+    expect(flags("Intro.\n## Methods\nText.\nMore text.\n")).toEqual([true, true, true, false]);
+    expect(flags("Intro.\n#\nText.\n")).toEqual([true, true, true]);
+    expect(flags("Items:\n- a\n* b\n+ c\n1. d\n22) e\ncontinued\n")).toEqual([
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+    ]);
+    // Not a heading or a list item: no blank after the marker, four spaces, seven #, ten digits.
+    expect(flags("Text.\n#hashtag\n    # code\n####### seven\n-dash\n1234567890. big\n")).toEqual([
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+    ]);
+    // Setext headings, block quotes, fences and tables are not read: blank lines alone govern them.
+    expect(flags("Title\n=====\n> quote\n```\n| a | b |\n")).toEqual([
+      true,
+      false,
+      false,
+      false,
+      false,
+    ]);
+    // Up to three spaces before a marker it is a list item; four make the line the paragraph's
+    // text. micromark with GFM renders `Text.` then `   - a` as a paragraph and a list, and with
+    // four spaces as one paragraph; the same for `1.`.
+    for (const marker of ["-", "1."]) {
+      for (const indent of [0, 1, 2, 3]) {
+        expect(flags(`Text.\n${" ".repeat(indent)}${marker} a\n`), `${indent} ${marker}`).toEqual([
+          true,
+          true,
+        ]);
+      }
+      for (const indent of [4, 5, 8]) {
+        expect(flags(`Text.\n${" ".repeat(indent)}${marker} a\n`), `${indent} ${marker}`).toEqual([
+          true,
+          false,
+        ]);
+      }
+    }
+    // Inside a list too: micromark renders `- a` then `    2. c` as one item whose text holds both.
+    expect(flags("- a\n    2. c\n")).toEqual([true, false]);
+  });
+
+  test("an ordered marker other than 1, or a marker with nothing after it, starts no paragraph inside one", () => {
+    const flags = (text: string) => normalizeProse(text).lines.map((line) => line.paragraphStart);
+    // micromark with GFM renders each of these as one paragraph: CommonMark lets only a bullet, or
+    // exactly 1. or 1), with text after it interrupt a paragraph.
+    expect(flags("Line one.\n2. INSERTED.\nLine two.\n")).toEqual([true, false, false]);
+    expect(flags("The study began in\n2019. The study enrolled forty adults.\n")).toEqual([
+      true,
+      false,
+    ]);
+    expect(flags("foo\n01. bar\n")).toEqual([true, false]);
+    expect(flags("foo\n1.\nbar\n")).toEqual([true, false, false]);
+    expect(flags("foo\n*\nbar\n")).toEqual([true, false, false]);
+    expect(flags("foo\n2. a\n3. b\n")).toEqual([true, false, false]);
+    // A bullet, or 1) or 1., with text after it does interrupt one.
+    expect(flags("foo\n1) bar\n")).toEqual([true, true]);
+    expect(flags("foo\n1. bar\n2. baz\n")).toEqual([true, true, true]);
+    expect(flags("foo\n-\tbar\n")).toEqual([true, true]);
+    // Where no paragraph is open the others start one too: on the first line, after a blank line
+    // or a heading, after an item, or after a line that continues an item with no blank line.
+    expect(flags("2. x\n")).toEqual([true]);
+    expect(flags("Text.\n\n2. x\n")).toEqual([true, true]);
+    expect(flags("# H\n2. x\n")).toEqual([true, true]);
+    expect(flags("Items:\n- a\n2019. b\n")).toEqual([true, true, true]);
+    expect(flags("Items:\n1. a\nb\nc\n2. d\n")).toEqual([true, true, false, false, true]);
+    // A blank line or a heading closes the list: a plain line after it opens a paragraph again.
+    expect(flags("1. a\n\nfoo\n2. b\n")).toEqual([true, true, false]);
+    expect(flags("- a\n# H\nText.\n2. b\n")).toEqual([true, true, true, false]);
+  });
+
+  test("the block flags cost one pass over 4 MiB of headings, list items or a hostile line", () => {
+    const size = 4 * 1024 * 1024;
+    const fill = (unit: string): string => unit.repeat(Math.ceil(size / unit.length));
+    for (const text of [
+      fill("#\n"),
+      fill("- \n"),
+      fill("1) x\n"),
+      `#${" ".repeat(size)}x`,
+      fill("   1234567890"),
+    ]) {
+      const started = performance.now();
+      normalizeProse(text);
+      expect(performance.now() - started, text.slice(0, 6)).toBeLessThan(10_000);
+    }
   });
 
   test("a single break is named too: one LF is lf, one CRLF is crlf", () => {
@@ -933,6 +1046,81 @@ describe("protectedMask", () => {
     expect(protectedMask("readme", ["a", "a", "a"], ["a", "a"])).toEqual([true, true, true]);
   });
 
+  test("an original line minor-edited since the tag is protected, paired within its hunk", () => {
+    const anchor = ["# Methods", "Each recording lasted ten minutes."];
+    expect(
+      protectedMask(
+        "readme",
+        ["# Methods", "Each recordng lasted ten minutes.", "A later line."],
+        anchor,
+      ),
+    ).toEqual([true, true, false]);
+    // Pairs are made inside a hunk, not by line number: a line added above shifts every index.
+    expect(
+      protectedMask(
+        "readme",
+        ["A new first line.", "# Methods", "Each recordng lasted ten minutes."],
+        anchor,
+      ),
+    ).toEqual([false, true, true]);
+    // Edits that add up past the minor bound against the anchor line leave it unprotected.
+    expect(
+      protectedMask("readme", ["# Methods", "Each recordng lastd tn minuts."], anchor),
+    ).toEqual([true, false]);
+  });
+
+  test("an anchor with no line, or too far from the base to align, protects every base line", () => {
+    expect(protectedMask("readme", ["a", "b"], [])).toEqual([true, true]);
+    expect(
+      protectedMask("readme", distinctLines("base", 1000), distinctLines("anchor", 1001)),
+    ).toEqual(new Array(1000).fill(true));
+    // Twenty thousand lines against the same lines shuffled: capped after bounded work.
+    const random = mulberry32(0x1882);
+    const lines = distinctLines("line", 20_000);
+    const meter = { steps: 0 };
+    const started = performance.now();
+    const mask = protectedMask("readme", shuffled(lines, random), lines, meter);
+    expect(mask.every(Boolean)).toBe(true);
+    const maxD = ORIGINAL_LIMITS.maxEditDistance;
+    expect(meter.steps).toBeLessThanOrEqual(((maxD + 1) * (maxD + 2)) / 2 + lines.length);
+    expect(performance.now() - started).toBeLessThan(10_000);
+  });
+
+  test("a typo merged after the tag does not let a second pull request rewrite the line", () => {
+    const anchor = "# Methods\n\nEach recording lasted ten minutes.\nThe room was dark.\n";
+    const afterTypo = anchor.replace("recording", "recordng");
+    const rewritten = anchor.replace(
+      "Each recording lasted ten minutes.",
+      "Recordings were of variable length.",
+    );
+    // Step two, with step one merged: the rewrite of the minor-edited line still fails.
+    const twoStep = readme(
+      { "README.md": afterTypo },
+      { "README.md": rewritten },
+      { "README.md": anchor },
+    );
+    expect(twoStep.protectedAltered).toBe(1);
+    expect(twoStep.laterAltered).toBe(0);
+    expect(proseAltered(twoStep)).toBe(true);
+    // The control: the same rewrite without step one fails too.
+    const direct = readme(
+      { "README.md": anchor },
+      { "README.md": rewritten },
+      { "README.md": anchor },
+    );
+    expect(direct.protectedAltered).toBe(1);
+    // A line added after the tag stays later text: rewriting it is information.
+    const noted = `${anchor}\n## Notes\n\nA note added later.\n`;
+    const later = readme(
+      { "README.md": noted },
+      { "README.md": noted.replace("A note added later.", "Another note.") },
+      { "README.md": anchor },
+    );
+    expect(later.laterAltered).toBe(1);
+    expect(later.protectedAltered).toBe(0);
+    expect(proseAltered(later)).toBe(false);
+  });
+
   test("the original copy is protected even when a later copy was added above it", () => {
     // The anchor holds b then a; a copy of a was added above b later. Removing the original a
     // (the last line) is an alteration, never later text: counting copies protected the wrong one.
@@ -946,6 +1134,235 @@ describe("protectedMask", () => {
     expect(facts.laterAltered).toBe(0);
     expect(facts.preserved).toBe(false);
     expect(proseAltered(facts)).toBe(true);
+  });
+  // Lines far from one another (random letters, never a minor edit of each other), and one edit.
+  const FAR = farLines(70, 60, 0x1882);
+  const typo = (line: string, at = 3): string =>
+    `${line.slice(0, at)}${line[at] === "Z" ? "Y" : "Z"}${line.slice(at + 1)}`;
+  const TOP = "# Methods";
+  const END = "## Recording";
+
+  test("an edited original line next to a new line of its hunk is protected", () => {
+    const anchor = [TOP, "Each recording lasted ten minutes.", END];
+    // The hunk removes the anchor line and inserts two: a new sentence, then the edited line.
+    const base = [TOP, "A sentence merged later.", "Each recordng lasted ten minutes.", END];
+    expect(protectedMask("readme", base, anchor)).toEqual([true, false, true, true]);
+    // New lines at both ends of a hunk of two edited lines.
+    const [a, b] = FAR as [string, string];
+    expect(
+      protectedMask(
+        "readme",
+        [TOP, "New first.", typo(a), typo(b), "New last.", END],
+        [TOP, a, b, END],
+      ),
+    ).toEqual([true, false, true, true, false, true]);
+  });
+
+  test("a typo merged beside a new line still keeps a later rewrite of the line from passing", () => {
+    const anchor = "# Methods\n\nEach recording lasted ten minutes.\nThe room was dark.\n";
+    // Merged after the tag: a new sentence above the line, and a typo in it.
+    const merged = anchor.replace("Each recording", "A sentence merged later.\nEach recordng");
+    const rewritten = merged.replace(
+      "Each recordng lasted ten minutes.",
+      "Recordings were of variable length.",
+    );
+    const facts = readme(
+      { "README.md": merged },
+      { "README.md": rewritten },
+      { "README.md": anchor },
+    );
+    expect(facts.anchor).toBe("first_version_tag");
+    expect(facts.protectedAltered).toBe(1);
+    expect(facts.laterAltered).toBe(0);
+    expect(proseAltered(facts)).toBe(true);
+  });
+
+  test("one anchor line protects every edited copy of it; a line near two anchor lines is protected", () => {
+    const [a] = FAR as [string];
+    // The line copied and each copy edited in its own place.
+    expect(protectedMask("readme", [TOP, typo(a, 3), typo(a, 40), END], [TOP, a, END])).toEqual([
+      true,
+      true,
+      true,
+      true,
+    ]);
+    // The anchor holding the line twice, the base once, edited.
+    expect(protectedMask("readme", [TOP, typo(a), END], [TOP, a, a, END])).toEqual([
+      true,
+      true,
+      true,
+    ]);
+    const ten = "Each recording lasted ten minutes.";
+    const two = "Each recording lasted two minutes.";
+    const near = "Each recording lasted tn minutes.";
+    expect(isMinorEdit(ten, near) && isMinorEdit(two, near)).toBe(true);
+    expect(protectedMask("readme", [TOP, near, END], [TOP, ten, two, END])).toEqual([
+      true,
+      true,
+      true,
+    ]);
+  });
+
+  test("an anchor line removed in one hunk does not shift the pairs of the next", () => {
+    const [a, b, c, d] = FAR as [string, string, string, string];
+    // Two hunks: b removed on its own, then d edited.
+    expect(protectedMask("readme", [a, c, typo(d)], [a, b, c, d])).toEqual([true, true, true]);
+  });
+
+  test("past the pair cap a hunk is paired from its start and from its end", () => {
+    const lines = FAR.slice(0, 65);
+    const edits = lines.map((line) => typo(line));
+    const anchor = [TOP, ...lines, END];
+    expect(lines.length * (lines.length + 1)).toBeGreaterThan(ORIGINAL_LIMITS.maxMinorPairs);
+    const all = edits.map(() => true);
+    // A new line above the edited ones: the pairs from the end find every edit.
+    expect(protectedMask("readme", [TOP, "New first.", ...edits, END], anchor)).toEqual([
+      true,
+      false,
+      ...all,
+      true,
+    ]);
+    // A new line below them: the pairs from the start do.
+    expect(protectedMask("readme", [TOP, ...edits, "New last.", END], anchor)).toEqual([
+      true,
+      ...all,
+      false,
+      true,
+    ]);
+    // New lines at both ends: neither does, the accepted limit.
+    expect(
+      protectedMask("readme", [TOP, "New first.", ...edits, "New last.", END], anchor),
+    ).toEqual([true, false, ...edits.map(() => false), false, true]);
+    // Under the cap the same shape has every pair tried, and every edit is found.
+    const fewer = lines.slice(0, 60);
+    expect(fewer.length * (fewer.length + 2)).toBeLessThanOrEqual(ORIGINAL_LIMITS.maxMinorPairs);
+    expect(
+      protectedMask(
+        "readme",
+        [TOP, "New first.", ...fewer.map((line) => typo(line)), "New last.", END],
+        [TOP, ...fewer, END],
+      ),
+    ).toEqual([true, false, ...fewer.map(() => true), false, true]);
+  });
+
+  // Two long lines of random letters, each a thousand-letter block repeated `blocks` times.
+  const longPair = (seed: number, blocks: number): [string, string] => {
+    const [x, y] = farLines(2, 1_000, seed) as [string, string];
+    return [x.repeat(blocks), y.repeat(blocks)];
+  };
+
+  test("a hunk whose pairs would take more code points than the budget is paired from its ends", () => {
+    const budget = ORIGINAL_LIMITS.maxMinorPairCodePoints;
+    // Four pairs of 1.1 million code points each are past the budget, so the edits between two
+    // new lines are not found.
+    const [x, y] = longPair(1, 1_100);
+    expect(4 * x.length).toBeGreaterThan(budget);
+    expect(
+      protectedMask(
+        "readme",
+        [TOP, "New first.", typo(x), typo(y), "New last.", END],
+        [TOP, x, y, END],
+      ),
+    ).toEqual([true, false, false, false, false, true]);
+    // Half as long, the hunk is within it: every pair is tried.
+    const [u, v] = longPair(2, 550);
+    expect(4 * u.length).toBeLessThanOrEqual(budget);
+    expect(
+      protectedMask(
+        "readme",
+        [TOP, "New first.", typo(u), typo(v), "New last.", END],
+        [TOP, u, v, END],
+      ),
+    ).toEqual([true, false, true, true, false, true]);
+  });
+
+  test("the budget is spent across hunks: a later hunk past what is left is paired from its ends", () => {
+    const [u, v] = longPair(3, 550);
+    const [w, z] = longPair(4, 550);
+    // Each hunk is within the budget alone, not both together.
+    expect(4 * u.length).toBeLessThanOrEqual(ORIGINAL_LIMITS.maxMinorPairCodePoints);
+    expect(8 * u.length).toBeGreaterThan(ORIGINAL_LIMITS.maxMinorPairCodePoints);
+    const base = [TOP, "N1.", typo(u), typo(v), "N2.", END, "N3.", typo(w), typo(z), "N4.", TOP];
+    expect(protectedMask("readme", base, [TOP, u, v, END, w, z, TOP])).toEqual([
+      true,
+      false,
+      true,
+      true,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+    ]);
+  });
+
+  test("hostile hunks stay bounded in steps and time", () => {
+    const maxD = ORIGINAL_LIMITS.maxEditDistance;
+    // Two thousand lines against two thousand others: past the alignment's cap, every base line
+    // protected and no pair tried.
+    let meter = { steps: 0 };
+    let started = performance.now();
+    const capped = protectedMask("readme", farLines(2_000, 60, 5), farLines(2_000, 60, 6), meter);
+    expect(capped.every(Boolean)).toBe(true);
+    expect(meter.steps).toBeLessThanOrEqual(((maxD + 1) * (maxD + 2)) / 2 + 4_000);
+    expect(performance.now() - started).toBeLessThan(10_000);
+    // A thousand edited lines: the largest hunk the alignment takes, past the pair cap, every
+    // edit found by the pairs from the start.
+    const thousand = farLines(1_000, 60, 7);
+    meter = { steps: 0 };
+    started = performance.now();
+    const paired = protectedMask(
+      "readme",
+      thousand.map((line) => typo(line)),
+      thousand,
+      meter,
+    );
+    expect(paired.every(Boolean)).toBe(true);
+    expect(meter.steps).toBeLessThanOrEqual(((maxD + 1) * (maxD + 2)) / 2 + 2_000);
+    expect(performance.now() - started).toBeLessThan(10_000);
+    // Sixty-four against sixty-four lines of 65,535 code points, near copies of one line that differ
+    // in 22 places spread along them, so no pair is a minor edit and no banded distance stops
+    // early: past the budget, paired from the start only (as many lines on each side).
+    const random = mulberry32(0x40);
+    const length = 65_535;
+    const shared = Array.from({ length }, () =>
+      String.fromCharCode(97 + Math.floor(random() * 26)),
+    );
+    const copy = (tag: number): string => {
+      const letters = [...shared];
+      letters[0] = String.fromCharCode(0x100 + tag);
+      for (let e = 0; e < 21; e++) {
+        letters[Math.floor(((e + 0.5) * length) / 21)] = String.fromCharCode(0x4e00 + tag * 32 + e);
+      }
+      return letters.join("");
+    };
+    const anchor = Array.from({ length: 64 }, (_, i) => copy(i));
+    const base = Array.from({ length: 64 }, (_, i) => copy(i + 64));
+    started = performance.now();
+    expect(protectedMask("readme", base, anchor).some(Boolean)).toBe(false);
+    expect(performance.now() - started).toBeLessThan(10_000);
+  });
+
+  test("an anchor too far from the base to align, or with no line, leaves the facts on the merge base", () => {
+    const base = `${farLines(1_100, 60, 8).join("\n\n")}\n`;
+    const head = `${base}\nA new line.\n`;
+    const far = readme(
+      { "README.md": base },
+      { "README.md": head },
+      {
+        "README.md": `${farLines(1_100, 60, 9).join("\n\n")}\n`,
+      },
+    );
+    expect(far.anchor).toBe("merge_base");
+    expect(far.protectedLines).toBe(1_100);
+    const blank = readme({ "README.md": base }, { "README.md": head }, { "README.md": "\n\n" });
+    expect(blank.anchor).toBe("merge_base");
+    // The control: the base as its own anchor aligns.
+    expect(readme({ "README.md": base }, { "README.md": head }, { "README.md": base }).anchor).toBe(
+      "first_version_tag",
+    );
   });
 });
 
@@ -1246,7 +1663,8 @@ describe("proseFacts: the cases of design B7", () => {
         document: "changes",
         preserved: false,
         protectedAltered: 1,
-        joinedInsertedRuns: 1,
+        // The edited entry is a list item: a block of its own, joined to no paragraph.
+        joinedInsertedRuns: 0,
         insertedLines: 1,
         examples: ["  - Fixed event onsets."],
       }),
@@ -1270,6 +1688,191 @@ describe("proseFacts: the cases of design B7", () => {
     expect(facts.insertedInsideParagraph).toBe(1);
     expect(facts.preserved).toBe(false);
     expect(proseAltered(facts)).toBe(false);
+  });
+});
+
+describe("proseFacts: a run is inside a paragraph only when no blank line sets it off", () => {
+  /** The facts of a README pull request, and whether they are an alteration. */
+  const judged = (base: string, head: string) => {
+    const facts = readme({ "README.md": base }, { "README.md": head });
+    return { facts, altered: proseAltered(facts) };
+  };
+
+  test("a section set off by blank lines before a heading the README never separated is an addition", () => {
+    const base = "## Methods\nEEG at 500 Hz.\n## License\nCC0\n";
+    const head =
+      "## Methods\nEEG at 500 Hz.\n\n## Acknowledgments\n\nThanks to the lab.\n\n## License\nCC0\n";
+    const { facts, altered } = judged(base, head);
+    expect(facts.insertedInsideParagraph).toBe(0);
+    expect(facts.joinedInsertedRuns).toBe(0);
+    expect(facts.preserved).toBe(true);
+    expect(altered).toBe(false);
+  });
+
+  test("a list item appended, then a blank line before the heading that followed the list, is an addition", () => {
+    const base = "## Sessions\n- rest\n- task\n## License\nCC0\n";
+    const head = "## Sessions\n- rest\n- task\n- recovery\n\n## License\nCC0\n";
+    const { facts, altered } = judged(base, head);
+    expect(facts.insertedInsideParagraph).toBe(0);
+    // A list item is a block of its own: joined to no paragraph.
+    expect(facts.joinedInsertedRuns).toBe(0);
+    expect(altered).toBe(false);
+  });
+
+  test("a new section before a heading with no blank line above it is an addition", () => {
+    const base = "# Title\n\nIntro text.\n## License\nCC0\n";
+    const head = "# Title\n\nIntro text.\n\n## Funding\n\nFunded by a grant.\n## License\nCC0\n";
+    const { facts, altered } = judged(base, head);
+    expect(facts.insertedInsideParagraph).toBe(0);
+    // The heading below it starts a block, so the new text joins no original paragraph.
+    expect(facts.joinedInsertedRuns).toBe(0);
+    expect(altered).toBe(false);
+  });
+
+  test("a paragraph put between two sentences of a one-sentence-per-line README, set off by blank lines, is an addition", () => {
+    const base = "Sentence one.\nSentence two.\nSentence three.\nSentence four.\n";
+    const head =
+      "Sentence one.\nSentence two.\n\nA new paragraph.\n\nSentence three.\nSentence four.\n";
+    const { facts, altered } = judged(base, head);
+    expect(facts).toEqual(untouched(4, { insertedLines: 1 }));
+    expect(altered).toBe(false);
+  });
+
+  test("a sentence put between two lines of a paragraph with no blank line is still inside, and altered", () => {
+    const base = "Sentence one.\nSentence two.\nSentence three.\n";
+    const head = "Sentence one.\nA new sentence.\nSentence two.\nSentence three.\n";
+    const { facts, altered } = judged(base, head);
+    expect(facts.insertedInsideParagraph).toBe(1);
+    expect(altered).toBe(true);
+    // A blank line on one side only: joined to the other side, information.
+    const oneSide = judged(
+      base,
+      "Sentence one.\nA new sentence.\n\nSentence two.\nSentence three.\n",
+    );
+    expect(oneSide.facts.insertedInsideParagraph).toBe(0);
+    expect(oneSide.facts.joinedInsertedRuns).toBe(1);
+    expect(oneSide.altered).toBe(false);
+  });
+
+  test("a run after a minor edit, joined on both sides, is inside", () => {
+    const base = "First original sentence of the paragraph.\nSecond original sentence of it.\n";
+    const head =
+      "First original sentence of the paragrapH.\nAn added sentence.\nSecond original sentence of it.\n";
+    const { facts, altered } = judged(base, head);
+    expect(facts.minorEdits).toBe(1);
+    expect(facts.insertedInsideParagraph).toBe(1);
+    expect(altered).toBe(true);
+  });
+
+  test("in a README with no blank lines, a section or a list item added before a heading is not inside", () => {
+    const dense = "## Methods\nEEG at 500 Hz.\n## License\nCC0\n";
+    const section = judged(
+      dense,
+      "## Methods\nEEG at 500 Hz.\n## Acknowledgments\nThanks to the lab.\n## License\nCC0\n",
+    );
+    expect(section.facts.insertedInsideParagraph).toBe(0);
+    expect(section.facts.joinedInsertedRuns).toBe(0);
+    expect(section.altered).toBe(false);
+    const list = "## Sessions\n- rest\n- task\n## License\nCC0\n";
+    const item = judged(list, "## Sessions\n- rest\n- task\n- recovery\n## License\nCC0\n");
+    expect(item.facts.insertedInsideParagraph).toBe(0);
+    expect(item.altered).toBe(false);
+  });
+
+  test("list items added to a dense list, at its end or between its items, are not inside", () => {
+    const base = "Sessions:\n- rest\n- task\n- recovery\n";
+    for (const head of [
+      "Sessions:\n- rest\n- task\n- recovery\n- follow-up\n- debrief\n",
+      "Sessions:\n- rest\n- practice\n- task\n- recovery\n",
+      "Sessions:\n- rest\n1. practice\n- task\n- recovery\n",
+    ]) {
+      const { facts, altered } = judged(base, head);
+      expect(facts.insertedInsideParagraph, head).toBe(0);
+      expect(altered, head).toBe(false);
+    }
+  });
+
+  test("a line opening with 2. or a year inside an original paragraph is in it, and altered", () => {
+    const base = "Line one of the text.\nLine two of the text.\n";
+    const numbered = judged(base, "Line one of the text.\n2. INSERTED.\nLine two of the text.\n");
+    expect(numbered.facts.insertedInsideParagraph).toBe(1);
+    expect(numbered.altered).toBe(true);
+    // An original line opening with a year is in its paragraph: a line put above it is inside.
+    const year = "The study began in\n2019. The study enrolled forty adults.\n";
+    const above = judged(
+      year,
+      "The study began in\nA new line.\n2019. The study enrolled forty adults.\n",
+    );
+    expect(above.facts.insertedInsideParagraph).toBe(1);
+    expect(above.altered).toBe(true);
+    // The control: a bullet with text after it is a block of its own, between the two lines.
+    const bullet = judged(base, "Line one of the text.\n- INSERTED.\nLine two of the text.\n");
+    expect(bullet.facts.insertedInsideParagraph).toBe(0);
+  });
+
+  test("a line put right under a heading the README never separated is joined, not inside", () => {
+    // The line after a heading starts a paragraph: micromark with GFM renders the heading, then the
+    // new line and the original one as one paragraph.
+    const { facts, altered } = judged(
+      "## Methods\nEEG at 500 Hz.\n",
+      "## Methods\nA new line.\nEEG at 500 Hz.\n",
+    );
+    expect(facts.insertedInsideParagraph).toBe(0);
+    expect(facts.joinedInsertedRuns).toBe(1);
+    expect(altered).toBe(false);
+  });
+
+  test("a heading put between two lines of an original paragraph is a new block, joined to the line below", () => {
+    const base = "Line one of the text.\nLine two of the text.\nLine three of the text.\n";
+    const { facts, altered } = judged(
+      base,
+      "Line one of the text.\nLine two of the text.\n## Notes\nA note.\nLine three of the text.\n",
+    );
+    expect(facts.insertedInsideParagraph).toBe(0);
+    // The heading is a block of its own; the note after it reads as one paragraph with the
+    // original third line: one joined run, information.
+    expect(facts.joinedInsertedRuns).toBe(1);
+    expect(altered).toBe(false);
+    // Plain text with no heading or list marker is still inside, and altered.
+    const plain = judged(
+      base,
+      "Line one of the text.\nLine two of the text.\nA note.\nLine three of the text.\n",
+    );
+    expect(plain.facts.insertedInsideParagraph).toBe(1);
+    expect(plain.altered).toBe(true);
+  });
+
+  test("CHANGES written as list items takes a new entry anywhere, and an edited entry still fails", () => {
+    const changes = "- 1.0.1 fixed event onsets\n- 1.0.0 initial release\n";
+    for (const head of [
+      `- 1.0.2 added a derivative\n${changes}`,
+      "- 1.0.1 fixed event onsets\n- 1.0.0.1 a backport\n- 1.0.0 initial release\n",
+    ]) {
+      const facts = factsOf("changes", { CHANGES: changes }, { CHANGES: head });
+      expect(facts.insertedInsideParagraph, head).toBe(0);
+      expect(proseAltered(facts), head).toBe(false);
+    }
+    const edited = factsOf(
+      "changes",
+      { CHANGES: changes },
+      { CHANGES: changes.replace("onsets", "onset") },
+    );
+    expect(edited.protectedAltered).toBe(1);
+    expect(proseAltered(edited)).toBe(true);
+  });
+
+  test("a run that starts a new part in the head is never inside the paragraph it came between", () => {
+    // B moved into a new part after the new line: at the base A and B were one paragraph, but in
+    // the head the new line opens README.md, so a paragraph break sets it off.
+    const facts = readme(
+      { README: "Line A of the paragraph.\nLine B of the paragraph.\n" },
+      {
+        README: "Line A of the paragraph.\n",
+        "README.md": "A new line.\nLine B of the paragraph.\n",
+      },
+    );
+    expect(facts.protectedAltered + facts.movedLines).toBe(0);
+    expect(facts.insertedInsideParagraph).toBe(0);
   });
 });
 
@@ -1527,17 +2130,168 @@ describe("proseFacts: the tripwires", () => {
     );
   });
 
-  test("the same lines attached to an original paragraph are hiding", () => {
+  test("next to an original paragraph a footnote definition hides it; a complete link definition or an image does not", () => {
+    // Directly above the Participants paragraph, with no blank line between.
+    const above = (line: string) =>
+      readme(
+        { "README.md": ORIGINAL },
+        { "README.md": edited((lines) => lines.splice(7, 0, line)) },
+      );
+    expect(above("[^1]: A note on the montage.").hidingMarkupInserted).toBe(1);
     for (const line of [
       "[1]: https://example.org/x",
-      "[^1]: A note on the montage.",
       "[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.1.svg)](https://doi.org/10.5281/zenodo.1)",
       "![Montage](montage.png)",
     ]) {
-      // Directly above the Participants paragraph, with no blank line between.
-      const head = edited((lines) => lines.splice(7, 0, line));
+      const facts = above(line);
+      expect(facts.hidingMarkupInserted, line).toBe(0);
+      expect(facts.joinedInsertedRuns, line).toBe(1);
+    }
+    // An open title or destination still hides, attached or not.
+    expect(above('[1]: <> "an open title').hidingMarkupInserted).toBe(1);
+    expect(above("[1]: <https://example.org").hidingMarkupInserted).toBe(1);
+  });
+
+  // Original paragraphs that open with a parenthesis, a double quote and a single quote: a link
+  // definition right above one takes that line, to its closing mark, as the definition's title,
+  // which renders as nothing. micromark with GFM renders each head below without the line.
+  const OPENED = [
+    "# Notes",
+    "",
+    "(Recorded at the university hospital between 2018 and 2019.)", // 2
+    "The montage followed the international 10-20 system.",
+    "",
+    '"The tasks were explained to each participant in their own language."', // 5
+    "",
+    "'The rare targets were shown on one trial in five.'", // 7
+  ].join("\n");
+  const DEFINED = "[x]: https://example.org/x";
+
+  test("a complete link definition right above an original line opening a title hides it", () => {
+    for (const at of [2, 5, 7]) {
+      const head = edited((lines) => lines.splice(at, 0, DEFINED), OPENED);
+      const facts = readme({ "README.md": OPENED }, { "README.md": head });
+      expect(facts.preserved, head).toBe(true);
+      expect(facts.joinedInsertedRuns, head).toBe(1);
+      expect(facts.hidingMarkupInserted, head).toBe(1);
+    }
+  });
+
+  test("the same definition after a blank line, or above a plain line, does not", () => {
+    const facts = (head: string) => readme({ "README.md": OPENED }, { "README.md": head });
+    // A blank line ends the definition: the line after it is a paragraph of its own.
+    expect(
+      facts(edited((lines) => lines.splice(2, 0, DEFINED, ""), OPENED)).hidingMarkupInserted,
+    ).toBe(0);
+    // A new plain line between: the definition takes nothing, and the two lines below render as
+    // one paragraph.
+    const between = edited((lines) => lines.splice(2, 0, DEFINED, "See the notes below."), OPENED);
+    expect(facts(between).hidingMarkupInserted).toBe(0);
+    // Right above the plain second line of the first paragraph: no title, and a definition cannot
+    // interrupt a paragraph, so it renders as text.
+    expect(facts(edited((lines) => lines.splice(3, 0, DEFINED), OPENED)).hidingMarkupInserted).toBe(
+      0,
+    );
+    // Right below the first paragraph, a blank line before the quoted one: the definition stays in
+    // the first paragraph as text and the quoted paragraph renders.
+    expect(facts(edited((lines) => lines.splice(4, 0, DEFINED), OPENED)).hidingMarkupInserted).toBe(
+      0,
+    );
+  });
+
+  test("a title closed before the end of its line is none, and still counts: the safe side", () => {
+    // micromark renders this line: the definition ends at its destination. The fact counts it.
+    const base = "# Notes\n\n(Smith 2020) found the same effect in older adults.\n";
+    const head = `# Notes\n\n${DEFINED}\n(Smith 2020) found the same effect in older adults.\n`;
+    expect(readme({ "README.md": base }, { "README.md": head }).hidingMarkupInserted).toBe(1);
+  });
+
+  test("a title line put under a kept link definition hides the original line it takes", () => {
+    const base =
+      "# Notes\n\n[1]: https://doi.org/10.1000/a\nThe montage followed the 10-20 system.\n";
+    // An inserted opening parenthesis and an inserted closing one: the original line between is
+    // the definition's title.
+    const wrapped = base
+      .replace("The montage", "(\nThe montage")
+      .replace("system.\n", "system.\n)\n");
+    const facts = readme({ "README.md": base }, { "README.md": wrapped });
+    // The opening line falls between the definition and the line, both kept: that alone alters.
+    expect(facts.insertedInsideParagraph).toBe(1);
+    expect(facts.hidingMarkupInserted).toBe(1);
+    // A minor edit that opens the original line with a parenthesis: nothing else moves, and no
+    // bracket is added, so only the run counts.
+    const opened = base.replace(
+      "The montage followed the 10-20 system.",
+      "(The montage followed the 10-20 system.)",
+    );
+    const edit = readme({ "README.md": base }, { "README.md": opened });
+    expect(edit.protectedAltered + edit.insertedInsideParagraph + edit.joinedInsertedRuns).toBe(0);
+    expect(edit.minorEdits).toBe(1);
+    expect(edit.hidingMarkupInserted).toBe(1);
+    // The same line opened with no definition above it is ordinary.
+    const plain = "# Notes\n\nThe montage followed the 10-20 system.\n";
+    const free = readme(
+      { "README.md": plain },
+      { "README.md": plain.replace("The", "(The").replace("system.", "system.)") },
+    );
+    expect(free.minorEdits).toBe(1);
+    expect(free.hidingMarkupInserted).toBe(0);
+  });
+
+  test("a reference appended to an original reference block, or a badge under the title, is ordinary", () => {
+    const references = "# Title\n\n## References\n\n[1]: https://doi.org/10.1000/a\n";
+    const appended = `${references}[2]: https://doi.org/10.1000/b\n`;
+    const facts = readme({ "README.md": references }, { "README.md": appended });
+    expect(facts.hidingMarkupInserted).toBe(0);
+    expect(proseAltered(facts)).toBe(false);
+    const badged =
+      "# Title\n[![DOI](https://zenodo.org/badge/x.svg)](https://doi.org/x)\n\nText.\n";
+    const badge = readme({ "README.md": "# Title\n\nText.\n" }, { "README.md": badged });
+    expect(badge.hidingMarkupInserted).toBe(0);
+    expect(proseAltered(badge)).toBe(false);
+  });
+
+  test("a less-than sign before a letter reads as an open tag, in code too; p < 0.05 and closed tags do not", () => {
+    const hidingOf = (line: string) =>
+      readme(
+        { "README.md": ORIGINAL },
+        { "README.md": edited((lines) => lines.splice(9, 0, line)) },
+      ).hidingMarkupInserted;
+    // Flagged, the safe side: a person looks.
+    expect(hidingOf("Use `a<b` to compare.")).toBe(1);
+    expect(hidingOf("Use a<b to compare.")).toBe(1);
+    const fenced = `${ORIGINAL}\n\`\`\`\nif a<b\n\`\`\`\n`;
+    expect(readme({ "README.md": ORIGINAL }, { "README.md": fenced }).hidingMarkupInserted).toBe(1);
+    // Not a tag at all, or a tag that closes and hides nothing.
+    for (const line of [
+      "p < 0.05 in all sessions.",
+      "Pick a <label>name</label> for it.",
+      "A List<String> of names.",
+    ]) {
+      expect(hidingOf(line), line).toBe(0);
+    }
+  });
+
+  test("the four code-span attacks around an original paragraph are hiding", () => {
+    // (a) an escaped backtick, then a comment opened above the paragraph and closed below it.
+    const a = edited((lines) => {
+      lines.splice(9, 0, "\\` --> \\`");
+      lines.splice(7, 0, "\\` <!-- \\`");
+    });
+    // (b) details between escaped backticks, as a paragraph of its own above the original text.
+    const b = edited((lines) => lines.splice(7, 0, "\\` <details> \\`", ""));
+    // (c) a backtick paired across a line break, leaving details live.
+    const c = edited((lines) => lines.splice(7, 0, "Note: `", "x` <details> `"));
+    // (d) a backtick inside an attribute value.
+    const d = edited((lines) => lines.splice(7, 0, '<span title="`"><details>`">'));
+    for (const [label, head] of [
+      ["a", a],
+      ["b", b],
+      ["c", c],
+      ["d", d],
+    ] as const) {
       const facts = readme({ "README.md": ORIGINAL }, { "README.md": head });
-      expect(facts.hidingMarkupInserted, line).toBe(1);
+      expect(facts.hidingMarkupInserted, label).toBeGreaterThanOrEqual(1);
     }
   });
 
@@ -1576,8 +2330,14 @@ describe("proseFacts: the tripwires", () => {
   });
 
   test("a run at the start of the document joins the first paragraph; a new part starts its own", () => {
-    const top = `New first line.\n${ORIGINAL}`;
-    expect(readme({ "README.md": ORIGINAL }, { "README.md": top }).joinedInsertedRuns).toBe(1);
+    const plain = "First original line.\nSecond original line.\n";
+    const top = `New first line.\n${plain}`;
+    expect(readme({ "README.md": plain }, { "README.md": top }).joinedInsertedRuns).toBe(1);
+    // Above a heading it is no part of the heading's block: not joined.
+    const aboveHeading = `New first line.\n${ORIGINAL}`;
+    expect(
+      readme({ "README.md": ORIGINAL }, { "README.md": aboveHeading }).joinedInsertedRuns,
+    ).toBe(0);
     // A part's first line starts a paragraph: a new part's lines join no original paragraph.
     const facts = readme(
       { README: "Original line one.\nOriginal line two.\n" },
@@ -1592,8 +2352,9 @@ describe("proseFacts: the tripwires", () => {
     // A run that is cut by a paragraph start counts once per paragraph it is in.
     const split = edited((lines) => lines.splice(9, 0, "Joined line.", "", "Own paragraph."));
     expect(readme({ "README.md": ORIGINAL }, { "README.md": split }).joinedInsertedRuns).toBe(1);
-    // And the other way round: its own paragraph first, then a line joined to the next heading.
-    const reverse = edited((lines) => lines.splice(10, 0, "Own paragraph.", "", "Joined line."));
+    // And the other way round: its own paragraph first, then a line joined to the original line
+    // below it (above a heading it would join nothing: a heading starts a block).
+    const reverse = edited((lines) => lines.splice(12, 0, "Own paragraph.", "", "Joined line."));
     expect(readme({ "README.md": ORIGINAL }, { "README.md": reverse }).joinedInsertedRuns).toBe(1);
   });
 
@@ -1673,6 +2434,26 @@ describe("proseFacts: the tripwires", () => {
 });
 
 describe("hidesText", () => {
+  test("markup between backticks is read like any text: four ways CommonMark leaves it live", () => {
+    // micromark with GFM renders each of these with the comment or the details element live
+    // (an escaped backtick is a literal one; a backtick pairs across a line break; one inside an
+    // attribute value is no code span), so none may be blanked as inline code.
+    expect(hidesText(["\\` <!-- \\`"])).toBe(true);
+    expect(hidesText(["\\` <details> \\`"])).toBe(true);
+    expect(hidesText(["Note: `", "x` <details> `"])).toBe(true);
+    expect(hidesText(['<span title="`"><details>`">'])).toBe(true);
+  });
+
+  test("hostile 4 MiB runs of backticks and markup are read in one pass", () => {
+    const size = 4 * 1024 * 1024;
+    const fill = (unit: string): string => unit.repeat(Math.ceil(size / unit.length));
+    for (const text of [fill("` `` ``` "), fill("`a<b` "), fill("``x` "), fill("`"), fill("x`")]) {
+      const started = performance.now();
+      hidesText([text]);
+      expect(performance.now() - started, text.slice(0, 8)).toBeLessThan(5_000);
+    }
+  });
+
   test("comments, hiding elements and hiding attributes are markup that hides", () => {
     for (const line of [
       "<!--",
@@ -3897,5 +4678,514 @@ describe("participantValuesAltered: which files and which summaries", () => {
     expect(summary.classes.length).toBeGreaterThan(0);
     expect(participantValuesAltered(summary, modifiedFiles([events]), NO_COSMETIC)).toBe(0);
     expect(participantValuesAltered(EMPTY_SUMMARY, [], NO_COSMETIC)).toBe(0);
+  });
+});
+
+/** The builder's input for a pull request that changed nothing, for each test to fill in. */
+function contentInput(over: Partial<OriginalContentInput> = {}): OriginalContentInput {
+  return {
+    changes: [],
+    documents: { readme: { base: [], head: [] }, changes: { base: [], head: [] } },
+    anchor: null,
+    anchorLookup: "not_needed",
+    description: { before: "absent", after: "absent" },
+    recordings: [],
+    summary: EMPTY_SUMMARY,
+    cosmetic: NO_COSMETIC,
+    ...over,
+  };
+}
+
+/** One changed path as the content pass lists it. */
+const modified = (path: string): { path: string; status: RecordingChange["status"] } => ({
+  path,
+  status: "modified",
+});
+
+/** The facts a compared document holds, or a failed expectation naming what it was instead. */
+function comparedFacts(result: DocumentResult): ProseFacts {
+  if (result.status !== "compared") throw new Error(`not compared: ${result.status}`);
+  return result.facts;
+}
+
+describe("originalContentFacts: the documents", () => {
+  const base = parts({ "README.md": ORIGINAL });
+  const removed = parts({ "README.md": edited((lines) => lines.splice(7, 2)) });
+
+  test("a document no part of which changed is unchanged and never read, whatever its parts hold", () => {
+    // Parts that could not be read, and would be refused if they were compared.
+    const unreadable: DocumentPart[] = [
+      { name: "README.md", mode: "100644", oid: "a".repeat(40), content: "unreadable" },
+    ];
+    const facts = originalContentFacts(
+      contentInput({
+        changes: [modified("sub-01/eeg/sub-01_task-rest_eeg.json"), modified("docs/README.md")],
+        documents: {
+          readme: { base: unreadable, head: unreadable },
+          changes: { base: unreadable.map((p) => ({ ...p, name: "CHANGES" })), head: [] },
+        },
+      }),
+    );
+    expect(facts.readme).toEqual({ status: "unchanged" });
+    expect(facts.changes).toEqual({ status: "unchanged" });
+    // The same parts, with the README changed: compared, so refused.
+    const changed = originalContentFacts(
+      contentInput({
+        changes: [modified("README.md")],
+        documents: {
+          readme: { base: unreadable, head: unreadable },
+          changes: { base: [], head: [] },
+        },
+      }),
+    );
+    expect(changed.readme).toEqual({ status: "refused", refusal: "unreadable" });
+    expect(changed.changes).toEqual({ status: "unchanged" });
+  });
+
+  test("a changed document is compared once, from the merge base to the head, as proseFacts compares it", () => {
+    const facts = originalContentFacts(
+      contentInput({
+        changes: [modified("README.md")],
+        documents: { readme: { base, head: removed }, changes: { base: [], head: [] } },
+      }),
+    );
+    const direct = proseFacts({ document: "readme", base, head: removed, anchor: null });
+    expect(direct.ok).toBe(true);
+    expect(facts.readme).toEqual({
+      status: "compared",
+      facts: direct.ok ? direct.facts : untouched(0),
+    });
+    expect(comparedFacts(facts.readme).protectedAltered).toBe(2);
+    expect(facts.abandoned).toBe(false);
+  });
+
+  test("a part added or removed beside an unchanged one changes the document", () => {
+    const head = [...base, part("README.txt", "A note added beside the README.\n")];
+    const facts = originalContentFacts(
+      contentInput({
+        changes: [{ path: "README.txt", status: "added" }],
+        documents: { readme: { base, head }, changes: { base: [], head: [] } },
+      }),
+    );
+    expect(comparedFacts(facts.readme)).toMatchObject({ partsBefore: 1, partsAfter: 2 });
+  });
+
+  test("a refused document says its closed word", () => {
+    const binary = parts({ "README.md": new Uint8Array([0x61, 0x00, 0x62]) });
+    const cases: [DocumentPart[], DocumentPart[], ProseRefusal][] = [
+      [base, binary, "binary"],
+      [base, [{ ...(base[0] as DocumentPart), mode: "120000" }], "not_regular"],
+      [[{ ...(base[0] as DocumentPart), content: "unreadable" }], removed, "unreadable"],
+    ];
+    for (const [before, after, refusal] of cases) {
+      const facts = originalContentFacts(
+        contentInput({
+          changes: [modified("README.md")],
+          documents: { readme: { base: before, head: after }, changes: { base: [], head: [] } },
+        }),
+      );
+      expect(facts.readme, refusal).toEqual({ status: "refused", refusal });
+    }
+  });
+
+  test("the anchor protects the README alone: CHANGES keeps every merge-base line", () => {
+    // Lines 7 and 8 were added after the anchor: removing them is later text, not original text.
+    const anchor = parts({ "README.md": edited((lines) => lines.splice(6, 3)) });
+    const changesBase = parts({ CHANGES: "1.1.0\n - Added sub-03\n1.0.0\n - Initial release\n" });
+    const changesHead = parts({ CHANGES: "1.1.0\n - Added sub-03\n1.0.0\n" });
+    const input = contentInput({
+      changes: [modified("README.md"), modified("CHANGES")],
+      documents: {
+        readme: { base, head: removed },
+        changes: { base: changesBase, head: changesHead },
+      },
+      anchor,
+      anchorLookup: "first_version_tag",
+    });
+    const facts = originalContentFacts(input);
+    expect(facts.anchorLookup).toBe("first_version_tag");
+    expect(comparedFacts(facts.readme)).toMatchObject({
+      anchor: "first_version_tag",
+      protectedAltered: 0,
+      laterAltered: 2,
+    });
+    expect(comparedFacts(facts.changes)).toMatchObject({
+      anchor: "merge_base",
+      protectedLines: 4,
+      protectedAltered: 1,
+    });
+    // With no anchor the same README removal is original text.
+    const strict = originalContentFacts({ ...input, anchor: null, anchorLookup: "no_ancestor" });
+    expect(strict.anchorLookup).toBe("no_ancestor");
+    expect(comparedFacts(strict.readme)).toMatchObject({
+      anchor: "merge_base",
+      protectedAltered: 2,
+      laterAltered: 0,
+    });
+    expect(strict.changes).toEqual(facts.changes);
+    expect(facts.paths).toEqual({ readme: "README.md", changes: "CHANGES", participants: null });
+  });
+
+  test("a finding's README is the part the platform showed at the merge base; CHANGES its first part", () => {
+    const head = (names: string[]) => names.map((name) => part(name, "Text.\n"));
+    const pathsOf = (base: string[], changesBase: string[], changed: string[]) =>
+      originalContentFacts(
+        contentInput({
+          changes: changed.map(modified),
+          documents: {
+            readme: { base: head(base), head: head(base) },
+            changes: { base: head(changesBase), head: head(changesBase) },
+          },
+        }),
+      ).paths;
+    // README.md comes before README in the platform's order, whatever the code-unit order says.
+    expect(
+      pathsOf(["README", "README.md"], ["CHANGES.md", "CHANGELOG"], ["README", "CHANGES.md"]),
+    ).toEqual({ readme: "README.md", changes: "CHANGELOG", participants: null });
+    // A README the platform does not show (a lower-case name) is still the README: its first part
+    // is named, never CHANGES.
+    expect(pathsOf(["readme.md"], ["CHANGES"], ["readme.md"])).toEqual({
+      readme: "readme.md",
+      changes: null,
+      participants: null,
+    });
+    expect(pathsOf(["readme.txt", "readme.md"], [], ["readme.txt"]).readme).toBe("readme.md");
+    // No README part at the merge base at all: nothing to point at.
+    expect(pathsOf([], [], ["README.md"]).readme).toBeNull();
+    // A document that did not change names nothing, even when it has parts.
+    expect(pathsOf(["README.md"], ["CHANGES"], ["sub-01/eeg/x.json"])).toEqual({
+      readme: null,
+      changes: null,
+      participants: null,
+    });
+  });
+});
+
+describe("originalContentFacts: no protection before publication", () => {
+  const base = parts({ "README.md": ORIGINAL });
+  const removed = parts({ "README.md": edited((lines) => lines.splice(7, 2)) });
+  const changesBase = parts({ CHANGES: "1.1.0\n - Added sub-03\n1.0.0\n - Initial release\n" });
+  const changesHead = parts({ CHANGES: "1.1.0\n - Added sub-03\n1.0.0\n - First release\n" });
+  const texts = contentInput({
+    changes: [modified("README.md"), modified("CHANGES")],
+    documents: {
+      readme: { base, head: removed },
+      changes: { base: changesBase, head: changesHead },
+    },
+  });
+
+  test("when the lookup found no version tag, a changed README or CHANGES is unpublished and not compared", () => {
+    const facts = originalContentFacts({ ...texts, anchorLookup: "no_tag" });
+    expect(facts.anchorLookup).toBe("no_tag");
+    expect(facts.readme).toEqual({ status: "unpublished" });
+    expect(facts.changes).toEqual({ status: "unpublished" });
+    expect(Object.isFrozen(facts.readme)).toBe(true);
+    // Not compared at all: parts that would be refused are not refused either.
+    const unreadable: DocumentPart[] = [
+      { name: "README.md", mode: "100644", oid: "a".repeat(40), content: "unreadable" },
+    ];
+    const refusedIfRead = originalContentFacts({
+      ...texts,
+      documents: {
+        readme: { base: unreadable, head: unreadable },
+        changes: texts.documents.changes,
+      },
+      anchorLookup: "no_tag",
+    });
+    expect(refusedIfRead.readme).toEqual({ status: "unpublished" });
+    // A document no part of which changed stays unchanged.
+    const readmeOnly = originalContentFacts({
+      ...texts,
+      changes: [modified("README.md")],
+      anchorLookup: "no_tag",
+    });
+    expect([readmeOnly.readme.status, readmeOnly.changes.status]).toEqual([
+      "unpublished",
+      "unchanged",
+    ]);
+  });
+
+  test("every other lookup word compares both documents: only an answer of no tag lifts the protection", () => {
+    for (const word of ANCHOR_LOOKUPS) {
+      if (word === "no_tag") continue;
+      const facts = originalContentFacts({ ...texts, anchorLookup: word });
+      expect([facts.readme.status, facts.changes.status], word).toEqual(["compared", "compared"]);
+      if (facts.readme.status === "compared") {
+        expect(facts.readme.facts.protectedAltered, word).toBe(2);
+      }
+    }
+  });
+
+  test("the author fields, the participant values and the recordings are decided whatever the lookup found", () => {
+    const edit: Edit = {
+      path: PARTICIPANTS_TSV,
+      before: sexTable("None", "M"),
+      after: sexTable("F", "M"),
+    };
+    const recordings = [
+      recording("sub-01/eeg/sub-01_task-x_eeg.edf", locked(keyOf(1)), locked(keyOf(2)), true),
+    ];
+    const everything = contentInput({
+      ...texts,
+      changes: [
+        ...texts.changes,
+        modified("dataset_description.json"),
+        modified(PARTICIPANTS_TSV),
+        ...recordings.map(({ path, status }) => ({ path, status })),
+      ],
+      description: { before: description(DESCRIPTION), after: changed({ Name: "A new name" }) },
+      summary: summaryOf([edit]),
+      recordings,
+    });
+    const strict = originalContentFacts({ ...everything, anchorLookup: "lookup_failed" });
+    const unpublished = originalContentFacts({ ...everything, anchorLookup: "no_tag" });
+    expect(unpublished.authorFields).toEqual(noFieldChange({ altered: ["Name"] }));
+    expect(unpublished.participantValues).toBe(1);
+    expect(unpublished.recordings).toEqual(noRecordingChange({ replaced: 1 }));
+    for (const key of ["authorFields", "participantValues", "recordings", "paths"] as const) {
+      expect(unpublished[key], key).toEqual(strict[key]);
+    }
+  });
+});
+
+describe("originalContentFacts: the description, the participants and the recordings", () => {
+  const before = description(DESCRIPTION);
+  const renamed = changed({ Name: "A new name" });
+
+  test("the author fields are compared only when dataset_description.json changed", () => {
+    const sides = { before, after: renamed };
+    expect(originalContentFacts(contentInput({ description: sides })).authorFields).toBeNull();
+    expect(
+      originalContentFacts(
+        contentInput({ changes: [modified("dataset_description.json")], description: sides }),
+      ).authorFields,
+    ).toEqual(noFieldChange({ altered: ["Name"] }));
+    // Added, with nothing before it: every key it holds is added.
+    expect(
+      originalContentFacts(
+        contentInput({
+          changes: [{ path: "dataset_description.json", status: "added" }],
+          description: { before: "absent", after: before },
+        }),
+      ).authorFields,
+    ).toEqual(authorFieldFacts("absent", before));
+    // A side that could not be read is unparsed, never clean.
+    expect(
+      originalContentFacts(
+        contentInput({
+          changes: [modified("dataset_description.json")],
+          description: { before: "unreadable", after: renamed },
+        }),
+      ).authorFields,
+    ).toEqual(noFieldChange({ unparsed: true }));
+  });
+
+  test("an abandoned summary with no participants file changed counts 0, not unknown", () => {
+    const facts = originalContentFacts(
+      contentInput({
+        changes: [modified("README.md"), { path: PARTICIPANTS_TSV, status: "added" }],
+        documents: {
+          readme: { base: parts({ "README.md": "a\n" }), head: parts({ "README.md": "a\nb\n" }) },
+          changes: { base: [], head: [] },
+        },
+        summary: ABANDONED_SUMMARY,
+      }),
+    );
+    expect(facts.participantValues).toBe(0);
+    // The module's own count would be unknown for the same summary: the guard is the builder's.
+    expect(participantValuesAltered(ABANDONED_SUMMARY, [], NO_COSMETIC)).toBeNull();
+  });
+
+  test("a root participants file modified or changed type is counted, and unknown when it cannot be", () => {
+    for (const path of PARTICIPANT_FILES) {
+      for (const status of ["modified", "typechange"] as const) {
+        const facts = originalContentFacts(
+          contentInput({ changes: [{ path, status }], summary: ABANDONED_SUMMARY }),
+        );
+        expect(facts.participantValues, `${status} ${path}`).toBeNull();
+      }
+      // Removed: Part A's loss fact, and no value is asked about.
+      expect(
+        originalContentFacts(
+          contentInput({ changes: [{ path, status: "removed" }], summary: ABANDONED_SUMMARY }),
+        ).participantValues,
+      ).toBe(0);
+    }
+    // The first participants file modified or retyped is the one a finding names.
+    expect(
+      originalContentFacts(
+        contentInput({
+          changes: [
+            { path: PARTICIPANTS_TSV, status: "added" },
+            { path: PARTICIPANTS_JSON, status: "typechange" },
+          ],
+        }),
+      ).paths.participants,
+    ).toBe(PARTICIPANTS_JSON);
+    expect(
+      originalContentFacts(
+        contentInput({ changes: [modified(PARTICIPANTS_JSON), modified(PARTICIPANTS_TSV)] }),
+      ).paths.participants,
+    ).toBe(PARTICIPANTS_TSV);
+    // A summary that read the file counts its changed values.
+    const edit: Edit = {
+      path: PARTICIPANTS_TSV,
+      before: sexTable("None", "M"),
+      after: sexTable("F", "M"),
+    };
+    expect(
+      originalContentFacts(
+        contentInput({ changes: [modified(PARTICIPANTS_TSV)], summary: summaryOf([edit]) }),
+      ).participantValues,
+    ).toBe(1);
+    // One the platform proved cosmetic has nothing to count, even unread.
+    expect(
+      originalContentFacts(
+        contentInput({
+          changes: [modified(PARTICIPANTS_TSV)],
+          cosmetic: new Set([PARTICIPANTS_TSV]),
+        }),
+      ).participantValues,
+    ).toBe(0);
+    // A nested participants file is no root file: not asked, so 0 even from an abandoned summary.
+    expect(
+      originalContentFacts(
+        contentInput({
+          changes: [modified(`sub-01/${PARTICIPANTS_TSV}`)],
+          summary: ABANDONED_SUMMARY,
+        }),
+      ).participantValues,
+    ).toBe(0);
+  });
+
+  test("a finding names the participants file whose values were counted, not the first modified", () => {
+    // participants.tsv only gains a row (nothing counted); participants.json has a value changed.
+    const tsvRowAdded: Edit = {
+      path: PARTICIPANTS_TSV,
+      before: sexTable("M"),
+      after: sexTable("M", "F"),
+    };
+    const jsonValue: Edit = {
+      path: PARTICIPANTS_JSON,
+      before: json({ sex: { Description: "sex" } }),
+      after: json({ sex: { Description: "biological sex" } }),
+    };
+    const facts = originalContentFacts(
+      contentInput({
+        changes: [modified(PARTICIPANTS_TSV), modified(PARTICIPANTS_JSON)],
+        summary: summaryOf([tsvRowAdded, jsonValue]),
+      }),
+    );
+    expect(facts.participantValues).toBe(1);
+    expect(facts.paths.participants).toBe(PARTICIPANTS_JSON);
+  });
+
+  test("the file named is a participants file even when a class of another file comes first", () => {
+    // Two events files with the same cell replaced: one class over two files, which the summary
+    // orders before the participants class of one file.
+    const events = (subject: string): Edit => ({
+      path: `${subject}/eeg/${subject}_task-x_events.tsv`,
+      before: tsv(["onset", "trial_type"], ["1", "go"]),
+      after: tsv(["onset", "trial_type"], ["1", "stop"]),
+    });
+    const tsvValue: Edit = {
+      path: PARTICIPANTS_TSV,
+      before: sexTable("None", "M"),
+      after: sexTable("F", "M"),
+    };
+    const summary = summaryOf([events("sub-01"), events("sub-02"), tsvValue]);
+    const first = summary.classes[0];
+    expect(first?.shape).not.toBe(PARTICIPANTS_TSV);
+    expect(first !== undefined && ALTERS_PARTICIPANT_VALUE[first.kind]).toBe(true);
+    const facts = originalContentFacts(
+      contentInput({
+        changes: [modified(PARTICIPANTS_TSV), modified("sub-01/eeg/sub-01_task-x_events.tsv")],
+        summary,
+      }),
+    );
+    expect(facts.participantValues).toBe(1);
+    expect(facts.paths.participants).toBe(PARTICIPANTS_TSV);
+  });
+
+  test("the recordings are recordingFacts of every changed path", () => {
+    const recordings = [
+      recording("sub-01/eeg/sub-01_task-x_eeg.edf", locked(keyOf(1)), locked(keyOf(2)), true),
+      recording("derivatives/x/sub-02_eeg.edf", locked(keyOf(3)), null),
+      recording("sub-02/eeg/sub-02_task-x_eeg.edf", null, locked(keyOf(3)), true),
+      recording("sub-03/eeg/sub-03_task-x_eeg.edf", locked(keyOf(4)), plain("x", "unreadable")),
+    ];
+    const facts = originalContentFacts(
+      contentInput({
+        changes: recordings.map(({ path, status }) => ({ path, status })),
+        recordings,
+      }),
+    );
+    expect(facts.recordings).toEqual(noRecordingChange({ replaced: 1, moved: 1, unread: 1 }));
+    expect(facts.recordings).toEqual(recordingFacts(recordings));
+  });
+
+  test("a pull request that changed nothing Part B reads has nothing to say", () => {
+    expect(originalContentFacts(contentInput())).toEqual({
+      abandoned: false,
+      anchorLookup: "not_needed",
+      readme: { status: "unchanged" },
+      changes: { status: "unchanged" },
+      authorFields: null,
+      participantValues: 0,
+      recordings: noRecordingChange(),
+      paths: { readme: null, changes: null, participants: null },
+    });
+  });
+});
+
+describe("the facts of an abandoned pass", () => {
+  test("ORIGINAL_ABANDONED holds nothing and says the anchor was never looked for", () => {
+    expect(ORIGINAL_ABANDONED).toEqual({
+      abandoned: true,
+      anchorLookup: "not_looked_up",
+      readme: { status: "unchanged" },
+      changes: { status: "unchanged" },
+      authorFields: null,
+      participantValues: 0,
+      recordings: noRecordingChange(),
+      paths: { readme: null, changes: null, participants: null },
+    });
+  });
+
+  test("it is frozen at every level, so no reader can change it for the next", () => {
+    expect(Object.isFrozen(ORIGINAL_ABANDONED)).toBe(true);
+    expect(Object.isFrozen(ORIGINAL_ABANDONED.readme)).toBe(true);
+    expect(Object.isFrozen(ORIGINAL_ABANDONED.changes)).toBe(true);
+    expect(Object.isFrozen(ORIGINAL_ABANDONED.recordings)).toBe(true);
+    expect(Object.isFrozen(ORIGINAL_ABANDONED.paths)).toBe(true);
+    const writable = ORIGINAL_ABANDONED as { -readonly [K in keyof OriginalContentFacts]: unknown };
+    expect(() => {
+      writable.abandoned = false;
+    }).toThrow(TypeError);
+    expect(() => {
+      (ORIGINAL_ABANDONED.recordings as { unread: number }).unread = 1;
+    }).toThrow(TypeError);
+    expect(ORIGINAL_ABANDONED.abandoned).toBe(true);
+    expect(ORIGINAL_ABANDONED.recordings.unread).toBe(0);
+  });
+
+  test("the anchor words are a closed list that holds every reason chooseAnchor gives", () => {
+    expect(new Set(ANCHOR_LOOKUPS).size).toBe(ANCHOR_LOOKUPS.length);
+    const reasons = [
+      chooseAnchor([], () => true),
+      chooseAnchor([versionTag("1", "0", "0", sha(1))], () => false),
+      chooseAnchor([versionTag("1", "0", "0", sha(1))], () => null),
+      chooseAnchor(
+        Array.from({ length: ORIGINAL_LIMITS.maxTagsTried + 1 }, (_, i) =>
+          versionTag("1", "0", String(i), sha(i + 1)),
+        ),
+        () => false,
+      ),
+    ].map((choice) => (choice.anchor === "merge_base" ? choice.reason : choice.anchor));
+    expect(reasons).toEqual(["no_tag", "no_ancestor", "check_failed", "too_many_tags"]);
+    for (const reason of reasons) expect(ANCHOR_LOOKUPS as readonly string[]).toContain(reason);
+    expect(ANCHOR_LOOKUPS).toContain("first_version_tag");
+    // Words a log prints: lower case and underscores only.
+    for (const word of ANCHOR_LOOKUPS) expect(word).toMatch(/^[a-z_]+$/);
   });
 });

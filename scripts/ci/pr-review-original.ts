@@ -52,6 +52,12 @@ export const ORIGINAL_LIMITS = {
   maxDocumentLines: 20_000, // one side, counted after normalization (blank lines are not lines)
   // Lines removed plus lines inserted past which two sides are not aligned at all.
   maxEditDistance: 2_000,
+  // Removed times inserted lines of one anchor hunk up to which every pair is tried for a minor
+  // edit; past it, lines are paired from the start and from the end of the hunk.
+  maxMinorPairs: 4_096,
+  // Code points of the shorter line of each pair, summed over the hunks whose every pair is tried,
+  // past which a hunk is paired from its ends too: about one document's worth of banded distance.
+  maxMinorPairCodePoints: 4 * 1024 * 1024,
   // The minor-edit bound of one line is a tenth of the longer line, in code points, kept between
   // these two (design B2.1).
   minorFloor: 3,
@@ -154,7 +160,8 @@ export function decodeProse(bytes: Uint8Array): { text: string; notUtf8: boolean
 export interface NormalizedText {
   /**
    * The lines that are not blank, without their trailing spaces and tabs. `paragraphStart` is set
-   * on the first line of the text and on every line that followed a blank one.
+   * on the first line of the text, on every line that followed a blank one, and on the blocks
+   * {@link normalizeProse} reads: a heading, the line after it, and a list item that starts one.
    */
   lines: { text: string; paragraphStart: boolean }[];
   breaks: LineBreaks;
@@ -167,6 +174,22 @@ export interface NormalizedText {
    */
   overLimit: boolean;
 }
+
+/** An ATX heading line: up to three spaces, one to six `#`, then a blank or the end of the line. */
+const ATX_HEADING = /^ {0,3}#{1,6}(\s|$)/;
+
+/**
+ * A list item line: up to three spaces, `-`, `*`, `+` or one to nine digits and `.` or `)`, then a
+ * blank or the end of the line.
+ */
+const LIST_ITEM = /^ {0,3}([-*+]|\d{1,9}[.)])(\s|$)/;
+
+/**
+ * A list item that can interrupt a paragraph: a `-`, `*` or `+`, or exactly `1.` or `1)`, then a
+ * blank and some text. CommonMark lets no other item interrupt one: `2.`, `01.` or `2019.` in the
+ * middle of a paragraph, or a marker with nothing after it, is that paragraph's text.
+ */
+const INTERRUPTING_ITEM = /^ {0,3}([-*+]|1[.)])[ \t]+\S/;
 
 /** The code units {@link normalizeProse} read, for a test to bound. Added to, never reset. */
 export interface NormalizeMeter {
@@ -188,6 +211,16 @@ function isTrailingBlank(unit: number): boolean {
  * only way they can be decided. Nothing else changes: case, inner whitespace, leading indentation
  * and a no-break space are all significant.
  *
+ * Two kinds of line start a block in rendered Markdown, and so start a paragraph here too: an ATX
+ * heading ({@link ATX_HEADING}), and the line after it, and a list item ({@link LIST_ITEM}). A list
+ * item that cannot interrupt a paragraph (anything but {@link INTERRUPTING_ITEM}) starts one only
+ * where no paragraph is open to interrupt: on the first line, after a blank line or a heading, or
+ * inside a list, which an item opens and a blank line or a heading closes. A README written with
+ * no blank lines around its headings is then read as the sections it renders as, and a line that
+ * opens with a year (`2019. The study`) inside a paragraph stays in it. Nothing else of Markdown is
+ * parsed: fenced code, tables, setext headings and block quotes are not, and every other line is
+ * governed by blank lines alone.
+ *
  * This removes exactly the two artifacts measured on set A (a final newline added and CRLF turned
  * into LF) and the trailing whitespace a mass cleanup touches; `breaks` and `endsWithBreak` keep
  * what was removed so the caller can say it.
@@ -207,6 +240,8 @@ export function normalizeProse(
   const over: NormalizedText = { lines: [], breaks: "none", endsWithBreak: false, overLimit: true };
   const lines: { text: string; paragraphStart: boolean }[] = [];
   let paragraphStart = true;
+  let afterHeading = false;
+  let inList = false;
   let lf = 0;
   let crlf = 0;
   let cr = 0;
@@ -217,8 +252,16 @@ export function normalizeProse(
       paragraphStart = true;
       return;
     }
-    lines.push({ text: text.slice(from, end), paragraphStart });
+    const line = text.slice(from, end);
+    const heading = ATX_HEADING.test(line);
+    const item =
+      LIST_ITEM.test(line) &&
+      (paragraphStart || afterHeading || inList || INTERRUPTING_ITEM.test(line));
+    lines.push({ text: line, paragraphStart: paragraphStart || afterHeading || heading || item });
+    // A line of an item, its own or one that continues it with no blank line, keeps a list open.
+    inList = item || (inList && !heading && !paragraphStart);
     paragraphStart = false;
+    afterHeading = heading;
   };
   let start = 0;
   for (let i = 0; i < text.length; i++) {
@@ -249,7 +292,10 @@ export function normalizeProse(
 /** One normalized line of a document, with the part it came from. */
 export interface ProseLine {
   text: string;
-  /** The line follows a blank line, or is the first line of its part. */
+  /**
+   * The line starts a paragraph: it is the first line of its part, follows a blank line, or starts
+   * a block {@link normalizeProse} reads (a heading, the line after it, a list item).
+   */
   paragraphStart: boolean;
   /** The name of the part the line is in. */
   part: string;
@@ -381,7 +427,11 @@ function codePointLength(s: string): number {
  * within it; a rewritten sentence is not.
  */
 export function minorBound(a: string, b: string): number {
-  const longer = Math.max(codePointLength(a), codePointLength(b));
+  return boundOfLonger(Math.max(codePointLength(a), codePointLength(b)));
+}
+
+/** {@link minorBound} from the length of the longer line, in code points. */
+function boundOfLonger(longer: number): number {
   return Math.min(
     ORIGINAL_LIMITS.minorCeiling,
     Math.max(ORIGINAL_LIMITS.minorFloor, Math.floor(longer / 10)),
@@ -627,18 +677,128 @@ export function alignLines(
  * every copy errs the other way: removing a copy added after the tag reads as an alteration, a rare
  * false fail, which is the side to err on.
  *
- * With no anchor (null) every base line is protected. That is the strict side, and every failure to
- * find an anchor (no tag, no README at the tag, an anchor document that could not be read) falls
- * back to it.
+ * A README line is also protected when it is an original line minor-edited since the tag: the
+ * anchor is aligned with the base as {@link proseFacts} aligns two sides, and inside each hunk an
+ * inserted base line is protected when it is within {@link isMinorEdit} of any removed anchor line
+ * of the same hunk, so a new line merged next to the edited one does not hide the edit, and one
+ * anchor line can protect several base lines (a line copied and each copy edited). When the hunk
+ * has more than `maxMinorPairs` removed times inserted lines, or when trying every pair would take
+ * the code points of the shorter lines, summed over every hunk so tried, past
+ * `maxMinorPairCodePoints`, only the k-th line from the start of each side is tried with the
+ * other's k-th, and the k-th from the end with the k-th from the end: an edited line with new
+ * lines on both sides of it in such a hunk is then not protected, the accepted limit. A pair whose
+ * lengths alone differ by more than the bound is never computed.
+ * Without this, a typo merged after the tag (a minor edit, information) would make the line later
+ * text, and a second pull request could then rewrite it freely. Edits that add up past the minor
+ * bound against the anchor line (several merged minor edits of one line) leave it unprotected:
+ * the accepted limit, since the bound is what tells an edit of the original line from a new line.
+ *
+ * With no anchor (null), an anchor with no line, or an anchor too far from the base to align
+ * (more than `maxEditDistance` lines apart), every base line is protected. That is the strict side,
+ * and every failure to find an anchor (no tag, no README at the tag, an anchor document that could
+ * not be read) falls back to it. `meter`, when given, counts the alignment's work.
  */
 export function protectedMask(
   document: DocumentKind,
   base: readonly string[],
   anchor: readonly string[] | null,
+  meter?: AlignMeter,
 ): boolean[] {
-  if (document === "changes" || anchor === null) return base.map(() => true);
+  return anchoredMask(document, base, anchor, meter).mask;
+}
+
+/**
+ * {@link protectedMask}, and whether the anchor decided it: false when every base line is
+ * protected for want of an anchor that could be aligned, which the facts then call `merge_base`.
+ */
+function anchoredMask(
+  document: DocumentKind,
+  base: readonly string[],
+  anchor: readonly string[] | null,
+  meter?: AlignMeter,
+): { mask: boolean[]; anchored: boolean } {
+  const everyLine = { mask: base.map(() => true), anchored: false };
+  if (document === "changes" || anchor === null || anchor.length === 0) return everyLine;
+  const alignment = alignLines(anchor, base, ORIGINAL_LIMITS.maxEditDistance, meter);
+  if (alignment === null) return everyLine;
   const original = new Set(anchor);
-  return base.map((line) => original.has(line));
+  const mask = base.map((line) => original.has(line));
+  const budget = { codePoints: ORIGINAL_LIMITS.maxMinorPairCodePoints };
+  const { ops } = alignment;
+  let a = 0;
+  let b = 0;
+  let at = 0;
+  while (at < ops.length) {
+    if (ops[at] === "equal") {
+      a++;
+      b++;
+      at++;
+      continue;
+    }
+    const removed: number[] = [];
+    const inserted: number[] = [];
+    for (; at < ops.length && ops[at] !== "equal"; at++) {
+      if (ops[at] === "delete") removed.push(a++);
+      else inserted.push(b++);
+    }
+    protectMinorEdits(anchor, base, removed, inserted, mask, budget);
+  }
+  return { mask, anchored: true };
+}
+
+/**
+ * Within one hunk of the anchor's alignment with the base, sets `mask` for each inserted base line
+ * that is a minor edit of a removed anchor line, as {@link protectedMask} states it: every pair
+ * while the hunk is within `maxMinorPairs` and its pairs within what is left of `budget`, which
+ * they then spend, and otherwise the pairs counted from the start and from the end. A line already
+ * protected is not tried again, and a pair whose code point lengths differ by more than the bound
+ * is not computed.
+ */
+function protectMinorEdits(
+  anchor: readonly string[],
+  base: readonly string[],
+  removed: readonly number[],
+  inserted: readonly number[],
+  mask: boolean[],
+  budget: { codePoints: number },
+): void {
+  if (removed.length === 0 || inserted.length === 0) return;
+  const removedLengths = removed.map((line) => codePointLength(anchor[line] as string));
+  const insertedLengths = inserted.map((line) => codePointLength(base[line] as string));
+  // Whether the pair's lengths alone allow a minor edit.
+  const fits = (r: number, i: number): boolean => {
+    const was = removedLengths[r] as number;
+    const is = insertedLengths[i] as number;
+    return Math.abs(was - is) <= boundOfLonger(Math.max(was, is));
+  };
+  const tryPair = (r: number, i: number): void => {
+    const now = inserted[i] as number;
+    if (mask[now] || !fits(r, i)) return;
+    if (isMinorEdit(anchor[removed[r] as number] as string, base[now] as string)) mask[now] = true;
+  };
+  if (removed.length * inserted.length <= ORIGINAL_LIMITS.maxMinorPairs) {
+    let total = 0;
+    for (let i = 0; i < inserted.length; i++) {
+      for (let r = 0; r < removed.length; r++) {
+        if (fits(r, i))
+          total += Math.min(removedLengths[r] as number, insertedLengths[i] as number);
+      }
+    }
+    if (total <= budget.codePoints) {
+      budget.codePoints -= total;
+      for (let i = 0; i < inserted.length; i++) {
+        for (let r = 0; r < removed.length; r++) tryPair(r, i);
+      }
+      return;
+    }
+  }
+  // With as many lines on each side, the pairs from the end are the pairs from the start.
+  const shift = removed.length - inserted.length;
+  const paired = Math.min(removed.length, inserted.length);
+  for (let k = 0; k < paired; k++) {
+    tryPair(k, k);
+    if (shift !== 0) tryPair(removed.length - 1 - k, inserted.length - 1 - k);
+  }
 }
 
 /**
@@ -649,13 +809,16 @@ export function protectedMask(
  */
 export interface ProseFacts {
   document: DocumentKind;
-  /** Where protection came from: the first version tag's README, or every merge-base line. */
+  /**
+   * Where protection came from: the first version tag's README, or every merge-base line, which is
+   * also the word when the tag's README has no line or is too far from the base to align.
+   */
   anchor: "first_version_tag" | "merge_base";
   /**
    * Every protected line is kept verbatim and in order: none altered, moved or minor-edited, and
    * no run of new lines between two lines of one original paragraph (`insertedInsideParagraph` is
    * 0). It says nothing of new lines placed directly before or after an original paragraph with no
-   * blank line between, which the rendered README reads as part of that paragraph: that is
+   * paragraph start between, which the rendered README reads as part of that paragraph: that is
    * `joinedInsertedRuns`, which this fact does not consider.
    */
   preserved: boolean;
@@ -672,21 +835,26 @@ export interface ProseFacts {
   /** How many protected lines did so. */
   movedLines: number;
   /**
-   * Runs of new lines placed between two protected lines of one original paragraph, the earlier
-   * kept (verbatim or by a minor edit) and the later one not the start of a paragraph.
+   * Runs of new lines placed inside an original paragraph: between two protected lines that were
+   * adjacent in one paragraph at the base (the earlier kept, verbatim or by a minor edit), and in
+   * the head joined to both: neither the run's first line nor the line after its last starts a
+   * paragraph (a blank line, a heading, a list item; see {@link ProseLine.paragraphStart}). A run
+   * set off on either side is not inside: joined on one side it is a joined run
+   * (`joinedInsertedRuns`), on neither a new paragraph. So a section added between two lines a
+   * README never separated (a heading right after its text) is an addition, not an alteration.
    */
   insertedInsideParagraph: number;
   /**
    * Runs of new head lines (lines that are not kept, and not the new text of a minor edit) that
-   * sit in a head paragraph holding original text: the paragraph (consecutive head lines with no
-   * blank line between, new lines included, a part's first line always starting one) holds at
-   * least one kept protected line, verbatim or minor-edited. Each such run counts once, however
-   * many original lines it touches, and wherever in the paragraph it is: directly at an original
-   * line, or beyond a later line that is itself joined to one. A paragraph made only of new lines
-   * is not joined. Markdown can turn an original paragraph into something that renders as nothing
-   * this way (the open title of a link reference definition, a footnote definition above it), which
-   * no base-side fact sees. Not part of {@link proseAltered} or `preserved`: what it does is the
-   * caller's to decide.
+   * sit in a head paragraph holding original text: the paragraph (consecutive head lines from one
+   * that starts a paragraph to the next, new lines included; see {@link ProseLine.paragraphStart})
+   * holds at least one kept protected line, verbatim or minor-edited. Each such run counts once,
+   * however many original lines it touches, and wherever in the paragraph it is: directly at an
+   * original line, or beyond a later line that is itself joined to one. A paragraph made only of
+   * new lines is not joined. Markdown can turn an original paragraph into something that renders
+   * as nothing this way (the open title of a link reference definition, a footnote definition
+   * above it), which no base-side fact sees. Not part of {@link proseAltered} or `preserved`: what
+   * it does is the caller's to decide.
    */
   joinedInsertedRuns: number;
   /** Lines of the head that are not kept from the base, the new text of minor edits included. */
@@ -704,12 +872,19 @@ export interface ProseFacts {
    * Places where new markup can hide original text, counted two ways and added together. Each run
    * of consecutive head lines that are not kept verbatim (inserted lines and the new text of minor
    * edits together) counts once when {@link hidesText} finds markup in it (it reads the run as one
-   * text, so a tag split across lines is one tag), or when one of its new lines is a link or
-   * footnote definition, or a line the platform drops as an image, inside an original paragraph.
-   * And each minor edit counts once when its new text can hide the line it replaces
+   * text, so a tag split across lines is one tag), or when one of its new lines, inside an original
+   * paragraph, is a footnote definition (which takes the lines after it as its text) or a link
+   * definition whose next head line starts with `"`, `'` or `(` (CommonMark takes that line, and
+   * every line to the closing mark, as the definition's title, which renders as nothing), or when
+   * it starts with such a line right under a kept link definition. The title test is coarse, the
+   * safe side: a title closed before the end of its line is none, and still counts. And each
+   * minor edit counts once when its new text can hide the line it replaces
    * ({@link minorEditHides}). Wrapping original paragraphs in such markup keeps every protected
    * line verbatim or within a minor edit, so without this fact it would read as preserved. A
-   * definition, a footnote or an image in a paragraph of its own is ordinary and not counted.
+   * complete link definition followed by any other line, and an image line, next to an original
+   * paragraph are ordinary and not counted (the definition cannot take a plain line, and cannot
+   * interrupt a paragraph; an image line and the text beside it render as one visible paragraph),
+   * and neither is a footnote in a paragraph of its own.
    */
   hidingMarkupInserted: number;
   /**
@@ -767,6 +942,12 @@ const DEFINITION = /^ {0,3}\[\^?[^\]]*\]:/;
 // negated one that stops at its closing bracket, so neither can backtrack on a long line.
 const STANDALONE_IMAGE = /^[ \t]*!\[[^\]]*\]\([^)]*\)[ \t]*$/;
 const LINKED_IMAGE = /^[ \t]*\[!\[[^\]]*\]\([^)]*\)\]\([^)]*\)[ \t]*$/;
+
+/** The start of a link definition's title on a line of its own: blanks, then `"`, `'` or `(`. */
+const TITLE_START = /^[ \t]*["'(]/;
+
+/** The start of a GFM footnote definition: up to three spaces, `[^label]` and a colon. */
+const FOOTNOTE = /^ {0,3}\[\^[^\]]*\]:/;
 
 /** Whether a line is a link or footnote definition, or a line the platform drops as an image. */
 function definesOrIsAnImage(line: string): boolean {
@@ -891,9 +1072,13 @@ function markupHides(text: string): boolean {
  * Whether a run of consecutive new lines holds markup that can hide text: a link reference
  * definition left open on one of its lines ({@link opensLinkDefinition}), or HTML that hides in the
  * run read as one text, its lines joined by a space ({@link markupHides}), so a tag split across
- * lines (`<div` then `hidden>`) is read as the one tag it is. Inline code is not exempt: the fact
- * is a tripwire a person clears, and a person reads code spans better than a rule does. The cost
- * is one pass over the run, whatever it holds.
+ * lines (`<div` then `hidden>`) is read as the one tag it is. Inline code is read like any text:
+ * telling a code span from live HTML takes a whole CommonMark parse (an escaped backtick, a
+ * backtick pair across a line break or inside an attribute leaves the markup live), so what looks
+ * like markup is flagged even between backticks, the safe side. The cost: a `<` before a letter
+ * with no `>` after it in a new run (`a<b`, in prose or in code) holds the pull request as unknown
+ * for a person; `p < 0.05` and closed tags (`<label>`, `List<String>`) do not. One pass over the
+ * run, whatever it holds.
  */
 export function hidesText(run: readonly string[]): boolean {
   return run.some(opensLinkDefinition) || markupHides(run.join(" "));
@@ -925,7 +1110,10 @@ function cutExample(text: string): string {
  * taken once, by the protected lines in base order, after the minor edits took theirs), and
  * `protectedAltered` when it is not. A run of extra inserted lines (past the last pair of a hunk)
  * is `insertedInsideParagraph` when the base lines on either side of it are protected, the later
- * one does not start a paragraph, and the earlier one is kept verbatim or by a minor edit.
+ * one does not start a paragraph at the base, the earlier one is kept verbatim or by a minor edit,
+ * and in the head neither the run's first line nor the line after the run starts a paragraph: the
+ * run is read inside the paragraph only when nothing sets it off on either side (a blank line, a
+ * heading, a list item).
  *
  * The part the platform shows is the first of `README_CANDIDATES` present, compared with exact case
  * as git stores names, while the document's own names are matched without regard to case: a
@@ -960,7 +1148,7 @@ export function proseFacts(input: {
   }
   const base = baseRead.value.lines;
   const head = headRead.value.lines;
-  const isProtected = protectedMask(
+  const { mask: isProtected, anchored } = anchoredMask(
     document,
     base.map((line) => line.text),
     anchorLines,
@@ -1024,13 +1212,17 @@ export function proseFacts(input: {
       const earlier =
         removedHere.length > 0 ? (removedHere[removedHere.length - 1] as number) : before;
       const after = i;
+      // The run's first line in the head, and the head line after the run: the kept line `after`.
+      const firstExtra = insertedHere[removedHere.length] as number;
       if (
         earlier >= 0 &&
         after < base.length &&
         isProtected[earlier] &&
         isProtected[after] &&
         !(base[after] as ProseLine).paragraphStart &&
-        kept[earlier]
+        kept[earlier] &&
+        !(head[firstExtra] as ProseLine).paragraphStart &&
+        !(head[j] as ProseLine).paragraphStart
       ) {
         insertedInsideParagraph++;
       }
@@ -1111,14 +1303,25 @@ export function proseFacts(input: {
   }
   const attached = (line: number): boolean => holdsOriginal[paragraphOf[line] as number] === true;
   const isNew = (line: number): boolean => notKept.has(line) && !takenByMinor.has(line);
-  // A run of lines not kept hides when its markup does, or when one of its new lines is a
-  // definition or a dropped image inside an original paragraph; a minor edit hides on its own.
+  // A line a link definition right above it would take as its title: no blank line between, and
+  // an opening quote or parenthesis first. Read coarsely, the safe side: a title closed before the
+  // end of its line (`(Smith 2020) found`) is no title, and still counts.
+  const isTitle = (line: number): boolean => {
+    const at = head[line];
+    return at !== undefined && !at.paragraphStart && TITLE_START.test(at.text);
+  };
+  const isDefinition = (line: number): boolean =>
+    head[line] !== undefined && DEFINITION.test((head[line] as ProseLine).text);
+  // A run of lines not kept hides when its markup does, or, inside an original paragraph, when one
+  // of its new lines is a footnote definition or a link definition a title line follows, or when
+  // it starts with a title line under a kept link definition; a minor edit hides on its own.
   const hidingRuns = runsOf((line) => notKept.has(line)).filter(([first, last]) => {
     if (hidesText(head.slice(first, last + 1).map((line) => line.text))) return true;
+    if (attached(first) && isTitle(first) && isDefinition(first - 1)) return true;
     for (let line = first; line <= last; line++) {
-      if (isNew(line) && attached(line) && definesOrIsAnImage((head[line] as ProseLine).text)) {
-        return true;
-      }
+      if (!isNew(line) || !attached(line)) continue;
+      const text = (head[line] as ProseLine).text;
+      if (FOOTNOTE.test(text) || (isDefinition(line) && isTitle(line + 1))) return true;
     }
     return false;
   }).length;
@@ -1133,7 +1336,7 @@ export function proseFacts(input: {
     ok: true,
     facts: {
       document,
-      anchor: anchorLines === null ? "merge_base" : "first_version_tag",
+      anchor: anchored ? "first_version_tag" : "merge_base",
       preserved:
         protectedAltered === 0 &&
         movedLines === 0 &&
@@ -1821,4 +2024,236 @@ export function participantValuesAltered(
     if (participants && ALTERS_PARTICIPANT_VALUE[changeClass.kind]) altered += changeClass.items;
   }
   return altered;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The facts of one pull request: everything above, for the content pass to hand the review
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * What the search for the README's anchor came to. A closed list, printed in a public log like
+ * every word of this module:
+ *
+ * - `not_needed`: no root README or CHANGES part changed, so no tag was looked for;
+ * - `not_looked_up`: a README or CHANGES part changed and the version tags were not read (the
+ *   caller was told not to, as an offline calibration is), or the pass was abandoned;
+ * - `lookup_failed`: the repository's tags could not be listed (an error, a timeout, an answer past
+ *   its bound);
+ * - `tag_tree_unreadable`: a tag was chosen and its commit's root tree could not be listed;
+ * - `first_version_tag`: the README at the first version tag is the anchor;
+ * - `no_tag`: the tags were listed and the origin has no version tag at all. The dataset has never
+ *   been published, so nothing of its README or CHANGES is protected yet: a changed one is
+ *   `unpublished` (see {@link originalContentFacts});
+ * - `no_ancestor`, `check_failed`, `too_many_tags`: the other reasons of {@link AnchorChoice}.
+ *
+ * Every word but `first_version_tag` and `no_tag` leaves the README with no anchor, so every
+ * merge-base line is protected (the stricter side): only a lookup that succeeded and found no tag
+ * lifts the protection, and a lookup that failed in any way keeps it. A tag whose README could not
+ * be read, has no line or is too far from the merge base to align keeps `first_version_tag` here
+ * while the README's own facts say `merge_base`: this word is about the search, the facts' `anchor`
+ * about what protected the lines.
+ */
+export const ANCHOR_LOOKUPS = [
+  "not_needed",
+  "not_looked_up",
+  "lookup_failed",
+  "tag_tree_unreadable",
+  "first_version_tag",
+  "no_tag",
+  "no_ancestor",
+  "check_failed",
+  "too_many_tags",
+] as const;
+export type AnchorLookup = (typeof ANCHOR_LOOKUPS)[number];
+
+/**
+ * What became of one document: no part of it changed (`unchanged`, and nothing was compared), it
+ * changed in a dataset that has never been published (`unpublished`: the tag lookup found no
+ * version tag, so there is no original text to protect and nothing was compared), it was refused in
+ * one of the closed words of {@link PROSE_REFUSALS}, or it was compared.
+ */
+export type DocumentResult =
+  | { readonly status: "unchanged" }
+  | { readonly status: "unpublished" }
+  | { readonly status: "refused"; readonly refusal: ProseRefusal }
+  | { readonly status: "compared"; readonly facts: ProseFacts };
+
+/**
+ * Everything Part B says about one pull request, for the review to act on. All or nothing: when
+ * `abandoned` is true the pass that reads the bytes ran out of time or could not read them, and
+ * nothing below it is a fact (it is {@link ORIGINAL_ABANDONED}, which the caller reports as not
+ * compared, never as clean).
+ */
+export interface OriginalContentFacts {
+  readonly abandoned: boolean;
+  readonly anchorLookup: AnchorLookup;
+  readonly readme: DocumentResult;
+  readonly changes: DocumentResult;
+  /** Null when `dataset_description.json` is not among the changed paths. */
+  readonly authorFields: AuthorFieldFacts | null;
+  /**
+   * The count of {@link participantValuesAltered}, asked only when a root participants file is
+   * modified or changed type, and 0 otherwise; null when it cannot be known.
+   */
+  readonly participantValues: number | null;
+  readonly recordings: Readonly<RecordingFacts & { unread: number }>;
+  /**
+   * The root files a finding about each kind of change may name, or null. Each is a name the
+   * module's own patterns accept (a README or CHANGES part, a participants file), so none can carry
+   * more of a contributor's text than such a name.
+   */
+  readonly paths: Readonly<OriginalPaths>;
+}
+
+/** The root files of {@link OriginalContentFacts.paths}. */
+export interface OriginalPaths {
+  /**
+   * When any README part changed: the part the platform showed at the merge base (the first of
+   * `README_CANDIDATES` present, with exact case), else the first README part of the merge base in
+   * code-unit order (a `readme.md`, which is a README part but no candidate), or null when the
+   * merge base had no README part at all.
+   */
+  readme: string | null;
+  /** When any CHANGES part changed: the first part at the merge base, in code-unit order. */
+  changes: string | null;
+  /**
+   * The participants file whose values were counted: the file of the first class the count took,
+   * or, when none was counted, the first root participants file in {@link PARTICIPANT_FILES} order
+   * that was modified or retyped.
+   */
+  participants: string | null;
+}
+
+/** A document no part of which changed: one object, shared and frozen. */
+const UNCHANGED: DocumentResult = Object.freeze({ status: "unchanged" });
+
+/** A document that changed in a dataset never published: one object, shared and frozen. */
+const UNPUBLISHED: DocumentResult = Object.freeze({ status: "unpublished" });
+
+/**
+ * The facts of a pass that was abandoned: nothing compared, nothing counted, and the anchor never
+ * looked for. One object shared by every caller, frozen through every level it has, like the
+ * summary's `ABANDONED_SUMMARY`, so no reader can change it for the next one.
+ */
+export const ORIGINAL_ABANDONED: OriginalContentFacts = Object.freeze({
+  abandoned: true,
+  anchorLookup: "not_looked_up",
+  readme: UNCHANGED,
+  changes: UNCHANGED,
+  authorFields: null,
+  participantValues: 0,
+  recordings: Object.freeze({ replaced: 0, typeChanged: 0, moved: 0, unread: 0 }),
+  paths: Object.freeze({ readme: null, changes: null, participants: null }),
+});
+
+/**
+ * What {@link originalContentFacts} is given: the bytes and entries the caller read, and nothing it
+ * would have to decide here.
+ */
+export interface OriginalContentInput {
+  /**
+   * Every changed path with its status as `git diff --raw` names it, so a type change is
+   * `typechange` (the change list calls it modified, which would hide it).
+   */
+  changes: readonly { path: string; status: RecordingChange["status"] }[];
+  /**
+   * The parts of each document at the merge base and at the head, both sides of a document any part
+   * of which changed, the parts that did not change among them. A document with no changed part is
+   * not compared, so its parts are not needed.
+   */
+  documents: Readonly<
+    Record<DocumentKind, { base: readonly DocumentPart[]; head: readonly DocumentPart[] }>
+  >;
+  /** The README parts at the anchor the search found, or null when there is none. */
+  anchor: readonly DocumentPart[] | null;
+  anchorLookup: AnchorLookup;
+  /** `dataset_description.json` at the merge base and at the head. */
+  description: { before: DescriptionSide; after: DescriptionSide };
+  /** Every changed path, read as {@link recordingFacts} needs it: the same paths as `changes`. */
+  recordings: readonly RecordingChange[];
+  /** The change summary of the same pass. */
+  summary: ChangeSummary;
+  /** The paths the platform proved differ only in layout. */
+  cosmetic: ReadonlySet<string>;
+}
+
+/**
+ * The facts of one pull request from what its caller read (design B2 and B3, as built). Each
+ * document any part of which changed is compared once, with the anchor for the README alone
+ * (CHANGES protects every merge-base line whatever the anchor), and is `refused` in its closed word
+ * when it cannot be; a document no part of which changed is `unchanged`.
+ *
+ * No protection before publication: when the tag lookup succeeded and the origin has no version
+ * tag at all (`no_tag`), the dataset has never been published, so a README or CHANGES that changed
+ * is `unpublished` and is not compared (no counts, no tripwires, no refusals): its edits are the
+ * review's to judge like any other file's. Only that word does it. Every lookup that could not
+ * answer (`lookup_failed`, `tag_tree_unreadable`, `check_failed`, `no_ancestor`, `too_many_tags`)
+ * keeps every merge-base line protected, so a failure never lifts the protection; the cost of the
+ * rule is that a published dataset whose tags were all deleted loses it too. The author fields,
+ * the participant values and the recordings are compared whatever the lookup found.
+ *
+ * The author fields are
+ * compared only when `dataset_description.json` changed. Participant values are counted only when
+ * a root participants file was modified or changed type: an abandoned summary has no count for any
+ * file (see {@link participantValuesAltered}), and asking it about a pull request that touched no
+ * participants file would make every such pass unknown for no change at all.
+ */
+export function originalContentFacts(input: OriginalContentInput): OriginalContentFacts {
+  const changed = (document: DocumentKind): boolean =>
+    input.changes.some((change) => isDocumentName(document, change.path));
+  const documentResult = (document: DocumentKind): DocumentResult => {
+    if (!changed(document)) return UNCHANGED;
+    if (input.anchorLookup === "no_tag") return UNPUBLISHED;
+    const { base, head } = input.documents[document];
+    const anchor = document === "readme" ? input.anchor : null;
+    const result = proseFacts({ document, base, head, anchor });
+    return result.ok
+      ? { status: "compared", facts: result.facts }
+      : { status: "refused", refusal: result.refusal };
+  };
+  const participantsChanged = PARTICIPANT_FILES.filter((file) =>
+    input.changes.some(
+      (change) =>
+        change.path === file && (change.status === "modified" || change.status === "typechange"),
+    ),
+  );
+  const baseNames = (document: DocumentKind): string[] =>
+    changed(document)
+      ? input.documents[document].base
+          .map((part) => part.name)
+          .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+      : [];
+  const descriptionChanged = input.changes.some(
+    (change) => change.path === "dataset_description.json",
+  );
+  const participantValues =
+    participantsChanged.length > 0
+      ? participantValuesAltered(input.summary, input.changes, input.cosmetic)
+      : 0;
+  // The file the count came from: the shape of the first class it took (a root file's shape is its
+  // name), so a finding about participants.json values names it, not participants.tsv.
+  const countedFile =
+    participantValues !== null && participantValues > 0
+      ? (input.summary.classes.find(
+          (c) =>
+            (PARTICIPANT_FILES as readonly string[]).includes(c.shape) &&
+            ALTERS_PARTICIPANT_VALUE[c.kind],
+        )?.shape ?? null)
+      : null;
+  return {
+    abandoned: false,
+    anchorLookup: input.anchorLookup,
+    readme: documentResult("readme"),
+    changes: documentResult("changes"),
+    authorFields: descriptionChanged
+      ? authorFieldFacts(input.description.before, input.description.after)
+      : null,
+    participantValues,
+    recordings: recordingFacts(input.recordings),
+    paths: {
+      readme: firstReadme(baseNames("readme")) ?? baseNames("readme")[0] ?? null,
+      changes: baseNames("changes")[0] ?? null,
+      participants: countedFile ?? participantsChanged[0] ?? null,
+    },
+  };
 }

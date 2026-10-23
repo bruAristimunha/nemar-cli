@@ -16,6 +16,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { EvidenceRow } from "../scripts/ci/pr-review-calibrate";
 import { AUTHOR_OWNED_KEYS, PROSE_REFUSALS } from "../scripts/ci/pr-review-original";
 import {
   ORIGINAL_ROW_ERRORS,
@@ -274,4 +275,176 @@ describe("the set A baseline of original facts", () => {
     },
     300_000,
   );
+});
+
+describe("the evidence baseline of set A says what the original baseline says", () => {
+  // Both files are committed and this reads nothing else, so it runs everywhere. The evidence
+  // baseline (`set-a-evidence.json`) is what the review's content pass counted, offline and under
+  // the merge-base anchor; the original baseline is what the pure facts of Part B said of the same
+  // pull requests before the pass existed. The pass reads the same bytes through the same module, so
+  // every Part B number the first holds must be the second's, under the mapping below.
+  const evidenceRows = JSON.parse(
+    readFileSync(fixture("set-a-evidence.json"), "utf8"),
+  ) as EvidenceRow[];
+  const statsOf = (pr: string) => {
+    const found = evidenceRows.find((r) => r.pr === pr)?.evidence;
+    if (found === undefined || found === null) throw new Error(`no evidence for ${pr}`);
+    return found;
+  };
+
+  /**
+   * The Part B numbers of the evidence rows that one row of the original baseline stands for. A
+   * document is `refused` when its facts have a refusal, and then every number of it is 0; the
+   * README and CHANGES lines altered are the protected lines altered and the protected lines moved;
+   * the author fields altered are the keys altered or removed, once each; the data files replaced
+   * are the recordings replaced (annexed keys, and git files in the recordings area) and those
+   * annexed on one side only. The participant values are not in the
+   * original baseline (the pure facts take them from the change summary), so they are not here.
+   */
+  function expectedPartB(r: OriginalRow) {
+    const document = (d: OriginalRow["readme"]) => {
+      if (d === null) return { altered: 0, inside: 0, minor: 0, later: 0, refused: false };
+      if (d.refusal !== null) return { altered: 0, inside: 0, minor: 0, later: 0, refused: true };
+      return {
+        altered: d.protectedAltered + d.movedLines,
+        inside: d.insertedInsideParagraph,
+        minor: d.minorEdits,
+        later: d.laterAltered,
+        refused: false,
+      };
+    };
+    const readme = document(r.readme);
+    const changes = document(r.changes);
+    const fields = r.authorFields;
+    const recordings = r.recordings;
+    return {
+      readmeAlteredLines: readme.altered,
+      readmeInsideParagraph: readme.inside,
+      readmeMinorEdits: readme.minor,
+      readmeLaterAltered: readme.later,
+      readmeNotDecided: readme.refused,
+      changesAlteredLines: changes.altered,
+      changesNotDecided: changes.refused,
+      authorFieldsAltered:
+        fields === null ? 0 : new Set([...fields.altered, ...fields.removed]).size,
+      authorFieldsEdited: fields === null ? 0 : fields.minor.length,
+      authorFieldsNotDecided: fields?.unparsed === true,
+      recordingsReplaced: recordings === null ? 0 : recordings.replaced + recordings.typeChanged,
+      recordingsMoved: recordings === null ? 0 : recordings.moved,
+      recordingsUnread: recordings === null ? 0 : recordings.unread,
+    };
+  }
+
+  test("it is the same 86 pull requests, in the same order", () => {
+    expect(evidenceRows.map((r) => r.pr)).toEqual(rows.map((r) => r.pr));
+  });
+
+  test("every Part B number of every pull request is the original baseline's", () => {
+    for (const r of rows) {
+      const stats = statsOf(r.pr);
+      const expected = expectedPartB(r);
+      const got = Object.fromEntries(
+        Object.keys(expected).map((key) => [key, stats[key as keyof typeof stats]]),
+      );
+      expect(got, r.pr).toEqual(expected);
+    }
+  });
+
+  test("offline and under the merge-base anchor: no pass abandoned, no version tag looked up", () => {
+    for (const r of evidenceRows) {
+      expect(statsOf(r.pr).originalAbandoned, r.pr).toBe(false);
+      expect(statsOf(r.pr).anchorFromTag, r.pr).toBe(false);
+    }
+  });
+
+  test("Part B fails nine pull requests and holds five for a person; every other one is clear or information", () => {
+    const fails = evidenceRows.filter((r) => statsOf(r.pr).originalFails === 1).map((r) => r.pr);
+    const holds = evidenceRows
+      .filter((r) => statsOf(r.pr).originalFails === 0 && statsOf(r.pr).originalFindings > 0)
+      .map((r) => r.pr);
+    expect(fails.sort()).toEqual(
+      [
+        "nm000424#2",
+        "nm000501#2",
+        "nm000501#3",
+        "nm000513#2",
+        "on002578#2",
+        "on004588#1",
+        "on005420#1",
+        "on005628#1",
+        "on006126#1",
+      ].sort(),
+    );
+    expect(holds.sort()).toEqual(
+      ["on003029#1", "on003195#1", "on003343#3", "on003620#1", "on004703#1"].sort(),
+    );
+    // A fail is one finding that fails the pull request, a hold one finding that does not.
+    for (const r of evidenceRows) {
+      const { originalFails: fail, originalFindings: found } = statsOf(r.pr);
+      expect([fail, found], r.pr).toEqual(
+        fails.includes(r.pr) ? [1, 1] : holds.includes(r.pr) ? [0, 1] : [0, 0],
+      );
+    }
+    // What is left says something to the model at most: a typo fixed in Funding and a set of
+    // pointers moved with their keys.
+    const information = evidenceRows
+      .filter((r) => {
+        const e = statsOf(r.pr);
+        return (
+          e.originalFindings === 0 &&
+          e.readmeMinorEdits + e.readmeLaterAltered + e.authorFieldsEdited + e.recordingsMoved > 0
+        );
+      })
+      .map((r) => r.pr);
+    expect(information.sort()).toEqual(["on004306#1", "on007353#1"]);
+  });
+
+  test("each one fails or is held for the reason the design measured", () => {
+    const why = (pr: string) => {
+      const e = statsOf(pr);
+      return {
+        text: e.readmeAlteredLines + e.readmeInsideParagraph + e.changesAlteredLines,
+        fields: e.authorFieldsAltered,
+        participants: e.participantValuesAltered,
+        recordings: e.recordingsReplaced,
+        participantsNotDecided: e.participantsNotDecided,
+      };
+    };
+    const none = {
+      text: 0,
+      fields: 0,
+      participants: 0,
+      recordings: 0,
+      participantsNotDecided: false,
+    };
+    // README lines the original authors published, altered.
+    expect(why("nm000501#3")).toEqual({ ...none, text: 3 });
+    expect(why("on002578#2")).toEqual({ ...none, text: 21 });
+    // The Name of the dataset, three times by the platform's own account, and a link removed.
+    for (const pr of ["nm000424#2", "nm000501#2", "nm000513#2", "on006126#1"]) {
+      expect(why(pr), pr).toEqual({ ...none, fields: 1 });
+    }
+    // Participant values changed.
+    expect(why("on005420#1")).toEqual({ ...none, participants: 37 });
+    expect(why("on004588#1")).toEqual({ ...none, participants: 5 });
+    expect(why("on005628#1")).toEqual({ ...none, participants: 2 });
+    // Annexed files replaced or turned into git files: held, never failed.
+    expect(why("on003343#3")).toEqual({ ...none, recordings: 59 });
+    expect(why("on003029#1")).toEqual({ ...none, recordings: 41 });
+    expect(why("on004703#1")).toEqual({ ...none, recordings: 5 });
+    // A participants table the change summary could not read: the values are not known.
+    expect(why("on003195#1")).toEqual({ ...none, participantsNotDecided: true });
+    expect(why("on003620#1")).toEqual({ ...none, participantsNotDecided: true });
+    // Nothing else counts a participant value or a part not decided.
+    const others = evidenceRows.filter(
+      (r) => !["on005420#1", "on004588#1", "on005628#1", "on003195#1", "on003620#1"].includes(r.pr),
+    );
+    for (const r of others) {
+      const e = statsOf(r.pr);
+      expect(
+        [e.participantValuesAltered, e.participantsNotDecided, e.originalUndecided],
+        r.pr,
+      ).toEqual([0, false, false]);
+    }
+  });
 });
