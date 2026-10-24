@@ -74,6 +74,9 @@
       "biome check --fix"
     ]
   },
+  "trustedDependencies": [
+    "@biomejs/biome"
+  ],
   "devDependencies": {
     "@anthropic-ai/sdk": "^0.132.1",
     "@asteasolutions/zod-to-openapi": "^7.3.4",
