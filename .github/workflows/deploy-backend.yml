@@ -206,7 +206,11 @@ jobs:
           # has to keep the single check name `test-gate` that both deploy jobs and the
           # gate-reuse lookup above read, and the sharded proof lives in test.yml.
           set -euo pipefail
-          mapfile -t files < <(scripts/ci/unit-pure-files.sh)
+          # Written to a file first: process substitution would hide the classifier's exit
+          # status, and an empty list would run a bare `bun test` over everything.
+          scripts/ci/unit-pure-files.sh > "$RUNNER_TEMP/unit-pure-files.txt"
+          mapfile -t files < "$RUNNER_TEMP/unit-pure-files.txt"
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::the classifier listed no pure test files"; exit 1; }
           echo "Running ${#files[@]} pure test files"
           bun test "${files[@]}"
 

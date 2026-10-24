@@ -208,3 +208,36 @@ describe("the guard itself tells the tiers apart", () => {
     expect(claimedBy("no claim here")).toBeUndefined();
   });
 });
+
+describe("the pure tier has one classifier, used by both gates", () => {
+  const deploy = parse(readFileSync(`${ROOT}.github/workflows/deploy-backend.yml`, "utf8")) as {
+    jobs: Record<string, Job>;
+  };
+  const shardScripts = scriptsOf("unit-pure-shard");
+  const gateScripts = (deploy.jobs["test-gate"]?.steps ?? []).flatMap((s) =>
+    s.run ? [s.run] : [],
+  );
+  const INLINE_LOOP = /for f in [^;]*\*\.test\.ts/;
+
+  test("test.yml's shard step and deploy-backend's test-gate run the shared script", () => {
+    for (const scripts of [shardScripts, gateScripts]) {
+      expect(scripts.filter((s) => s.includes("scripts/ci/unit-pure-files.sh")).length).toBe(1);
+    }
+  });
+
+  test("neither workflow carries an inline classifier loop or a process-substituted list", () => {
+    for (const scripts of [shardScripts, gateScripts, scriptsOf("unit-pure")]) {
+      for (const script of scripts) {
+        expect(script).not.toMatch(INLINE_LOOP);
+        expect(script).not.toContain(unitPure.pattern);
+        expect(script).not.toContain("< <(scripts/ci/unit-pure-files.sh)");
+      }
+    }
+  });
+
+  test("each guards against an empty list", () => {
+    for (const scripts of [shardScripts, gateScripts]) {
+      expect(scripts.join("\n")).toMatch(/\$\{#files\[@\]\}" -gt 0/);
+    }
+  });
+});

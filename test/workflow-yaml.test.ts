@@ -252,6 +252,25 @@ describe("CI workflow templates", () => {
   });
 });
 
+/**
+ * `lint`, `unit-pure-shard` and the `unit-pure` gate all read ONE `changes` output,
+ * `unit_pure_due`, so they cannot disagree about whether they were due. The nine filter terms
+ * live in that output's expression.
+ */
+type DueWorkflow = { jobs: Record<string, { if?: string; outputs?: Record<string, string> }> };
+
+function unitPureDue(workflow: DueWorkflow): string {
+  return String(workflow.jobs.changes.outputs?.unit_pure_due ?? "");
+}
+
+function expectDueJobs(workflow: DueWorkflow): void {
+  for (const job of ["lint", "unit-pure-shard", "unit-pure"]) {
+    expect(workflow.jobs[job]?.if ?? "", job).toContain(
+      "needs.changes.outputs.unit_pure_due == 'true'",
+    );
+  }
+}
+
 describe("the repo's own test workflow routes changes to jobs", () => {
   /**
    * `.github/workflows/test.yml` decides which jobs run from a
@@ -289,9 +308,9 @@ describe("the repo's own test workflow routes changes to jobs", () => {
 
   test("shared/** has a filter, and gates the jobs that compile it", () => {
     expect(filterNames()).toContain("shared");
-    for (const job of ["lint", "unit-pure", "integration-dev"]) {
-      expect(workflow.jobs[job]?.if ?? "").toContain("outputs.shared == 'true'");
-    }
+    expect(unitPureDue(workflow)).toContain("steps.filter.outputs.shared == 'true'");
+    expect(workflow.jobs["integration-dev"]?.if ?? "").toContain("outputs.shared == 'true'");
+    expectDueJobs(workflow);
   });
 
   test("workflow files have a filter, and gate lint and unit-pure alike", () => {
@@ -301,9 +320,8 @@ describe("the repo's own test workflow routes changes to jobs", () => {
     // (the two `if:` conditions stay identical), not a requirement: a job skipped by its
     // `if:` reports Success and does not block a required check.
     expect(filterNames()).toContain("workflows");
-    for (const job of ["lint", "unit-pure"]) {
-      expect(workflow.jobs[job]?.if ?? "", job).toContain("outputs.workflows == 'true'");
-    }
+    expect(unitPureDue(workflow)).toContain("steps.filter.outputs.workflows == 'true'");
+    expectDueJobs(workflow);
     const filtersText = (workflow.jobs.changes.steps as { with?: { filters?: string } }[]).find(
       (s) => s.with?.filters,
     )?.with?.filters;
@@ -344,9 +362,8 @@ describe("a change to the validator pin alone", () => {
     // (under another filter, or in a comment).
     const filters = parse(filtersText ?? "") as Record<string, string[]>;
     expect(filters.cli).toContain("validator-version.json");
-    for (const job of ["lint", "unit-pure"]) {
-      expect(workflow.jobs[job]?.if ?? "", job).toContain("outputs.cli == 'true'");
-    }
+    expect(unitPureDue(workflow)).toContain("steps.filter.outputs.cli == 'true'");
+    expectDueJobs(workflow);
   });
 
   test("redeploys the Worker: a push to main that changes the pin is a deploy path", () => {
