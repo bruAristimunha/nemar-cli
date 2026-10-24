@@ -13,14 +13,25 @@ import { join } from "node:path";
 
 const MIGRATIONS_DIR = join(import.meta.dir, "../../src/db/migrations");
 
-export function freshDb(): Database {
-  const db = new Database(":memory:");
+function migrate(db: Database): Database {
   for (const file of readdirSync(MIGRATIONS_DIR)
     .filter((f) => f.endsWith(".sql"))
     .sort()) {
     db.exec(readFileSync(join(MIGRATIONS_DIR, file), "utf-8"));
   }
   return db;
+}
+
+// Migrating a database costs ~43 ms (every migration is re-read and re-run), and a suite calls
+// the helpers below hundreds of times. The migrated schema is built once per process, lazily, and
+// every call gets its own independent copy deserialized from those bytes (~0.04 ms). The result is
+// the same production schema, not a stand-in: a copy is a real, writable SQLite database.
+let template: Uint8Array | undefined;
+let templateWithForeignKeys: Uint8Array | undefined;
+
+export function freshDb(): Database {
+  template ??= migrate(new Database(":memory:")).serialize();
+  return Database.deserialize(template);
 }
 
 /**
@@ -32,13 +43,14 @@ export function freshDb(): Database {
  * does in D1 (probed on Miniflare). For a test of what a foreign key refuses.
  */
 export function freshDbWithForeignKeys(): Database {
-  const db = new Database(":memory:");
-  db.exec("PRAGMA foreign_keys = ON");
-  for (const file of readdirSync(MIGRATIONS_DIR)
-    .filter((f) => f.endsWith(".sql"))
-    .sort()) {
-    db.exec(readFileSync(join(MIGRATIONS_DIR, file), "utf-8"));
+  if (!templateWithForeignKeys) {
+    const db = new Database(":memory:");
+    db.exec("PRAGMA foreign_keys = ON");
+    templateWithForeignKeys = migrate(db).serialize();
   }
+  // The pragma is a connection setting, not part of the serialized bytes.
+  const db = Database.deserialize(templateWithForeignKeys);
+  db.exec("PRAGMA foreign_keys = ON");
   return db;
 }
 

@@ -61,6 +61,11 @@ jobs:
       agentdocs: ${{ steps.filter.outputs.agentdocs }}
       neurobagel_deploy: ${{ steps.filter.outputs.neurobagel_deploy }}
       workflows: ${{ steps.filter.outputs.workflows }}
+      # The ONE predicate for "lint and the pure unit tier are due", read by `lint`,
+      # `unit-pure-shard` and `unit-pure` so the three cannot disagree. It was the same nine-term
+      # condition copied into each. A skipped filter step (the release bot's version commits)
+      # leaves every term empty, so this is 'false' and all three jobs skip, as before.
+      unit_pure_due: ${{ (steps.filter.outputs.cli == 'true' || steps.filter.outputs.tests == 'true' || steps.filter.outputs.backend == 'true' || steps.filter.outputs.zarr == 'true' || steps.filter.outputs.shared == 'true' || steps.filter.outputs.decisions == 'true' || steps.filter.outputs.agentdocs == 'true' || steps.filter.outputs.neurobagel_deploy == 'true' || steps.filter.outputs.workflows == 'true') && 'true' || 'false' }}
       scrub: ${{ steps.filter.outputs.scrub }}
       # The ONE predicate for "the scrub suites must run", read by both `scrub-tools-shard` and
       # `scrub-tools` below so the shards and the check that gates on them cannot disagree about
@@ -776,11 +781,11 @@ jobs:
     # p95 0.5 min (44 green runs to 2026-10-13); 10 is the floor.
     timeout-minutes: 10
     needs: changes
-    # Kept identical to unit-pure's trigger so the two jobs run on the same changes.
+    # The same `unit_pure_due` output as unit-pure's trigger, so the two jobs run on the same changes.
     # (A job skipped by its `if:` reports Success and does not block a required check.
     # Only a skipped WORKFLOW leaves its checks pending, which is why `pull_request`
     # above has no paths-ignore.)
-    if: needs.changes.outputs.cli == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.zarr == 'true' || needs.changes.outputs.shared == 'true' || needs.changes.outputs.decisions == 'true' || needs.changes.outputs.agentdocs == 'true' || needs.changes.outputs.neurobagel_deploy == 'true' || needs.changes.outputs.workflows == 'true'
+    if: needs.changes.outputs.unit_pure_due == 'true'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -822,20 +827,54 @@ jobs:
   # Tier 1 (REQUIRED on dev + main): pure, deterministic tests with no network.
   # Auto-classified as every non-e2e file that does NOT hit the live backend
   # (no testRequest / TEST_API_URL / runCli) -- new tests route themselves, no
-  # renames. Fast (~1 min) and never flaky, so this is the gate for landing
-  # into dev. See https://docs.nemar.org/admin/operations/access-policies/ for the tiering rationale.
-  unit-pure:
+  # renames. Never flaky, so this is the gate for landing into dev. See
+  # https://docs.nemar.org/admin/operations/access-policies/ for the tiering rationale.
+  #
+  # The classification lives in ONE script, scripts/ci/unit-pure-files.sh, which
+  # deploy-backend.yml's `test-gate` also runs, so the PR gate and the deploy gate
+  # assert the same set.
+  #
+  # The suite is about 650 files and 17,000 tests. In one process it took about 31
+  # minutes and grew toward its limit, so it runs as a matrix of shards.
+  #
+  # THE CHECK NAME. `unit-pure-shard` is the matrix; `unit-pure` is a gate that needs it
+  # and keeps the name this REQUIRED check always had. The gate is skipped exactly when
+  # the shards were (the same `if`), as the single job was. When they ran it fails unless
+  # every shard succeeded AND the shards together ran every file the classifier lists
+  # (counted, and compared by a hash of the list), so a shard that ran nothing, or a
+  # partition that dropped a file, cannot pass green.
+  #
+  # TO ADD A SHARD, add the next number to `matrix.shard`. The slice each job runs comes
+  # from its position (`strategy.job-index`); a gap or a repeat is refused in the step.
+  #
+  # TO REFRESH test/unit-pure-timings.json (after files are added, removed or split, or
+  # when the shards drift apart): every shard uploads the durations it measured as the
+  # artifact `unit-pure-shard-<n>`. From a green run on the branch:
+  #   gh run download <run-id> --pattern 'unit-pure-shard-*' --dir /tmp/up-shards
+  #   jq -S -s '{version: 1, files: (map(.files) | add)}' /tmp/up-shards/*/timings.json \
+  #     > test/unit-pure-timings.json
+  # A file missing from the timings file still runs; it is only balanced less well. A
+  # file's duration varies between runs, so average two runs' artifacts.
+  unit-pure-shard:
+    name: unit-pure shard ${{ matrix.shard }}/${{ strategy.job-total }}
     runs-on: ubuntu-latest
-    # p95 21.7 min (44 green runs to 2026-10-13), so twice that. #1667: this job once
-    # hung for an hour installing git-annex; that step has its own limit below.
-    timeout-minutes: 44
+    # A shard is expected to take 5 to 8 minutes (about 31 minutes serial, split six ways,
+    # plus setup). The limit is generous because a cancelled check reads as neither green
+    # nor red. #1667: this job once hung for an hour installing git-annex; that step has
+    # its own limit below.
+    timeout-minutes: 20
     needs: changes
     # `decisions` is here, not only on `lint`: test/adr-index.unit.test.ts is the
     # thing that checks an ADR against the index, and `unit-pure` is the only job
     # that runs test/*.test.ts at all -- `lint` runs tsc and biome. Adding the
     # filter to `lint` alone left the index test still skipped on an ADR-only PR,
     # which is the gap it was added to close.
-    if: needs.changes.outputs.cli == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.zarr == 'true' || needs.changes.outputs.shared == 'true' || needs.changes.outputs.decisions == 'true' || needs.changes.outputs.agentdocs == 'true' || needs.changes.outputs.neurobagel_deploy == 'true' || needs.changes.outputs.workflows == 'true'
+    if: needs.changes.outputs.unit_pure_due == 'true'
+    strategy:
+      # Every shard reports, so one red shard does not hide a second one.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -982,7 +1021,7 @@ jobs:
           ref: main
           token: ${{ secrets.DOCS_READ_TOKEN || github.token }}
 
-      - name: Run pure unit tests (no live backend)
+      - name: Run pure unit tests (shard ${{ matrix.shard }}/${{ strategy.job-total }}, no live backend)
         env:
           # Names the checkout above. The parity test treats this as the
           # contract: a path that is not there FAILS rather than skipping, so a
@@ -1000,27 +1039,178 @@ jobs:
           # path there is still a hard failure -- which is the property that
           # stops a broken checkout step from silently disabling the guard.
           NEMAR_DOCS_CHECKOUT: ${{ (github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push') && 'docs-live' || '' }}
+          SHARD_INDEX: ${{ strategy.job-index }}
+          SHARD_TOTAL: ${{ strategy.job-total }}
+          SHARD_LABEL: ${{ matrix.shard }}
         run: |
           # Deliberately no TEST_API_URL / secrets: these tests don't touch the
           # backend, so a misclassified file fails loudly here instead of
           # silently flaking in the wrong tier.
+          set -euo pipefail
+          shard=$((SHARD_INDEX + 1))
+          if [ "$shard" != "$SHARD_LABEL" ]; then
+            echo "::error::matrix.shard must be 1..N in order: job $SHARD_INDEX is labeled $SHARD_LABEL, so a slice of the suite would run twice or never"
+            exit 1
+          fi
+
+          # Written to a file first so a failing classifier fails this step (process substitution
+          # would hide its exit status) and an empty list cannot become a bare `bun test`.
+          scripts/ci/unit-pure-files.sh > "$RUNNER_TEMP/unit-pure-files.txt"
+          mapfile -t files < "$RUNNER_TEMP/unit-pure-files.txt"
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::the classifier listed no pure test files"; exit 1; }
+          list_sha=$(sha256sum "$RUNNER_TEMP/unit-pure-files.txt" | cut -d' ' -f1)
+          echo "Classifier lists ${#files[@]} pure test files"
+
+          out="$RUNNER_TEMP/unit-pure-shard-out"
+          mkdir -p "$out"
+          timings="$out/timings.json"
+          cp test/unit-pure-timings.json "$timings"
+          log="$RUNNER_TEMP/unit-pure-shard.log"
+
+          # pipefail keeps bun's own exit status: a failing test fails this step.
+          bun test --timings "$timings" --update-timings --shard="$shard/$SHARD_TOTAL" \
+            --reporter=junit --reporter-outfile="$out/junit.xml" "${files[@]}" 2>&1 | tee "$log"
+
+          # The files this shard actually ran, from the junit report: every test file appears as
+          # a testsuite carrying its path in `file`. The gate compares these lists across shards.
+          grep -o '<testsuite [^>]*' "$out/junit.xml" | sed -nE 's/.* file="([^"]*)".*/\1/p' | sort -u > "$out/ran-files.txt"
+
+          # An empty shard is not an error to bun ("Ran 0 tests across 0 files", exit 0), so
+          # read the run's own summary, refuse an empty shard, and record what it ran.
+          esc=$(printf '\033')
+          plain=$(sed -E "s/${esc}\[[0-9;]*m//g" "$log")
+          header=$(grep -E -m1 '^--shard=[0-9]+/[0-9]+: running [0-9]+/[0-9]+ test files' <<<"$plain" || true)
+          summary=$(grep -E '^Ran [0-9]+ tests? across [0-9]+ files?' <<<"$plain" | tail -1 || true)
+          passline=$(grep -E '^ *[0-9]+ pass$' <<<"$plain" | tail -1 || true)
+          if [ -z "$header" ] || [ -z "$summary" ] || [ -z "$passline" ]; then
+            echo "::error::bun printed no shard header, run summary or pass count, so what this shard ran is unknown"
+            exit 1
+          fi
+          read -r planned discovered < <(sed -E 's#^--shard=[0-9]+/[0-9]+: running ([0-9]+)/([0-9]+) test files.*#\1 \2#' <<<"$header")
+          read -r tests ran < <(sed -E 's#^Ran ([0-9]+) tests? across ([0-9]+) files?.*#\1 \2#' <<<"$summary")
+          passed=$(sed -E 's#^ *([0-9]+) pass$#\1#' <<<"$passline")
+          if [ "$ran" -lt 1 ] || [ "$tests" -lt 1 ] || [ "$passed" -lt 1 ]; then
+            echo "::error::shard $shard/$SHARD_TOTAL ran $tests tests across $ran files and $passed passed; an empty or all-skipped shard passes bun and asserts nothing"
+            exit 1
+          fi
+          if [ "$ran" != "$planned" ]; then
+            echo "::error::shard $shard/$SHARD_TOTAL was assigned $planned files and ran $ran"
+            exit 1
+          fi
+          if [ "$(wc -l < "$out/ran-files.txt" | tr -d ' ')" != "$ran" ]; then
+            echo "::error::bun reported $ran files and the junit report names $(wc -l < "$out/ran-files.txt" | tr -d ' ')"
+            exit 1
+          fi
+          if [ -n "$(comm -23 "$out/ran-files.txt" <(sort "$RUNNER_TEMP/unit-pure-files.txt"))" ]; then
+            echo "::error::this shard ran a file the classifier does not list"
+            exit 1
+          fi
+          if [ "$discovered" != "${#files[@]}" ]; then
+            echo "::error::the classifier listed ${#files[@]} files and bun matched $discovered, so a listed file does not exist as a test file"
+            exit 1
+          fi
+
+          jq -n --argjson shard "$shard" --argjson total "$SHARD_TOTAL" \
+            --argjson files "$ran" --argjson discovered "$discovered" \
+            --argjson tests "$tests" --argjson passed "$passed" --arg list_sha "$list_sha" \
+            --rawfile ran_files "$out/ran-files.txt" \
+            '{shard: $shard, total: $total, files: $files, discovered: $discovered, tests: $tests, passed: $passed, list_sha: $list_sha, ran: ($ran_files | split("\n") | map(select(. != "")))}' \
+            > "$out/shard.json"
+          echo "shard $shard/$SHARD_TOTAL: $passed of $tests tests passed across $ran of $discovered files" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # The gate reads shard.json from every shard; timings.json is what a refresh of
+      # test/unit-pure-timings.json collects (see the note above the job).
+      - name: Upload what this shard ran and how long each file took
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-pure-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/unit-pure-shard-out
+          retention-days: 14
+          if-no-files-found: error
+          overwrite: true
+
+  # The check named `unit-pure`. See THE CHECK NAME above.
+  #
+  # `if: always()` so a failed or cancelled shard still reaches this job and turns it red; a
+  # job skipped because its dependency failed would read as passing. The second term skips it
+  # when the shards were not due, which is what the single job did.
+  unit-pure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [changes, unit-pure-shard]
+    if: always() && needs.changes.outputs.unit_pure_due == 'true'
+    steps:
+      - name: Every shard must have succeeded
+        env:
+          SHARDS_RESULT: ${{ needs.unit-pure-shard.result }}
+        run: |
+          if [ "$SHARDS_RESULT" != "success" ]; then
+            echo "::error::unit-pure-shard finished as '$SHARDS_RESULT', not 'success'"
+            exit 1
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download what every shard ran
+        uses: actions/download-artifact@v4
+        with:
+          pattern: unit-pure-shard-*
+          path: unit-pure-shards
+
+      # A green shard is not enough: bun can run a shard that holds no file, and a partition
+      # that disagreed between shards could drop or repeat a file. Each shard recorded how many
+      # files it ran, how many the classifier listed, and a hash of that list, and the names of the files it ran; this job lists
+      # the files itself and holds every shard to the same count and hash.
+      - name: The shards together ran every pure test file
+        shell: bash
+        run: |
+          set -euo pipefail
           shopt -s nullglob
-          files=()
-          for f in test/*.test.ts backend/test/*.test.ts backend/test/helpers/*.test.ts; do
-            base="$(basename "$f")"
-            case "$base" in
-              e2e-sandbox.test.ts|e2e-upload.test.ts|zenodo-sandbox.test.ts|ezid.test.ts|ezid-sandbox.test.ts|auth-passwordless.test.ts) continue;;
-              # *.integration.test.ts hit external networks (e.g. live DataCite/
-              # Crossref) and are non-deterministic; they must NOT gate the pure
-              # (required, offline) tier or, via test-gate, the prod deploy.
-              *.integration.test.ts) continue;;
-            esac
-            if grep -Eq 'testRequest|TEST_API_URL|runCli\(' "$f"; then continue; fi
-            files+=("$f")
-          done
-          if [ ${#files[@]} -eq 0 ]; then echo "No pure test files matched" >&2; exit 1; fi
-          echo "Running ${#files[@]} pure test files"
-          bun test "${files[@]}"
+          reports=(unit-pure-shards/*/shard.json)
+          if [ "${#reports[@]}" -eq 0 ]; then
+            echo "::error::no shard left a report"
+            exit 1
+          fi
+          scripts/ci/unit-pure-files.sh > "$RUNNER_TEMP/unit-pure-files.txt"
+          expected=$(wc -l < "$RUNNER_TEMP/unit-pure-files.txt" | tr -d ' ')
+          [ "$expected" -gt 0 ] || { echo "::error::the classifier listed no pure test files"; exit 1; }
+          expected_sha=$(sha256sum "$RUNNER_TEMP/unit-pure-files.txt" | cut -d' ' -f1)
+          problems=$(jq -r -s --argjson expected "$expected" --arg sha "$expected_sha" \
+            --rawfile list "$RUNNER_TEMP/unit-pure-files.txt" '
+            . as $all
+            | ($all[0].total) as $total
+            | [
+                (if ($all | length) != $total
+                  then "expected \($total) shard reports, found \($all | length)" else empty end),
+                (if ([$all[].total] | unique | length) != 1
+                  then "the shards disagree on how many shards there are" else empty end),
+                (if ([$all[].shard] | sort) != [range(1; $total + 1)]
+                  then "the shard numbers are not exactly 1..\($total)" else empty end),
+                (if ([$all[].discovered] | unique) != [$expected]
+                  then "the shards matched \([$all[].discovered] | unique) files and the classifier lists \($expected)" else empty end),
+                (if ([$all[].list_sha] | unique) != [$sha]
+                  then "the shards ran a different file list than the classifier gives this job" else empty end),
+                (if ([$all[].files] | add) != $expected
+                  then "the shards ran \([$all[].files] | add) test files and the classifier lists \($expected)" else empty end),
+                (([$all[].ran[]]) as $ran
+                  | ($list | split("\n") | map(select(. != "")) | sort) as $want
+                  | (if ($ran | sort) != $want
+                      then "the union of the files the shards ran differs from the classifier list: missing \($want - $ran | length), unlisted \($ran - $want | length)" else empty end),
+                    (if ($ran | length) != ($ran | unique | length)
+                      then "files ran in more than one shard: \($ran | group_by(.) | map(select(length > 1) | .[0]) | join(", "))" else empty end)),
+                ($all[] | select(.files < 1 or .tests < 1 or .passed < 1)
+                  | "shard \(.shard) ran \(.tests) tests across \(.files) files and \(.passed) passed")
+              ] | .[]' "${reports[@]}")
+          if [ -n "$problems" ]; then
+            while IFS= read -r line; do echo "::error::$line"; done <<<"$problems"
+            exit 1
+          fi
+          jq -r -s '
+            "| shard | files | tests | passed |\n|---|---|---|---|\n"
+            + ([.[] | "| \(.shard)/\(.total) | \(.files) | \(.tests) | \(.passed) |"] | join("\n"))
+            + "\n| all | \([.[].files] | add) of \(.[0].discovered) | \([.[].tests] | add) | \([.[].passed] | add) |"
+          ' "${reports[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
 
   # Tier 2 (SOFT on dev, REQUIRED on main): integration tests that hit the LIVE
   # dev backend (real AWS STS / D1 / network). These flake transiently (a
