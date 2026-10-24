@@ -1997,6 +1997,60 @@ export function registerUsersRoutes(admin: AdminRouter): void {
     return c.json(result);
   });
 
+  /**
+   * GET /admin/notify/:id - Progress of one announcement.
+   *
+   * A queued announcement (epic #1893 phase 2) finishes after the POST has answered: the
+   * consumer writes one outcome per message to the audit row. `unknown_count` is sends whose
+   * outcome the provider never confirmed (a timeout, an internal error); they are not retried
+   * because a retry could deliver twice. `failed_recipients` holds the redacted addresses the
+   * row stores, never full ones.
+   */
+  admin.get("/notify/:id", async (c) => {
+    const id = Number(c.req.param("id"));
+    if (!Number.isInteger(id) || id < 1) {
+      return c.json({ error: "Invalid broadcast id" }, 400);
+    }
+    const row = await c.env.DB.prepare(
+      `SELECT id, status, subject, recipient_group, queued_count, delivered_count,
+              failure_count, unknown_count, failed_recipients, sent_at
+         FROM broadcast_emails WHERE id = ?`,
+    )
+      .bind(id)
+      .first<{
+        id: number;
+        status: string;
+        subject: string;
+        recipient_group: string;
+        queued_count: number;
+        delivered_count: number;
+        failure_count: number;
+        unknown_count: number;
+        failed_recipients: string | null;
+        sent_at: string;
+      }>();
+    if (!row) return c.json({ error: "Broadcast not found" }, 404);
+
+    let failed: unknown = [];
+    try {
+      failed = JSON.parse(row.failed_recipients ?? "[]");
+    } catch {
+      failed = [];
+    }
+    return c.json({
+      id: row.id,
+      status: row.status,
+      subject: row.subject,
+      recipient_group: row.recipient_group,
+      queued_count: row.queued_count,
+      delivered_count: row.delivered_count,
+      failure_count: row.failure_count,
+      unknown_count: row.unknown_count,
+      failed_recipients: Array.isArray(failed) ? failed : [],
+      sent_at: row.sent_at,
+    });
+  });
+
   // ---------------------------------------------------------------------------
   // Test-only fixtures
   // ---------------------------------------------------------------------------

@@ -1553,9 +1553,31 @@ export async function updateEmailPreferences(
 
 export interface BroadcastResponse {
   broadcast_id: number;
+  /** `sent`: finished inline. `queued`: handed to the announcement outbox; check progress with
+   *  {@link getBroadcastStatus}. `done`: queued and already complete. Older servers omit it. */
+  status?: "sent" | "queued" | "done";
+  /** Delivered, or queued when `status` is `queued`. */
   recipient_count: number;
   failure_count: number;
   failed_recipients: string[];
+  /** Recipients withheld by a non-production delivery fence. Older servers omit it. */
+  suppressed_count?: number;
+  error?: string;
+}
+
+export interface BroadcastStatusResponse {
+  id: number;
+  status: "sent" | "queued" | "done";
+  subject: string;
+  recipient_group: string;
+  queued_count: number;
+  delivered_count: number;
+  failure_count: number;
+  /** Sends whose outcome the provider never confirmed; not retried, so none is delivered twice. */
+  unknown_count: number;
+  /** Redacted addresses (first letter and domain only). */
+  failed_recipients: string[];
+  sent_at: string;
 }
 
 export interface BroadcastDryRunResponse {
@@ -1585,6 +1607,11 @@ export async function sendBroadcast(data: {
     },
     true,
   );
+}
+
+/** Progress of one announcement (admin only): `GET /admin/notify/:id`. */
+export async function getBroadcastStatus(id: number): Promise<BroadcastStatusResponse> {
+  return request<BroadcastStatusResponse>(`/admin/notify/${id}`, {}, true);
 }
 
 // ============================================================================

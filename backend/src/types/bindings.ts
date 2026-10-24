@@ -110,6 +110,11 @@ export interface Bindings {
    *  configuration error, never a silent fallback to Resend
    *  (services/email.ts resolveEmailProvider). */
   EMAIL_PROVIDER?: string;
+  /** "resend" lets a send that Cloudflare refused for a quota or account
+   *  reason (services/email.ts RESEND_FALLBACK_CODES) go out once through
+   *  Resend. Unset or anything else: no fallback. Never set in [env.dev], so
+   *  staging cannot reach Resend. Also needs a non-blank RESEND_API_KEY. */
+  EMAIL_FALLBACK?: string;
   /** Cloudflare Email Service `send_email` binding. In [env.dev] it is
    *  restricted to the staging sender addresses, so the dev worker cannot
    *  send as nemar.org. Optional: absent on every other worker. */
@@ -119,6 +124,10 @@ export interface Bindings {
    *  `nemar-mail-dev` in [env.dev] only; absent elsewhere, and a Worker with no
    *  bucket rejects the message. */
   MAIL_INBOUND?: R2Bucket;
+  /** Announcement outbox queue (epic #1893 phase 2): `nemar-email-outbox` in production,
+   *  `nemar-email-outbox-dev` in [env.dev]. Optional: with no binding `nemar admin notify`
+   *  sends inline as before. Consumed by `queue()` in index.ts. */
+  EMAIL_OUTBOX?: Queue;
   /** Reply-To address (e.g. "info@nemar.org") when FROM is a no-reply mailbox.
    *  Omitted when unset/empty. */
   REPLY_TO?: string;
