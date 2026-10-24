@@ -4,7 +4,8 @@
  * `.github/workflows/test.yml` routes a file by text, not by header: a file whose text holds one
  * of three marker names (read from the workflow below, never spelled here) goes to the
  * `integration-dev` job, which runs with `--retry=2 --timeout 30000` and is not required on dev;
- * every other file goes to the required `unit-pure` job, which runs `bun test` with the default
+ * every other file goes to the required `unit-pure` job (sharded as `unit-pure-shard`; its file list comes
+ * from `scripts/ci/unit-pure-files.sh`, shared with the deploy gate), which runs `bun test` with the default
  * five-second timeout and no retry; a file named `*.integration.test.ts` goes to the integration
  * job whatever its text says. When the spawn of the CLI moved out of six suites into a shared
  * helper, none of them held a marker any more, all six moved to `unit-pure` while their headers
@@ -55,7 +56,12 @@ interface Routing {
 
 /** The routing of one job, or a thrown error naming what could not be read. */
 function routingOf(job: string): Routing {
-  const found = scriptsOf(job).flatMap((script) =>
+  return routingOfScripts(`the ${job} job`, scriptsOf(job));
+}
+
+/** The routing read from scripts, `label` naming where they came from in an error. */
+function routingOfScripts(label: string, scripts: string[]): Routing {
+  const found = scripts.flatMap((script) =>
     [...script.matchAll(/grep -Eq '([^']+)' "\$f"; then (continue|files\+=)/g)].map((m) => ({
       script,
       pattern: m[1],
@@ -64,16 +70,19 @@ function routingOf(job: string): Routing {
   );
   if (found.length !== 1) {
     throw new Error(
-      `expected exactly one routing grep in the ${job} job, found ${found.length}: this guard must be updated with the workflow`,
+      `expected exactly one routing grep in ${label}, found ${found.length}: this guard must be updated with the workflow`,
     );
   }
   const [{ script, pattern, onMatch }] = found;
   const skipLine = script.match(/^\s*([\w.-]+(?:\|[\w.-]+)+)\) continue;;/m);
-  if (!skipLine) throw new Error(`the ${job} job's skip list could not be read`);
+  if (!skipLine) throw new Error(`${label}'s skip list could not be read`);
   return { pattern, onMatch, skipped: skipLine[1].split("|") };
 }
 
-const unitPure = routingOf("unit-pure");
+// The required tier's classifier is one script shared with deploy-backend.yml's test-gate.
+const unitPure = routingOfScripts("scripts/ci/unit-pure-files.sh", [
+  readFileSync(`${ROOT}scripts/ci/unit-pure-files.sh`, "utf8"),
+]);
 const integrationDev = routingOf("integration-dev");
 
 /**
