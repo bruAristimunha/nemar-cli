@@ -110,6 +110,11 @@ export interface Bindings {
    *  configuration error, never a silent fallback to Resend
    *  (services/email.ts resolveEmailProvider). */
   EMAIL_PROVIDER?: string;
+  /** "resend" lets a send that Cloudflare refused for a quota or account
+   *  reason (services/email.ts RESEND_FALLBACK_CODES) go out once through
+   *  Resend. Unset or anything else: no fallback. Never set in [env.dev], so
+   *  staging cannot reach Resend. Also needs a non-blank RESEND_API_KEY. */
+  EMAIL_FALLBACK?: string;
   /** Cloudflare Email Service `send_email` binding. In [env.dev] it is
    *  restricted to the staging sender addresses, so the dev worker cannot
    *  send as nemar.org. Optional: absent on every other worker. */

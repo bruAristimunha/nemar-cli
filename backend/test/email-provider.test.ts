@@ -14,11 +14,13 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  CLOUDFLARE_NON_DELIVERY_CODES,
   type CloudflareSendEmail,
   DevEmailFenceError,
   type EmailDeliveryEnv,
   EmailProviderConfigError,
   EmailRejectedError,
+  RESEND_FALLBACK_CODES,
   isCertainNonDelivery,
   parseMailbox,
   redactAddressIn,
@@ -28,7 +30,7 @@ import {
   sendRevocationEmail,
 } from "../src/services/email";
 import { bindingError, recordingBinding } from "./helpers/cloudflare-email";
-import { withFakeResend } from "./helpers/resend";
+import { asSend, withFakeResend } from "./helpers/resend";
 
 const FROM = "NEMAR Staging <noreply@staging.nemar.test>";
 const REPLY_TO = "support@staging.nemar.test";
@@ -321,5 +323,151 @@ describe("the bound on a Cloudflare send (timeoutMs)", () => {
       5_000,
     );
     expect(sent.length).toBe(1);
+  });
+});
+
+describe("the gated Resend fallback", () => {
+  const FALLBACK = [
+    "E_RATE_LIMIT_EXCEEDED",
+    "E_DAILY_LIMIT_EXCEEDED",
+    "E_ACCOUNT_SUSPENDED",
+    "E_SENDER_DOMAIN_NOT_AVAILABLE",
+  ];
+  const fallbackEnv = (binding: CloudflareSendEmail, extra: Partial<EmailDeliveryEnv> = {}) => ({
+    ...stagingEnv(binding),
+    EMAIL_FALLBACK: "resend",
+    ...extra,
+  });
+  const send = (env: EmailDeliveryEnv, key = "resend-key", timeoutMs?: number) =>
+    sendEmail(ALLOWED, "Subject", "<p>h</p>", key, FROM, REPLY_TO, true, env, timeoutMs);
+
+  test("the fallback codes are exactly these four, each a certain non-delivery", () => {
+    expect([...RESEND_FALLBACK_CODES].sort()).toEqual([...FALLBACK].sort());
+    for (const code of RESEND_FALLBACK_CODES) {
+      expect(CLOUDFLARE_NON_DELIVERY_CODES.has(code)).toBe(true);
+    }
+  });
+
+  for (const code of FALLBACK) {
+    test(`${code} reaches Resend exactly once with the wrapped subject and the same sender`, async () => {
+      const { binding, sent } = recordingBinding(() => bindingError(code));
+      const warnings: string[] = [];
+      const realWarn = console.warn;
+      console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(" "));
+      try {
+        await withFakeResend(async (calls) => {
+          await send(fallbackEnv(binding));
+          expect(calls.length).toBe(1);
+          expect(calls[0].path).toBe("/emails");
+          const body = asSend(calls[0]);
+          expect(body.subject).toBe("[DEV] Subject");
+          expect(body.from).toBe(FROM);
+          expect(body.to).toEqual([ALLOWED]);
+        });
+      } finally {
+        console.warn = realWarn;
+      }
+      expect(sent.length).toBe(1); // Cloudflare was tried first, once
+      const line = warnings.find((w) => w.startsWith("[email][cloudflare-fallback]")) ?? "";
+      expect(line).toContain(code);
+      expect(line.toLowerCase()).not.toContain(ALLOWED);
+    });
+  }
+
+  test("a Resend failure after the fallback propagates and is not retried", async () => {
+    const { binding } = recordingBinding(() => bindingError("E_RATE_LIMIT_EXCEEDED"));
+    await withFakeResend(
+      async (calls) => {
+        const error = await send(fallbackEnv(binding)).catch((e: unknown) => e);
+        expect(error).toBeInstanceOf(EmailRejectedError);
+        expect((error as EmailRejectedError).code).toBeUndefined();
+        expect(calls.length).toBe(1);
+      },
+      { status: 403 },
+    );
+  });
+
+  const NO_FALLBACK: Array<[string, unknown]> = [
+    ["E_RECIPIENT_SUPPRESSED", bindingError("E_RECIPIENT_SUPPRESSED")],
+    ["E_VALIDATION_ERROR", bindingError("E_VALIDATION_ERROR")],
+    ["E_DELIVERY_FAILED", bindingError("E_DELIVERY_FAILED")],
+    ["E_HEADER_NAME_INVALID", bindingError("E_HEADER_NAME_INVALID")],
+    ["E_INTERNAL_SERVER_ERROR", bindingError("E_INTERNAL_SERVER_ERROR")],
+    ["an unknown code", bindingError("E_SOMETHING_NEW")],
+    ["no code", bindingError(undefined)],
+  ];
+  for (const [label, failure] of NO_FALLBACK) {
+    test(`${label} does not reach Resend`, async () => {
+      const { binding } = recordingBinding(() => failure);
+      await withFakeResend(async (calls) => {
+        await expect(send(fallbackEnv(binding))).rejects.toThrow();
+        expect(calls.length).toBe(0);
+      });
+    });
+  }
+
+  test("a timeout does not reach Resend", async () => {
+    const hung: CloudflareSendEmail = { send: () => new Promise(() => {}) };
+    await withFakeResend(async (calls) => {
+      const error = await send(fallbackEnv(hung), "resend-key", 25).catch((e: unknown) => e);
+      expect((error as Error).message).toContain("timed out");
+      expect(calls.length).toBe(0);
+    });
+  });
+
+  const GATED_OFF: Array<[string, EmailDeliveryEnv["EMAIL_FALLBACK"], string]> = [
+    ["EMAIL_FALLBACK unset", undefined, "resend-key"],
+    ["EMAIL_FALLBACK other", "other", "resend-key"],
+    ["a blank Resend key", "resend", "   "],
+  ];
+  for (const [label, setting, key] of GATED_OFF) {
+    test(`${label}: a fallback code rethrows and Resend is not reached`, async () => {
+      const { binding } = recordingBinding(() => bindingError("E_DAILY_LIMIT_EXCEEDED"));
+      await withFakeResend(async (calls) => {
+        const error = await send(fallbackEnv(binding, { EMAIL_FALLBACK: setting }), key).catch(
+          (e: unknown) => e,
+        );
+        expect(error).toBeInstanceOf(EmailRejectedError);
+        expect((error as EmailRejectedError).code).toBe("E_DAILY_LIMIT_EXCEEDED");
+        expect(calls.length).toBe(0);
+      });
+    });
+  }
+
+  test("EMAIL_FALLBACK is read trimmed and case-insensitively", async () => {
+    const { binding } = recordingBinding(() => bindingError("E_RATE_LIMIT_EXCEEDED"));
+    await withFakeResend(async (calls) => {
+      await send(fallbackEnv(binding, { EMAIL_FALLBACK: " Resend " }));
+      expect(calls.length).toBe(1);
+    });
+  });
+
+  test("the fence refuses an off-list recipient before either provider is called", async () => {
+    const { binding, sent } = recordingBinding(() => bindingError("E_RATE_LIMIT_EXCEEDED"));
+    await withFakeResend(async (calls) => {
+      const error = await sendEmail(
+        "someone@example.org",
+        "s",
+        "<p>h</p>",
+        "resend-key",
+        FROM,
+        REPLY_TO,
+        true,
+        fallbackEnv(binding),
+      ).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(DevEmailFenceError);
+      expect(calls.length).toBe(0);
+    });
+    expect(sent.length).toBe(0);
+  });
+
+  test("a configuration error never falls back", async () => {
+    await withFakeResend(async (calls) => {
+      const error = await send({ ...stagingEnv(undefined), EMAIL_FALLBACK: "resend" }).catch(
+        (e: unknown) => e,
+      );
+      expect(error).toBeInstanceOf(EmailProviderConfigError);
+      expect(calls.length).toBe(0);
+    });
   });
 });

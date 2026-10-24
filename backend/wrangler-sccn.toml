@@ -206,6 +206,14 @@ bucket_name = "nemar-news-media"
 binding = "NEUROBAGEL"
 bucket_name = "nemar-neurobagel"
 
+# Outbound mail (epic #1893, ADR 0110). The Cloudflare Email Service binding.
+# Production has the binding but does NOT set EMAIL_PROVIDER, so it still sends
+# through Resend; a later config change flips it, after the Cloudflare sending
+# limit increase and a staging soak.
+[[send_email]]
+name = "EMAIL"
+allowed_sender_addresses = ["noreply@nemar.org", "support@nemar.org"]
+
 # Workers Observability (Workers Paid plan).
 # Captures invocation logs (inbound request shape, response status, duration,
 # subrequest count) and console.log output for searchable runtime telemetry.
@@ -283,9 +291,10 @@ MCP_HOSTNAME = "mcp.nemar.org"
 # xx090001-xx099899 without repo-name collisions in the shared nemarDatasets org.
 # (xx099900+ is the reserved exemplar band, ADR 0068.)
 SANDBOX_ID_CEILING = "89999"
-# Sender + reply-to for Resend emails. The domain in FROM_EMAIL must be
-# verified in the Resend account tied to RESEND_API_KEY; otherwise sends
-# 403 and resolveEmailConfig logs once but does not propagate the failure.
+# Sender + reply-to for outbound emails, whichever provider sends. The domain in
+# FROM_EMAIL must be verified with that provider (the Resend account tied to
+# RESEND_API_KEY, or the Cloudflare Email Service); otherwise sends are
+# refused and resolveEmailConfig logs once but does not propagate the failure.
 FROM_EMAIL = "NEMAR Archive <noreply@nemar.org>"
 REPLY_TO = "info@nemar.org"
 # DEV_EMAIL_ALLOWLIST (issue #957) is not set here: the delivery fence in
