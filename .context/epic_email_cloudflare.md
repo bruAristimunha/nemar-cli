@@ -19,18 +19,19 @@ Send and receive every NEMAR email on Cloudflare: sending through the Workers `s
 
 | Phase | Content | State |
 |---|---|---|
-| 1 (#1894) | Staging mail on `test.nemar.org`: provider switch, broadcast path, inbound handler into R2, staging configuration, ADR 0110. | in review |
-| 2 | Announcements move from per-recipient sends to a Queue. | open |
-| 3 | The ticket model: parsing, tags, rules, restricted queues, replies from the support address; amends ADR 0110. | open |
-| 4, 5 | See the epic issue. | open |
-| 6 | Production cutover: apex routing and the catch-all, `nemar.org` sending. | open |
-| 7 | Retire Resend: remove the key from every Worker and the fallback code. | open |
+| 1 (#1894) | Staging mail on `test.nemar.org`: provider switch, broadcast path, inbound handler into R2, staging configuration, ADR 0110. | merged into the epic branch (#1902); staging checks pending |
+| 2 (#1895) | Production sending: `nemar.org` onboarded for Email Sending, the production binding, the Resend fallback for certain non-delivery only, announcements on a Queue, bounce and complaint events. Production switches only after the daily limit is raised and staging has run cleanly. | open |
+| 3 (#1896) | Inbound mail and the tickets backend: schema, threading, tags, rules, restricted queues, replies from the support address; amends ADR 0110. | open |
+| 4 (#1897) | `nemar admin mail` in the CLI. | open |
+| 5 (#1898) | The website's admin mail tab. | open |
+| 6 (#1899) | Cutover: the apex catch-all moves from forwarding to the Worker. | open |
+| 7 (#1900) | Retire Resend: remove the key from every Worker and the fallback code. | open |
 
 ## Facts that shape the plan (checked 2026-10-23)
 
 - Resend is called only from `backend/src/services/email.ts` (`sendEmail`) and `backend/src/services/broadcast.ts` (`/emails/batch`). Every wrapper passes the Worker env as `deliveryEnv`, so the provider switch needed no signature change across the call sites.
 - A catch-all rule is apex-only. A subdomain has literal addresses only, so staging tests a fixed address list, and the catch-all is first exercised at the cutover.
-- Email Routing is zone-level and its documented subdomain flow starts from the apex. The apex MX must stay on its current host until phase 6, so enabling routing for the subdomain alone is the riskiest operator step: if the platform requires enabling it on the apex, stop and ask the maintainer.
+- Email Routing is zone-level and enabling it for the subdomain required enabling it for the apex. Since 2026-10-23 the apex MX points at Email Routing and the catch-all forwards to the inbox that held the domain's mail before, so incoming mail is unchanged; phase 6 points the catch-all at the Worker.
 - The dev Worker deploys only from `dev`, so staging sees this work only after the epic branch reaches `dev`.
 - `@cloudflare/workers-types` predates the structured `send_email` form, so `services/email.ts` declares a local minimal interface instead of bumping the package. Miniflare 4.20260424 accepts the structured form, which `backend/test/email-send-binding.test.ts` drives.
 - Several senders check `RESEND_API_KEY` before calling `sendEmail`, so the dev secret stays until phase 7.
