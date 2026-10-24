@@ -1,13 +1,15 @@
 /**
- * Email service using Resend API
+ * Email service: Resend API (the default) or the Cloudflare Email Service binding
  *
  * Handles email notifications (verification, approval, publication, revocation)
  * and admin email preference management.
- * Uses fetch directly for Cloudflare Workers compatibility.
+ * Resend is called with fetch directly for Cloudflare Workers compatibility; the
+ * Cloudflare path calls the `send_email` binding (epic #1893, ADR 0110).
  */
 
 import { datasetLandingUrl } from "../../../shared/datacite-constants.js";
 import { escapeHtml } from "../lib/escape";
+import { htmlToText } from "../lib/html-to-text";
 import { STALENESS_LIMIT_DAYS } from "./staleness";
 
 /** Fallback sender when FROM_EMAIL env var is unset. Mirrors the FROM_EMAIL set
@@ -23,11 +25,12 @@ let warnedMissingFromEmail = false;
  * `replyTo` passes through as-is (undefined when unset or empty/whitespace).
  * Callers pass `c.env` to avoid repeating the fallback at every site.
  *
- * NOTE: The domain in FROM_EMAIL must be verified in the Resend account tied
- * to RESEND_API_KEY, otherwise Resend will reject the send. A deploy that
- * forgets FROM_EMAIL falls back to DEFAULT_FROM_EMAIL (nemar.org); if that
- * domain is not verified on the account, every send fails. We log once per
- * worker instance to surface this in Workers Logs.
+ * NOTE: The domain in FROM_EMAIL must be verified with the provider the
+ * worker sends through (the Resend account tied to RESEND_API_KEY, or the
+ * Cloudflare Email Service for EMAIL_PROVIDER=cloudflare), otherwise the
+ * provider will reject the send. A deploy that forgets FROM_EMAIL falls back
+ * to DEFAULT_FROM_EMAIL (nemar.org); if that domain is not verified, every
+ * send fails. We log once per worker instance to surface this in Workers Logs.
  */
 export function resolveEmailConfig(env: {
   FROM_EMAIL?: string;
@@ -43,7 +46,7 @@ export function resolveEmailConfig(env: {
   if (!from && !warnedMissingFromEmail) {
     warnedMissingFromEmail = true;
     console.error(
-      `FROM_EMAIL env var is unset; falling back to ${DEFAULT_FROM_EMAIL}. If the Resend account tied to this worker does not verify nemar.org, every email will fail. Set FROM_EMAIL in wrangler config.`,
+      `FROM_EMAIL env var is unset; falling back to ${DEFAULT_FROM_EMAIL}. If the email provider tied to this worker does not verify nemar.org, every email will fail. Set FROM_EMAIL in wrangler config.`,
     );
   }
   return {
@@ -78,14 +81,100 @@ export function applyDevWrap(
   };
 }
 
+/** A mailbox in the structured form the `send_email` binding accepts. */
+export interface CloudflareMailbox {
+  email: string;
+  name?: string;
+}
+
 /**
- * Env fields the delivery fence below needs (issue #957). Structurally
- * typed, not `Bindings`, matching resolveEmailConfig's own loose env
- * parameter -- this module stays decoupled from the full binding surface.
+ * The structured (builder) form of the Cloudflare `send_email` binding, declared
+ * locally: the repo's `@cloudflare/workers-types` predates it, and bumping that
+ * package is not part of this change. Errors it throws carry a `code` string
+ * (`E_VALIDATION_ERROR`, `E_SENDER_NOT_VERIFIED`, ...).
+ */
+export interface CloudflareSendEmail {
+  send(message: {
+    from: string | CloudflareMailbox;
+    to: string | CloudflareMailbox | Array<string | CloudflareMailbox>;
+    subject: string;
+    html?: string;
+    text?: string;
+    replyTo?: string | CloudflareMailbox;
+    headers?: Record<string, string>;
+  }): Promise<{ messageId: string }>;
+}
+
+/**
+ * Env fields the delivery fence below needs (issue #957), plus the two that pick
+ * the provider. Structurally typed, not `Bindings`, matching resolveEmailConfig's
+ * own loose env parameter -- this module stays decoupled from the full binding
+ * surface.
  */
 export interface EmailDeliveryEnv {
   ENVIRONMENT?: string;
   DEV_EMAIL_ALLOWLIST?: string;
+  /** `cloudflare` sends through the `EMAIL` binding; unset or `resend` is Resend; anything else is a
+   *  configuration error. */
+  EMAIL_PROVIDER?: string;
+  /** The Cloudflare Email Service `send_email` binding. */
+  EMAIL?: CloudflareSendEmail;
+}
+
+/** The provider a send goes through; the Cloudflare case carries its binding. */
+export type ResolvedEmailProvider =
+  | { provider: "cloudflare"; binding: CloudflareSendEmail }
+  | { provider: "resend" };
+
+/**
+ * Thrown when EMAIL_PROVIDER names no known provider, or is `cloudflare` with no `EMAIL`
+ * binding. Never answered by falling back to Resend: a staging worker that was told to send
+ * through Cloudflare, or whose setting has a typo, must not reach a provider whose key it
+ * still holds. Nothing was sent.
+ */
+export class EmailProviderConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "EmailProviderConfigError";
+  }
+}
+
+/**
+ * Which provider a send goes through. EMAIL_PROVIDER is read trimmed and case-insensitively:
+ * unset or empty and `resend` are Resend (production sets nothing), `cloudflare` is Cloudflare
+ * and needs the binding. Any other value, and `cloudflare` without the binding, throws
+ * {@link EmailProviderConfigError}, so a typo cannot silently send through Resend.
+ */
+export function resolveEmailProvider(env: EmailDeliveryEnv | undefined): ResolvedEmailProvider {
+  const setting = (env?.EMAIL_PROVIDER ?? "").trim().toLowerCase();
+  if (setting === "" || setting === "resend") return { provider: "resend" };
+  if (setting !== "cloudflare") {
+    throw new EmailProviderConfigError(
+      `EMAIL_PROVIDER is "${setting.slice(0, 40)}", which is not a known provider (resend or cloudflare)`,
+    );
+  }
+  if (!env?.EMAIL) {
+    throw new EmailProviderConfigError(
+      "EMAIL_PROVIDER is cloudflare but the EMAIL send_email binding is not configured",
+    );
+  }
+  return { provider: "cloudflare", binding: env.EMAIL };
+}
+
+/**
+ * Split `"Display Name <addr@host>"` into the binding's `{ email, name }`; a bare
+ * address (or `<addr@host>`) returns `{ email }`. Surrounding quotes on the name go.
+ */
+export function parseMailbox(mailbox: string): CloudflareMailbox {
+  const trimmed = mailbox.trim();
+  const match = /^(.*)<([^<>]+)>\s*$/.exec(trimmed);
+  if (!match) return { email: trimmed };
+  const name = match[1]
+    .trim()
+    .replace(/^"(.*)"$/, "$1")
+    .trim();
+  const email = match[2].trim();
+  return name ? { email, name } : { email };
 }
 
 /**
@@ -340,38 +429,88 @@ export async function getAdminEmailsForCategory(
 }
 
 /**
- * Resend ANSWERED a send with a 4xx: it refused the message itself (a bad key,
- * a bad address, a malformed body) and delivered nothing. The message keeps the
- * plain error's words. A thrown fetch, a timeout or a 5xx is not this class:
- * the mail may have been accepted and only the answer lost.
+ * The provider ANSWERED a send with a refusal: Resend with a 4xx, or the Cloudflare
+ * binding with a definite non-delivery code (a bad key, a bad address, a malformed
+ * body, an unverified sender). It refused the message itself and delivered nothing. The
+ * message keeps the plain error's words. A thrown fetch, a timeout, a 5xx or a Cloudflare
+ * internal error is not this class: the mail may have been accepted and only the answer
+ * lost. `code` is the Cloudflare error code, absent for Resend.
  */
 export class EmailRejectedError extends Error {
   constructor(
     readonly httpStatus: number,
     message: string,
+    readonly code?: string,
   ) {
     super(message);
     this.name = "EmailRejectedError";
   }
 }
 
+/** Cloudflare send_email codes that say nothing was delivered. `E_HEADER*` is matched by prefix. */
+const CLOUDFLARE_NON_DELIVERY_CODES: ReadonlySet<string> = new Set([
+  "E_VALIDATION_ERROR",
+  "E_FIELD_MISSING",
+  "E_TOO_MANY_RECIPIENTS",
+  "E_TOO_MANY_ATTACHMENTS",
+  "E_SENDER_NOT_VERIFIED",
+  "E_RECIPIENT_NOT_ALLOWED",
+  "E_RECIPIENT_SUPPRESSED",
+  "E_ACCOUNT_SUSPENDED",
+  "E_SENDER_DOMAIN_NOT_AVAILABLE",
+  "E_CONTENT_TOO_LARGE",
+  // Single recipient per send, and Cloudflare documents this as the recipient server rejecting it.
+  "E_DELIVERY_FAILED",
+  "E_RATE_LIMIT_EXCEEDED",
+  "E_DAILY_LIMIT_EXCEEDED",
+]);
+
+/** The two Cloudflare codes that mean "slow down", mapped to a 429 like a Resend limit. */
+const CLOUDFLARE_LIMIT_CODES: ReadonlySet<string> = new Set([
+  "E_RATE_LIMIT_EXCEEDED",
+  "E_DAILY_LIMIT_EXCEEDED",
+]);
+
 /**
- * Whether a failed {@link sendEmail} certainly delivered nothing: Resend ANSWERED with a 4xx
- * ({@link EmailRejectedError}), or the dev fence refused the recipient before any request
+ * A failed binding call as the error {@link sendEmail} throws: an {@link EmailRejectedError}
+ * for a code that says nothing was delivered, a plain Error for `E_INTERNAL_SERVER_ERROR`,
+ * an unknown code or no code (the message may have been accepted).
+ */
+function cloudflareSendFailure(error: unknown, message: string): Error {
+  const code =
+    typeof (error as { code?: unknown } | null)?.code === "string"
+      ? (error as { code: string }).code
+      : undefined;
+  if (code && (CLOUDFLARE_NON_DELIVERY_CODES.has(code) || code.startsWith("E_HEADER"))) {
+    return new EmailRejectedError(CLOUDFLARE_LIMIT_CODES.has(code) ? 429 : 422, message, code);
+  }
+  return new Error(message);
+}
+
+/**
+ * Whether a failed {@link sendEmail} certainly delivered nothing: the provider ANSWERED with a
+ * refusal ({@link EmailRejectedError}: a Resend 4xx or a definite Cloudflare code), the provider
+ * setting is unusable ({@link EmailProviderConfigError}, thrown before any call), or the dev
+ * fence refused the recipient before any request
  * ({@link DevEmailFenceError}). Anything else (a timeout, a dropped connection, a 5xx) may have
  * been accepted and only the answer lost, so a caller that reports to a person must not say
  * "nothing was sent" for it. One classification for the sweep's report and the comment route.
  */
 export function isCertainNonDelivery(error: unknown): boolean {
-  return error instanceof EmailRejectedError || error instanceof DevEmailFenceError;
+  return (
+    error instanceof EmailRejectedError ||
+    error instanceof DevEmailFenceError ||
+    error instanceof EmailProviderConfigError
+  );
 }
 
 /**
- * Send email via Resend API.
+ * Send email through the provider `deliveryEnv` selects (Resend unless
+ * EMAIL_PROVIDER=cloudflare, see {@link resolveEmailProvider}).
  *
  * `deliveryEnv` (issue #957) is the delivery-level fence: when set and not
- * production, a recipient not on DEV_EMAIL_ALLOWLIST is refused BEFORE the
- * Resend fetch ever fires -- see isEmailDeliveryAllowed's doc comment for
+ * production, a recipient not on DEV_EMAIL_ALLOWLIST is refused BEFORE any
+ * provider is called -- see isEmailDeliveryAllowed's doc comment for
  * why an unset/unrecognized ENVIRONMENT fails toward refusing, not
  * allowing. `deliveryEnv` is optional only so this function's own type
  * signature doesn't force every caller to thread it through in one commit;
@@ -379,11 +518,12 @@ export function isCertainNonDelivery(error: unknown): boolean {
  * still fails closed (isEmailDeliveryAllowed treats undefined ENVIRONMENT
  * as non-production with an empty allow-list, i.e. refuses).
  *
- * `timeoutMs`, when given, bounds the Resend call (the identifier sweep's weekly
- * report passes one). A 4xx answer throws {@link EmailRejectedError}: Resend
- * refused the message, so nothing was delivered.
+ * `timeoutMs`, when given, bounds the provider call (the identifier sweep's weekly
+ * report passes one). A refusal throws {@link EmailRejectedError}: the provider
+ * refused the message, so nothing was delivered. `resendApiKey` is unused on the
+ * Cloudflare path.
  */
-async function sendEmail(
+export async function sendEmail(
   to: string,
   subject: string,
   html: string,
@@ -404,11 +544,44 @@ async function sendEmail(
   }
 
   const wrapped = applyDevWrap(subject, html, isDev);
+  const resolved = resolveEmailProvider(deliveryEnv);
+  if (resolved.provider === "cloudflare") {
+    await sendViaCloudflare(
+      resolved.binding,
+      to,
+      wrapped.subject,
+      wrapped.html,
+      fromEmail,
+      replyTo,
+      timeoutMs,
+    );
+    return;
+  }
+  await sendViaResend(
+    to,
+    wrapped.subject,
+    wrapped.html,
+    resendApiKey,
+    fromEmail,
+    replyTo,
+    timeoutMs,
+  );
+}
+
+async function sendViaResend(
+  to: string,
+  subject: string,
+  html: string,
+  resendApiKey: string,
+  fromEmail: string,
+  replyTo?: string,
+  timeoutMs?: number,
+): Promise<void> {
   const body: Record<string, unknown> = {
     from: fromEmail,
     to: [to],
-    subject: wrapped.subject,
-    html: wrapped.html,
+    subject,
+    html,
   };
   if (replyTo) body.reply_to = replyTo;
   const response = await fetch(RESEND_API_URL, {
@@ -428,6 +601,50 @@ async function sendEmail(
       throw new EmailRejectedError(response.status, message);
     }
     throw new Error(message);
+  }
+}
+
+async function sendViaCloudflare(
+  binding: CloudflareSendEmail,
+  to: string,
+  subject: string,
+  html: string,
+  fromEmail: string,
+  replyTo?: string,
+  timeoutMs?: number,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const sent = binding.send({
+      from: parseMailbox(fromEmail),
+      to,
+      subject,
+      html,
+      // Resend gets the HTML alone; this provider is sent a text part too, for clients and
+      // spam filters that prefer one.
+      text: htmlToText(html),
+      ...(replyTo ? { replyTo: parseMailbox(replyTo) } : {}),
+    });
+    if (!timeoutMs) {
+      await sent;
+      return;
+    }
+    // The binding takes no AbortSignal, so the bound is a race. A timeout is a plain Error
+    // (the message may have been accepted), like Resend's aborted fetch; the loser's own
+    // rejection is swallowed so it cannot surface as an unhandled one.
+    sent.catch(() => {});
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timed out after ${timeoutMs}ms`)), timeoutMs);
+    });
+    await Promise.race([sent, timeout]);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw cloudflareSendFailure(
+      error,
+      `Failed to send email from ${fromEmail} to ${to}: ${reason}`,
+    );
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
@@ -929,7 +1146,7 @@ export async function sendAdminNotificationEmail(
 export interface AdminNotificationOutcome {
   /** Admins we tried to reach. 0 means the category had no opted-in recipient. */
   attempted: number;
-  /** Sends Resend accepted. `> 0` is what "the admins were told" means. */
+  /** Sends the provider accepted. `> 0` is what "the admins were told" means. */
   delivered: number;
   /** One entry per failed send, recipient redacted for logging. */
   failures: { recipient: string; error: string }[];
@@ -1614,7 +1831,7 @@ export async function sendPublicationDeniedEmail(
  * when there is a `replyTo` address to send one to: the mail is sent from a no-reply address.
  *
  * Like every sender here it goes through `sendEmail`'s delivery fence, and a send that does not
- * go (a fence refusal, a Resend refusal, an unreachable host) throws: the route reports it, so an
+ * go (a fence refusal, a provider refusal, an unreachable host) throws: the route reports it, so an
  * administrator is never told that a message went when it did not.
  */
 export async function sendPublicationCommentEmail(
@@ -2447,8 +2664,14 @@ export async function sendAnonymityFindingsEmail(
   return { delivered, failed };
 }
 
-/** How long one send of the identifier sweep's weekly report waits for Resend. */
+/** How long one send of the identifier sweep's weekly report waits for the provider. */
 export const IDENTIFIER_SWEEP_EMAIL_TIMEOUT_MS = 15_000;
+
+/**
+ * How long one per-recipient send of a broadcast on the Cloudflare provider waits for the
+ * binding, so a hung call fails that recipient instead of holding the admin request.
+ */
+export const BROADCAST_SEND_TIMEOUT_MS = 10_000;
 
 /**
  * What the identifier sweep's weekly report says (ADR 0088). Structurally the
@@ -2514,7 +2737,7 @@ export async function sendIdentifierSweepReportEmail(
       );
       delivered++;
     } catch (error) {
-      // Refused for certain (`isCertainNonDelivery`): a 4xx from Resend, or the dev
+      // Refused for certain (`isCertainNonDelivery`): a provider refusal (a Resend 4xx or a definite Cloudflare code), or the dev
       // fence before any request. Anything else (a timeout, a dropped connection,
       // a 5xx) may have been accepted, and the caller must not treat it as "reached nobody".
       if (!isCertainNonDelivery(error)) ambiguous++;
