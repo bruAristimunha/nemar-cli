@@ -13,7 +13,7 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
-## 0.10.23 - 2026-10-24
+## 0.10.23 - 2026-10-23
 
 The dataset pull request review now reads a large change as an exact summary the platform computes, and protects what the original authors published.
 This release has no migration, sets no new Worker secret or variable, and changes no workflow or Worker configuration; the review check is still not required (`PR_REVIEW_AUTO_REQUIRE` stays unset).
