@@ -81,6 +81,7 @@ import {
   runWeeklyImportSummaryCron,
   weeklySummaryCronLine,
 } from "./services/import-weekly-summary-sweep";
+import { handleInboundEmail } from "./services/inbound-mail";
 import { manifestIntegritySweep } from "./services/manifest-sweep";
 import { runNeurobagelReconcileCron } from "./services/neurobagel-hooks";
 import {
@@ -900,6 +901,11 @@ async function scheduledCleanup(env: Bindings): Promise<void> {
 
 export default {
   fetch: app.fetch,
+  // Email Routing delivers inbound mail here (epic #1893, ADR 0110). With no MAIL_INBOUND
+  // binding, which is every Worker but staging, the message is rejected.
+  async email(message: ForwardableEmailMessage, env: Bindings) {
+    await handleInboundEmail(message, env);
+  },
   async scheduled(event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) {
     // Two cron schedules share this handler; branch on which one fired so the
     // daily jobs don't run on the frequent auto-import tick (#775). The

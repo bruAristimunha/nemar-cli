@@ -471,6 +471,25 @@ bucket_name = "nemar-news-media-dev"
 binding = "NEUROBAGEL"
 bucket_name = "nemar-neurobagel-dev"
 
+# Outbound mail for dev (epic #1893, ADR 0110; not inherited from top-level).
+# The Cloudflare Email Service binding the dev worker sends staging mail through
+# when EMAIL_PROVIDER="cloudflare" (see [env.dev.vars]). It is restricted to the
+# staging sender addresses, so this worker structurally cannot send as nemar.org.
+# Sending must be enabled for the staging subdomain before the first deploy that
+# carries this block.
+[[env.dev.send_email]]
+name = "EMAIL"
+allowed_sender_addresses = ["noreply@test.nemar.org", "support@test.nemar.org"]
+
+# Inbound mail for dev (epic #1893 phase 1; not inherited from top-level). Email
+# Routing delivers messages for the literal addresses on test.nemar.org to this
+# worker's email() handler, which stores each raw message here. Its own bucket,
+# private, with a 30-day expiry rule. Must exist before the next dev deploy
+# (`wrangler r2 bucket create nemar-mail-dev`), or that deploy fails.
+[[env.dev.r2_buckets]]
+binding = "MAIL_INBOUND"
+bucket_name = "nemar-mail-dev"
+
 # Observability for dev (not inherited from top-level)
 [env.dev.observability]
 enabled = true
@@ -541,8 +560,14 @@ S3_BUCKET = "nemar-dev"
 # window ran to xx099999 and the fleet was protected only by its ids already
 # being taken.
 SANDBOX_ID_FLOOR = "90001"
-FROM_EMAIL = "NEMAR Archive <noreply@nemar.org>"
-REPLY_TO = "info@nemar.org"
+# Staging sends its mail through the Cloudflare Email Service binding (EMAIL, above)
+# from the test.nemar.org subdomain, not through Resend (epic #1893, ADR 0110);
+# production is unchanged. With EMAIL_PROVIDER="cloudflare" a missing binding is an
+# error, never a fall back to Resend. The dev RESEND_API_KEY secret stays set until
+# the final phase of the epic, only so the senders' key checks keep passing.
+EMAIL_PROVIDER = "cloudflare"
+FROM_EMAIL = "NEMAR Staging <noreply@test.nemar.org>"
+REPLY_TO = "support@test.nemar.org"
 # DEV_EMAIL_ALLOWLIST is a dev Worker SECRET, not a var: exact human addresses
 # only, never a domain. "@nemar.org" delivered every fixture notice to that
 # domain's catch-all (a real inbox: 52 mails in one CI day), and "@nemar.test"

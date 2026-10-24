@@ -48,6 +48,7 @@ Trust these for how things work today.
 | [pr_architecture.md](pr_architecture.md) | PR + staging mechanics. **The branch-protection payload it described is superseded**; see ADR 0001. | public |
 | [phase5-cross-repo-owner-deploys.md](phase5-cross-repo-owner-deploys.md) | Known cross-repo gaps needing owner action. | public |
 | [epic_browser_compute_state.md](epic_browser_compute_state.md) | The live map of the in-browser compute epic across osa, eegprep, nemar-cli and website: what is decided, what blocks what, what is still open. | public |
+| [epic_email_cloudflare.md](epic_email_cloudflare.md) | The live map of the email epic (#1893): moving all NEMAR mail to the Cloudflare Email Service, what is decided (ADR 0110), the phases and what is still open. | public |
 | [eegprep_lean_contract.md](eegprep_lean_contract.md) | What `eegprep-lean` will guarantee and where it deliberately differs from eegprep. The deliverable ADR 0069 names; drafted before the package exists. | public |
 | [ideas.md](ideas.md) | Exploratory design notes. Frequently rewritten; promote settled items to an ADR. | public |
 | [research.md](research.md) | Prior art from the `nemar-tools` scripts. Describes the **pre-NEMAR** Zenodo flow; DOIs are EZID now (ADR 0007). | public |
