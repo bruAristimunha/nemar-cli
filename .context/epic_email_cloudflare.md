@@ -20,7 +20,7 @@ Send and receive every NEMAR email on Cloudflare: sending through the Workers `s
 | Phase | Content | State |
 |---|---|---|
 | 1 (#1894) | Staging mail on `test.nemar.org`: provider switch, broadcast path, inbound handler into R2, staging configuration, ADR 0110. | merged into the epic branch (#1902); staging checks pending |
-| 2 (#1895) | Production sending: `nemar.org` onboarded for Email Sending, the production binding, the Resend fallback for certain non-delivery only, announcements on a Queue, bounce and complaint events. Production switches only after the daily limit is raised and staging has run cleanly. | open |
+| 2 (#1895) | Production sending: `nemar.org` onboarded for Email Sending, the production binding, the Resend fallback for certain non-delivery only, announcements on a Queue, bounce and complaint events. Production switches only after the daily limit is raised and staging has run cleanly. | in progress: sending path, announcement Queue and event storage built; production flips by configuration only after the limit increase and a clean staging soak |
 | 3 (#1896) | Inbound mail and the tickets backend: schema, threading, tags, rules, restricted queues, replies from the support address; amends ADR 0110. | open |
 | 4 (#1897) | `nemar admin mail` in the CLI. | open |
 | 5 (#1898) | The website's admin mail tab. | open |
@@ -36,6 +36,13 @@ Send and receive every NEMAR email on Cloudflare: sending through the Workers `s
 - `@cloudflare/workers-types` predates the structured `send_email` form, so `services/email.ts` declares a local minimal interface instead of bumping the package. Miniflare 4.20260424 accepts the structured form, which `backend/test/email-send-binding.test.ts` drives.
 - Several senders check `RESEND_API_KEY` before calling `sendEmail`, so the dev secret stays until phase 7.
 - The Cloudflare path sends the HTML and a plain-text part derived from it; the Resend request is unchanged.
+
+## Phase 2 notes
+
+- The Resend fallback covers only `E_RATE_LIMIT_EXCEEDED`, `E_DAILY_LIMIT_EXCEEDED`, `E_ACCOUNT_SUSPENDED` and `E_SENDER_DOMAIN_NOT_AVAILABLE`, and only where `EMAIL_FALLBACK="resend"`, which is set only in production.
+- Announcements use the `nemar-email-outbox` Queue. A possibly accepted send is counted unknown and never retried; limit refusals retry after a delay. `nemar admin notify --status <id>` reads the counts.
+- Bounce and complaint events arrive on `nemar-email-events` (the Worker is a consumer only) and are stored in `email_delivery_events` for 180 days by the daily cleanup. Cloudflare suppresses those recipients itself; Phase 4 reads this table.
+- The queues and the per-domain event subscriptions are created by the operator before the deploy that binds them.
 
 ## Open questions for the owner
 

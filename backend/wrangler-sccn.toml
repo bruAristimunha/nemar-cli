@@ -399,6 +399,33 @@ OPENNEURO_MAINTAINER_EMAIL_ENABLED = "false"
 # - GITHUB_APP_INSTALLATION_ID_NEMAR_DATASETS  (installation ID on the nemarDatasets org)
 # - GITHUB_APP_INSTALLATION_ID_NEMAR_ORG       (installation ID on the nemarOrg org)
 
+# Announcement outbox (epic #1893 phase 2, ADR 0110). `nemar admin notify` enqueues one
+# message per recipient when the Cloudflare provider is active; this same Worker consumes
+# them one send at a time (max_concurrency = 1 paces the sends under the rate limit).
+# These queues must exist before the deploy that carries these blocks, or the deploy fails:
+# `nemar-email-outbox` and its dead-letter queue `nemar-email-outbox-dlq` (production), and
+# `nemar-email-outbox-dev` and `nemar-email-outbox-dev-dlq` (dev). max_retries is mirrored by
+# OUTBOX_MAX_RETRIES in services/email-outbox.ts; change both together.
+[[queues.producers]]
+binding = "EMAIL_OUTBOX"
+queue = "nemar-email-outbox"
+
+[[queues.consumers]]
+queue = "nemar-email-outbox"
+max_batch_size = 10
+max_concurrency = 1
+max_retries = 10
+dead_letter_queue = "nemar-email-outbox-dlq"
+
+# Bounce and complaint events (epic #1893 phase 2, ADR 0110). Consumer only: Cloudflare
+# publishes into this queue through an event subscription per sending domain, which the
+# operator creates; the queues exist already. Stored by services/email-events.ts.
+[[queues.consumers]]
+queue = "nemar-email-events"
+max_batch_size = 25
+max_retries = 5
+dead_letter_queue = "nemar-email-events-dlq"
+
 # Development environment (SCCN account)
 [env.dev]
 name = "nemar-api-dev"
@@ -498,6 +525,28 @@ allowed_sender_addresses = ["noreply@test.nemar.org", "support@test.nemar.org"]
 [[env.dev.r2_buckets]]
 binding = "MAIL_INBOUND"
 bucket_name = "nemar-mail-dev"
+
+# Announcement outbox for dev (not inherited from top-level). Same shape as the production
+# blocks above, on the dev queues (names listed there), which must exist before the next dev deploy.
+[[env.dev.queues.producers]]
+binding = "EMAIL_OUTBOX"
+queue = "nemar-email-outbox-dev"
+
+[[env.dev.queues.consumers]]
+queue = "nemar-email-outbox-dev"
+max_batch_size = 10
+max_concurrency = 1
+max_retries = 10
+dead_letter_queue = "nemar-email-outbox-dev-dlq"
+
+# Bounce and complaint events (epic #1893 phase 2, ADR 0110). Consumer only: Cloudflare
+# publishes into this queue through an event subscription per sending domain, which the
+# operator creates; the queues exist already. Stored by services/email-events.ts.
+[[env.dev.queues.consumers]]
+queue = "nemar-email-events-dev"
+max_batch_size = 25
+max_retries = 5
+dead_letter_queue = "nemar-email-events-dev-dlq"
 
 # Observability for dev (not inherited from top-level)
 [env.dev.observability]

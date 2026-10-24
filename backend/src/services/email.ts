@@ -493,7 +493,7 @@ export const RESEND_FALLBACK_CODES: ReadonlySet<string> = new Set([
 ]);
 
 /** The two Cloudflare codes that mean "slow down", mapped to a 429 like a Resend limit. */
-const CLOUDFLARE_LIMIT_CODES: ReadonlySet<string> = new Set([
+export const CLOUDFLARE_LIMIT_CODES: ReadonlySet<string> = new Set([
   "E_RATE_LIMIT_EXCEEDED",
   "E_DAILY_LIMIT_EXCEEDED",
 ]);

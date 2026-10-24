@@ -124,6 +124,10 @@ export interface Bindings {
    *  `nemar-mail-dev` in [env.dev] only; absent elsewhere, and a Worker with no
    *  bucket rejects the message. */
   MAIL_INBOUND?: R2Bucket;
+  /** Announcement outbox queue (epic #1893 phase 2): `nemar-email-outbox` in production,
+   *  `nemar-email-outbox-dev` in [env.dev]. Optional: with no binding `nemar admin notify`
+   *  sends inline as before. Consumed by `queue()` in index.ts. */
+  EMAIL_OUTBOX?: Queue;
   /** Reply-To address (e.g. "info@nemar.org") when FROM is a no-reply mailbox.
    *  Omitted when unset/empty. */
   REPLY_TO?: string;
