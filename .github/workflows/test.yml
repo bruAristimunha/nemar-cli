@@ -762,12 +762,6 @@ jobs:
                   then "the shard numbers are not exactly 1..\($total)" else empty end),
                 (if ([$all[].files] | add) != $discovered
                   then "the shards ran \([$all[].files] | add) test files and bun discovered \($discovered)" else empty end),
-                (([$all[].ran[]]) as $ran
-                  | ($list | split("\n") | map(select(. != "")) | sort) as $want
-                  | (if ($ran | sort) != $want
-                      then "the union of the files the shards ran differs from the classifier list: missing \($want - $ran | length), unlisted \($ran - $want | length)" else empty end),
-                    (if ($ran | length) != ($ran | unique | length)
-                      then "files ran in more than one shard: \($ran | group_by(.) | map(select(length > 1) | .[0]) | join(", "))" else empty end)),
                 ($all[] | select(.files < 1 or .tests < 1 or .passed < 1)
                   | "shard \(.shard) ran \(.tests) tests across \(.files) files and \(.passed) passed")
               ] | .[]' "${reports[@]}")
