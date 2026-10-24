@@ -369,7 +369,7 @@ With the check required, a pull request in that state could not merge without an
 
 - The review costs more when it uses its room: 128,000 output tokens is about $1.28 at $10 per million, against $0.32 for 32,000, plus the input at $2 per million.
   A pull request that truncates truncates again each time it is restarted (up to five times by edits, and by an administrator's start), so a run of them multiplies it.
-  The output-tokens-per-minute limit of the workspace is estimated from `max_tokens` when a request starts, so a bulk `nemar admin pr-reviews start --all` reserves 128,000 tokens per review at once; the owner checks that limit before a bulk start.
+  The output-tokens-per-minute limit of the workspace is estimated from `max_tokens` when a request starts, so a bulk `nemar admin pr-reviews start --all` reserves 128,000 tokens per review at once; the owner checks that limit before a bulk start, and `--concurrency <n>` paces the run to fit it (ADR 0093, the second amendment of 2026-10-24).
   Most reviews are expected to use far less, and the volume line of the admin list shows what they cost, but a run of large pull requests can spend the $175 monthly limit quickly, and the owner decides whether to raise it.
 - The workflow file in `nemarDatasets/.github` has to carry `timeout-minutes: 50` before the release reaches `main`: the new script runs from `main` as soon as it is released, and a 28-minute job would be cancelled by GitHub in the middle of a long review.
 - Folding changes what a bulk edit's evidence looks like, not what the Worker accepts: `files_read` never exceeds `files_changed`, and the report's other fields are the same.
