@@ -25,8 +25,9 @@ name: Auto Bump Dev
 # THIS WORKFLOW ALSO OWNS THE DEV DEPLOY AND THE DEV PUBLISH. After `bump`,
 # `plan` picks the commit dev ends at: the bump when there is one, else the
 # pushed commit. `deploy` runs deploy-backend.yml on it (a reusable-workflow
-# call) when there was a bump or the push touched backend/**, shared/** or
-# deploy-backend.yml (the paths that used to trigger a dev deploy directly).
+# call) when there was a bump or the push touched backend/**, shared/**,
+# validator-version.json or deploy-backend.yml (the paths deploy-backend.yml
+# deploys on, which used to trigger a dev deploy directly).
 # `publish` dispatches npm-publish.yml once, which builds the head of dev;
 # every push to dev used to publish itself. The bump's own push does neither:
 # the run that made it has. So one merge is one dev deploy, at the bumped

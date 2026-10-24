@@ -24,12 +24,16 @@ import {
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { parse } from "yaml";
-import { PR_REVIEW_DEADLINE_MINUTES } from "../backend/src/services/pr-review";
+import {
+  PR_REVIEW_DEADLINE_MINUTES,
+  PR_REVIEW_JOB_MINUTES,
+} from "../backend/src/services/pr-review";
 import {
   CALLBACK_ATTEMPTS,
   CALLBACK_ORIGINS,
   CALLBACK_TIMEOUT_MS,
   DEADLINE_GRACE_MS,
+  REVIEW_MAX_TOKENS,
   STAGE_BUDGETS,
   callbackBackoffMs,
 } from "../scripts/ci/pr-review";
@@ -586,7 +590,7 @@ describe("failure and logging", () => {
   });
 
   test("a job cannot run for ever, and ends before the Worker gives up on it", () => {
-    expect(job["timeout-minutes"]).toBeLessThanOrEqual(30);
+    expect(job["timeout-minutes"]).toBeLessThanOrEqual(50);
     expect(job["timeout-minutes"]).toBeLessThan(PR_REVIEW_DEADLINE_MINUTES);
   });
 
@@ -613,10 +617,17 @@ describe("failure and logging", () => {
       callbackMs += callbackBackoffMs(attempt);
     }
     const worst = SETUP_MINUTES + EVIDENCE_MINUTES + stages + minutes(callbackMs);
-    expect(job["timeout-minutes"]).toBe(28);
-    expect(PR_REVIEW_DEADLINE_MINUTES).toBe(40);
+    expect(job["timeout-minutes"]).toBe(50);
+    // An administrator's start leaves a claimed review alone for this long (see isRestartable).
+    expect(PR_REVIEW_JOB_MINUTES).toBe(job["timeout-minutes"]);
+    expect(PR_REVIEW_DEADLINE_MINUTES).toBe(60);
     expect(worst).toBeLessThanOrEqual(job["timeout-minutes"]);
     expect(job["timeout-minutes"]).toBeLessThan(PR_REVIEW_DEADLINE_MINUTES);
+    // The review's deadline lets the model decode slowly and still reach its ceiling: the rate seen
+    // on 2026-10-20 was about 100 tokens a second (32,000 in about five minutes), and a stage that
+    // runs out of time first ends `model_unavailable`, which advises no split.
+    const breakEven = REVIEW_MAX_TOKENS / (STAGE_BUDGETS.review.deadlineMs / 1000);
+    expect(breakEven).toBeLessThan(75);
     // Each stage's first-byte timeout fits inside its own deadline, so a retry can still happen.
     for (const stage of [STAGE_BUDGETS.screen, STAGE_BUDGETS.review]) {
       expect(stage.timeoutMs * 2).toBeLessThanOrEqual(stage.deadlineMs);

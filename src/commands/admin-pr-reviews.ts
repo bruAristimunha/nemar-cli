@@ -90,6 +90,14 @@ import {
   whoAmI,
 } from "../lib/pr-review-approve.js";
 import { approveAllowed, parseChoice } from "../lib/pr-review-next.js";
+import {
+  type PaceOutcome,
+  type PaceStop,
+  paceKey,
+  parseConcurrency,
+  runPaced,
+  sleepUnlessAborted,
+} from "../lib/pr-review-pace.js";
 import { LineReader, PASTE_SETTLE_MS } from "../lib/prompt-lines.js";
 import { ageOf, clip, plain } from "../lib/terminal-text.js";
 
@@ -1123,6 +1131,8 @@ function stopFor(assessed: { stop: Stop }): never {
 /** Why a start did not start one, in the words an administrator reads. Keys are the gate's fixed words. */
 const NOT_STARTED: Record<string, string> = {
   duplicate: "this commit already has a review (running or finished)",
+  review_running:
+    "a review of this commit is running, and a redo waits until it reports or its time (about an hour) is up",
   contributor_paused: "the contributor is blocked by an administrator",
   exempt_author: "its author is a NEMAR owner or administrator, so it is not reviewed",
   exempt_naming_waived:
@@ -1190,11 +1200,19 @@ export function notStartedText(r: StartReviewResponse): string {
 prReviewsCommand
   .command("start [dataset] [pr]")
   .description(
-    "Review a pull request that is already open, or start again one whose review ended without a verdict",
+    "Review a pull request that is already open, or start again one whose review ended without a verdict (or, with --redo, has a result)",
   )
   .option(
     "--all",
     "Every open pull request whose current commit has no review, or one that was declined or ended without a verdict (an owner's or administrator's is exempt and left out, unless a review of its current commit is on record; one refused for too many edits is left out too, and started by name)",
+  )
+  .option(
+    "--redo",
+    "Also start again a commit whose review already has a result (a second run, which costs model calls); with --all, the pull requests whose current commit has a pass, fail or uncertain review are included",
+  )
+  .option(
+    "--concurrency <n>",
+    "With --all: keep at most n of the reviews this run started in progress at once, starting the next as each reports (the default starts them all at once)",
   )
   .option("--dry-run", "With --all: list what would be started and start nothing")
   .option("-y, --yes", "With --all: do not ask before starting")
@@ -1213,15 +1231,45 @@ skipped when the rule finds nothing (or an administrator waived it for this comm
 refuses the title or the new dataset name, and one that needs a person when the name could not be
 read. No count of reviews, and no record of rejected pull requests, holds a start back. A commit
 whose review was declined, ended in an error or never reported is started again, and so is one
-handed to GitHub more than 40 minutes ago that never came back; one that is running or has a
+handed to GitHub more than 60 minutes ago that never came back and that no job claimed in the last
+50 minutes; one that is running or has a
 result is not started again. A start that restarts a review that already ran costs a second run.
 A commit whose review was refused for too many edits (five restarts by edits, reopenings and
 markings as ready) is left out of --all, so that a bulk start never lifts the cap unasked; start it
 by name, which starts its review and lifts the cap.
 
+A finished review is not run again by anything but --redo, or by an edit of the pull request's title,
+description or target branch, a reopening or a marking as ready (five of those at most for one commit).
+--redo starts it again on the same review: its old result leaves the pull request's check while the new
+run is going. A blocked contributor's pull request is not redone: the block is the answer and the
+finished review stands. An owner's or administrator's pull request is still not reviewed unless a
+review of its current commit is on record. A review that is running, or whose job has not had its
+time yet, is never started again, so a redo waits for it. A redo leaves the count of edits as it is
+(it is no edit), and costs a second run of up to two model calls. A bulk redo cannot be resumed:
+running it again redoes the reviews that finished in between.
+
+Every review reserves up to 128,000 output tokens of the workspace's per-minute limit while it runs,
+so a bulk start of many asks for all of it at once. --concurrency <n> paces it: at most n of the
+reviews this run started are in progress at any time, and the next one starts as each reports (it
+reads the admin list every 30 seconds while it waits). Pick n so that n x 128,000 fits the limit.
+Other reviews that are running, from contributors' pushes, are not counted. A review that leaves the
+list is checked once more before its slot is freed, because a pull request that is closed or that
+GitHub's search leaves out also leaves the list while its job runs, and no slot is held for more
+than 100 minutes. The run takes as long as the reviews take and has to stay in the terminal. If the
+list cannot be read completely ten times in a row (about five minutes) it stops, because it cannot
+keep its limit blind.
+
+Ctrl-C ends any --all run, paced or not: it stops after the request in flight, lists the pull
+requests it did not start (for --redo, as commands to continue by name; running --all --redo again
+would redo the finished ones once more) and exits 130. A second Ctrl-C leaves at once. Reviews
+already started keep running.
+
   nemar admin pr-reviews start nm000108 12
+  nemar admin pr-reviews start nm000108 12 --redo
   nemar admin pr-reviews start --all --dry-run
   nemar admin pr-reviews start --all --yes
+  nemar admin pr-reviews start --all --redo --dry-run
+  nemar admin pr-reviews start --all --redo --concurrency 4 --yes
 
 Each review is one run of up to two model calls: the screen, and then the review unless the screen
 stops it as spam; a run the naming rule ends makes none. A blocked contributor is asked about like
@@ -1233,16 +1281,36 @@ any other and declined by the Worker, which says so; after 'allow', the same com
     async (
       datasetArg: string | undefined,
       prArg: string | undefined,
-      options: { all?: boolean; dryRun?: boolean; yes?: boolean; json?: boolean },
+      options: {
+        all?: boolean;
+        redo?: boolean;
+        concurrency?: string;
+        dryRun?: boolean;
+        yes?: boolean;
+        json?: boolean;
+      },
     ) => {
       if (!requireAuth(options.json)) process.exit(1);
       const out = say(options.json);
+      let concurrency: number | undefined;
+      if (options.concurrency !== undefined) {
+        if (!options.all) die("--concurrency goes with --all.", undefined, options.json);
+        const n = parseConcurrency(options.concurrency);
+        if (n === null) {
+          die(
+            "--concurrency takes a whole number of at least 1.",
+            "nemar admin pr-reviews start --all --concurrency 4",
+            options.json,
+          );
+        }
+        concurrency = n;
+      }
 
       if (options.all) {
         if (datasetArg !== undefined || prArg !== undefined) {
           die("Give either <dataset> <pr> or --all, not both.", undefined, options.json);
         }
-        await startAll(options);
+        await startAll({ ...options, concurrency });
         return;
       }
       if (datasetArg === undefined || prArg === undefined) {
@@ -1259,7 +1327,7 @@ any other and declined by the Worker, which says so; after 'allow', the same com
       const spinner = options.json ? null : ora("Starting the review...").start();
       let r: StartReviewResponse;
       try {
-        r = await startPrReview(dataset, pr);
+        r = await startPrReview(dataset, pr, { redo: options.redo });
         spinner?.stop();
       } catch (err) {
         if (err instanceof ApiError && errorWord(err) === "no_such_pull_request") {
@@ -1271,9 +1339,14 @@ any other and declined by the Worker, which says so; after 'allow', the same com
         }
         failApi(err, spinner, "Could not start the review", options.json);
       }
+      // An older Worker ignores the flag: what it did is reported as it was (it starts a commit
+      // that has no review, and says "already has a review" of one that has), and then the
+      // command says the flag did nothing and fails.
+      const ignored = options.redo === true && r.redo !== true;
       if (options.json) {
-        console.log(JSON.stringify(r, null, 2));
-        if (!r.dispatched && START_FAULTS.has(r.reason)) process.exit(1);
+        console.log(JSON.stringify(ignored ? { ...r, redo_ignored: true } : r, null, 2));
+        if (ignored) markReportedExit();
+        if (ignored || (!r.dispatched && START_FAULTS.has(r.reason))) process.exit(1);
         return;
       }
       if (r.dispatched) {
@@ -1282,13 +1355,19 @@ any other and declined by the Worker, which says so; after 'allow', the same com
         );
       } else {
         const text = notStartedText(r);
-        const fault = START_FAULTS.has(r.reason);
         console.log(
-          `${chalk.bold(`${dataset} #${pr}`)}  ${fault ? chalk.red(text) : chalk.yellow(text)}`,
+          `${chalk.bold(`${dataset} #${pr}`)}  ${START_FAULTS.has(r.reason) ? chalk.red(text) : chalk.yellow(text)}`,
         );
-        if (fault) process.exit(1);
       }
       envNote(r.environment);
+      if (ignored) {
+        console.log(chalk.red(REDO_IGNORED));
+        // An answer about the Worker's version, not a fault in the command: no invitation to file a
+        // bug. A fault the Worker also reported (a dispatch GitHub refused) keeps its own hint.
+        if (r.dispatched || !START_FAULTS.has(r.reason)) markReportedExit();
+        process.exit(1);
+      }
+      if (!r.dispatched && START_FAULTS.has(r.reason)) process.exit(1);
     },
   );
 
@@ -1302,8 +1381,111 @@ type StartResult =
  * one costs, which is a run of up to two model calls (a run the screen or the naming rule ends
  * makes fewer).
  */
-export function startAllQuestion(count: number): string {
-  return `Start the automated review of ${count} pull request${count === 1 ? "" : "s"}? Each is one run of up to two model calls.`;
+export function startAllQuestion(count: number, redo = false, concurrency?: number): string {
+  const some = `${count} pull request${count === 1 ? "" : "s"}`;
+  const paced = concurrency === undefined ? "" : ` At most ${concurrency} run at once.`;
+  return redo
+    ? `Start or redo the automated review of ${some}, finished reviews included? Each is one run of up to two model calls.${paced}`
+    : `Start the automated review of ${some}? Each is one run of up to two model calls.${paced}`;
+}
+
+/** Milliseconds between two reads of the admin list while a paced run waits (tests shorten it). */
+function pollMs(): number {
+  const raw = process.env.NEMAR_PR_REVIEWS_POLL_MS;
+  const n = raw !== undefined && /^[1-9][0-9]{1,6}$/.test(raw) ? Number(raw) : 30_000;
+  return n;
+}
+
+/**
+ * How long one read of the admin list or of a stored review may take while a paced run waits
+ * (the Worker's own search is bounded at 90 seconds, so the default is generous; tests shorten it).
+ */
+function readTimeoutMs(): number {
+  const raw = process.env.NEMAR_PR_REVIEWS_READ_TIMEOUT_MS;
+  return raw !== undefined && /^[1-9][0-9]{2,6}$/.test(raw) ? Number(raw) : 120_000;
+}
+
+/** `p`, or `fallback` when it takes longer than the read timeout (the request itself is left to end). */
+async function within<T>(p: Promise<T>, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<T>((resolve) => {
+    timer = setTimeout(() => resolve(fallback), readTimeoutMs());
+  });
+  try {
+    return await Promise.race([p, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** The pull requests in progress right now, or null when the list is incomplete or unreadable. */
+async function inProgressNow(): Promise<ReadonlySet<string> | null> {
+  const q = await within(listPrReviews({ verdicts: ["in_progress"] }), null);
+  if (q === null || q.truncated || q.skipped.unreadable > 0) return null;
+  return new Set(q.entries.map((e) => paceKey(e)));
+}
+
+/**
+ * Whether a started review that left the in-progress list is really finished: the stored review of
+ * the commit this run started it for is not in progress. A pull request that was closed or merged,
+ * or that GitHub's search leaves out for a moment, also drops out of the list while its job may
+ * still run. The commit is named, because without it the Worker judges the pull request's current
+ * head, and reads `not_reviewed` whenever GitHub cannot be asked or the head has moved even though
+ * the stored review of the started commit is still running. A pull request GitHub no longer has
+ * and that has no stored review is finished; any other failure to read is not an answer.
+ */
+async function confirmFinished(e: {
+  dataset_id: string;
+  pr_number: number;
+  head_sha: string;
+}): Promise<boolean> {
+  try {
+    const d = await within(getPrReview(e.dataset_id, e.pr_number, e.head_sha), null);
+    if (d === null) return false;
+    return d.verdict !== "in_progress";
+  } catch (err) {
+    return err instanceof ApiError && errorWord(err) === "no_such_pull_request";
+  }
+}
+
+/**
+ * Whether a start that threw may still have begun the review. A refusal with a 4xx cannot have: the
+ * Worker answered before it dispatched anything. A connection that failed or a body that could not
+ * be read (the client reports both as status 0) and a 5xx can all come after the Worker dispatched
+ * it, so they may have.
+ */
+function startMayHaveBegun(err: unknown): boolean {
+  return !(err instanceof ApiError && err.statusCode >= 400 && err.statusCode < 500);
+}
+
+/** Reads of the admin list in a row that may fail to tell before a paced run stops. */
+const MAX_UNKNOWN_POLLS = 10;
+
+/**
+ * A slot is never held longer than this: a job cannot outlive its limit (50 minutes after its claim,
+ * inside the Worker's 60-minute deadline and the queue's 30 minutes of grace).
+ */
+const MAX_HOLD_MS = 100 * 60_000;
+
+/** More than this many starting at once gets the hint about `--concurrency`. */
+const PACE_HINT_ABOVE = 10;
+
+/** What `start --redo` says when the Worker answered without the echo that says it honored the flag. */
+export const REDO_IGNORED =
+  "This Worker does not know --redo yet, so it ignored the flag: a finished review was not redone (a commit with no review was started as usual). Deploy the Worker, or run this against an environment that has it, then run the command again.";
+
+/** The queue verdicts `start --all` takes up: a current commit with no review, or one that ended without a verdict. */
+export const START_VERDICTS: QueueVerdict[] = ["not_reviewed", "could_not_decide"];
+
+/**
+ * With `--redo` the commits whose review has a result join them. A review in progress is not one
+ * (a redo never supersedes a running review) and an exempt pull request has none to redo.
+ */
+export const REDO_VERDICTS: QueueVerdict[] = [...START_VERDICTS, "pass", "fail", "uncertain"];
+
+/** Whether an entry's current commit has a finished review: the ones only a redo takes up. */
+function isFinished(e: Pick<QueueEntry, "verdict">): boolean {
+  return !START_VERDICTS.includes(e.verdict);
 }
 
 /** Whether the review of an entry's current commit was refused at the cap on restarts by edits. */
@@ -1311,17 +1493,41 @@ function isCapped(e: Pick<QueueEntry, "verdict" | "detail">): boolean {
   return e.verdict === "could_not_decide" && e.detail === "edit_limit";
 }
 
+/**
+ * Sort the queue's entries for a `--all` run: drafts are left out, so are the commits capped for
+ * edits (starting one begins the count again, which a bulk start must not do unasked), and what is
+ * left is the verdicts the run takes up. Filtering by verdict here as well as in the request keeps
+ * a review in progress and an exempt pull request out of a redo whatever the Worker returns.
+ */
+export function splitStartCandidates<E extends Pick<QueueEntry, "draft" | "verdict" | "detail">>(
+  entries: E[],
+  redo: boolean,
+): { drafts: E[]; capped: E[]; todo: E[] } {
+  const wanted = new Set<QueueVerdict>(redo ? REDO_VERDICTS : START_VERDICTS);
+  const drafts = entries.filter((e) => e.draft);
+  const live = entries.filter((e) => !e.draft && wanted.has(e.verdict));
+  return {
+    drafts,
+    capped: live.filter((e) => isCapped(e)),
+    todo: live.filter((e) => !isCapped(e)),
+  };
+}
+
 /** The `--all` run: list, show, ask, then start one at a time. */
 async function startAll(options: {
+  redo?: boolean;
+  concurrency?: number;
   dryRun?: boolean;
   yes?: boolean;
   json?: boolean;
 }): Promise<void> {
   const json = options.json === true;
+  const redo = options.redo === true;
+  const concurrency = options.concurrency;
   const spinner = json ? null : ora("Reading the open pull requests...").start();
   let q: QueueResponse;
   try {
-    q = await listPrReviews({ verdicts: ["not_reviewed", "could_not_decide"] });
+    q = await listPrReviews({ verdicts: redo ? REDO_VERDICTS : START_VERDICTS });
     spinner?.stop();
   } catch (err) {
     failApi(err, spinner, "Could not read the open pull requests", options.json);
@@ -1334,15 +1540,16 @@ async function startAll(options: {
     );
   }
 
-  const drafts = q.entries.filter((e) => e.draft);
   // A commit whose review was refused at the cap on restarts by edits is left out. Starting it
   // starts the review and begins the count again, which is the one thing a bulk start must not do
   // without being asked: an administrator starts it by name and so means it.
-  const capped = q.entries.filter((e) => !e.draft && isCapped(e));
-  const todo = q.entries.filter((e) => !e.draft && !isCapped(e));
+  const { drafts, capped, todo } = splitStartCandidates(q.entries, redo);
+  const finished = todo.filter(isFinished);
   const incomplete = q.truncated || q.skipped.unreadable > 0;
   const common = {
     environment: q.environment,
+    redo,
+    ...(concurrency === undefined ? {} : { concurrency }),
     drafts: drafts.length,
     // The commits left out for the cap, by name, so a script sees what it has to start itself.
     capped: capped.map((e) => ({
@@ -1364,14 +1571,24 @@ async function startAll(options: {
     } else {
       console.log(
         chalk.bold(
-          `${todo.length} pull request${todo.length === 1 ? "" : "s"} waiting for a review (none of the current commit, or one that was declined or ended without a verdict)`,
+          redo
+            ? `${todo.length} pull request${todo.length === 1 ? "" : "s"} to start or redo (${finished.length} with a finished review of the current commit, the rest waiting for one)`
+            : `${todo.length} pull request${todo.length === 1 ? "" : "s"} waiting for a review (none of the current commit, or one that was declined or ended without a verdict)`,
         ),
       );
       for (const e of todo) {
+        const mark = isFinished(e) ? `  ${chalk.yellow(`finished: ${e.verdict}`)}` : "";
         console.log(
-          `  ${e.dataset_id} #${e.pr_number}  ${plain(e.author_login)}  ${chalk.dim(clip(e.title, 60))}`,
+          `  ${e.dataset_id} #${e.pr_number}  ${plain(e.author_login)}  ${chalk.dim(clip(e.title, 60))}${mark}`,
         );
       }
+    }
+    if (concurrency === undefined && todo.length > PACE_HINT_ABOVE) {
+      console.log(
+        chalk.dim(
+          "These start at once; each running review reserves up to 128,000 output tokens per minute of the workspace's limit. --concurrency <n> paces them.",
+        ),
+      );
     }
     if (drafts.length > 0) {
       console.log(chalk.dim(`${drafts.length} draft${drafts.length === 1 ? "" : "s"} left out.`));
@@ -1398,7 +1615,20 @@ async function startAll(options: {
     }
   }
   if (todo.length === 0) {
-    if (json) console.log(JSON.stringify({ ...common, results: [], failed: 0 }, null, 2));
+    if (json) {
+      console.log(
+        JSON.stringify(
+          {
+            ...common,
+            results: [],
+            failed: 0,
+            ...(concurrency !== undefined ? { not_started: [] } : {}),
+          },
+          null,
+          2,
+        ),
+      );
+    }
     return;
   }
   if (options.dryRun) {
@@ -1407,15 +1637,24 @@ async function startAll(options: {
         dataset_id: e.dataset_id,
         pr_number: e.pr_number,
         author_login: e.author_login,
+        // Under --redo, which of them have a finished review that would be spent again.
+        ...(redo ? { verdict: e.verdict } : {}),
       }));
       console.log(JSON.stringify({ ...common, dry_run: true, would_start: would }, null, 2));
     } else {
+      if (concurrency !== undefined) {
+        console.log(
+          `\nWould start ${todo.length} pull request${todo.length === 1 ? "" : "s"}, at most ${concurrency} running at once.`,
+        );
+      }
       console.log(chalk.dim("\nThis was a dry run: nothing was started."));
     }
     return;
   }
   if (!json) console.log();
-  const go = await confirm(startAllQuestion(todo.length), { yes: options.yes });
+  const go = await confirm(startAllQuestion(todo.length, redo, concurrency), {
+    yes: options.yes,
+  });
   if (go !== "confirmed") {
     // Not on stdout under --json, which is read as one document.
     (json ? console.error : console.log)("Cancelled.");
@@ -1424,32 +1663,149 @@ async function startAll(options: {
 
   const results: StartResult[] = [];
   let failed = 0;
-  for (const e of todo) {
-    const label = `${e.dataset_id} #${e.pr_number}`;
-    try {
-      const r = await startPrReview(e.dataset_id, e.pr_number);
-      results.push({ ...r, dataset_id: e.dataset_id, pr_number: e.pr_number });
-      if (!json) {
+  // An older Worker ignores the flag. The first answer without the echo says so: it is kept like
+  // any other (the Worker may have started the commit, which has no review), the run stops there so
+  // that nothing more is asked of a Worker that cannot do what was asked, and the end reports both.
+  let redoIgnored = false;
+  // Ctrl-C stops the run after the start in flight and lists what was never tried, so that a
+  // paced redo can be continued by name instead of redoing the finished ones again.
+  const abort = new AbortController();
+  let interrupts = 0;
+  let lastInterrupt = 0;
+  // The start in flight, so a second Ctrl-C can say which one may or may not have begun.
+  let inFlight: string | null = null;
+  const onSigint = () => {
+    // One keypress can reach the process twice (a signal delivered to a whole process tree, or by
+    // the runtime waking an idle loop), so a second signal within half a second of the first is
+    // the same Ctrl-C and not a request to leave at once.
+    const at = Date.now();
+    if (interrupts > 0 && at - lastInterrupt < 500) return;
+    lastInterrupt = at;
+    interrupts++;
+    // A request in flight cannot be taken back, so the first Ctrl-C asks the run to stop after it
+    // and the second leaves at once (the reviews already started keep running either way).
+    if (interrupts > 1) {
+      if (!json && inFlight !== null) {
         console.log(
-          `  ${label}  ${r.dispatched ? chalk.green(startedWord(r)) : chalk.yellow(notStartedText(r))}`,
+          chalk.dim(
+            `\nThe start of ${inFlight} was in flight; check it with: nemar admin pr-reviews show ${inFlight.replace(" #", " ")}`,
+          ),
         );
       }
-    } catch (err) {
-      failed++;
-      const word =
-        err instanceof ApiError ? (errorWord(err) ?? `http_${err.statusCode}`) : "unknown";
-      results.push({ dataset_id: e.dataset_id, pr_number: e.pr_number, error: word });
-      if (!json) {
-        const gone = word === "no_such_pull_request";
-        console.log(
-          `  ${label}  ${chalk.red(gone ? "failed: GitHub has no such pull request" : `failed: ${err instanceof ApiError ? plain(err.message) : "could not be started"}`)}`,
-        );
-      }
+      process.exit(130);
     }
+    abort.abort();
+    if (!json) {
+      console.log(
+        chalk.dim("\nStopping after the request in flight; press Ctrl-C again to exit now."),
+      );
+    }
+  };
+  process.on("SIGINT", onSigint);
+  let lastWait = "";
+  let outcome: PaceOutcome<(typeof todo)[number], StartReviewResponse>;
+  try {
+    outcome = await runPaced<(typeof todo)[number], StartReviewResponse>(
+      todo,
+      {
+        start: async (e) => {
+          inFlight = `${e.dataset_id} #${e.pr_number}`;
+          try {
+            return await startPrReview(e.dataset_id, e.pr_number, { redo });
+          } finally {
+            inFlight = null;
+          }
+        },
+        isRunning: (r) => r.dispatched,
+        maybeRunning: startMayHaveBegun,
+        inProgress: inProgressNow,
+        confirmFinished,
+        sleep: sleepUnlessAborted,
+        onUnknown: ({ count, max }) => {
+          if (json) return;
+          console.log(
+            chalk.dim(
+              `  could not read the admin list completely (${count} of ${max}); still waiting`,
+            ),
+          );
+        },
+        stopAfter: (r) => {
+          if (redo && r.redo !== true) {
+            redoIgnored = true;
+            return true;
+          }
+          return false;
+        },
+        onWait: ({ running, remaining }) => {
+          const line = `${running} running (limit ${concurrency}); ${remaining} to go: waiting for one to report`;
+          if (json || line === lastWait) return;
+          lastWait = line;
+          console.log(chalk.dim(`  ${line}`));
+        },
+        onResult: (e, o) => {
+          const label = `${e.dataset_id} #${e.pr_number}`;
+          if ("answer" in o) {
+            const r = o.answer;
+            results.push({ ...r, dataset_id: e.dataset_id, pr_number: e.pr_number });
+            if (!json) {
+              console.log(
+                `  ${label}  ${r.dispatched ? chalk.green(startedWord(r)) : chalk.yellow(notStartedText(r))}`,
+              );
+            }
+            return;
+          }
+          failed++;
+          const err = o.error;
+          const word =
+            err instanceof ApiError ? (errorWord(err) ?? `http_${err.statusCode}`) : "unknown";
+          results.push({ dataset_id: e.dataset_id, pr_number: e.pr_number, error: word });
+          if (!json) {
+            const gone = word === "no_such_pull_request";
+            console.log(
+              `  ${label}  ${chalk.red(gone ? "failed: GitHub has no such pull request" : `failed: ${err instanceof ApiError ? plain(err.message) : "could not be started"}`)}`,
+            );
+          }
+        },
+      },
+      {
+        concurrency: concurrency ?? Number.POSITIVE_INFINITY,
+        pollMs: pollMs(),
+        maxUnknownPolls: MAX_UNKNOWN_POLLS,
+        maxHoldMs: MAX_HOLD_MS,
+        signal: abort.signal,
+      },
+    );
+  } finally {
+    process.off("SIGINT", onSigint);
   }
+  const stoppedEarly: PaceStop | null =
+    outcome.stoppedBy === "interrupted" || outcome.stoppedBy === "unknown_polls"
+      ? outcome.stoppedBy
+      : null;
 
   if (json) {
-    console.log(JSON.stringify({ ...common, results, failed }, null, 2));
+    console.log(
+      JSON.stringify(
+        {
+          ...common,
+          results,
+          failed,
+          ...(redoIgnored ? { redo_ignored: true } : {}),
+          ...(stoppedEarly ? { stopped_by: stoppedEarly } : {}),
+          ...(concurrency !== undefined || outcome.notStarted.length > 0
+            ? {
+                not_started: outcome.notStarted.map((e) => ({
+                  dataset_id: e.dataset_id,
+                  pr_number: e.pr_number,
+                  author_login: e.author_login,
+                })),
+              }
+            : {}),
+        },
+        null,
+        2,
+      ),
+    );
   } else {
     const answered = results.filter(
       (r): r is StartReviewResponse & { dataset_id: string; pr_number: number } => "reason" in r,
@@ -1462,9 +1818,63 @@ async function startAll(options: {
       `${started} started, ${had} already had a review, ${other} not started, ${failed} failed`,
     );
     envNote(q.environment);
+    if (redoIgnored) {
+      const left = todo.length - results.length;
+      console.log(
+        chalk.red(
+          left > 0
+            ? `${REDO_IGNORED} ${left} pull request${left === 1 ? " was" : "s were"} not tried.`
+            : REDO_IGNORED,
+        ),
+      );
+    }
+    if (stoppedEarly) {
+      const n = outcome.notStarted.length;
+      console.log(
+        chalk.yellow(
+          stoppedEarly === "interrupted"
+            ? `Interrupted: ${n} pull request${n === 1 ? "" : "s"} not started. Reviews already started keep running.`
+            : `The admin list could not be read completely ${MAX_UNKNOWN_POLLS} times in a row, so the limit of ${concurrency} running at once cannot be kept: ${n} pull request${n === 1 ? "" : "s"} not started. Reviews already started keep running.`,
+        ),
+      );
+      // A start that failed may or may not have begun the review, so it is listed to be looked at
+      // (its failure is printed above) before anything is run again.
+      const failedStarts = results.filter((r) => "error" in r);
+      for (const e of outcome.notStarted) {
+        console.log(
+          redo
+            ? `  nemar admin pr-reviews start ${e.dataset_id} ${e.pr_number} --redo`
+            : `  ${e.dataset_id} #${e.pr_number}`,
+        );
+      }
+      if (failedStarts.length > 0) {
+        console.log(
+          chalk.dim("Their start failed (see above); check each before starting it again:"),
+        );
+        for (const f of failedStarts) {
+          console.log(chalk.dim(`  nemar admin pr-reviews show ${f.dataset_id} ${f.pr_number}`));
+        }
+      }
+      if (redo && n > 0) {
+        console.log(
+          chalk.dim(
+            "Run these by name: running --all --redo again would redo the finished reviews once more. They start at once, so paste a few at a time.",
+          ),
+        );
+      } else if (n > 0) {
+        console.log(
+          chalk.dim(
+            "Run the same command again to start these: it takes up only what has no review.",
+          ),
+        );
+      }
+    }
   }
+  // An answer about the Worker's version, not a fault in the command: no invitation to file a bug.
+  if (redoIgnored && failed === 0) markReportedExit();
+  if (stoppedEarly === "interrupted") process.exit(130);
   const faulted = results.some((r) => "reason" in r && !r.dispatched && START_FAULTS.has(r.reason));
-  if (failed > 0 || faulted) process.exit(1);
+  if (failed > 0 || faulted || redoIgnored || stoppedEarly === "unknown_polls") process.exit(1);
 }
 
 // -- approve ------------------------------------------------------------------------------------

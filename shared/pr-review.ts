@@ -142,6 +142,14 @@ export const FINDING_CODES = [
   "name_template_field",
   // The pull request changes dataset_description.json and its new name could not be read.
   "name_unchecked",
+  // What the original authors published was changed or what was recorded was replaced (epic #1851,
+  // Part B). The review script decides these from platform facts and never a model, and has
+  // emitted them since Part B was integrated into the review. They have been accepted here since
+  // v0.10.22, a release earlier, because the review script runs from `main` as soon as it is
+  // released while the Worker deploys separately.
+  "original_text_altered",
+  "original_field_altered",
+  "recording_replaced",
   "other",
 ] as const;
 export type FindingCode = (typeof FINDING_CODES)[number];
@@ -232,7 +240,7 @@ export interface ChangedFile {
  */
 export interface ReviewEvidenceV1 {
   files_changed: number;
-  /** How many changed files had their content (a diff) given to the model. The rest were judged by name and type. */
+  /** How many changed files had their content given to the model, as a diff or as a file the platform's exact change summary accounted for (a modified table or sidecar it showed completely), a change repeated line for line across files counted for each file it covers. The rest were judged by name and type. */
   files_read: number;
   /**
    * Something the reviewer needed to see was not shown in full: the change list was cut at
@@ -1272,7 +1280,7 @@ const ERROR_COPY: Record<RunError, string> = {
   auth_failed: `The review service could not sign in. ${capitalized(PERSON)} needs to fix the review service.`,
   model_unavailable: "The reviewing model was unavailable, or did not finish in time.",
   model_refused: "The reviewing model declined to review this change.",
-  model_truncated: "The reviewing model ran out of room before it finished.",
+  model_truncated: `The automated review used all the room it is given before it reached an answer, which a large pull request is likely to cause. Split it into smaller pull requests, for example by group of subjects or by kind of change, and open each one separately. ${capitalized(PERSON)} can also review it by hand.`,
   model_invalid: "The reviewing model did not return a usable review.",
   report_invalid: "The review could not be read back.",
   dispatch_failed: "The review could not be started. Push again to re-run it.",
@@ -1308,6 +1316,9 @@ const CODE_LABEL: Record<FindingCode, string> = {
   name_doi: "New dataset name has a citation (an author and a year, or a DOI)",
   name_template_field: "New dataset name has an unfilled template field",
   name_unchecked: "New dataset name could not be read",
+  original_text_altered: "Original text changed",
+  original_field_altered: "Original field changed",
+  recording_replaced: "Recorded data changed",
   other: "Other",
 };
 
@@ -1418,9 +1429,29 @@ function listChangedFiles(e: ReviewEvidenceV1): string {
 }
 
 /**
+ * The findings that say a contributor changed what the original authors published (epic #1851,
+ * Part B). A moved or replaced recording is not one of them: that is a question for a person, and
+ * the paragraph below does not answer it.
+ */
+export const ORIGINAL_ALTERED_CODES: readonly FindingCode[] = [
+  "original_text_altered",
+  "original_field_altered",
+];
+
+/**
+ * What the contributor does instead, said once under the findings of a report that has one of
+ * {@link ORIGINAL_ALTERED_CODES}. It is one line so a check, a comment and a terminal show it
+ * unbroken, and its own words are fixed: the Worker and the CLI render it from here.
+ */
+export const ORIGINAL_CONTENT_PARAGRAPH =
+  "Contributors add to what the original authors published and do not change it. Describe your change in the CHANGES entry for the new version. Put new information in a new, clearly separate section of the README. If something the authors wrote is wrong, open an issue for the NEMAR administrators, who can correct it; an administrator can also review this pull request by hand.";
+
+/**
  * What a reader should look at before approving: a steering attempt, each finding, the facts
  * that no finding already states, and a warning when the reviewer did not see everything. Empty
- * when there is nothing to say. One bullet per line, in markdown.
+ * when there is nothing to say. One bullet per line, in markdown, then (when a finding says the
+ * original authors' content was changed) a blank line and one paragraph on what to do instead, so
+ * the bullets stay one list.
  */
 export function findingLines(report: PrReviewReport): string[] {
   // A code newer than this build (the CLI ships apart from the Worker) is named, not "undefined".
@@ -1451,6 +1482,11 @@ export function findingLines(report: PrReviewReport): string[] {
     details.push(
       "- Some changed files were not shown to the reviewer in full, so a clean result is not claimed.",
     );
+  }
+  // Last, and once however many findings qualify: the findings and the facts above stay one list,
+  // and the Worker clips a long check from its end, which reaches the changed-files list first.
+  if (report.findings.some((f) => ORIGINAL_ALTERED_CODES.includes(f.code))) {
+    details.push("", ORIGINAL_CONTENT_PARAGRAPH);
   }
   return details;
 }
@@ -1545,9 +1581,14 @@ export function renderCheck(outcome: ReviewOutcome): RenderedCheck {
   if (outcome.kind === "error") {
     return {
       // The refusal at the edit cap says why in its title: the person who reads the check list
-      // learns that nothing is wrong with the review, and that the edits are what held it.
+      // learns that nothing is wrong with the review, and that the edits are what held it. So does
+      // a review that used all its room: the title tells the author to make the pull request smaller.
       title:
-        outcome.error === "edit_limit" ? "Could not decide: too many edits" : "Could not decide",
+        outcome.error === "edit_limit"
+          ? "Could not decide: too many edits"
+          : outcome.error === "model_truncated"
+            ? "Could not decide: split this pull request"
+            : "Could not decide",
       summary: ERROR_COPY[outcome.error],
       text: `${FOOTER}\n\n${NO_VERDICT}`,
     };

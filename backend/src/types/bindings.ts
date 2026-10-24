@@ -1,3 +1,4 @@
+import type { CloudflareSendEmail } from "../services/email";
 import type { WebSessionUser } from "../services/web-session";
 import type { MaintenanceMode } from "./maintenance";
 
@@ -95,11 +96,38 @@ export interface Bindings {
   DATA_BASE_URL?: string;
   /** Undefined is treated as "off". See backend/src/types/maintenance.ts. */
   MAINTENANCE_MODE?: MaintenanceMode;
-  /** Sender for outbound Resend emails, e.g. "NEMAR Archive <noreply@nemar.org>".
+  /** Sender for outbound emails, e.g. "NEMAR Archive <noreply@nemar.org>".
    *  Falls back to DEFAULT_FROM_EMAIL in email.ts if unset/empty.
-   *  The domain must be verified in the Resend account tied to RESEND_API_KEY,
-   *  otherwise Resend rejects the send (caught and logged per-site). */
+   *  The domain must be verified with the provider the worker sends through
+   *  (the Resend account tied to RESEND_API_KEY, or the Cloudflare Email
+   *  Service for EMAIL_PROVIDER=cloudflare), otherwise the send is rejected
+   *  (caught and logged per-site). */
   FROM_EMAIL?: string;
+  /** Which provider sends mail (epic #1893, ADR 0110): "cloudflare"
+   *  (case-insensitive) sends through the EMAIL binding; unset, empty or
+   *  "resend" is Resend. Set only in [env.dev] while staging proves the move.
+   *  Any other value, and "cloudflare" with no EMAIL binding, is a
+   *  configuration error, never a silent fallback to Resend
+   *  (services/email.ts resolveEmailProvider). */
+  EMAIL_PROVIDER?: string;
+  /** "resend" lets a send that Cloudflare refused for a quota or account
+   *  reason (services/email.ts RESEND_FALLBACK_CODES) go out once through
+   *  Resend. Unset or anything else: no fallback. Never set in [env.dev], so
+   *  staging cannot reach Resend. Also needs a non-blank RESEND_API_KEY. */
+  EMAIL_FALLBACK?: string;
+  /** Cloudflare Email Service `send_email` binding. In [env.dev] it is
+   *  restricted to the staging sender addresses, so the dev worker cannot
+   *  send as nemar.org. Optional: absent on every other worker. */
+  EMAIL?: CloudflareSendEmail;
+  /** Inbound mail bucket (epic #1893 phase 1): raw messages from Email Routing,
+   *  stored at `inbound/raw/YYYY/MM/DD/<uuid>.eml` by services/inbound-mail.ts.
+   *  `nemar-mail-dev` in [env.dev] only; absent elsewhere, and a Worker with no
+   *  bucket rejects the message. */
+  MAIL_INBOUND?: R2Bucket;
+  /** Announcement outbox queue (epic #1893 phase 2): `nemar-email-outbox` in production,
+   *  `nemar-email-outbox-dev` in [env.dev]. Optional: with no binding `nemar admin notify`
+   *  sends inline as before. Consumed by `queue()` in index.ts. */
+  EMAIL_OUTBOX?: Queue;
   /** Reply-To address (e.g. "info@nemar.org") when FROM is a no-reply mailbox.
    *  Omitted when unset/empty. */
   REPLY_TO?: string;

@@ -13,6 +13,109 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
+## 0.10.23 - 2026-10-23
+
+The dataset pull request review now reads a large change as an exact summary the platform computes, and protects what the original authors published.
+This release has no migration, sets no new Worker secret or variable, and changes no workflow or Worker configuration; the review check is still not required (`PR_REVIEW_AUTO_REQUIRE` stays unset).
+The review scripts run from `main`, so reviews dispatched after the merge run the new scripts while the Worker deploys; the Worker's only change is rendering one paragraph, and an older Worker renders the same reports without it.
+The review prompt changed and the model calibration of ADR 0107 on the new prompt is not done; that is acceptable only while the check is not required.
+
+### Changed
+
+- **A modified table or sidecar counts as read when an exact change summary accounts for it (epic #1851, Part A).**
+  The summary parses tables and JSON documents strictly, pairs rows, keys and renames by exact rules, and reports what changed as a few classes with counts, so a bulk pull request such as 125 tables with one edit no longer fills the model's context with 114 diffs.
+  The model reads the summary beside the diffs it still needs, and a file counts as read only when every class in it that is not additive was shown completely.
+  An unrelocated or unkept removal (rows, columns with values, or keys with values that the pull request keeps nowhere else) is a platform blocker on `no_degradation`, placed first in the findings; it can only lower a verdict, and a model cannot raise it.
+- **The review protects what the original authors published (Part B).**
+  A README or CHANGES line altered beyond a minor edit, moved or removed, a line put inside an original paragraph, an author-owned `dataset_description.json` field altered or removed, or a participant value changed fails `no_degradation`, with the codes `original_text_altered` and `original_field_altered` that 0.10.22 made the Worker accept.
+  A replaced recording, a comparison that could not be made and an abandoned pass are `unknown` (`recording_replaced`, `evidence_incomplete`), never clean.
+  Minor edits, text added after the dataset's first version, line endings, added fields and moved pointers are information for the model.
+  The README is compared with the one at the dataset's first version tag (one `git ls-remote --tags origin` per review of a pull request that changes a README); when the lookup fails, finds no tag or finds no ancestor tag, every line at the merge base is protected.
+  The check shows one paragraph under the findings of a report that has one of the two failing codes: contributors add to what the original authors published, describe the change in CHANGES, put new information in a new section, and ask an administrator to correct what the authors wrote.
+- **The review prompt gained the change summary and the `original_content` facts.**
+  The system prompt grows by about 4,000 characters, the longest message stays under the 300,000-character cap, and the model, effort and token ceilings are unchanged.
+
+### Production behavior changes
+
+- **The check of an open pull request changes the next time it is reviewed**, on a push, an edit, a reopen, a ready-for-review or an administrator start; nothing changes retroactively.
+  Of the 129 dataset pull requests open on 2026-10-23, 107 are on public datasets, the only ones the Worker dispatches: measured with the real tag lookup, 79 read clear, 20 fail (three of them the platform account's own `Name` changes, which the Worker exempts), 5 are `unknown` only and 3 carry information.
+  Merging a pull request that fails needs an administrator's `--force` in `nemar admin pr-reviews`, as for any failing review.
+- **Contributors who rewrite original content now read "Needs changes".**
+  An author who reworded or expanded original README lines, edited a participant value or changed a dataset name sees the failing finding and the paragraph above on the check.
+
+### Not in this release
+
+- The 400-name cut (#1861) and the small evidence additions (#1862) follow separately.
+- The calibration tool cannot fetch private datasets online (#1884), the unit-pure job flakes on 5-second timeouts of unrelated backend tests (#1885), CI lint covers only `src/` (#1890), and two GitHub-view-only gaps of the hiding tripwire (#1883) are filed.
+
+## 0.10.22 - 2026-10-21
+
+The Worker's report parser now accepts three finding codes that nothing emits yet.
+This release has no migration and sets no new Worker secret or variable.
+It moves the Brain Imaging Data Structure (BIDS) validator from 2.4.1 to 3.0.2, which changes one dataset's publication gate verdict; see Production behavior changes below before releasing.
+
+### Changed
+
+- **The review report accepts `original_text_altered`, `original_field_altered` and `recording_replaced` (epic #1851, S0).**
+  They are for the rules on what a contributor may change of the original authors' content, which a later release adds.
+  The review script runs from `main` as soon as a release lands while the Worker deploys separately, so a script that emitted a code the Worker did not know would have its report refused as `report_invalid`.
+  The codes are therefore accepted, labeled for the check ("Original text changed", "Original field changed", "Recorded data changed") and kept out of the codes the review model is offered, one release before anything emits them.
+
+- **The BIDS validator is pinned at 3.0.2, and a monthly pull request moves the pin to the newest stable release (issue #1036).**
+  The pin was 2.4.1, and the bump workflow selected only the 2.x line, so the pin could not move to 3.x by itself.
+  The bump runs on the first day of each month, selects the newest stable release of any major version from the JavaScript Registry (JSR) metadata, skips yanked and prerelease versions, and runs the reference-dataset comparison before it opens its pull request.
+  If the comparison is incomplete, the bump fails rather than opening a pull request, and the comparison is kept as a run artifact.
+- **Every validation report names the validator release that produced it.**
+  `nemar dataset validate` prints `Validator: @bids/validator <version>` after the validator's own text report, and adds a top-level `validatorVersion` key to the `--json` report.
+  A report written with `--outfile` names the release in the same way: the key in a `--json` file, or a final `Validator:` line in a text file.
+- **A validator run that fails is reported as a failure.**
+  An exit other than 0 (valid) or 16 (errors found) is a failed run: `nemar dataset validate` shows the validator's own message and exits with its code.
+  A report without a list of issues is refused rather than read as clean.
+  The message for a failed run is written to stderr, not stdout, so a script that reads only stdout sees no error text.
+
+### Production behavior changes
+
+- **One dataset's publication gate verdict changes under 3.0.2.**
+  The comparison covered 1,091 of the 1,093 datasets in the nemarDatasets organization. `nm000255` and `nm000256` crash under both releases, so neither could be compared.
+  `on008837` passes under 2.4.1 and fails under 3.0.2 with 38 HED `SIDECAR_INVALID` errors: its events sidecar has a top-level `HED` key that holds a column description, which 3.0.2 rejects and 2.4.1 accepts.
+  Its next validation refuses it until its sidecar is fixed or the rule is judged wrong.
+  `on003004` already fails the gate and gains one HED error (`SCHEMA_LOAD_FAILED`): its events files have a HED column whose values are all `n/a`, with no HED version declared, and 3.0.2 requires a schema for that column.
+  No other dataset's gating errors change.
+- **Real git-annex links are read the same by both releases.**
+  A link to a git-annex key, the layout real datasets have, gives the same gating errors under 2.4.1 and 3.0.2, and so does a pointer file.
+  A link to no annex key is reported as broken, with its sidecar as orphaned, by 3.0.2 only. The comparison carries that layout as a detector, not as a layout that exists.
+- **Under the upload preflight's flags, which keep warnings, 3.0.2 reports fewer warnings on six reference datasets.**
+  The six are `nm000189`, `xx099905`, and `nm000104` to `nm000107`. The other six reference datasets report the same number of warnings under both releases, and no warning gates.
+
+### Deploy coupling
+
+- **Pushes and pull requests validate with the pin in each dataset's shim until the shim is rewritten.**
+  The `bids-validation.yml` shim in each dataset repository sends the pinned release in its dispatch payload, and the central workflow in `nemarDatasets/.github` runs the release that the payload names.
+  Sampled repositories still sent 2.4.1 when this release was prepared, so until a fleet sync rewrites them, their pushes use 2.4.1.
+- **Revalidation uses the Worker's pin as soon as the Worker deploys.**
+  `POST /admin/datasets/:id/revalidate`, which `nemar admin fleet revalidate` calls, sends the Worker's pin directly, so it validates with 3.0.2 whatever a shim says.
+- **The browser validator is not part of this release.**
+  The in-browser validation planned in website#161 pins its own release, so it has to move to 3.0.2 on its side, with a check against this repository's `validator-version.json`.
+
+## 0.10.21 - 2026-10-20
+
+The dataset pull-request review is given the room to finish, and a bulk edit that repeats one change across files is read once.
+This release has no migration, sets no new Worker secret or variable, and leaves `PR_REVIEW_AUTO_REQUIRE` unset.
+The review workflow's `timeout-minutes` is 50 in `nemarDatasets/.github` and in the source copy here, and has to be merged there before this release reaches `main`: the new script runs from `main` at once, and a 28-minute job would be cancelled in the middle of a long review.
+
+### Changed
+
+- **The review stage may use 128,000 output tokens, and a review that still runs out tells the author to split the pull request (ADR 0107, amendment of 2026-10-20).**
+  On the first day of the shadow run seven of nine reviews on real pull requests ended `model_truncated` at 32,000 tokens, after about five minutes: the model's thinking at effort `max` filled the budget, not its input.
+  The review stage's `max_tokens` is now 128,000, the most `claude-sonnet-5-5` allows in one answer; the screen stays at 32,000.
+  The review's deadline is 30 minutes, the job's `timeout-minutes` is 50 and the Worker's `PR_REVIEW_DEADLINE_MINUTES` is 60, so a check can stay `running` for up to 50 minutes on a pull request that uses all its room, and the watchdog's wait for a review that never reported grows from 40 to 60 minutes.
+  A review that still uses all of its room is `action_required` as before, now titled "Could not decide: split this pull request", and tells the author that the review used all its room and to split the pull request into smaller ones.
+  A review costs up to about $1.28 of output, plus its input, when it uses the whole ceiling, and a pull request that truncates truncates again on each restart; the spend limit is the owner's to raise, and a bulk `pr-reviews start --all` reserves 128,000 output tokens per review against the workspace's per-minute limit.
+- **A change repeated across many files is read once.**
+  A changed metadata file whose diff is identical to one already shown, line for line and at the same lines, with the same mode, is counted on that diff and is not read again: it uses none of the file or character budget, and is covered by that diff when it was shown in full (a cut diff covers nothing).
+  Before this, a sidecar edit made the same way in every subject filled the 40-file budget and left the rest unread, so `no_degradation` could not pass.
+  The match is exact, so a change that differs in one byte, or names its own subject, is shown on its own, and a symlink or an executable is never one with a regular file; at most 500 files' diffs are examined, and, once the patches are full, the search stops early when the content pass is short of time, leaving the rest unread.
+
 ## 0.10.20 - 2026-10-19
 
 The Zarr conversion that runs on `hallu` now pins biosigIO 1.2.13 and types the failures caused by missing companion data.

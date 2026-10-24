@@ -12,6 +12,10 @@ import { describe, expect, test } from "bun:test";
 import { validateMeshTerms } from "../backend/src/services/llm-enrich";
 import type { NemarMetadataV2 } from "../shared/datacite-constants";
 
+// CI has seen one NLM answer take 25 seconds, so the default 30-second budget leaves no margin.
+// Only the two tests that reach the live API get this budget; their assertions are unchanged.
+const NLM_TIMEOUT_MS = 120_000;
+
 describe("validateMeshTerms", () => {
   test("returns unchanged metadata when no keywords", async () => {
     const metadata: NemarMetadataV2 = { version: "2.0" };
@@ -46,28 +50,36 @@ describe("validateMeshTerms", () => {
     expect(result.keywords?.[2]).toEqual({ term: "plain keyword" });
   });
 
-  test("confirms valid MeSH term via NLM API", async () => {
-    const metadata: NemarMetadataV2 = {
-      version: "2.0",
-      keywords: [{ term: "Electroencephalography", subject_scheme: "MeSH" }],
-    };
-    const { metadata: result, log } = await validateMeshTerms(metadata);
-    expect(log).toHaveLength(1);
-    expect(log[0].action).toBe("confirmed");
-    expect(log[0].mesh_uri).toContain("nlm.nih.gov/mesh");
-    expect(result.keywords?.[0].value_uri).toContain("nlm.nih.gov/mesh");
-    expect(result.keywords?.[0].subject_scheme).toBe("MeSH");
-  });
+  test(
+    "confirms valid MeSH term via NLM API",
+    async () => {
+      const metadata: NemarMetadataV2 = {
+        version: "2.0",
+        keywords: [{ term: "Electroencephalography", subject_scheme: "MeSH" }],
+      };
+      const { metadata: result, log } = await validateMeshTerms(metadata);
+      expect(log).toHaveLength(1);
+      expect(log[0].action).toBe("confirmed");
+      expect(log[0].mesh_uri).toContain("nlm.nih.gov/mesh");
+      expect(result.keywords?.[0].value_uri).toContain("nlm.nih.gov/mesh");
+      expect(result.keywords?.[0].subject_scheme).toBe("MeSH");
+    },
+    NLM_TIMEOUT_MS,
+  );
 
-  test("strips scheme from invalid MeSH term", async () => {
-    const metadata: NemarMetadataV2 = {
-      version: "2.0",
-      keywords: [{ term: "BrainWaveStuff123NotReal", subject_scheme: "MeSH" }],
-    };
-    const { metadata: result, log } = await validateMeshTerms(metadata);
-    expect(log).toHaveLength(1);
-    expect(log[0].action).toBe("scheme_removed");
-    expect(result.keywords?.[0].subject_scheme).toBeUndefined();
-    expect(result.keywords?.[0].term).toBe("BrainWaveStuff123NotReal");
-  });
+  test(
+    "strips scheme from invalid MeSH term",
+    async () => {
+      const metadata: NemarMetadataV2 = {
+        version: "2.0",
+        keywords: [{ term: "BrainWaveStuff123NotReal", subject_scheme: "MeSH" }],
+      };
+      const { metadata: result, log } = await validateMeshTerms(metadata);
+      expect(log).toHaveLength(1);
+      expect(log[0].action).toBe("scheme_removed");
+      expect(result.keywords?.[0].subject_scheme).toBeUndefined();
+      expect(result.keywords?.[0].term).toBe("BrainWaveStuff123NotReal");
+    },
+    NLM_TIMEOUT_MS,
+  );
 });

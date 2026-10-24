@@ -1,13 +1,16 @@
 name: Deploy Backend
 
 on:
-  # Production: every push to main that touches the backend.
+  # Production: every push to main that touches the backend, or the validator pin the
+  # Worker bundles (backend/src/services/github/shared.ts reads validator-version.json
+  # from the repository root), so a change to the pin alone redeploys the Worker.
   push:
     branches:
       - main
     paths:
       - 'backend/**'
       - 'shared/**'
+      - 'validator-version.json'
       - '.github/workflows/deploy-backend.yml'
   # The dev worker: called by auto-bump-dev.yml, ONCE per push to dev, after it has
   # pushed the version bump, with the commit to deploy (the bump). Until 2026-10, a
@@ -156,7 +159,9 @@ jobs:
     needs: detect-environment
     if: needs.detect-environment.outputs.environment != '' && needs.detect-environment.outputs.gate_reused != 'true'
     runs-on: ubuntu-latest
-    # p95 21.8 min (50 green runs to 2026-10-13), so twice that.
+    # The serial pure tier took about 22 min at p95 (50 green runs to 2026-10-13) before the
+    # migrated-database template cut the backend suite's time; the limit is kept at twice that
+    # until a run measures the new duration.
     timeout-minutes: 44
     steps:
       - name: Checkout code
@@ -196,23 +201,16 @@ jobs:
 
       - name: Run pure unit tests (no live backend)
         run: |
-          # Same auto-classification as test.yml's required unit-pure tier: every
-          # non-e2e test file that does NOT hit the live backend. Kept in lockstep
-          # with test.yml so the deploy gate and the PR gate assert the same set.
-          shopt -s nullglob
-          files=()
-          for f in test/*.test.ts backend/test/*.test.ts backend/test/helpers/*.test.ts; do
-            base="$(basename "$f")"
-            case "$base" in
-              e2e-sandbox.test.ts|e2e-upload.test.ts|zenodo-sandbox.test.ts|ezid.test.ts|ezid-sandbox.test.ts|auth-passwordless.test.ts) continue;;
-              # *.integration.test.ts hit external networks (live DataCite/Crossref);
-              # they are non-deterministic and must never gate the prod deploy.
-              *.integration.test.ts) continue;;
-            esac
-            if grep -Eq 'testRequest|TEST_API_URL|runCli\(' "$f"; then continue; fi
-            files+=("$f")
-          done
-          if [ ${#files[@]} -eq 0 ]; then echo "No pure test files matched" >&2; exit 1; fi
+          # The same classifier as test.yml's required unit-pure tier (one script, so the
+          # deploy gate and the PR gate assert the same set). Serial on purpose: this job
+          # has to keep the single check name `test-gate` that both deploy jobs and the
+          # gate-reuse lookup above read, and the sharded proof lives in test.yml.
+          set -euo pipefail
+          # Written to a file first: process substitution would hide the classifier's exit
+          # status, and an empty list would run a bare `bun test` over everything.
+          scripts/ci/unit-pure-files.sh > "$RUNNER_TEMP/unit-pure-files.txt"
+          mapfile -t files < "$RUNNER_TEMP/unit-pure-files.txt"
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::the classifier listed no pure test files"; exit 1; }
           echo "Running ${#files[@]} pure test files"
           bun test "${files[@]}"
 

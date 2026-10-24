@@ -251,8 +251,11 @@ dedupe, the contributor pause and the platform's daily pool all apply. Two thing
 administrator's choice made by name. The per-contributor hourly and daily allowances do not hold that
 review back (they exist to bound outsiders). And a commit whose review ended without a verdict
 (declined, errored, never reported, or handed to GitHub more than `PR_REVIEW_DEADLINE_MINUTES` ago and
-never answered) is started again; one that is running or has a result is not. A new delivery of the
-same commit still restarts nothing but a dispatch GitHub did not run.
+never answered, and that no job claimed in the last 50 minutes) is started again; one that is running
+or has a result is not (a `--redo` starts one that has a result,
+[ADR 0093](0093-pull-requests-awaiting-approval-are-managed-from-one-admin-command-and-an-approval-is-the-administrators-own.md),
+amendment of 2026-10-24). A new delivery of the same commit still restarts nothing but a dispatch
+GitHub did not run.
 
 A restart is held to the gate like a new row. A contributor who is paused is declined, and the
 platform's pool is asked again with the row ranked as the newest: it keeps its old id, which the cap

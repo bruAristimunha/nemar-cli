@@ -50,6 +50,8 @@ const EXPECTED_ENTRIES: Record<string, number> = {
   "GET /email-preferences": 1,
   "PUT /email-preferences": 2,
   "POST /notify": 2,
+  // Epic #1893 phase 2: progress of a queued announcement (handler only; the router gates).
+  "GET /notify/:id": 1,
   "POST /test-fixtures/seed-web-user": 2,
   // #1255, epic #1250: ORCID name backfill (zValidator + handler).
   "POST /users/backfill-names": 2,
@@ -231,7 +233,7 @@ describe("admin route inventory", () => {
   });
 
   test("entry total is pinned", () => {
-    expect(adminRoutes.routes.length).toBe(154);
+    expect(adminRoutes.routes.length).toBe(155);
   });
 
   // The count pin above can't see a SWAP of the router-level middleware

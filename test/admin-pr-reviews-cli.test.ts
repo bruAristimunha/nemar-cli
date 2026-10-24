@@ -2070,7 +2070,9 @@ describe("nemar admin pr-reviews next", () => {
     nodes(ready("nm000201", 7));
 
     const r = await cliOnTerminal([...PR, "next"], async (t) => {
-      const shown = await t.waitFor("c comment");
+      // The menu words also print in the queue header, before the card is shown, and a key typed
+      // before the card is shown is discarded. Wait for the prompt, which prints after that step.
+      const shown = await t.waitFor("q quit > ");
       t.type("c\n");
       const asked = await t.waitFor("Comment (empty cancels): ", shown);
       t.type("The first line of a pasted paragraph\n");

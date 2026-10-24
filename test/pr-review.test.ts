@@ -19,6 +19,8 @@ import {
   MAX_MODEL_FILES,
   MODEL_PRICES_USD_PER_MTOK,
   NOTE_MAX,
+  ORIGINAL_ALTERED_CODES,
+  ORIGINAL_CONTENT_PARAGRAPH,
   OVERRIDE_MODES,
   PRODUCED_DECLINE_REASONS,
   PR_REVIEW_COMMENT_MARKER,
@@ -35,6 +37,7 @@ import {
   effectiveCriteria,
   estimateCostUsd,
   factsOf,
+  findingLines,
   isRunError,
   namingLines,
   parseCallbackOutcome,
@@ -1143,6 +1146,193 @@ describe("the evidence block cannot claim more than it can hold", () => {
   });
 });
 
+describe("the codes for what the original authors published and what was recorded (epic #1851)", () => {
+  // The script will decide these from platform facts; until it does, the Worker only has to accept
+  // them, because the review script runs from `main` as soon as it is released while the Worker
+  // deploys separately.
+  const platformCodes: [string, string][] = [
+    ["original_text_altered", "Original text changed"],
+    ["original_field_altered", "Original field changed"],
+    ["recording_replaced", "Recorded data changed"],
+  ];
+
+  test.each(platformCodes)(
+    "%s is accepted, parsed back, round-tripped and rendered",
+    (code, label) => {
+      const raw = report({
+        criteria: {
+          no_degradation: "unknown",
+          advances_revision: "pass",
+          material_improvement: "pass",
+        },
+        findings: [
+          {
+            criterion: "no_degradation",
+            severity: "blocker",
+            code,
+            path: null,
+            note: "A fixed note.",
+          },
+        ],
+      });
+      expect(refusal(raw)).toBe("accepted");
+      expect(parseStoredPrReviewReport(raw).findings[0]?.code).toBe(code);
+      const outcome = parseCallbackOutcome({ outcome: "reported", report: raw, error: undefined });
+      expect(outcome.kind).toBe("reported");
+      expect(conclusionOf(outcome)).toBe("action_required");
+      const { text } = renderCheck(outcome);
+      expect(text).toContain("A fixed note.");
+      expect(text).toContain(label);
+      expect(text).not.toContain(code);
+      // The pull request's comment says the same, in the same words.
+      const comment = renderComment(outcome, "0123456789abcdef0123456789abcdef01234567");
+      expect(comment).toContain(label);
+      expect(comment).not.toContain(code);
+    },
+  );
+
+  test("a code outside the vocabulary is still refused", () => {
+    const raw = report({
+      findings: [
+        {
+          criterion: "no_degradation",
+          severity: "note",
+          code: "original_text",
+          path: null,
+          note: "",
+        },
+      ],
+    });
+    expect(refusal(raw)).not.toBe("accepted");
+  });
+});
+
+describe("what a contributor does instead of changing the original authors' content (epic #1851)", () => {
+  // Spelled out here, not imported, so a change to the constant is a change to this test.
+  const PARAGRAPH =
+    "Contributors add to what the original authors published and do not change it. Describe your change in the CHANGES entry for the new version. Put new information in a new, clearly separate section of the README. If something the authors wrote is wrong, open an issue for the NEMAR administrators, who can correct it; an administrator can also review this pull request by hand.";
+  const count = (haystack: string, needle: string) => haystack.split(needle).length - 1;
+  const finding = (code: string) => ({
+    criterion: "no_degradation",
+    severity: "blocker",
+    code,
+    path: null,
+    note: "A fixed note.",
+  });
+  /** A full report the real parser accepted, whose `no_degradation` is explained by `codes`. */
+  const filed = (codes: string[], over: Record<string, unknown> = {}): PrReviewReport =>
+    parsed({
+      criteria: { no_degradation: "fail" },
+      findings: codes.map(finding),
+      ...over,
+    });
+
+  test("the words are fixed, are one line, and belong to exactly the two codes for altered content", () => {
+    expect(ORIGINAL_CONTENT_PARAGRAPH).toBe(PARAGRAPH);
+    expect(PARAGRAPH).toHaveLength(375);
+    expect(PARAGRAPH).not.toContain("\n");
+    expect([...ORIGINAL_ALTERED_CODES]).toEqual([
+      "original_text_altered",
+      "original_field_altered",
+    ]);
+    for (const code of ORIGINAL_ALTERED_CODES) expect(FINDING_CODES).toContain(code);
+  });
+
+  test.each(["original_text_altered", "original_field_altered"])(
+    "a finding with %s ends the findings with a blank line and the paragraph",
+    (code) => {
+      const lines = findingLines(filed([code]));
+      expect(lines.slice(-2)).toEqual(["", PARAGRAPH]);
+      expect(count(lines.join("\n"), PARAGRAPH)).toBe(1);
+      expect(lines.slice(0, -2).every((l) => l.startsWith("- "))).toBe(true);
+    },
+  );
+
+  test("two qualifying findings, or one code twice, give the paragraph once", () => {
+    for (const codes of [
+      ["original_text_altered", "original_field_altered"],
+      ["original_field_altered", "original_text_altered"],
+      ["original_text_altered", "original_text_altered"],
+    ]) {
+      const lines = findingLines(filed(codes));
+      expect(count(lines.join("\n"), PARAGRAPH), codes.join()).toBe(1);
+      expect(lines.slice(-2)).toEqual(["", PARAGRAPH]);
+    }
+  });
+
+  test("recorded data that changed has no such paragraph, alone or beside other findings", () => {
+    const alone = filed(["recording_replaced"], { criteria: { no_degradation: "unknown" } });
+    expect(findingLines(alone).join("\n")).not.toContain("Contributors add");
+    const beside = filed(["recording_replaced", "data_removed"]);
+    expect(findingLines(beside).join("\n")).not.toContain("Contributors add");
+    // Beside a finding that does qualify it is shown, once.
+    const both = filed(["recording_replaced", "original_text_altered"]);
+    expect(count(findingLines(both).join("\n"), PARAGRAPH)).toBe(1);
+  });
+
+  test("no other finding, and no finding at all, gets it", () => {
+    for (const code of FINDING_CODES) {
+      if (ORIGINAL_ALTERED_CODES.includes(code)) continue;
+      // The parser takes any closed code against any criterion, so each is a real report.
+      expect(findingLines(filed([code])).join("\n"), code).not.toContain("Contributors add");
+    }
+    expect(findingLines(parsed())).toEqual([]);
+    expect(findingLines(parsed({ steering: true })).join("\n")).not.toContain("Contributors add");
+  });
+
+  test("it comes after every other line: the steering bullet, the findings, a fact and the truncation bullet", () => {
+    const report = filed(["original_text_altered", "data_removed"], {
+      steering: true,
+      evidence: evidence({ truncated: true, version_before: "1.0.0", version_after: "1.0.0" }),
+    });
+    const lines = findingLines(report);
+    expect(lines.slice(-2)).toEqual(["", PARAGRAPH]);
+    const bullets = lines.slice(0, -2);
+    expect(bullets.every((l) => l.startsWith("- "))).toBe(true);
+    // The steering bullet, two findings, the fact that the version did not move, and the truncation.
+    expect(bullets[0]).toContain("tried to instruct the reviewer");
+    expect(bullets[1]).toContain("**Original text changed**");
+    expect(bullets[2]).toContain("**Data removed**");
+    expect(bullets.some((l) => l.includes("**Version not advanced**"))).toBe(true);
+    expect(bullets.at(-1)).toContain("not shown to the reviewer in full");
+  });
+
+  test("the check and the comment carry it once, under the findings and ahead of what is clipped first", () => {
+    const outcome: ReviewOutcome = {
+      kind: "reported",
+      report: filed(["original_text_altered", "original_field_altered"]),
+    };
+    const check = renderCheck(outcome);
+    expect(count(check.text, PARAGRAPH)).toBe(1);
+    expect(check.text).toContain(`\n\n${PARAGRAPH}\n\n`);
+    // The Worker clips a long check from its end: the changed-files list and the footer go first.
+    const at = check.text.indexOf(PARAGRAPH);
+    expect(at).toBeGreaterThan(check.text.indexOf("### Findings"));
+    expect(at).toBeLessThan(check.text.indexOf("<details>"));
+    expect(at).toBeLessThan(check.text.indexOf("An automated review of the changes"));
+    expect(check.title).not.toContain("Contributors add");
+    expect(check.summary).not.toContain("Contributors add");
+    const comment = renderComment(outcome, "0123456789abcdef0123456789abcdef01234567");
+    expect(count(comment, PARAGRAPH)).toBe(1);
+    // It reads as a paragraph after the list, not as part of the last bullet.
+    expect(comment).toMatch(/\n- [^\n]*\n\nContributors add/);
+  });
+
+  test("the check of recorded data that changed, and of an ordinary failure, does not carry it", () => {
+    const replaced = filed(["recording_replaced"], { criteria: { no_degradation: "unknown" } });
+    expect(renderCheck({ kind: "reported", report: replaced }).text).not.toContain(
+      "Contributors add",
+    );
+    const ordinary = filed(["data_removed"]);
+    expect(renderCheck({ kind: "reported", report: ordinary }).text).not.toContain(
+      "Contributors add",
+    );
+    for (const o of everyOutcome()) {
+      expect(renderCheck(o).text, o.kind).not.toContain("Contributors add");
+    }
+  });
+});
+
 describe("the callback body becomes an outcome, and never a verdict by itself", () => {
   test("a good report is a reported outcome", () => {
     const o = parseCallbackOutcome({ outcome: "reported", report: report(), error: undefined });
@@ -1247,7 +1437,7 @@ describe("the refusal at the edit cap (ADR 0107, decision 4)", () => {
   });
 
   test("no other error has that title, and its summary is its own", () => {
-    for (const error of RUN_ERRORS.filter((w) => w !== "edit_limit")) {
+    for (const error of RUN_ERRORS.filter((w) => w !== "edit_limit" && w !== "model_truncated")) {
       const r = renderCheck({ kind: "error", error });
       expect(r.title, error).toBe("Could not decide");
       expect(r.summary, error).not.toContain("the most one commit gets");
@@ -2200,6 +2390,17 @@ describe("the check text of version 2", () => {
         "No verdict was reached, so this check does not pass. A NEMAR administrator needs to look at this pull request.",
       );
     }
+  });
+
+  test("a review that used all its room does not pass and tells the author to split the pull request", () => {
+    const outcome = { kind: "error", error: "model_truncated" } as const;
+    expect(conclusionOf(outcome)).toBe("action_required");
+    const r = renderCheck(outcome);
+    expect(r.title).toBe("Could not decide: split this pull request");
+    expect(r.summary).toContain("used all the room it is given");
+    expect(r.summary).toContain("Split it into smaller pull requests");
+    // The other errors keep the plain title.
+    expect(renderCheck({ kind: "error", error: "model_refused" }).title).toBe("Could not decide");
   });
 
   test("conclusionOf is never skipped for a reported review, at any stage", () => {

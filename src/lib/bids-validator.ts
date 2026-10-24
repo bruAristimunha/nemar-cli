@@ -4,15 +4,15 @@
  * Wraps the BIDS validator (via Deno subprocess) to validate datasets.
  * The validator version is pinned exactly via `validator-version.json` so the
  * CLI and the per-dataset CI workflow always resolve the same release (see
- * issue #586). The weekly `bump-validator.yml` workflow opens a PR when JSR
- * publishes a newer 2.x release.
+ * issue #586). The monthly `bump-validator.yml` workflow opens a PR when JSR
+ * publishes a newer stable release, of any major version (issue #1036).
  *
  * Requirements:
  * - Deno must be installed (https://deno.com)
  * - Network access for first run or when updating
  */
 
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "bun";
@@ -21,7 +21,10 @@ import validatorPin from "../../validator-version.json" with { type: "json" };
 
 export const VALIDATOR_VERSION = validatorPin.version;
 const VALIDATOR_JSR_SPECIFIER = `${validatorPin.specifier}@${VALIDATOR_VERSION}`;
-const STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000; // 1 day — pin changes weekly via bump-validator.yml
+const STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000; // 1 day — pin changes monthly via bump-validator.yml
+
+/** The validator's exit code when it finds errors in a dataset. 0 means valid; any other exit is a failed run. */
+export const VALIDATOR_ERRORS_FOUND_EXIT = 16;
 
 /**
  * BIDS validation issue from the validator
@@ -59,6 +62,8 @@ export interface BidsValidationResult {
   summary: BidsSummary;
   errorCount: number;
   warningCount: number;
+  /** The @bids/validator release that produced this result: the pin, which runs at that exact version. */
+  validatorVersion: string;
 }
 
 /**
@@ -139,6 +144,7 @@ export async function updateValidatorCache(): Promise<string | null> {
       cmd: [
         "deno",
         "run",
+        "--node-modules-dir=none",
         `--reload=${VALIDATOR_JSR_SPECIFIER}`,
         "-ERWN",
         VALIDATOR_JSR_SPECIFIER,
@@ -233,6 +239,32 @@ function buildValidatorArgs(
 }
 
 /**
+ * A colour or cursor sequence. Deno writes these to stderr unless NO_COLOR reaches it, and it lets
+ * FORCE_COLOR override NO_COLOR, so a failure message is stripped here rather than trusted.
+ */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: matching the escape byte is the point
+const ANSI_ESCAPE = /\u001b\[[0-9;]*[A-Za-z]/g;
+
+/**
+ * The line of a failed validator run's stderr that says why it failed, or undefined when stderr has
+ * nothing to say. The validator is a Deno program: an uncaught error prints an `error:` line and
+ * then stack-frame lines (`at ...`), and a cold cache prints `Download` progress lines before
+ * either. So the reason is the first `error:` line, or else the last line that is not a stack
+ * frame, with colour codes removed first so the prefixes match.
+ */
+export function validatorFailureReason(stderr: string): string | undefined {
+  const lines = stderr
+    .replace(ANSI_ESCAPE, "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "" && !line.startsWith("Download"));
+  return (
+    lines.find((line) => line.startsWith("error:")) ??
+    lines.filter((line) => !line.startsWith("at ")).pop()
+  );
+}
+
+/**
  * Validate a BIDS dataset (JSON mode, for programmatic use by upload command).
  *
  * @param datasetPath - Path to the BIDS dataset directory
@@ -249,18 +281,24 @@ export async function validateBidsDataset(
     cmd: ["deno", ...args],
     stdout: "pipe",
     stderr: "pipe",
+    // NO_COLOR asks Deno for plain output, but Deno lets FORCE_COLOR override it (checked on Deno 2.9
+    // with both set), so the request is not a guarantee. validatorFailureReason strips colour codes
+    // itself, which is why FORCE_COLOR stays in the environment: nothing else reads this stderr.
+    env: { ...process.env, NO_COLOR: "1" },
   });
 
   const stdout = await new Response(proc.stdout).text();
   const stderr = await new Response(proc.stderr).text();
   const exitCode = await proc.exited;
 
-  // Handle errors
-  if (exitCode !== 0 && !stdout.trim()) {
+  // 0 means valid and 16 means the validator found errors. Any other exit is a failed run, and the
+  // validator's own error line says why.
+  if (exitCode !== 0 && exitCode !== VALIDATOR_ERRORS_FOUND_EXIT) {
+    const reason = validatorFailureReason(stderr);
     throw new Error(
-      stderr.includes("error:")
-        ? stderr.split("\n").find((l) => l.includes("error:")) || "Validation failed"
-        : `Validation failed with exit code ${exitCode}`,
+      reason
+        ? `BIDS validator failed (exit ${exitCode}): ${reason}`
+        : `BIDS validator failed with exit code ${exitCode}`,
     );
   }
 
@@ -279,7 +317,11 @@ export async function validateBidsDataset(
     throw new Error(`Failed to parse validator output: ${stdout.slice(0, 200)}`);
   }
 
-  const issues = result.issues.issues || [];
+  // A report without a list of issues is not a clean report: refuse it rather than read it as valid.
+  if (!Array.isArray(result?.issues?.issues)) {
+    throw new Error("The BIDS validator's report has no list of issues");
+  }
+  const issues = result.issues.issues;
   const errorCount = issues.filter((i) => i.severity === "error").length;
   const warningCount = issues.filter((i) => i.severity === "warning").length;
 
@@ -290,6 +332,7 @@ export async function validateBidsDataset(
     summary: result.summary,
     errorCount,
     warningCount,
+    validatorVersion: VALIDATOR_VERSION,
   };
 }
 
@@ -314,6 +357,85 @@ export async function runBidsValidatorDirect(
   const exitCode = await proc.exited;
 
   return { stdout, stderr, exitCode };
+}
+
+/**
+ * Add the validator version to a `--json` report. The report is the validator's own JSON object,
+ * so the version is one more top-level key, and the report stays on one line. Output that is not a
+ * JSON object is refused: a `--json` consumer must not read it as a report.
+ */
+export function withValidatorVersion(report: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(report);
+  } catch {
+    throw new Error("The BIDS validator did not print a JSON report");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("The BIDS validator's JSON report is not an object");
+  }
+  return JSON.stringify({ ...parsed, validatorVersion: VALIDATOR_VERSION });
+}
+
+/**
+ * The file the validator is asked to write its report to, found among the pass-through arguments
+ * of `nemar dataset validate`: `--outfile <file>`, `--outfile=<file>` or `-o <file>`. The last one
+ * wins. The value is the next argument whatever it looks like, because that is how the validator
+ * reads it, and a flag with nothing after it names no file.
+ */
+export function reportFileFromArgs(args: string[]): string | undefined {
+  let file: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--outfile" || arg === "-o") {
+      const value = args[i + 1];
+      if (value) {
+        file = value;
+        i++;
+      }
+    } else if (arg.startsWith("--outfile=") && arg.length > "--outfile=".length) {
+      file = arg.slice("--outfile=".length);
+    }
+  }
+  return file;
+}
+
+/**
+ * Add the validator release to the report file the validator wrote for `--outfile`, so a report on
+ * disk names its release just as one on stdout does. A `--json` report gets the key that
+ * withValidatorVersion adds and stays on one line. A text report gets the Validator line that the
+ * console report ends with. A target that is not a regular file, such as /dev/null, holds no
+ * report to add to and is left alone. A missing file throws: the validator exited as if it had
+ * written a report, and it wrote none.
+ */
+export function addValidatorVersionToReport(reportPath: string, json: boolean): void {
+  try {
+    if (!statSync(reportPath).isFile()) return;
+  } catch (error) {
+    if ((error as { code?: string }).code === "ENOENT") {
+      throw new Error(`The BIDS validator exited normally but wrote no report to ${reportPath}`);
+    }
+    throw error;
+  }
+
+  const report = readFileSync(reportPath, "utf-8");
+  if (json) {
+    let stamped: string;
+    try {
+      stamped = withValidatorVersion(report);
+    } catch {
+      throw new Error(
+        `The BIDS validator's report file does not hold a JSON report: ${reportPath}`,
+      );
+    }
+    writeFileSync(reportPath, stamped);
+    return;
+  }
+  const separator = report === "" || report.endsWith("\n") ? "" : "\n";
+  writeFileSync(
+    reportPath,
+    `${report}${separator}Validator: @bids/validator ${VALIDATOR_VERSION}\n`,
+  );
 }
 
 /**
@@ -380,6 +502,7 @@ export function formatValidationResult(result: BidsValidationResult, color = tru
     lines.push(`  Modalities: ${result.summary.modalities.join(", ")}`);
   }
   lines.push(`  Schema: BIDS ${result.summary.schemaVersion}`);
+  lines.push(`  Validator: @bids/validator ${result.validatorVersion}`);
   lines.push("");
 
   // Final count

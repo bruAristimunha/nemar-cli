@@ -169,8 +169,9 @@ contributor back, which ADR 0107 settled).
 belongs to the commit it read, an approval is the administrator's OWN act from their machine with their
 own GitHub login and no Worker code path approves, a failing, running or unreadable review needs
 `--force`, nothing merges without `--merge` or a `y` in `nemar admin pr-reviews next`, both of which
-read GitHub's state before approving and need `clean`, and each Worker lists only the datasets it
-owns).
+read GitHub's state before approving and need `clean`, each Worker lists only the datasets it
+owns, and an administrator runs a finished review again only with `start --redo`, which never
+supersedes a running one).
 0094 (the upload save step skips re-reading annexed content only once recorded annexed bytes reach
 1 GiB, only for files whose size and mtime still match the upload plan, and only while it can clear
 `assume-unchanged` safely; failures to verify or clear the state fail the save),
@@ -180,7 +181,13 @@ them),
 under a `site:` key, `X-Forwarded-For` is never read when `CF-Connecting-IP` is present, the caller
 must set it from its own `CF-Connecting-IP` and never pass a visitor's header through, and the
 Cloudflare account is the trust boundary),
-0099 (counters are fixed windows and a refusal writes nothing).
+0099 (counters are fixed windows and a refusal writes nothing),
+0109 (a modified table or sidecar counts as read when the exact change summary accounts for it;
+an unrelocated or unkept removal is then a platform blocker that only lowers, placed first; the
+original authors' content is protected by facts the platform computes: a README or CHANGES line
+altered beyond a minor edit, an author-owned field or a participant value changed fails, a replaced
+recording or an undecidable comparison holds the pull request, and the README is compared with the
+one at the first version tag, else with the merge base; the facts carry only class words and counts).
 
 **Account copy and the profile-gap matrix are declared once, in
 [`shared/contract/account-copy.ts`](shared/contract/account-copy.ts) and

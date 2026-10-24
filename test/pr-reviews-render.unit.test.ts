@@ -21,6 +21,8 @@ import {
   verdictOf,
 } from "../shared/pr-review";
 import {
+  REDO_VERDICTS,
+  START_VERDICTS,
   ageOf,
   briefLines,
   namingFactLines,
@@ -28,6 +30,7 @@ import {
   plain,
   renderQueue,
   reportLines,
+  splitStartCandidates,
   standingLines,
   startAllQuestion,
   startedWord,
@@ -696,7 +699,7 @@ describe("a version 2 report on the terminal", () => {
   });
 
   /** A full report: the screen let the pull request through, and the review read the files and answered. */
-  const full = (criteriaOver: Record<string, string> = {}) =>
+  const full = (criteriaOver: Record<string, string> = {}, findings: unknown[] = []) =>
     parsePrReviewReport({
       v: 2,
       stage: "full",
@@ -710,7 +713,7 @@ describe("a version 2 report on the terminal", () => {
         description_not_misleading: "pass",
         ...criteriaOver,
       },
-      findings: [],
+      findings,
       summary: "Adds a subject.",
       steering: false,
       evidence: evidence({ files_read: 1, truncated: false, changelog_entry: "added" }),
@@ -719,6 +722,43 @@ describe("a version 2 report on the terminal", () => {
         review: { input_tokens: 5000, output_tokens: 700 },
       },
     });
+
+  test("what to do instead of changing the original authors' content ends the findings, once, and only for them", () => {
+    const paragraph =
+      "Contributors add to what the original authors published and do not change it. Describe your change in the CHANGES entry for the new version. Put new information in a new, clearly separate section of the README. If something the authors wrote is wrong, open an issue for the NEMAR administrators, who can correct it; an administrator can also review this pull request by hand.";
+    const filed = (...codes: string[]) =>
+      brief(
+        full(
+          { no_degradation: "fail" },
+          codes.map((code) => ({
+            criterion: "no_degradation",
+            severity: "blocker",
+            code,
+            path: null,
+            note: "A fixed note.",
+          })),
+        ),
+      );
+    for (const codes of [
+      ["original_text_altered"],
+      ["original_field_altered"],
+      ["original_text_altered", "original_field_altered"],
+    ]) {
+      const lines = filed(...codes);
+      expect(
+        lines.filter((l) => l === paragraph),
+        codes.join(),
+      ).toHaveLength(1);
+      // The last two lines of the card: a blank line, then the paragraph.
+      expect(lines.slice(-2), codes.join()).toEqual(["", paragraph]);
+      expect(lines).toContain("Findings:");
+    }
+    // Recorded data that changed is a question for a person, and this paragraph does not answer it.
+    for (const other of [["recording_replaced"], ["data_removed"]]) {
+      expect(filed(...other).join("\n"), other.join()).not.toContain("Contributors add");
+    }
+    expect(brief(full()).join("\n")).not.toContain("Contributors add");
+  });
 
   test("a screen report and a full report keep their own words", () => {
     const stopped = brief(screen());
@@ -788,6 +828,64 @@ describe("startAllQuestion", () => {
       "Start the automated review of 3 pull requests? Each is one run of up to two model calls.",
     );
     expect(startAllQuestion(3)).not.toContain("one or two");
+  });
+
+  test("a redo names the finished reviews it includes, and still says what a review costs", () => {
+    expect(startAllQuestion(1, true)).toBe(
+      "Start or redo the automated review of 1 pull request, finished reviews included? Each is one run of up to two model calls.",
+    );
+    expect(startAllQuestion(3, true)).toContain("3 pull requests, finished reviews included");
+    // The default is not a redo.
+    expect(startAllQuestion(3, false)).toBe(startAllQuestion(3));
+  });
+});
+
+describe("what start --all takes up", () => {
+  type E = {
+    draft: boolean;
+    verdict: (typeof REDO_VERDICTS)[number] | "in_progress" | "exempt";
+    detail: string | null;
+    id: string;
+  };
+  const entry = (id: string, verdict: E["verdict"], over: Partial<E> = {}): E => ({
+    id,
+    draft: false,
+    verdict,
+    detail: null,
+    ...over,
+  });
+  const entries: E[] = [
+    entry("new", "not_reviewed"),
+    entry("undecided", "could_not_decide"),
+    entry("capped", "could_not_decide", { detail: "edit_limit" }),
+    entry("passed", "pass"),
+    entry("failed", "fail"),
+    entry("uncertain", "uncertain"),
+    entry("running", "in_progress"),
+    entry("exempt", "exempt"),
+    entry("draft", "pass", { draft: true }),
+  ];
+  const ids = (xs: E[]) => xs.map((e) => e.id);
+
+  test("without --redo only a commit with no review, or one that ended without a verdict", () => {
+    const got = splitStartCandidates(entries, false);
+    expect(ids(got.todo)).toEqual(["new", "undecided"]);
+    expect(ids(got.capped)).toEqual(["capped"]);
+    expect(ids(got.drafts)).toEqual(["draft"]);
+  });
+
+  test("with --redo a finished review joins them; a running one, an exempt one, a draft and a capped commit do not", () => {
+    const got = splitStartCandidates(entries, true);
+    expect(ids(got.todo)).toEqual(["new", "undecided", "passed", "failed", "uncertain"]);
+    expect(ids(got.capped)).toEqual(["capped"]);
+    expect(ids(got.drafts)).toEqual(["draft"]);
+  });
+
+  test("the verdicts asked of the Worker are the ones taken up", () => {
+    expect(START_VERDICTS).toEqual(["not_reviewed", "could_not_decide"]);
+    expect(REDO_VERDICTS).toEqual([...START_VERDICTS, "pass", "fail", "uncertain"]);
+    expect(REDO_VERDICTS).not.toContain("in_progress" as never);
+    expect(REDO_VERDICTS).not.toContain("exempt" as never);
   });
 });
 
@@ -1057,5 +1155,34 @@ describe("waiverLines", () => {
         expect(l.length).toBeLessThan(400);
       }
     });
+  });
+});
+
+describe("start --redo wording", () => {
+  test("a redo that finds the review still running says why it waits", () => {
+    const text = notStartedText({
+      environment: "production",
+      dispatched: false,
+      reason: "review_running",
+      review_id: 4,
+      author_login: null,
+      redo: true,
+    } satisfies StartReviewResponse);
+    expect(text).toBe(
+      "not started: a review of this commit is running, and a redo waits until it reports or its time (about an hour) is up",
+    );
+  });
+
+  test("a redone commit reads as started again", () => {
+    expect(
+      startedWord({
+        environment: "production",
+        dispatched: true,
+        reason: "redispatched",
+        review_id: 4,
+        author_login: null,
+        redo: true,
+      }),
+    ).toBe("started again");
   });
 });
