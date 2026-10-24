@@ -10,7 +10,8 @@
  *   DELETE /admin/pr-review-authors/:login        remove that decision
  *   POST   /admin/pr-reviews/:dataset/:pr/start   review a pull request that is already open (or
  *                                                 start again a commit whose review ended without a
- *                                                 verdict); the Worker reads it from GitHub itself
+ *                                                 verdict, or with `?redo=1` one that has a result);
+ *                                                 the Worker reads it from GitHub itself
  *   POST   /admin/pr-reviews/:dataset/:pr/allow   waive the naming rule for an owner's or an
  *                                                 administrator's pull request at its current commit
  *                                                 (`{reason, head_sha?}`); recorded, and the check
@@ -140,7 +141,11 @@ export function registerPrReviewRoutes(admin: AdminRouter): void {
   admin.post("/pr-reviews/:dataset/:pr/start", async (c) => {
     try {
       const { dataset, pr } = target(c);
-      return c.json(await startPullRequestReview(c.env, c.get("user").id, dataset, pr));
+      return c.json(
+        await startPullRequestReview(c.env, c.get("user").id, dataset, pr, {
+          redo: truthy(c.req.query("redo")),
+        }),
+      );
     } catch (err) {
       return fail(c, err);
     }

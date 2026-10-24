@@ -24,7 +24,10 @@ import {
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { parse } from "yaml";
-import { PR_REVIEW_DEADLINE_MINUTES } from "../backend/src/services/pr-review";
+import {
+  PR_REVIEW_DEADLINE_MINUTES,
+  PR_REVIEW_JOB_MINUTES,
+} from "../backend/src/services/pr-review";
 import {
   CALLBACK_ATTEMPTS,
   CALLBACK_ORIGINS,
@@ -615,6 +618,8 @@ describe("failure and logging", () => {
     }
     const worst = SETUP_MINUTES + EVIDENCE_MINUTES + stages + minutes(callbackMs);
     expect(job["timeout-minutes"]).toBe(50);
+    // An administrator's start leaves a claimed review alone for this long (see isRestartable).
+    expect(PR_REVIEW_JOB_MINUTES).toBe(job["timeout-minutes"]);
     expect(PR_REVIEW_DEADLINE_MINUTES).toBe(60);
     expect(worst).toBeLessThanOrEqual(job["timeout-minutes"]);
     expect(job["timeout-minutes"]).toBeLessThan(PR_REVIEW_DEADLINE_MINUTES);

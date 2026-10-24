@@ -160,6 +160,16 @@ export const PR_REVIEW_BASE_BRANCH = "main";
 export const PR_REVIEW_DEADLINE_MINUTES = 60;
 
 /**
+ * How long a job that has claimed its review may still be running: the review workflow's
+ * `timeout-minutes`, counted from the claim. The deadline above runs from when the row was recorded,
+ * so a job that waited in GitHub's queue can still be inside this limit when the watchdog has closed
+ * its row as `unreported`, and an administrator's start must not supersede it (it would waste the
+ * job's model calls and refuse its report). `test/pr-review-workflow.test.ts` pins this to the
+ * workflow.
+ */
+export const PR_REVIEW_JOB_MINUTES = 50;
+
+/**
  * A result that did not reach GitHub is eligible to be tried again this long after it was decided,
  * up to {@link PUBLISH_MAX_ATTEMPTS} times. The watchdog runs on a 30-minute tick, so the real gap
  * between attempts is that tick, and five attempts take about two and a half hours.
@@ -844,6 +854,13 @@ export interface PrReviewOptions {
    * not run. It names no sender, so whether the pull request is exempt is judged on its author alone.
    */
   adminStart?: boolean;
+  /**
+   * The administrator also asked for a commit whose review has a result (`reported`) to be run
+   * again (`start --redo`). Meaningful only with `adminStart`: nothing else asks for it. It reaches
+   * no further than that: a review that is running is not superseded, and the gate, the block and
+   * the exemption apply as to any start.
+   */
+  redo?: boolean;
 }
 
 /**
@@ -1154,9 +1171,9 @@ async function decideInserted(
  * current commit, which is what force-pushing back to an earlier reviewed commit means), its
  * stored result is re-stated on the pull request, and a review whose dispatch failed is tried
  * again. Nothing else is reviewed twice, except that an administrator's start also restarts a
- * commit whose review ended without a verdict, and an edit of the title, the body or the base, a
- * reopening and a marking as ready restart the review of the commit they are on, whatever state
- * that is in (see `isRestartable`).
+ * commit whose review ended without a verdict (and, for a `redo`, one that has a result), and an
+ * edit of the title, the body or the base, a reopening and a marking as ready restart the review of
+ * the commit they are on, whatever state that is in (see `isRestartable`).
  */
 async function handleRepeat(
   env: Bindings,
@@ -1186,7 +1203,10 @@ async function handleRepeat(
   // delivery, and is never told "too many edits" (a declined restart is not counted either).
   let current = existing;
   const textChange = changesTheText(pr);
-  const tries = textChange ? EDIT_RESTART_TRIES : 1;
+  // An administrator's start is tried again like a change of the text: the row it meant to restart
+  // may have moved between the read and the write (the watchdog closing it, a report stored), and
+  // the restart is then tried against the row as it is now instead of answering `duplicate`.
+  const tries = textChange || options.adminStart === true ? EDIT_RESTART_TRIES : 1;
   for (let attempt = 0; attempt < tries; attempt++) {
     if (
       textChange &&
@@ -1200,6 +1220,15 @@ async function handleRepeat(
       continue;
     }
     if (!(await isRestartable(db, current, pr, options))) break;
+    // A redo does not change the text the review judged, so a block on the author does not replace
+    // a finished review with a decline: the answer is the block, and the stored result stands.
+    if (
+      options.redo === true &&
+      current.state === "reported" &&
+      (await gateDecision(env, pr, options, "on_record")) === "blocked"
+    ) {
+      return no("contributor_paused", existing.id);
+    }
     const restarted = await restartReview(env, current, pr, secret, options);
     if (restarted) return restarted;
     current = (await readRow(db, existing.id)) ?? current;
@@ -1207,6 +1236,11 @@ async function handleRepeat(
 
   const outcome = outcomeOfRow(current);
   if (outcome) await publishOutcome(env, current, outcome, { commentOnly: true });
+  // A redo that found the review still running says so: "already has a review" would be true and
+  // would read as if the redo had been refused for having a result.
+  if (options.adminStart === true && options.redo === true && (await mayBeRunning(db, current))) {
+    return no("review_running", existing.id);
+  }
   return no("duplicate", existing.id);
 }
 
@@ -1273,8 +1307,12 @@ function changesTheText(pr: PrIntake): boolean {
  * A commit that was declined, ended in an error or never reported is restarted otherwise only when
  * an administrator asks by name: a new delivery of the same commit must not buy a second model
  * call. So is one handed to GitHub that is past the watchdog's deadline: the production watchdog
- * would have closed it as `unreported`, and the dev Worker never runs it. A review that is running,
- * or has a result, is not restarted by anything else.
+ * would have closed it as `unreported`, and the dev Worker never runs it, unless a job claimed it
+ * less than its limit ago ({@link mayBeRunning}). A review that has a result (`reported`) is
+ * restarted by an administrator only when the start says `redo`, which is the administrator
+ * choosing to pay for a second run of a finished review (the owner re-judges after the rules
+ * changed). A review that is running is not restarted by anything else, a redo included:
+ * superseding it would waste its calls and could cut off a job about to report.
  */
 async function isRestartable(
   db: Db,
@@ -1285,18 +1323,34 @@ async function isRestartable(
   if (changesTheText(pr)) return true;
   if (row.state === "errored" && row.detail === "dispatch_failed") return true;
   if (options.adminStart !== true) return false;
+  if (await mayBeRunning(db, row)) return false;
   if (row.state === "declined" || row.state === "errored" || row.state === "unreported") {
     return true;
   }
-  if (row.state !== "dispatched") return false;
-  const overdue = await db
+  if (row.state === "reported") return options.redo === true;
+  // A review handed to GitHub, past the deadline, and no job inside its limit: it never came back.
+  return row.state === "dispatched";
+}
+
+/**
+ * Whether a job may still be working on the row: it was handed to GitHub less than the watchdog's
+ * deadline ago, or a job claimed it less than the workflow's limit ago (the deadline runs from when
+ * the row was recorded and the limit from the claim, so the watchdog can have closed a row as
+ * `unreported` while its job is still inside its limit). An administrator's start never supersedes
+ * such a review: its model calls would be wasted and its report refused.
+ */
+async function mayBeRunning(db: Db, row: ReviewRow): Promise<boolean> {
+  if (row.state !== "dispatched" && row.state !== "unreported") return false;
+  const live = await db
     .prepare(
-      `SELECT 1 AS overdue FROM pr_reviews
-        WHERE id = ? AND created_at < datetime('now', '-' || ? || ' minutes')`,
+      `SELECT 1 AS live FROM pr_reviews
+        WHERE id = ? AND state IN ('dispatched', 'unreported')
+          AND ((state = 'dispatched' AND created_at >= datetime('now', '-' || ? || ' minutes'))
+            OR claimed_at >= datetime('now', '-' || ? || ' minutes'))`,
     )
-    .bind(row.id, PR_REVIEW_DEADLINE_MINUTES)
-    .first<{ overdue: number }>();
-  return overdue !== null;
+    .bind(row.id, PR_REVIEW_DEADLINE_MINUTES, PR_REVIEW_JOB_MINUTES)
+    .first<{ live: number }>();
+  return live !== null;
 }
 
 /**
@@ -1308,8 +1362,8 @@ async function isRestartable(
  * made a call, and several quick edits before it starts are still one run). A restart of a row that
  * did spend one adds a second run to its `attempts`, and the administrator's volume count sums
  * `attempts` over the rows that did. `stage` is the stage of a stored version 2 report and is
- * absent for any other row; only a change of the text restarts a reported row, and
- * {@link stageOfReport} reads its stage for this. `claimed_at` is left out by a caller that does not
+ * absent for any other row; only a change of the text, or an administrator's redo, restarts a
+ * reported row, and {@link stageOfReport} reads its stage for this. `claimed_at` is left out by a caller that does not
  * have it (the volume's groups), and absent is not null: it says nothing, so the row is counted.
  *
  * A review refused at the edit cap (`edit_limit`) counts as a spent call: it is a refusal and not a
@@ -1378,11 +1432,13 @@ async function restartReview(
   const paused = (await gateDecision(env, pr, options, "on_record")) === "blocked";
   const nonce = crypto.randomUUID();
   // The cap's count: an administrator's start begins it again when it starts the review (a start
-  // that a block declines is a restart too, and a decline is no run to count), a delivery that
-  // changes the text adds one unless it was declined, and anything else (a push that restarts a
-  // review whose dispatch failed) leaves it as it is.
+  // that a block declines is a restart too, and a decline is no run to count), except a redo of a
+  // finished review, which is no edit and must not lift the cap a contributor is near; a delivery
+  // that changes the text adds one unless it was declined, and anything else (a push that restarts
+  // a review whose dispatch failed) leaves it as it is.
+  const redoOfResult = options.redo === true && existing.state === "reported";
   const count = options.adminStart
-    ? paused
+    ? paused || redoOfResult
       ? "edit_restarts"
       : "0"
     : changesTheText(pr) && !paused
@@ -1395,7 +1451,7 @@ async function restartReview(
               published_at = ${paused ? KEEP_RECENT_DECLINE_STAMP : "NULL"},
               publish_attempts = 0, edit_restarts = ${count}, decided_at = ${paused ? "datetime('now')" : "NULL"},
               created_at = datetime('now'), verdict = NULL, report = NULL
-        WHERE id = ? AND state = ? AND detail IS ? AND edit_restarts = ?`,
+        WHERE id = ? AND state = ? AND detail IS ? AND edit_restarts = ? AND claimed_at IS ?`,
     )
     .bind(
       paused ? "declined" : "dispatched",
@@ -1405,6 +1461,7 @@ async function restartReview(
       existing.state,
       existing.detail,
       existing.editRestarts,
+      existing.claimedAt,
     )
     .run();
   if ((reset.meta.changes ?? 0) !== 1) return null;

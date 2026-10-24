@@ -15,7 +15,9 @@
  * the rule for this commit, `naming_rule` with a failed check when the title or the new dataset
  * name breaks it, and `naming_unchecked` with a check that needs a person when the dataset's name
  * could not be read (whatever the title says). One thing differs, and it is the administrator's choice made by name: a
- * commit whose review ended without a verdict (declined, errored, never reported) is started again.
+ * commit whose review ended without a verdict (declined, errored, never reported) is started again,
+ * and with `redo` so is one whose review has a result (a second run, which costs model calls). A
+ * review that is running is never started again, a redo included: the answer is `review_running`.
  *
  * Nothing here approves, merges or comments on a pull request itself; the review's own check and
  * comment are published by the same code that publishes them for a delivery.
@@ -137,8 +139,13 @@ export async function startPullRequestReview(
   adminUserId: number,
   datasetId: string,
   prNumber: number,
+  options: { redo?: boolean } = {},
 ): Promise<StartReviewResponse> {
   const environment = environmentName(env);
+  const redo = options.redo === true;
+  // Echoed in every answer when asked for, so a CLI can tell a Worker that honored the flag from
+  // one that predates it and ignored it.
+  const echo = redo ? { redo: true as const } : {};
   if (!ownedHere(env, datasetId)) {
     throw new QueueError(
       404,
@@ -153,6 +160,7 @@ export async function startPullRequestReview(
       reason: "pr_review_disabled",
       review_id: null,
       author_login: null,
+      ...echo,
     };
   }
 
@@ -166,6 +174,7 @@ export async function startPullRequestReview(
       reason: reviewable === "unknown" ? "unknown_dataset" : "dataset_not_reviewable",
       review_id: null,
       author_login: null,
+      ...echo,
     };
   }
 
@@ -178,7 +187,7 @@ export async function startPullRequestReview(
       // The shape a `pull_request` delivery has: GitHub's own record of the pull request, and the
       // repository it targets. `synchronize` is only the delivery's name for "take it up".
       { action: "synchronize", pull_request: pull, repository: base?.repo },
-      { adminStart: true },
+      { adminStart: true, redo },
     );
   } catch (err) {
     // The author is exempt and GitHub would not take the check the naming rule decided on (skipped,
@@ -201,6 +210,7 @@ export async function startPullRequestReview(
     reason: result.reason,
     review_id: result.review_id ?? null,
     author_login: typeof login === "string" && LOGIN.test(login) ? login : null,
+    ...echo,
   };
   // Only a start is a fact worth an audit row; a decision not to start changed nothing an
   // administrator did. And the row is best effort: a review that is already running must not be
@@ -217,6 +227,7 @@ export async function startPullRequestReview(
           head_sha: typeof head === "string" ? head : null,
           reason: answer.reason,
           review_id: answer.review_id,
+          ...(redo ? { redo: true } : {}),
         }),
       }).run();
     } catch (err) {

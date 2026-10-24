@@ -2410,13 +2410,18 @@ export async function getPrReview(
  * Review a pull request that is already open, or start again a commit whose review ended without a
  * verdict. The Worker reads the pull request from GitHub itself; only the dataset and the number are
  * sent. The answer is the review gate's own fixed word (`dispatched`, `duplicate`, ...).
+ *
+ * With `redo`, a commit whose review already has a result is started again too. The Worker echoes
+ * `redo: true` when it honored the flag, and a Worker that predates it ignores the flag and does not.
  */
 export async function startPrReview(
   datasetId: string,
   prNumber: number,
+  options: { redo?: boolean } = {},
 ): Promise<StartReviewResponse> {
+  const query = options.redo ? "?redo=1" : "";
   return request<StartReviewResponse>(
-    `/admin/pr-reviews/${encodeURIComponent(datasetId)}/${prNumber}/start`,
+    `/admin/pr-reviews/${encodeURIComponent(datasetId)}/${prNumber}/start${query}`,
     { method: "POST" },
     true,
   );

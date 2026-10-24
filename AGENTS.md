@@ -169,8 +169,9 @@ contributor back, which ADR 0107 settled).
 belongs to the commit it read, an approval is the administrator's OWN act from their machine with their
 own GitHub login and no Worker code path approves, a failing, running or unreadable review needs
 `--force`, nothing merges without `--merge` or a `y` in `nemar admin pr-reviews next`, both of which
-read GitHub's state before approving and need `clean`, and each Worker lists only the datasets it
-owns).
+read GitHub's state before approving and need `clean`, each Worker lists only the datasets it
+owns, and an administrator runs a finished review again only with `start --redo`, which never
+supersedes a running one).
 0094 (the upload save step skips re-reading annexed content only once recorded annexed bytes reach
 1 GiB, only for files whose size and mtime still match the upload plan, and only while it can clear
 `assume-unchanged` safely; failures to verify or clear the state fail the save),

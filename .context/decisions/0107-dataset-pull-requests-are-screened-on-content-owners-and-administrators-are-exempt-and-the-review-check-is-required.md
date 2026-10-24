@@ -63,12 +63,12 @@ And the review only ever sees a pull request's text and metadata, so a count of 
   When the rule refuses the title or the dataset's new name the check is a failure, and when the dataset's name could not be read it is `action_required`, a check that needs a person and does not pass, whatever the title says: nothing can be waived while the name is unread, so the check, the answer of a start and the list's label all say that the name has to be read first.
   No row is stored, no model is called, nothing is dispatched, and no comment is made.
 - **That applies only to a commit no review has touched.**
-  A commit that has a row keeps what its review said, whoever acts on it next: a force-push back to it, or an administrator's start of a review that has a result.
+  A commit that has a row keeps what its review said, whoever acts on it next: a force-push back to it, or an administrator's start of a review that has a result (unless it is a `--redo`, [ADR 0093](0093-pull-requests-awaiting-approval-are-managed-from-one-admin-command-and-an-approval-is-the-administrators-own.md), amendment of 2026-10-24).
   The exceptions are the deliveries that change the text the review judged: an edit of the title, the body or the base, a reopening and a marking as ready restart the review of a commit that has a row, whoever caused them and an exempt author included (decision 4).
   What takes the place of the stored result is a review that runs again, never `skipped`.
   A row means someone put the commit through review (a stranger's push to an owner's branch, or an author who was not exempt yet), `skipped` counts as passing for a required check, and writing it over a failed or undecided review would erase a verdict nobody exempt gave.
   An exempt author who wants such a commit through pushes a new commit, which is exempt in its own right.
-  An administrator's start of such a commit, and an exempt author's own redelivery of one whose dispatch failed, are handled like anyone's: a review is started again if the earlier one ended without a verdict, and a block on the author holds it back.
+  An administrator's start of such a commit, and an exempt author's own redelivery of one whose dispatch failed, are handled like anyone's: a review is started again if the earlier one ended without a verdict (or has a result, for a `--redo`), and a block on the author holds it back.
 - **`skipped` does not break "unknown is never green" (ADR 0092, ADR 0053, ADR 0086).**
   GitHub counts `skipped` as passing for a required check, which is why ADR 0092 kept it out of `conclusionOf`.
   It is now the conclusion of exactly one outcome, `exempt`, and of no other, and a test pins that.
@@ -215,6 +215,7 @@ The owner set the models, the budgets and the prompt on 2026-10-16, after a comp
   `attempts` goes up by one when the earlier run could have cost a model call, as for any restart, and the answer's reason word is `redispatched_after_edit`.
   A review that was handed to GitHub and never claimed could not have cost one, so several quick edits before the job starts are still one run.
   A contributor an administrator has blocked is declined again, as for any restart.
+  An administrator's `start --redo` uses this same restart for a finished review (ADR 0093, amendment of 2026-10-24); it never supersedes a running one and leaves the count of a finished review as it is.
   The restart is tried against the row as it is now.
   If a result or the watchdog's verdict lands between the Worker's read of the row and its write, the write finds nothing to change, and the edit is tried again on a fresh read, up to three times in all, so it is not dropped for having lost that race.
   A reopening and a marking as ready are retried the same way.

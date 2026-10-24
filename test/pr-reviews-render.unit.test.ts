@@ -21,6 +21,8 @@ import {
   verdictOf,
 } from "../shared/pr-review";
 import {
+  REDO_VERDICTS,
+  START_VERDICTS,
   ageOf,
   briefLines,
   namingFactLines,
@@ -28,6 +30,7 @@ import {
   plain,
   renderQueue,
   reportLines,
+  splitStartCandidates,
   standingLines,
   startAllQuestion,
   startedWord,
@@ -826,6 +829,64 @@ describe("startAllQuestion", () => {
     );
     expect(startAllQuestion(3)).not.toContain("one or two");
   });
+
+  test("a redo names the finished reviews it includes, and still says what a review costs", () => {
+    expect(startAllQuestion(1, true)).toBe(
+      "Start or redo the automated review of 1 pull request, finished reviews included? Each is one run of up to two model calls.",
+    );
+    expect(startAllQuestion(3, true)).toContain("3 pull requests, finished reviews included");
+    // The default is not a redo.
+    expect(startAllQuestion(3, false)).toBe(startAllQuestion(3));
+  });
+});
+
+describe("what start --all takes up", () => {
+  type E = {
+    draft: boolean;
+    verdict: (typeof REDO_VERDICTS)[number] | "in_progress" | "exempt";
+    detail: string | null;
+    id: string;
+  };
+  const entry = (id: string, verdict: E["verdict"], over: Partial<E> = {}): E => ({
+    id,
+    draft: false,
+    verdict,
+    detail: null,
+    ...over,
+  });
+  const entries: E[] = [
+    entry("new", "not_reviewed"),
+    entry("undecided", "could_not_decide"),
+    entry("capped", "could_not_decide", { detail: "edit_limit" }),
+    entry("passed", "pass"),
+    entry("failed", "fail"),
+    entry("uncertain", "uncertain"),
+    entry("running", "in_progress"),
+    entry("exempt", "exempt"),
+    entry("draft", "pass", { draft: true }),
+  ];
+  const ids = (xs: E[]) => xs.map((e) => e.id);
+
+  test("without --redo only a commit with no review, or one that ended without a verdict", () => {
+    const got = splitStartCandidates(entries, false);
+    expect(ids(got.todo)).toEqual(["new", "undecided"]);
+    expect(ids(got.capped)).toEqual(["capped"]);
+    expect(ids(got.drafts)).toEqual(["draft"]);
+  });
+
+  test("with --redo a finished review joins them; a running one, an exempt one, a draft and a capped commit do not", () => {
+    const got = splitStartCandidates(entries, true);
+    expect(ids(got.todo)).toEqual(["new", "undecided", "passed", "failed", "uncertain"]);
+    expect(ids(got.capped)).toEqual(["capped"]);
+    expect(ids(got.drafts)).toEqual(["draft"]);
+  });
+
+  test("the verdicts asked of the Worker are the ones taken up", () => {
+    expect(START_VERDICTS).toEqual(["not_reviewed", "could_not_decide"]);
+    expect(REDO_VERDICTS).toEqual([...START_VERDICTS, "pass", "fail", "uncertain"]);
+    expect(REDO_VERDICTS).not.toContain("in_progress" as never);
+    expect(REDO_VERDICTS).not.toContain("exempt" as never);
+  });
 });
 
 describe("tokenText", () => {
@@ -1094,5 +1155,34 @@ describe("waiverLines", () => {
         expect(l.length).toBeLessThan(400);
       }
     });
+  });
+});
+
+describe("start --redo wording", () => {
+  test("a redo that finds the review still running says why it waits", () => {
+    const text = notStartedText({
+      environment: "production",
+      dispatched: false,
+      reason: "review_running",
+      review_id: 4,
+      author_login: null,
+      redo: true,
+    } satisfies StartReviewResponse);
+    expect(text).toBe(
+      "not started: a review of this commit is running, and a redo waits until it reports or its time (about an hour) is up",
+    );
+  });
+
+  test("a redone commit reads as started again", () => {
+    expect(
+      startedWord({
+        environment: "production",
+        dispatched: true,
+        reason: "redispatched",
+        review_id: 4,
+        author_login: null,
+        redo: true,
+      }),
+    ).toBe("started again");
   });
 });

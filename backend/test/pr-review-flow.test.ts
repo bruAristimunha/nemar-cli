@@ -3553,6 +3553,96 @@ describe("the cap on restarts a pull request's text can cause (ADR 0107)", () =>
     expect(dispatchesMade()).toHaveLength(made + 2);
   });
 
+  test("an administrator's redo restarts a finished review on its row, and the old job's token is refused", async () => {
+    const id = (await deliver(prEvent())).body.review_id as number;
+    const oldToken = payloadOf(0).callback_token as string;
+    expect((await claim(id, oldToken)).status).toBe(200);
+    expect(
+      (await callback(id, { outcome: "reported", report: goodReport() }, oldToken)).status,
+    ).toBe(200);
+    expect(rows()[0]).toMatchObject({ state: "reported", verdict: "pass" });
+    const made = dispatchesMade().length;
+
+    // The control: a start without redo leaves the result alone.
+    const plain = await handlePullRequestEvent(
+      env(),
+      prEvent({ action: "synchronize", sender: null }),
+      {
+        adminStart: true,
+      },
+    );
+    expect(plain).toMatchObject({ dispatched: false, reason: "duplicate", review_id: id });
+    expect(rows()[0]).toMatchObject({ state: "reported", verdict: "pass" });
+    expect(dispatchesMade()).toHaveLength(made);
+
+    const started = await handlePullRequestEvent(
+      env(),
+      prEvent({ action: "synchronize", sender: null }),
+      {
+        adminStart: true,
+        redo: true,
+      },
+    );
+    expect(started).toMatchObject({ dispatched: true, reason: "redispatched", review_id: id });
+    expect(rows()[0]).toMatchObject({
+      id,
+      state: "dispatched",
+      verdict: null,
+      report: null,
+      claimed_at: null,
+      attempts: 2,
+      edit_restarts: 0,
+    });
+    expect(dispatchesMade()).toHaveLength(made + 1);
+
+    // The superseded job can neither claim again nor report.
+    expect((await claim(id, oldToken)).status).toBe(401);
+    const stale = await callback(id, { outcome: "reported", report: goodReport() }, oldToken);
+    expect(stale.status).toBe(401);
+    expect(rows()[0]).toMatchObject({ state: "dispatched", verdict: null });
+
+    // The new job's token works, and its result is the commit's.
+    const fresh = latestToken();
+    expect((await claim(id, fresh)).status).toBe(200);
+    expect((await callback(id, { outcome: "reported", report: goodReport() }, fresh)).status).toBe(
+      200,
+    );
+    expect(rows()[0]).toMatchObject({ state: "reported", verdict: "pass" });
+  });
+
+  test("an administrator's redo does not supersede a running review: its token still reports", async () => {
+    const id = (await deliver(prEvent())).body.review_id as number;
+    const token = payloadOf(0).callback_token as string;
+    expect((await claim(id, token)).status).toBe(200);
+    const made = dispatchesMade().length;
+
+    const asked = await handlePullRequestEvent(
+      env(),
+      prEvent({ action: "synchronize", sender: null }),
+      {
+        adminStart: true,
+        redo: true,
+      },
+    );
+    expect(asked).toMatchObject({ dispatched: false, reason: "review_running", review_id: id });
+    expect(dispatchesMade()).toHaveLength(made);
+
+    expect((await callback(id, { outcome: "reported", report: goodReport() }, token)).status).toBe(
+      200,
+    );
+    expect(rows()[0]).toMatchObject({ state: "reported", verdict: "pass" });
+  });
+
+  test("redo means nothing to a delivery: a push back to a finished commit still only re-states it", async () => {
+    const id = (await deliver(prEvent())).body.review_id as number;
+    await callback(id, { outcome: "reported", report: goodReport() });
+    const r = await handlePullRequestEvent(env(), prEvent({ action: "synchronize" }), {
+      redo: true,
+    });
+    expect(r).toMatchObject({ dispatched: false, reason: "duplicate", review_id: id });
+    expect(rows()[0]).toMatchObject({ state: "reported", verdict: "pass" });
+  });
+
   test("an administrator's start that lands between the read and the refusal is not overwritten by it", async () => {
     const id = await toTheCap();
     // The job the fifth edit started ends in an error, so the commit is at the cap and an
