@@ -78,7 +78,7 @@ describe("sendBroadcast on the Cloudflare provider", () => {
     expect(sent.map((m) => m.to)).toEqual(["a@nemar.test", "b@nemar.test"]);
     for (const message of sent) {
       expect(message.from).toEqual({ email: "noreply@staging.nemar.test", name: "NEMAR Staging" });
-      expect(message.replyTo).toEqual({ email: REPLY_TO });
+      expect(message.replyTo).toBe(REPLY_TO);
       // The [DEV] wrap is applied once, not twice.
       expect(message.subject).toBe("[DEV] Maintenance window");
       expect(message.html).toContain("DEV BACKEND - NOT PRODUCTION");

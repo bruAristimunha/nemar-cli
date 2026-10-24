@@ -81,10 +81,14 @@ export function applyDevWrap(
   };
 }
 
-/** A mailbox in the structured form the `send_email` binding accepts. */
+/**
+ * A named mailbox in the structured form the `send_email` binding accepts. The
+ * runtime requires `name` to be a string whenever the object form is used, so an
+ * address without a display name is passed as a plain string instead.
+ */
 export interface CloudflareMailbox {
   email: string;
-  name?: string;
+  name: string;
 }
 
 /**
@@ -163,18 +167,19 @@ export function resolveEmailProvider(env: EmailDeliveryEnv | undefined): Resolve
 
 /**
  * Split `"Display Name <addr@host>"` into the binding's `{ email, name }`; a bare
- * address (or `<addr@host>`) returns `{ email }`. Surrounding quotes on the name go.
+ * address (or `<addr@host>`) returns the address as a string, because the runtime
+ * refuses an object without a string `name`. Surrounding quotes on the name go.
  */
-export function parseMailbox(mailbox: string): CloudflareMailbox {
+export function parseMailbox(mailbox: string): string | CloudflareMailbox {
   const trimmed = mailbox.trim();
   const match = /^(.*)<([^<>]+)>\s*$/.exec(trimmed);
-  if (!match) return { email: trimmed };
+  if (!match) return trimmed;
   const name = match[1]
     .trim()
     .replace(/^"(.*)"$/, "$1")
     .trim();
   const email = match[2].trim();
-  return name ? { email, name } : { email };
+  return name ? { email, name } : email;
 }
 
 /**

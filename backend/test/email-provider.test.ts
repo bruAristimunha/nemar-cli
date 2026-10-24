@@ -95,10 +95,13 @@ describe("parseMailbox", () => {
     });
   });
 
-  test("a bare address has no name", () => {
-    expect(parseMailbox("support@test.nemar.org")).toEqual({ email: "support@test.nemar.org" });
-    expect(parseMailbox("  support@test.nemar.org  ")).toEqual({ email: "support@test.nemar.org" });
-    expect(parseMailbox("<support@test.nemar.org>")).toEqual({ email: "support@test.nemar.org" });
+  // The runtime refuses `{ email }` without a string `name` (staging, 2026-10-23), so a
+  // bare address must reach the binding as a string, never as an object.
+  test("a bare address is passed as a string", () => {
+    expect(parseMailbox("support@test.nemar.org")).toBe("support@test.nemar.org");
+    expect(parseMailbox("  support@test.nemar.org  ")).toBe("support@test.nemar.org");
+    expect(parseMailbox("<support@test.nemar.org>")).toBe("support@test.nemar.org");
+    expect(parseMailbox("  <support@test.nemar.org>")).toBe("support@test.nemar.org");
   });
 
   test("a quoted name loses its quotes and keeps a comma", () => {
@@ -120,7 +123,7 @@ describe("a send through the Cloudflare binding", () => {
     const message = sent[0];
     expect(message.from).toEqual({ email: "noreply@staging.nemar.test", name: "NEMAR Staging" });
     expect(message.to).toBe(ALLOWED);
-    expect(message.replyTo).toEqual({ email: REPLY_TO });
+    expect(message.replyTo).toBe(REPLY_TO);
     expect(message.subject.startsWith("[DEV] ")).toBe(true);
     expect(message.html).toContain("DEV BACKEND - NOT PRODUCTION");
   });
