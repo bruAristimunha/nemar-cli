@@ -441,6 +441,53 @@ describe("an input the executor does not run is refused before anything is writt
     expect(await snapshot(w.d1)).toEqual(before);
   });
 
+  test("an executor the recipe does not list is refused before anything else, through the route, the service and the dry run (MUTATION: if (false) at each call site of recipeRunsOn)", async () => {
+    const [w] = worlds() as [World];
+    await ready(w);
+    const env = w.env();
+    const id = await dataset(w);
+    const before = await snapshot(w.d1);
+    // `nemar-ica` lists Tapis only. It is a placeholder, and asking where it may run comes first, so the real
+    // registry shows the answer for an unlisted executor (nemar-floor lists both).
+    for (const extra of [{}, { dry_run: true }]) {
+      const r = await call(
+        "POST",
+        "/compute/pipeline/run",
+        "admin",
+        { recipe: "nemar-ica", dataset: id, executor: "runner", ...extra },
+        env,
+      );
+      expect([extra, r.status, r.body.code]).toEqual([extra, 400, "invalid_body"]);
+      expect(String(r.body.error)).toContain("executor");
+    }
+    expect(await dispatch(env, id, { recipe: "nemar-ica", executor: "runner" })).toMatchObject({
+      ok: false,
+      code: "invalid_spec",
+      field: "executor",
+    });
+    expect(
+      await pipelineDryRun(env, { recipe: "nemar-ica", datasetId: id, executor: "runner" }),
+    ).toEqual({ ok: false, code: "invalid_spec", field: "executor" });
+    // Where it does run, the placeholder is still refused as one, through every door.
+    expect(await dispatch(env, id, { recipe: "nemar-ica" })).toMatchObject({
+      ok: false,
+      code: "recipe_placeholder",
+    });
+    expect(await pipelineDryRun(env, { recipe: "nemar-ica", datasetId: id })).toEqual({
+      ok: false,
+      code: "recipe_placeholder",
+    });
+    const placeholder = await call(
+      "POST",
+      "/compute/pipeline/run",
+      "admin",
+      { recipe: "nemar-ica", dataset: id },
+      env,
+    );
+    expect([placeholder.status, placeholder.body.code]).toEqual([422, "recipe_placeholder"]);
+    expect(await snapshot(w.d1)).toEqual(before);
+  });
+
   test("a word that is not an input is invalid_body, not a refusal of the registry", async () => {
     const [w] = worlds() as [World];
     const env = w.env();
@@ -583,6 +630,29 @@ describe("the queue and the dry run read the input", () => {
     expect(await candidates(env, "bids")).toContain(id);
   });
 
+  test("three counted Zarr failures older than the cooldown leave the dataset a BIDS candidate and no longer a Zarr one (MUTATION: c.input = ?8 becomes (c.input = ?8 OR 1))", async () => {
+    const [w] = worlds() as [World];
+    await ready(w);
+    const env = w.env();
+    const id = await dataset(w);
+    // Three failures the dataset's own word names (`outputs_missing` counts toward the cap), each far older
+    // than the seven-day cooldown, so only the cap can keep a dataset out.
+    for (const attempt of [1, 2, 3]) {
+      await w.d1
+        .prepare(
+          `INSERT INTO compute_pipeline_stamps
+             (dataset_id, version, recipe, recipe_version, engine, input, attempt, state, refusal_code, updated_at)
+           VALUES (?1, 'v1.0.0', 'nemar-floor', '1.0.0', 'eegprep@0.5.0', 'zarr', ?2, 'failed',
+                   'outputs_missing', datetime('now', '-30 days'))`,
+        )
+        .bind(id, attempt)
+        .run();
+    }
+    expect(await candidates(env, "zarr")).not.toContain(id);
+    expect(await candidates(env, "bids")).toContain(id);
+    expect(await candidates(env)).toContain(id);
+  });
+
   test("the Tapis queue dispatches over the BIDS tuple only: a Zarr stamp does not make a dataset current for it", async () => {
     const [w] = worlds() as [World];
     await ready(w);
@@ -623,9 +693,26 @@ const READER = "eegprep-lean@0.3.1+89abcdef0123456789abcdef0123456789abcdef";
 const DIGEST = `sha256:${"0123456789abcdef".repeat(4)}`;
 const SOURCE = "fedcba9876543210fedcba9876543210fedcba98";
 
-/** A Zarr-input record: the floor's own, with the input block and the reader the recipe writes. */
+/** The two stores a Zarr run of the test dataset was given, and the rows of what it read of them. */
+const STORES = ["sub-01/eeg/sub-01_task-rest_eeg.edf", "sub-02/eeg/sub-02_task-rest_eeg.edf"];
+const rowsOf = (paths: string[]) =>
+  paths.map((path) => ({ path, group: "eeg", content_sha256: "ab".repeat(32) }));
+
+/**
+ * A Zarr-input record: the floor's own, with the input block and the reader the recipe writes, and, by default,
+ * the coverage of a run that read every store it was given in full (`stores_content` has a row for each store
+ * of `stores`, `stores_unread` is an empty list). `over` changes one thing at a time.
+ */
 const zarrRecord = (
-  over: { reader?: unknown; engine?: unknown; digest?: unknown; kind?: unknown } = {},
+  over: {
+    reader?: unknown;
+    engine?: unknown;
+    digest?: unknown;
+    kind?: unknown;
+    stores?: unknown;
+    content?: unknown;
+    unread?: unknown;
+  } = {},
 ) =>
   recipeRecord({
     dataset: { id: "nm000104", version: "v1.0.0", source_commit: COMMIT },
@@ -634,6 +721,9 @@ const zarrRecord = (
       kind: "kind" in over ? over.kind : "zarr",
       zarr_engine_version: "engine" in over ? over.engine : "0.4.2",
       input_digest: "digest" in over ? over.digest : DIGEST,
+      stores: "stores" in over ? over.stores : STORES,
+      stores_content: "content" in over ? over.content : rowsOf(STORES),
+      stores_unread: "unread" in over ? over.unread : [],
     },
   });
 
@@ -757,6 +847,136 @@ describe("a succeeded stamp records what the run read", () => {
     expect(lines.some((l) => l.includes("field=input_engine"))).toBe(false);
   });
 
+  test("the product of a Zarr run is read under the one floor label: desc-nemarfloor_*, and a product under the old Zarr label is not read", async () => {
+    const [w] = worlds() as [World];
+    const { id, jobId } = await zarrRun(w);
+    const floor = findRecipe("nemar-floor") as NonNullable<ReturnType<typeof findRecipe>>;
+    expect(recipeRequiredOutputs(floor)).toEqual({
+      record: "product/desc-nemarfloor_signalJourney.json",
+      table: "product/desc-nemarfloor_recordings.tsv",
+    });
+    // A run that wrote its product under the transition name's label is a run whose files are not there.
+    for (const [path, content] of [
+      ["product/desc-nemarfloorzarr_signalJourney.json", zarrRecord()],
+      ["product/desc-nemarfloorzarr_recordings.tsv", "path\tstatus\n"],
+    ] as const) {
+      await fx.harness.results.put(
+        resultsOutputKey(jobId, path),
+        new TextEncoder().encode(content),
+      );
+    }
+    await w.d1
+      .prepare(
+        "UPDATE compute_jobs SET state = 'finished', ended_at = datetime('now') WHERE id = ?1",
+      )
+      .bind(jobId)
+      .run();
+    expect(await syncPipelineStamps(w.env())).toMatchObject({ succeeded: 0, failed: 1 });
+    expect((await stampsOf(w.d1, id))[0]).toMatchObject({
+      state: "failed",
+      refusal_code: "outputs_missing",
+    });
+    // Under the label the registry names the same record is read.
+    const again = await dataset(w);
+    const r = await dispatch(w.env(), again, asRunner);
+    if (!r.ok) throw new Error("not dispatched");
+    await finishRunnerJob(w, r.jobId, zarrRecord());
+    expect(
+      await fx.harness.results.head(
+        resultsOutputKey(r.jobId, "product/desc-nemarfloor_signalJourney.json"),
+      ),
+    ).not.toBeNull();
+    expect(await syncPipelineStamps(w.env())).toMatchObject({ succeeded: 1 });
+  });
+
+  test("a Worker-dispatched BIDS record names no source commit: its digest is empty and that is not logged, absent or refused (the BIDS stamp carries no digest)", async () => {
+    const [w] = worlds() as [World];
+    await ready(w);
+    const id = await dataset(w);
+    const r = await dispatch(w.env(), id);
+    if (!r.ok) throw new Error("not dispatched");
+    for (const record of [bidsRecord(null), recipeRecord()]) {
+      await finishRunnerJob(w, r.jobId, record);
+      await w.d1
+        .prepare(
+          "UPDATE compute_pipeline_stamps SET state = 'dispatched', recipe_version = '1.0.0', input_digest = NULL WHERE id = ?1",
+        )
+        .bind(r.stampId)
+        .run();
+      const lines = await logged(async () => {
+        expect(await syncPipelineStamps(w.env())).toMatchObject({ succeeded: 1, failed: 0 });
+      });
+      expect((await stampsOf(w.d1, id))[0]).toMatchObject({
+        state: "succeeded",
+        input_digest: null,
+        reader: null,
+        input_engine: null,
+      });
+      expect(lines.filter((l) => l.includes("stamp_field_"))).toEqual([]);
+    }
+  });
+
+  test("a Zarr input digest is stored only when the record shows it covers every store: unread stores, no content, or other paths leave it empty with the reason (MUTATION: store it whenever it is well formed)", async () => {
+    const [w] = worlds() as [World];
+    const cases: Array<[string, Parameters<typeof zarrRecord>[0], string | null]> = [
+      // The whole run read: stored.
+      ["everything read", {}, null],
+      // A stand-in record of a run that left two stores unread, with a digest that looks valid.
+      ["two stores unread", { unread: ["HUGE", "MISSING"] }, "stores_unread"],
+      ["one store unread", { unread: [STORES[1]] }, "stores_unread"],
+      ["unread is a count, not a list", { unread: 2 }, "stores_unread"],
+      ["unread is not stated", { unread: undefined }, "stores_unread"],
+      ["no rows of content", { content: [] }, "no_stores_content"],
+      ["content is not a list", { content: "all" }, "no_stores_content"],
+      ["content is not stated", { content: undefined }, "no_stores_content"],
+      [
+        "a row without a path",
+        { content: [{ group: "eeg" }, ...rowsOf(STORES)] },
+        "no_stores_content",
+      ],
+      ["one store has no row", { content: rowsOf(STORES.slice(0, 1)) }, "stores_differ"],
+      [
+        "a row for a store not named",
+        { content: rowsOf([...STORES, "sub-03/x.edf"]) },
+        "stores_differ",
+      ],
+      ["other paths", { content: rowsOf(["a.edf", "b.edf"]) }, "stores_differ"],
+      [
+        "a path twice",
+        { content: rowsOf([STORES[0] as string, STORES[0] as string]) },
+        "stores_differ",
+      ],
+      ["stores is not stated", { stores: undefined }, "stores_differ"],
+      ["stores is not a list of paths", { stores: [1, 2] }, "stores_differ"],
+    ];
+    for (const [name, over, reason] of cases) {
+      await ready(w);
+      const id = await dataset(w);
+      const r = await dispatch(w.env(), id, asRunner);
+      if (!r.ok) throw new Error("not dispatched");
+      await finishRunnerJob(w, r.jobId, zarrRecord(over));
+      const lines = await logged(async () => {
+        expect(await syncPipelineStamps(w.env())).toMatchObject({ succeeded: 1, failed: 0 });
+      });
+      const stamp = (await stampsOf(w.d1, id))[0];
+      // The run is a success whatever the digest; the digest is what the record shows is whole, or nothing.
+      expect([name, stamp?.state, stamp?.input_digest]).toEqual([
+        name,
+        "succeeded",
+        reason === null ? DIGEST : null,
+      ]);
+      // The other fields are stored as before.
+      expect([name, stamp?.reader, stamp?.input_engine]).toEqual([name, READER, "0.4.2"]);
+      const refusals = lines.filter((l) => l.includes("stamp_field_refused"));
+      expect([name, refusals.length]).toEqual([name, reason === null ? 0 : 1]);
+      if (reason !== null) {
+        expect(refusals[0]).toContain(`field=input_digest reason=${reason}`);
+        // A field name and a reason word, never what the record said.
+        expect(refusals[0]).not.toContain("HUGE");
+      }
+    }
+  });
+
   test("a BIDS record whose source commit is not a full commit leaves the digest empty and says so", async () => {
     const [w] = worlds() as [World];
     await ready(w);
@@ -774,10 +994,10 @@ describe("a succeeded stamp records what the run read", () => {
 
 // --- (e) Drift -------------------------------------------------------------------------------------------------
 
-describe("a record whose input kind disagrees holds the tuple of the input that was claimed", () => {
+describe("a record whose input kind disagrees ends the stamp failed and holds the tuple of the input that was claimed", () => {
   const floor = findRecipe("nemar-floor") as NonNullable<ReturnType<typeof findRecipe>>;
 
-  test("a Zarr stamp whose record says bids holds the Zarr tuple, stores nothing it read, and leaves BIDS free (MUTATION: remove the input-kind comparison)", async () => {
+  test("a Zarr stamp whose record says bids ends failed tuple_mismatch, which holds the Zarr tuple, stores nothing it read and leaves BIDS free (MUTATION: remove the input-kind comparison)", async () => {
     const [w] = worlds() as [World];
     await ready(w);
     const id = await dataset(w);
@@ -787,24 +1007,32 @@ describe("a record whose input kind disagrees holds the tuple of the input that 
     // The record is the floor's own on every other count, and says it read the dataset's files.
     await finishRunnerJob(w, r.jobId, zarrRecord({ kind: "bids" }));
     const lines = await logged(async () => {
-      expect(await syncPipelineStamps(w.env())).toMatchObject({ succeeded: 1 });
+      expect(await syncPipelineStamps(w.env())).toMatchObject({
+        examined: 1,
+        succeeded: 0,
+        failed: 1,
+      });
     });
     expect(lines.some((l) => l.includes("tuple_mismatch"))).toBe(true);
     const stamps = await stampsOf(w.d1, id);
-    // The stamp ended as the claim made it, input and all, with nothing of what the record said it read;
-    // and the claimed tuple is held with the job that showed the mismatch, as a hold of its own input.
-    expect(stamps.map((s) => [s.input, s.state, s.refusal_code])).toEqual([
-      ["zarr", "succeeded", null],
-      ["zarr", "failed", "tuple_mismatch"],
+    // ONE stamp, and it never says "succeeded": it ended failed with the word, still linked to the job that
+    // showed it, with nothing of what the record said it read. That stamp is the hold of its own input.
+    expect(stamps.map((s) => [s.input, s.state, s.refusal_code, s.job_id])).toEqual([
+      ["zarr", "failed", "tuple_mismatch", r.jobId],
     ]);
     expect([stamps[0]?.reader, stamps[0]?.input_engine, stamps[0]?.input_digest]).toEqual([
       null,
       null,
       null,
     ]);
-    expect(stamps[1]?.job_id).toBe(r.jobId);
     expect(await tupleHeld(w.d1, floor, "zarr")).toBe(true);
     expect(await tupleHeld(w.d1, floor, "bids")).toBe(false);
+    // It holds no live slot and counts toward no cooldown: the word is the registry's, not the dataset's.
+    expect(
+      await count(w.d1, "compute_pipeline_stamps", "state IN ('dispatched', 'succeeded')"),
+    ).toBe(0);
+    // A second sync meets nothing of it.
+    expect(await syncPipelineStamps(w.env())).toMatchObject({ examined: 0 });
     // On every path the Zarr input is refused and the BIDS input still runs.
     expect(await dispatch(w.env(), other, asRunner)).toMatchObject({
       ok: false,
@@ -822,7 +1050,7 @@ describe("a record whose input kind disagrees holds the tuple of the input that 
     expect(await dispatch(w.env(), other)).toMatchObject({ ok: true });
   });
 
-  test("a BIDS stamp whose record says zarr holds the BIDS tuple and leaves the Zarr input free", async () => {
+  test("a BIDS stamp whose record says zarr ends failed tuple_mismatch and holds the BIDS tuple, leaving the Zarr input free", async () => {
     const [w] = worlds() as [World];
     await ready(w);
     const id = await dataset(w);
@@ -833,9 +1061,8 @@ describe("a record whose input kind disagrees holds the tuple of the input that 
     await syncPipelineStamps(w.env());
     expect(await tupleHeld(w.d1, floor, "bids")).toBe(true);
     expect(await tupleHeld(w.d1, floor, "zarr")).toBe(false);
-    expect((await stampsOf(w.d1, id)).map((s) => [s.input, s.state])).toEqual([
-      ["bids", "succeeded"],
-      ["bids", "failed"],
+    expect((await stampsOf(w.d1, id)).map((s) => [s.input, s.state, s.refusal_code])).toEqual([
+      ["bids", "failed", "tuple_mismatch"],
     ]);
     expect(await dispatch(w.env(), other)).toMatchObject({ ok: false, code: "registry_drift" });
     expect(await dispatch(w.env(), other, asRunner)).toMatchObject({ ok: true });

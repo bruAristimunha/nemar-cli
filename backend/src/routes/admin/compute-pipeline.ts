@@ -40,6 +40,7 @@ import {
   defaultInput,
   findRecipe,
   recipeRunsInput,
+  recipeRunsOn,
 } from "../../../../shared/compute-recipes.js";
 import { COMPUTE_ROUTE_SENTENCES } from "../../../../shared/compute-state.js";
 import {
@@ -323,18 +324,19 @@ export function registerComputePipelineAdminRoutes(admin: AdminRouter): void {
     const body = parsed.data;
     const recipe = findRecipe(body.recipe);
     if (recipe === null) return refuse(c, "recipe_unknown");
-    if (recipe.placeholder === true) return refuse(c, "recipe_placeholder");
     // The executor is part of the request's validity, decided from the registry before anything is read:
     // a recipe is dispatched only to an executor it lists, and a runner run names ONE dataset (the queue's
-    // clamps are Tapis's: the daily cap and the tenant ceiling mean nothing to a runner job).
+    // clamps are Tapis's: the daily cap and the tenant ceiling mean nothing to a runner job). It is asked
+    // before the placeholder, as the service asks it, so that a placeholder is answered for its executors too.
     const executor = body.executor ?? "tapis";
-    if (!recipe.executors.includes(executor)) {
+    if (!recipeRunsOn(recipe, executor)) {
       return invalid(
         c,
         "invalid_body",
         executorIssue("that recipe is not dispatched to that executor"),
       );
     }
+    if (recipe.placeholder === true) return refuse(c, "recipe_placeholder");
     if (executor === "runner" && body.dataset === undefined) {
       return invalid(c, "invalid_body", executorIssue("a runner run names one dataset"));
     }

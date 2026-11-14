@@ -512,26 +512,79 @@ export const STAMP_ZARR_DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
 /** The input digest of a BIDS run: `git:` and the 40 lowercase hexadecimal digits of the source commit. */
 export const STAMP_GIT_DIGEST_RE = /^git:[0-9a-f]{40}$/;
 
+/**
+ * Why a value the record states was not stored, a fixed word for the log: `bad_shape` (it is not in the shape of
+ * its column), and, for a Zarr input digest that is well formed, the three ways the record does not show that
+ * the digest covers everything the run was given: `stores_unread` (the record's `stores_unread` is not an empty
+ * list), `no_stores_content` (`stores_content` is not a non-empty list of rows with a path) and `stores_differ`
+ * (the paths of its rows are not exactly `input.stores`).
+ */
+export const STAMP_REFUSAL_REASONS = [
+  "bad_shape",
+  "stores_unread",
+  "no_stores_content",
+  "stores_differ",
+] as const;
+
+export type StampRefusalReason = (typeof STAMP_REFUSAL_REASONS)[number];
+
 /** What a record says it read, each value as the stamp may store it, or null. */
 export interface StampInputFields {
   reader: string | null;
   input_engine: string | null;
   input_digest: string | null;
-  /** The fields the record states in a form the column refuses: left null, never stored, and logged by name. */
+  /** The fields the record states but the stamp does not take: left null, never stored, and logged by name and reason. */
   refused: StampInputField[];
-  /** The fields the record does not state at all, though the input should (an image from before they existed). */
+  /** The reason word of each refused field. */
+  reasons: Partial<Record<StampInputField, StampRefusalReason>>;
+  /** The fields a Zarr record does not state at all (an image from before they existed): null, and logged. */
   absent: StampInputField[];
+}
+
+/**
+ * Whether a Zarr dataset record shows that its input digest covers every store the run was given, or the word
+ * of what it does not show. The digest names only the stores whose content was read in full
+ * (`stores_content`); it is the key of a derivative (plan D14), so it is stored only when nothing the run was
+ * given is missing from it: `stores_unread` is an empty list (a run that left stores unread, or that does not
+ * say, has a digest of less than its input), `stores_content` is a non-empty list, and the paths of its rows
+ * are exactly the stores the run named (`input.stores`), each once.
+ *
+ * What this does NOT check is that the stated digest is the digest of those rows: that recomputation belongs
+ * to the derivative store (card V1b), which holds the one shared definition of the input digest
+ * (`nemar.store-content.v1`); this file does not carry a second copy of it.
+ */
+function zarrCoverageRefusal(block: Record<string, unknown> | null): StampRefusalReason | null {
+  const unread = block?.stores_unread;
+  if (!Array.isArray(unread) || unread.length !== 0) return "stores_unread";
+  const rows = block?.stores_content;
+  if (!Array.isArray(rows) || rows.length === 0) return "no_stores_content";
+  const paths: string[] = [];
+  for (const row of rows) {
+    const path = object(row)?.path;
+    if (typeof path !== "string") return "no_stores_content";
+    paths.push(path);
+  }
+  const stores = block?.stores;
+  if (!Array.isArray(stores) || stores.some((p) => typeof p !== "string")) return "stores_differ";
+  const wanted = [...(stores as string[])].sort();
+  const got = [...paths].sort();
+  if (wanted.length !== got.length || wanted.some((p, i) => p !== got[i])) return "stores_differ";
+  // Each store once: two rows of one path are not a covering of a list of stores.
+  if (new Set(got).size !== got.length) return "stores_differ";
+  return null;
 }
 
 /**
  * What a succeeded stamp records of what the run READ, from the recipe's dataset record (plan D12 and D14):
  *  - `zarr`: the reader (`extensions.nemar.reader`, `eegprep-lean@<version>+<commit>`), the Zarr engine
  *    (`extensions.nemar.input.zarr_engine_version`) and the input digest (`extensions.nemar.input.input_digest`,
- *    `sha256:` and 64 hexadecimal digits);
+ *    `sha256:` and 64 hexadecimal digits), the digest only when the record shows it covers every store of the
+ *    run ({@link zarrCoverageRefusal});
  *  - `bids`: the input digest `git:` and `extensions.nemar.dataset.source_commit`, when that is a full commit
- *    (40 lowercase hexadecimal digits); no reader and no Zarr engine.
- * A value that is not exactly in the shape of its column is left null and named in `refused`; a value the record
- * does not state is null and named in `absent`. Nothing the record says is stored as it came: the record is the
+ *    (40 lowercase hexadecimal digits); no reader and no Zarr engine. A Worker-dispatched BIDS run is not given
+ *    a source commit, so its record carries none and its digest is null: an expected null, not logged as absent.
+ * A value that does not fit is left null and named in `refused` with its reason; a Zarr value the record does
+ * not state is null and named in `absent`. Nothing the record says is stored as it came: the record is the
  * job's own statement and the columns hold fixed shapes only.
  */
 export function stampInputFields(value: unknown, input: RecipeInput): StampInputFields {
@@ -541,36 +594,61 @@ export function stampInputFields(value: unknown, input: RecipeInput): StampInput
     input_engine: null,
     input_digest: null,
     refused: [],
+    reasons: {},
     absent: [],
   };
+  const refuse = (field: StampInputField, reason: StampRefusalReason): void => {
+    out.refused.push(field);
+    out.reasons[field] = reason;
+  };
+  /** A value the input must state: absent is named, a value that does not fit is refused. */
   const take = (
     field: StampInputField,
     stated: unknown,
     fits: (text: string) => boolean,
-    set: (text: string) => string,
+    set: (text: string) => string = (text) => text,
   ): void => {
     if (stated === undefined || stated === null) {
       out.absent.push(field);
     } else if (typeof stated === "string" && fits(stated)) {
       out[field] = set(stated);
     } else {
-      out.refused.push(field);
+      refuse(field, "bad_shape");
     }
   };
-  const keep = (text: string): string => text;
   if (input === "zarr") {
     const block = object(nemar?.input);
-    take("reader", nemar?.reader, (t) => STAMP_WORD_RE.test(t), keep);
-    take("input_engine", block?.zarr_engine_version, (t) => STAMP_WORD_RE.test(t), keep);
-    take("input_digest", block?.input_digest, (t) => STAMP_ZARR_DIGEST_RE.test(t), keep);
+    take("reader", nemar?.reader, (t) => STAMP_WORD_RE.test(t));
+    take("input_engine", block?.zarr_engine_version, (t) => STAMP_WORD_RE.test(t));
+    take("input_digest", block?.input_digest, (t) => STAMP_ZARR_DIGEST_RE.test(t));
+    if (out.input_digest !== null) {
+      const reason = zarrCoverageRefusal(block);
+      if (reason !== null) {
+        out.input_digest = null;
+        refuse("input_digest", reason);
+      }
+    }
   } else {
-    // The digest of a BIDS input is the commit the files were read at.
-    take(
-      "input_digest",
-      object(nemar?.dataset)?.source_commit,
-      (t) => SOURCE_COMMIT_RE.test(t),
-      (t) => `git:${t}`,
-    );
+    // The digest of a BIDS input is the commit the files were read at; a record that names none is the usual case.
+    const commit = object(nemar?.dataset)?.source_commit;
+    if (commit !== undefined && commit !== null) {
+      if (typeof commit === "string" && SOURCE_COMMIT_RE.test(commit)) {
+        out.input_digest = `git:${commit}`;
+      } else {
+        refuse("input_digest", "bad_shape");
+      }
+    }
   }
   return out;
+}
+
+/**
+ * Whether a recipe lists the executor: the one decision the route, the dispatch and the dry run take of where a
+ * recipe may be dispatched, before the input is looked at ({@link recipeRunsInput}).
+ */
+export function recipeRunsOn(
+  recipe: Pick<ComputeRecipe, "executors">,
+  executor: RecipeExecutor,
+): boolean {
+  return recipe.executors.includes(executor);
 }

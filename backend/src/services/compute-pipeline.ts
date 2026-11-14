@@ -39,7 +39,8 @@
  *    what the run READ: the reader, the Zarr engine and the input digest of a Zarr run, the source commit
  *    of a BIDS run (`stampInputFields`; a value that does not fit its column is never stored). A record
  *    that is missing, unreadable, or names another recipe ends the stamp `failed`; the job is untouched. A
- *    record that names another input than the stamp claimed holds the claimed tuple like a wrong engine.
+ *    record that names another input than the stamp claimed ends the stamp `failed` with `tuple_mismatch`, which
+ *    holds the claimed tuple (a stamp that says what ran never says "read zarr" of a run that read another input).
  *  - NOTHING HERE TOUCHES GITHUB OR MAIL. A run reaches D1, the compute buckets and Tapis, all through
  *    the gateway's own services.
  */
@@ -57,6 +58,7 @@ import {
   recipeCommand,
   recipeRequiredOutputs,
   recipeRunsInput,
+  recipeRunsOn,
   recipeZarrArguments,
   recipeZarrBase,
   stampInputFields,
@@ -604,8 +606,9 @@ export const TUPLE_MISMATCH_WORD = "tuple_mismatch";
 /**
  * Is a registry tuple (`?1` recipe, `?2` version, `?3` engine, `?4` input) held? A hold is a failed stamp with
  * the mismatch word. The input is part of the tuple: a Zarr run that showed a wrong engine or a wrong input
- * holds the Zarr tuple and leaves the BIDS tuple of the same recipe, which another image and another executor
- * run, free.
+ * holds the Zarr tuple and leaves the BIDS tuple of the same recipe free. One runtime image serves both
+ * executors (`COMPUTE_RUNTIME_IMAGE`), so a wrong image can show itself on either input; the hold is the
+ * claimed input's alone, and a run that shows the drift on the other input holds that one when it finishes.
  */
 export const TUPLE_HELD_SQL = `SELECT 1 FROM compute_pipeline_stamps
   WHERE recipe = ?1 AND recipe_version = ?2 AND engine = ?3 AND input = ?4
@@ -674,15 +677,16 @@ export async function dispatchPipelineJob(
   if (input.actor.kind === "cron" && !recipe.autoDispatch) {
     return fail("recipe_not_automatic", datasetId);
   }
-  // A placeholder is on no path: not an administrator's run, not the queue, not the cron.
-  if (recipe.placeholder === true) return fail("recipe_placeholder", datasetId);
   // The executor, decided from the registry: a recipe is run only where it lists, and a runner needs its
   // switch. The route has said so already in its own words; this is the boundary that holds if another caller
-  // reaches the service (the cron passes none, so it is always `tapis`).
+  // reaches the service (the cron passes none, so it is always `tapis`). It is asked before the placeholder, so
+  // that where a recipe may run is answered for every recipe in the registry, a placeholder included.
   const executor = input.executor ?? "tapis";
-  if (!recipe.executors.includes(executor)) {
+  if (!recipeRunsOn(recipe, executor)) {
     return fail("invalid_spec", datasetId, { field: "executor" });
   }
+  // A placeholder is on no path: not an administrator's run, not the queue, not the cron.
+  if (recipe.placeholder === true) return fail("recipe_placeholder", datasetId);
   // The cron is the Tapis queue's: `autoDispatch` says a recipe may be run automatically on Tapis, and a runner
   // run is an administrator's (the daily dispatcher never names an executor, so this holds for any other caller).
   if (input.actor.kind === "cron" && executor !== "tapis") {
@@ -1058,10 +1062,20 @@ export async function syncPipelineStamps(
         result.failed++;
         continue;
       }
-      // The input the record says it read is part of the tuple: a record of another input than the stamp
-      // claimed is a tuple mismatch like a wrong engine (the image ran something the registry does not name).
-      const wrongInput = read.inputKind !== stamp.input;
-      if (read.version !== stamp.recipe_version || read.engine !== stamp.engine || wrongInput) {
+      // The input the record says it read is part of the tuple, and a stamp says what ran: a record of another
+      // input than the stamp claimed ends the stamp `failed` with `tuple_mismatch`, never `succeeded`. That
+      // stamp IS the hold of the claimed tuple (a failed `tuple_mismatch` stamp of its recipe, version, engine
+      // and input), so no separate hold row is written; a stamp that says "read zarr" of a run that read
+      // something else would keep the tuple's live slot and could be keyed from. Nothing it read is stored.
+      if (read.inputKind !== stamp.input) {
+        await finishStamp(db, stamp.id, "failed", TUPLE_MISMATCH_WORD);
+        console.error(
+          `[compute-pipeline] tuple_mismatch stamp=${stamp.id} dataset=${stamp.dataset_id} job=${job.id} input_kind_differs`,
+        );
+        result.failed++;
+        continue;
+      }
+      if (read.version !== stamp.recipe_version || read.engine !== stamp.engine) {
         // The result carries a tuple other than the one claimed: hold the CLAIMED tuple (the registry is
         // out of date, or the image is), before the stamp is rewritten and the claim is lost.
         await db
@@ -1080,16 +1094,16 @@ export async function syncPipelineStamps(
           `[compute-pipeline] tuple_mismatch stamp=${stamp.id} dataset=${stamp.dataset_id} job=${job.id}`,
         );
       }
-      // What the run read. A record of another input has nothing of this input's to give, so none of it is
-      // stored; otherwise each value is stored only in the shape of its column, and a value that is not is
-      // named in the log (a field name, never the value) and left null.
-      const fields = wrongInput ? null : read.fields;
-      for (const field of fields?.refused ?? []) {
+      // What the run read: each value is stored only in the shape of its column, and a value that is not (or
+      // that the record does not show covers the whole input) is named in the log (a field name and a fixed
+      // reason word, never the value) and left null.
+      const fields = read.fields;
+      for (const field of fields.refused) {
         console.error(
-          `[compute-pipeline] stamp_field_refused field=${field} stamp=${stamp.id} dataset=${stamp.dataset_id} job=${job.id}`,
+          `[compute-pipeline] stamp_field_refused field=${field} reason=${fields.reasons[field] ?? "bad_shape"} stamp=${stamp.id} dataset=${stamp.dataset_id} job=${job.id}`,
         );
       }
-      for (const field of fields?.absent ?? []) {
+      for (const field of fields.absent) {
         console.error(
           `[compute-pipeline] stamp_field_absent field=${field} stamp=${stamp.id} dataset=${stamp.dataset_id} job=${job.id}`,
         );
@@ -1101,9 +1115,9 @@ export async function syncPipelineStamps(
             stamp.id,
             read.version,
             read.engine,
-            fields?.reader ?? null,
-            fields?.input_engine ?? null,
-            fields?.input_digest ?? null,
+            fields.reader,
+            fields.input_engine,
+            fields.input_digest,
           )
           .run();
         if ((moved.meta?.changes ?? 0) > 0) result.succeeded++;
@@ -1439,10 +1453,13 @@ const DRY_RUN_SCAN_ROWS = 5000;
 export async function pipelineDryRun(env: Bindings, input: DryRunInput): Promise<DryRunResult> {
   const recipe = findRecipe(input.recipe);
   if (recipe === null) return { ok: false, code: "recipe_unknown" };
-  if (recipe.placeholder === true) return { ok: false, code: "recipe_placeholder" };
   const executor = input.executor ?? "tapis";
-  // The route refuses these in its own words; a direct caller meets the boundary here.
-  if (!recipe.executors.includes(executor)) return { ok: false, code: "invalid_spec" };
+  // The route refuses these in its own words; a direct caller meets the boundary here. The executor is asked
+  // before the placeholder, as `dispatchPipelineJob` asks it.
+  if (!recipeRunsOn(recipe, executor)) {
+    return { ok: false, code: "invalid_spec", field: "executor" };
+  }
+  if (recipe.placeholder === true) return { ok: false, code: "recipe_placeholder" };
   const recipeInput = input.input ?? defaultInput(executor);
   if (!recipeRunsInput(recipe, recipeInput, executor)) {
     return { ok: false, code: "invalid_spec", field: "input" };

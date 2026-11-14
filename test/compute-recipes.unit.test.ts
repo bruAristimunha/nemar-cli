@@ -24,6 +24,7 @@ import {
   type RecipeExecutor,
   type RecipeInput,
   STAMP_INPUT_FIELDS,
+  STAMP_REFUSAL_REASONS,
   defaultInput,
   findRecipe,
   readRecipeRecord,
@@ -33,6 +34,7 @@ import {
   recipeLabel,
   recipeRequiredOutputs,
   recipeRunsInput,
+  recipeRunsOn,
   stampInputFields,
 } from "../shared/compute-recipes";
 import {
@@ -93,6 +95,16 @@ describe("the registry", () => {
     // The transition name is gone from the registry.
     expect(findRecipe("nemar-floor-zarr")).toBeNull();
     expect(COMPUTE_RECIPES.map((r) => r.name)).toEqual(["nemar-floor", "nemar-ica"]);
+  });
+
+  test("nemar-floor's outputs are desc-nemarfloor_* for both inputs, and no label of the transition name remains", () => {
+    const floor = findRecipe("nemar-floor") as NonNullable<ReturnType<typeof findRecipe>>;
+    expect(recipeLabel(floor)).toBe("nemarfloor");
+    expect(recipeRequiredOutputs(floor)).toEqual({
+      record: "product/desc-nemarfloor_signalJourney.json",
+      table: "product/desc-nemarfloor_recordings.tsv",
+    });
+    for (const recipe of COMPUTE_RECIPES) expect(recipeLabel(recipe)).not.toContain("zarr");
   });
 
   test("every input a recipe lists is a word of the shared list, and the list is the stamp column's", () => {
@@ -196,6 +208,27 @@ describe("which input runs where", () => {
     expect(recipeRunsInput(ica, "bids", "tapis")).toBe(true);
     expect(recipeRunsInput(ica, "zarr", "runner")).toBe(false);
     expect(recipeRunsInput({ inputs: [] }, "bids", "tapis")).toBe(false);
+  });
+});
+
+describe("where a recipe may run", () => {
+  test("a recipe runs only on the executors it lists (MUTATION: always true)", () => {
+    // A synthetic entry that lists both inputs and one executor: the registry has no such recipe now, so the
+    // decision is shown on its own, and the route, the dispatch and the dry run each take it at their call site.
+    const tapisOnly = { inputs: ["bids", "zarr"], executors: ["tapis"] } as const;
+    expect(recipeRunsOn(tapisOnly, "tapis")).toBe(true);
+    expect(recipeRunsOn(tapisOnly, "runner")).toBe(false);
+    expect(recipeRunsOn({ executors: ["runner"] }, "tapis")).toBe(false);
+    expect(recipeRunsOn({ executors: [] }, "tapis")).toBe(false);
+    expect(recipeRunsOn({ executors: ["tapis", "runner"] }, "runner")).toBe(true);
+    // The input decision is separate: listing an input does not make an executor list it.
+    expect(recipeRunsInput(tapisOnly, "zarr", "runner")).toBe(true);
+    expect(recipeRunsOn(tapisOnly, "runner")).toBe(false);
+    // The registry: nemar-floor lists both, nemar-ica Tapis only.
+    const floor = findRecipe("nemar-floor") as NonNullable<ReturnType<typeof findRecipe>>;
+    const ica = findRecipe("nemar-ica") as NonNullable<ReturnType<typeof findRecipe>>;
+    expect([recipeRunsOn(floor, "tapis"), recipeRunsOn(floor, "runner")]).toEqual([true, true]);
+    expect([recipeRunsOn(ica, "tapis"), recipeRunsOn(ica, "runner")]).toEqual([true, false]);
   });
 });
 
@@ -356,7 +389,20 @@ describe("what a run read, for the stamp", () => {
   const SHA = `sha256:${"ab".repeat(32)}`;
   const COMMIT = "0123456789abcdef0123456789abcdef01234567";
   const READER = "eegprep-lean@0.3.1+89abcdef0123456789abcdef0123456789abcdef";
-  const zarrRecord = (over: { reader?: unknown; engine?: unknown; digest?: unknown } = {}) => ({
+  const STORES = ["sub-01/eeg/a.edf", "sub-02/eeg/b.edf"];
+  const rows = (paths: unknown[]) =>
+    paths.map((path) => ({ path, group: "eeg", content_sha256: "cd".repeat(32) }));
+  /** A Zarr record that read every store it was given in full, unless `over` says otherwise. */
+  const zarrRecord = (
+    over: {
+      reader?: unknown;
+      engine?: unknown;
+      digest?: unknown;
+      stores?: unknown;
+      content?: unknown;
+      unread?: unknown;
+    } = {},
+  ) => ({
     extensions: {
       nemar: {
         dataset: { id: "nm000104", source_commit: COMMIT },
@@ -365,6 +411,9 @@ describe("what a run read, for the stamp", () => {
           kind: "zarr",
           zarr_engine_version: "engine" in over ? over.engine : "0.4.2",
           input_digest: "digest" in over ? over.digest : SHA,
+          stores: "stores" in over ? over.stores : STORES,
+          stores_content: "content" in over ? over.content : rows(STORES),
+          stores_unread: "unread" in over ? over.unread : [],
         },
       },
     },
@@ -379,6 +428,7 @@ describe("what a run read, for the stamp", () => {
       input_engine: "0.4.2",
       input_digest: SHA,
       refused: [],
+      reasons: {},
       absent: [],
     });
   });
@@ -389,6 +439,7 @@ describe("what a run read, for the stamp", () => {
       input_engine: null,
       input_digest: `git:${COMMIT}`,
       refused: [],
+      reasons: {},
       absent: [],
     });
     // A BIDS stamp never takes what a Zarr block says, and a Zarr stamp never takes the commit.
@@ -407,6 +458,7 @@ describe("what a run read, for the stamp", () => {
     const refused = (over: Parameters<typeof zarrRecord>[0], field: string) => {
       const got = stampInputFields(zarrRecord(over), "zarr");
       expect([over, got.refused]).toEqual([over, [field]]);
+      expect(got.reasons).toEqual({ [field]: "bad_shape" });
       expect(got[field as (typeof STAMP_INPUT_FIELDS)[number]]).toBeNull();
       expect(got.absent).toEqual([]);
     };
@@ -452,11 +504,66 @@ describe("what a run read, for the stamp", () => {
       "z".repeat(40),
       7,
     ]) {
-      expect([bad, stampInputFields(bidsRecord(bad), "bids").refused]).toEqual([
+      const got = stampInputFields(bidsRecord(bad), "bids");
+      expect([bad, got.refused, got.reasons]).toEqual([
         bad,
         ["input_digest"],
+        { input_digest: "bad_shape" },
       ]);
     }
+  });
+
+  test("a Zarr digest is stored only when the record shows it covers every store (each condition, MUTATION: skip one)", () => {
+    const refusal = (over: Parameters<typeof zarrRecord>[0]) => {
+      const got = stampInputFields(zarrRecord(over), "zarr");
+      // Whatever the record says, the other two fields are stored as before.
+      expect([got.reader, got.input_engine]).toEqual([READER, "0.4.2"]);
+      return [got.input_digest, got.refused, got.reasons.input_digest];
+    };
+    // All three hold: stored, in any order of the rows, and when the stores are listed in another order.
+    expect(refusal({})).toEqual([SHA, [], undefined]);
+    expect(refusal({ content: rows([...STORES].reverse()) })).toEqual([SHA, [], undefined]);
+    expect(refusal({ stores: [...STORES].reverse() })).toEqual([SHA, [], undefined]);
+    // stores_unread: anything but an empty list. A stand-in record of a run that left two stores unread, with
+    // a digest that looks right, has none.
+    for (const unread of [["HUGE", "MISSING"], ["HUGE"], 2, 0, "", null, undefined, {}]) {
+      expect([unread, refusal({ unread })]).toEqual([
+        unread,
+        [null, ["input_digest"], "stores_unread"],
+      ]);
+    }
+    // stores_content: a non-empty list of rows that each have a path.
+    for (const content of [[], "all", 3, null, undefined, [{ group: "eeg" }], [null], rows([7])]) {
+      expect([content, refusal({ content })]).toEqual([
+        content,
+        [null, ["input_digest"], "no_stores_content"],
+      ]);
+    }
+    // The paths of the rows are the stores the run named, each once.
+    for (const [content, stores] of [
+      [rows(STORES.slice(0, 1)), STORES],
+      [rows([...STORES, "sub-03/eeg/c.edf"]), STORES],
+      [rows(["x.edf", "y.edf"]), STORES],
+      [rows([STORES[0], STORES[0]]), STORES],
+      [rows(STORES), STORES.slice(0, 1)],
+      [rows(STORES), undefined],
+      [rows(STORES), "sub-01"],
+      [rows(STORES), [1, 2]],
+    ] as const) {
+      expect([content, stores, refusal({ content, stores })]).toEqual([
+        content,
+        stores,
+        [null, ["input_digest"], "stores_differ"],
+      ]);
+    }
+    // A digest that is not even well formed is refused for its shape, before coverage is asked.
+    expect(refusal({ digest: SHA.toUpperCase(), unread: ["HUGE"] })).toEqual([
+      null,
+      ["input_digest"],
+      "bad_shape",
+    ]);
+    // The reasons are a closed list of plain words.
+    for (const reason of STAMP_REFUSAL_REASONS) expect(reason).toMatch(/^[a-z_]+$/);
   });
 
   test("a field the record does not state is null and named absent, not refused", () => {
@@ -465,6 +572,7 @@ describe("what a run read, for the stamp", () => {
       input_engine: null,
       input_digest: null,
       refused: [],
+      reasons: {},
       absent: ["reader", "input_engine", "input_digest"],
     });
     expect(stampInputFields(zarrRecord({ reader: null, digest: undefined }), "zarr")).toMatchObject(
@@ -474,10 +582,23 @@ describe("what a run read, for the stamp", () => {
         absent: ["reader", "input_digest"],
       },
     );
-    expect(stampInputFields(null, "bids")).toMatchObject({
-      input_digest: null,
-      absent: ["input_digest"],
-    });
+    // A BIDS record names no source commit when the Worker dispatched it (the recipe is not given one): the
+    // null digest is the expected case, so it is neither absent nor refused.
+    for (const record of [
+      null,
+      {},
+      bidsRecord(null),
+      { extensions: { nemar: { dataset: { id: "nm000104" } } } },
+    ]) {
+      expect(stampInputFields(record, "bids")).toEqual({
+        reader: null,
+        input_engine: null,
+        input_digest: null,
+        refused: [],
+        reasons: {},
+        absent: [],
+      });
+    }
   });
 
   test("every value it returns fits the migration's column, whatever the record says", () => {
