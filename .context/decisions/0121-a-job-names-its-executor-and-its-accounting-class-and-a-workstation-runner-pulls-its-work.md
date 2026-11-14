@@ -71,6 +71,15 @@ Money must be counted only where an allocation exists, and every job, wherever i
 9. **A result is reproducible from an image digest, a launch specification and an input snapshot, with no runner and no Tapis.**
    The launch specification carries a per-job token, so it is never the record of an input; a recipe that streams a Zarr store, not the platform, records what it read.
    Each runner job records its registration's facts (site, trust, capacity) as host facts.
+10. **A pipeline stamp names the input a recipe read, and the one `nemar-floor` reads two.**
+    This refines the pipeline stamp of the [ADR 0118](0118-the-compute-gateway-records-every-tenant-job-and-keeps-the-ledger-in-expanse-service-units.md) amendment of 2026-11-05 (items 1 to 3) in four ways, built by migration 0141 and `shared/compute-recipes.ts`.
+    First, the stamp's tuple is (dataset version, recipe, recipe version, engine, input), where `input` is `bids` (the dataset's files, on Tapis) or `zarr` (its Zarr serving copy, on a runner), so one run of each input of one dataset version coexist and the one-live-stamp rule holds per input.
+    The recipe `nemar-floor-zarr` is gone from the registry: `nemar-floor` lists both inputs, the table of which input runs on which executor is declared once, and the old stamps keep their recipe name with `input` set to `zarr`, so the registry answers `recipe_unknown` for them and they never occupy a `nemar-floor` slot.
+    Second, the command is still `nemar-recipe run <name>` for the BIDS input, byte for byte, and is `nemar-recipe run <name> --input zarr` for the Zarr input; the arguments are unchanged, because a Zarr job's arguments already fill the 64 a launch specification may carry.
+    Third, the registry hold is per input, not one per registry tuple: a finished record that names another recipe version, engine or input than the stamp claimed holds the claimed tuple and input only, and a record of another input ends the stamp `failed` with `tuple_mismatch` (that stamp is the hold), so a stamp never says "read zarr" of a run that read something else.
+    Fourth, a `succeeded` stamp takes three fields from the recipe's own record, each stored only in the shape of its column and otherwise left empty and logged by name: `reader`, `input_engine` and `input_digest`.
+    A Zarr digest (`sha256:`) is stored only when the record shows it covers the whole input (an empty `stores_unread`, a non-empty `stores_content`, and the paths of its rows equal to `input.stores`); a BIDS digest is `git:` and the source commit the record carries, and a Worker-dispatched BIDS record carries none, so a BIDS stamp has no digest.
+    The stamp does not recompute the digest from the rows: that check belongs to the derivative store (item 8), which holds the one shared definition of the input digest.
 
 ## Consequences
 
