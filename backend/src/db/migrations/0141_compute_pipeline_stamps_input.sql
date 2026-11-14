@@ -1,8 +1,15 @@
 -- The input a pipeline run read, and what the run said it read (portable compute, card Q0b; ADR 0121;
 -- plan D12 and D14). One recipe, `nemar-floor`, reads two inputs: `bids` (the dataset's files, on Tapis) and
 -- `zarr` (the dataset's Zarr serving copy, on a runner). Until now the Zarr input was its own recipe name,
--- `nemar-floor-zarr`, a transition name; this migration folds it into `nemar-floor` with the input as part of
--- the stamp's CLAIMED tuple, and gives a succeeded stamp the fields a derivative will be keyed from.
+-- `nemar-floor-zarr`, a transition name; the registry no longer has it, the input is part of the stamp's
+-- CLAIMED tuple, and a succeeded stamp gets the fields a derivative will be keyed from.
+--
+-- THE OLD NAME STAYS ON THE OLD ROWS. A stamp of `nemar-floor-zarr` gets `input = 'zarr'` and KEEPS its recipe
+-- name. The registry answers `recipe_unknown` for that name, so the old rows fail closed: a demo-era
+-- succeeded stamp does not occupy the live slot of a `nemar-floor` Zarr run forever, an old `tuple_mismatch`
+-- hold does not become a hold on `nemar-floor` that refuses every Zarr run, and a stamp's recipe always equals
+-- its record's `pipelineInfo.name` (the old recipe wrote another name). Nothing is lost and nothing reads
+-- the rows as `nemar-floor`.
 --
 -- THE TUPLE GROWS BY `input`. A stamp is one run of a recipe, at a version, on an engine, over one version of
 -- one dataset, reading one input. `compute_pipeline_stamps_live` (one `dispatched` or `succeeded` stamp per
@@ -19,9 +26,9 @@
 -- hexadecimal digits of the commit a BIDS run read). All three are NULL on a stamp that has not succeeded and
 -- on one whose record did not state them.
 --
--- THE ORDER MATTERS. The two unique indexes are dropped BEFORE the rename, because a `nemar-floor-zarr` stamp
--- and a `nemar-floor` stamp of the same dataset version, recipe version and engine are two tuples now (two
--- inputs) and the old five-column indexes would refuse the rename; they are recreated after it, with `input`.
+-- THE INDEXES. The two unique indexes are dropped and recreated with `input` after `engine`: the old
+-- five-column indexes would refuse a BIDS stamp and a Zarr stamp of one dataset version, recipe version and
+-- engine, which are two tuples now.
 --
 -- Every CHECK is named, every term is TRUE or FALSE and never NULL (as 0117 requires), and every GLOB is at
 -- most 50 characters (D1 refuses longer). No foreign key; nothing here names a person, a path or a host.
@@ -50,10 +57,8 @@ DROP INDEX compute_pipeline_stamps_live;
 
 DROP INDEX compute_pipeline_stamps_attempt;
 
--- The transition name becomes the one recipe with its input: the stamps of `nemar-floor-zarr` are the
--- `nemar-floor` stamps that read `zarr`.
-UPDATE compute_pipeline_stamps SET recipe = 'nemar-floor', input = 'zarr'
- WHERE recipe = 'nemar-floor-zarr';
+-- The stamps of the transition name read `zarr`; their recipe name stays (see above).
+UPDATE compute_pipeline_stamps SET input = 'zarr' WHERE recipe = 'nemar-floor-zarr';
 
 -- THE RULE: one live or succeeded stamp per tuple and input. A query that relies on it states the same predicate.
 CREATE UNIQUE INDEX compute_pipeline_stamps_live
