@@ -657,12 +657,15 @@ async function commitRunnerPlan(
 
 /**
  * The usage a runner measured, written once under the lease: `?1` job, `?2` runner, `?3` lease, `?4`..`?6`
- * the numbers. It has NO state term, because a completed job keeps its lease and a repeat completion fills a
- * usage a first one did not get to write; it has the lease and runner terms, so a completion that held a
- * lease which was since released, replaced or revoked records nothing.
+ * the numbers, `?7` whether the runner marked them partial (1 or 0: under Docker or Podman it cannot always
+ * measure all three, and every report that shows them says so, risk K14). It has NO state term, because a
+ * completed job keeps its lease and a repeat completion fills a usage a first one did not get to write; it
+ * has the lease and runner terms, so a completion that held a lease which was since released, replaced or
+ * revoked records nothing.
  */
 export const RECORD_USAGE_SQL = `UPDATE compute_jobs SET
-    runner_wall_seconds = ?4, runner_cpu_seconds = ?5, runner_max_rss_mb = ?6
+    runner_wall_seconds = ?4, runner_cpu_seconds = ?5, runner_max_rss_mb = ?6,
+    runner_usage_partial = ?7
   WHERE id = ?1 AND executor = 'runner' AND runner_id = ?2 AND lease_id = ?3
     AND runner_wall_seconds IS NULL`;
 
@@ -697,7 +700,7 @@ export async function completeRunnerJob(
   const usage = [body.usage.wall_seconds, body.usage.cpu_seconds, body.usage.max_rss_mb] as const;
   const recordUsage = () =>
     env.DB.prepare(RECORD_USAGE_SQL)
-      .bind(job.id, runner.id, body.lease_id, ...usage)
+      .bind(job.id, runner.id, body.lease_id, ...usage, body.usage_partial ? 1 : 0)
       .run();
   if (TERMINAL_STATES.has(job.state)) {
     await recordUsage();
