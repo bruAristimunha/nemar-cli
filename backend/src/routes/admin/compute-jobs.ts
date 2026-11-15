@@ -10,7 +10,8 @@
  * code the webhook, the 30-minute tick and a person's own cancel run (`advanceComputeJob`,
  * `requestComputeCancel`): an administrator has no second path to a job's state.
  *
- * What an administrator is shown is `jobView`: fixed words, numbers and times, `platform_failure` (an
+ * What an administrator is shown is `jobView` (the cancel answer adds a runner job's partial-usage mark, as
+ * every report does): fixed words, numbers and times, `platform_failure` (an
  * INFORMATION flag, so a NEMAR-caused failure can be compensated by a manual grant: nothing is ever
  * refunded automatically) and the four flags. No identity, no specification, no token, no address and
  * no log. Every refusal is `{ error, code }` with the words of `shared/compute-state.ts`. The routes
@@ -29,6 +30,7 @@ import {
   jobView,
   requestComputeCancel,
 } from "../../services/compute-lifecycle.js";
+import { reportedJobView, withUsageMark } from "../../services/compute-reporting.js";
 import type { AdminRouter } from "./shared.js";
 
 export function registerComputeJobAdminRoutes(admin: AdminRouter): void {
@@ -54,8 +56,14 @@ export function registerComputeJobAdminRoutes(admin: AdminRouter): void {
         COMPUTE_REFUSAL_STATUS[code],
       );
     }
+    // A runner job that already ended carries the usage its runner reported, and with it the mark that says
+    // whether that usage is whole: the answer is the report view, not the bare one (`getJob` does not select it).
     const job = await getJob(c.env.DB, id);
-    return c.json({ ok: true, outcome: result.outcome, job: job ? jobView(job) : null });
+    return c.json({
+      ok: true,
+      outcome: result.outcome,
+      job: job ? reportedJobView(await withUsageMark(c.env.DB, job)) : null,
+    });
   });
 
   admin.post("/compute/jobs/:id/advance", async (c) => {

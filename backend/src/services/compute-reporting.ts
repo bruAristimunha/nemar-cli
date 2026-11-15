@@ -16,7 +16,7 @@
  *   `resolveJobRef`               a NEMAR job id, a Tapis uuid or a Slurm id, in that order
  *   `recordSummary`               one job: the index row, its ledger entries, provenance, manifest
  *   `accountReport`               one account's jobs and charge in a date range; runner jobs are listed and
- *                                 totalled APART, in the runner's own figures, never in service units
+ *                                 totaled APART, in the runner's own figures, never in service units
  *   `runnersUsageReport`          every runner registration's usage in a date range, never in service units
  *   `accessReport`                distinct gateway users and jobs by partition and source in a quarter
  *   `listAccessReportFailures`    `failed` ACCESS report rows, counted by their fixed word
@@ -87,6 +87,19 @@ const partialOf = (stored: number | null | undefined): boolean | null =>
  */
 export function reportedJobView(job: ReportedJobRow) {
   return { ...jobView(job), runner_usage_partial: partialOf(job.runner_usage_partial) };
+}
+
+/**
+ * The job row with the mark `getJob`'s column list does not select: for a route that answers with a job read
+ * by `getJob` (the cancel answer of a runner job that already ended carries the usage its runner reported,
+ * and so the mark that says whether it is whole).
+ */
+export async function withUsageMark(db: D1Database, job: ComputeJobRow): Promise<ReportedJobRow> {
+  const stored = await db
+    .prepare("SELECT runner_usage_partial FROM compute_jobs WHERE id = ?1")
+    .bind(job.id)
+    .first<{ runner_usage_partial: number | null }>();
+  return { ...job, runner_usage_partial: stored?.runner_usage_partial ?? null };
 }
 
 /**
@@ -343,8 +356,11 @@ export interface AccountReport {
    * The runner jobs, APART from `totals` and `by_pool` (ADR 0121: a runner-reported core-hour is never
    * added to a service-unit total). `totals` and `by_pool` count `accounting = 'su'` jobs only; this holds
    * the jobs a runner ran, in the runner's own figures. `core_hours` is `cpu_seconds / 3600` rounded down
-   * to three decimals. `partial_jobs` counts the jobs whose usage the runner marked partial, so the sums
-   * are a lower bound when it is above zero. A job that has not reported yet adds to `jobs` and nothing else.
+   * to three decimals. `reported_jobs` counts the jobs whose runner has reported usage: a job that has not
+   * adds to `jobs` and nothing else, so `reported_jobs` below `jobs` says that a sum leaves jobs out and a
+   * zero sum is not zero usage. `partial_jobs` counts the jobs whose usage the runner marked partial, so the
+   * sums are a lower bound when it is above zero, and `unmarked_jobs` those that reported usage with no mark
+   * (completed before the mark was stored): whether they are whole is unknown, never assumed.
    */
   runner_totals: RunnerTotals;
   jobs: Array<{
@@ -389,7 +405,9 @@ export interface RunnerTotals {
   wall_seconds: number;
   cpu_seconds: number;
   core_hours: number;
+  reported_jobs: number;
   partial_jobs: number;
+  unmarked_jobs: number;
 }
 
 /**
@@ -443,7 +461,14 @@ export async function accountReport(
   const page = rows.slice(0, ACCOUNT_REPORT_ROWS_MAX);
   const byPool: AccountReport["by_pool"] = {};
   const totals = { jobs: 0, charged_milli: 0, unsettled: 0, open_hold_milli: 0 };
-  const runnerSums = { jobs: 0, wall_seconds: 0, cpu_seconds: 0, partial_jobs: 0 };
+  const runnerSums = {
+    jobs: 0,
+    wall_seconds: 0,
+    cpu_seconds: 0,
+    reported_jobs: 0,
+    partial_jobs: 0,
+    unmarked_jobs: 0,
+  };
   const jobs = page.map((r) => {
     const settled = r.settled_provisional_at !== null;
     const openHold = settled ? 0 : r.held_milli;
@@ -469,6 +494,10 @@ export async function accountReport(
       runnerSums.jobs++;
       runnerSums.wall_seconds += r.runner_wall_seconds ?? 0;
       runnerSums.cpu_seconds += r.runner_cpu_seconds ?? 0;
+      if (r.runner_wall_seconds !== null) {
+        runnerSums.reported_jobs++;
+        if (r.runner_usage_partial === null) runnerSums.unmarked_jobs++;
+      }
       if (r.runner_usage_partial === 1) runnerSums.partial_jobs++;
     }
     return {
@@ -543,8 +572,12 @@ export interface RunnersUsageReport {
     cpu_seconds: number;
     core_hours: number;
     max_rss_mb: number | null;
+    /** The jobs whose runner has reported usage: below `jobs`, the sums leave some out (a zero is not zero usage). */
+    reported_jobs: number;
     /** Jobs whose usage the runner marked partial (Docker or Podman): the sums are a lower bound. */
     partial_jobs: number;
+    /** Jobs that reported usage with no mark (completed before it was stored): whole or not is unknown. */
+    unmarked_jobs: number;
   }>;
   totals: RunnerTotals;
 }
@@ -579,7 +612,10 @@ export async function runnersUsageReport(
                 COALESCE(SUM(runner_wall_seconds), 0) AS wall_seconds,
                 COALESCE(SUM(runner_cpu_seconds), 0) AS cpu_seconds,
                 MAX(runner_max_rss_mb) AS max_rss_mb,
-                COALESCE(SUM(CASE WHEN runner_usage_partial = 1 THEN 1 ELSE 0 END), 0) AS partial_jobs
+                COALESCE(SUM(CASE WHEN runner_wall_seconds IS NOT NULL THEN 1 ELSE 0 END), 0) AS reported_jobs,
+                COALESCE(SUM(CASE WHEN runner_usage_partial = 1 THEN 1 ELSE 0 END), 0) AS partial_jobs,
+                COALESCE(SUM(CASE WHEN runner_wall_seconds IS NOT NULL AND runner_usage_partial IS NULL
+                                  THEN 1 ELSE 0 END), 0) AS unmarked_jobs
            FROM compute_jobs
           WHERE executor = 'runner' AND runner_id IS NOT NULL
             AND created_at >= ?1 AND created_at < date(?2, '+1 day')
@@ -593,13 +629,29 @@ export async function runnersUsageReport(
         wall_seconds: number;
         cpu_seconds: number;
         max_rss_mb: number | null;
+        reported_jobs: number;
         partial_jobs: number;
+        unmarked_jobs: number;
       }>()
   ).results;
-  const totals = { jobs: 0, wall_seconds: 0, cpu_seconds: 0, partial_jobs: 0 };
+  const totals = {
+    jobs: 0,
+    wall_seconds: 0,
+    cpu_seconds: 0,
+    reported_jobs: 0,
+    partial_jobs: 0,
+    unmarked_jobs: 0,
+  };
   const runners = registrations.map((r) => {
     const own = groups.filter((g) => g.runner_id === r.id);
-    const sum = { jobs: 0, wall_seconds: 0, cpu_seconds: 0, partial_jobs: 0 };
+    const sum = {
+      jobs: 0,
+      wall_seconds: 0,
+      cpu_seconds: 0,
+      reported_jobs: 0,
+      partial_jobs: 0,
+      unmarked_jobs: 0,
+    };
     const byState: Record<string, number> = {};
     let maxRss: number | null = null;
     for (const g of own) {
@@ -607,7 +659,9 @@ export async function runnersUsageReport(
       sum.jobs += g.jobs;
       sum.wall_seconds += g.wall_seconds;
       sum.cpu_seconds += g.cpu_seconds;
+      sum.reported_jobs += g.reported_jobs;
       sum.partial_jobs += g.partial_jobs;
+      sum.unmarked_jobs += g.unmarked_jobs;
       if (g.max_rss_mb !== null) maxRss = Math.max(maxRss ?? 0, g.max_rss_mb);
     }
     for (const key of Object.keys(totals) as Array<keyof typeof totals>) totals[key] += sum[key];
@@ -623,7 +677,9 @@ export async function runnersUsageReport(
       cpu_seconds: sum.cpu_seconds,
       core_hours: runnerCoreHours(sum.cpu_seconds),
       max_rss_mb: maxRss,
+      reported_jobs: sum.reported_jobs,
       partial_jobs: sum.partial_jobs,
+      unmarked_jobs: sum.unmarked_jobs,
     };
   });
   return {

@@ -13,7 +13,7 @@
  *   POST   /compute/records/:ref/read             owner  one record, with a stated reason, audited first
  *                                                       (the identity snapshot or the specification)
  *   GET    /compute/report                        admin  one account's jobs and charge in a date range;
- *                                                       runner jobs are totalled apart, never in SU
+ *                                                       runner jobs are totaled apart, never in SU
  *   GET    /compute/reports/runners               admin  every runner registration's usage in a date
  *                                                       range, in the runner's own figures, never in SU
  *   GET    /compute/access-report                 admin  a quarter's distinct gateway users and jobs

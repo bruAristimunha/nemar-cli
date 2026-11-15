@@ -859,6 +859,10 @@ export const ComputeAccountReportResponseSchema = z
         cpu_seconds: z.number().int(),
         core_hours: z.number(),
         partial_jobs: z.number().int(),
+        // How many of `jobs` have reported usage (below `jobs`, a zero sum is not zero usage) and how many of
+        // those reported with no partial mark (completed before it was stored). Optional: an older Worker.
+        reported_jobs: z.number().int().optional(),
+        unmarked_jobs: z.number().int().optional(),
       })
       .passthrough()
       .optional(),
@@ -877,6 +881,29 @@ export const COMPUTE_RUNNER_REPORT_DAYS_MAX = 366;
  * cannot always measure all of a job's usage, so the figure is a lower bound (risk K14).
  */
 export const COMPUTE_PARTIAL_USAGE_NOTE = " (partial: Docker or Podman)";
+
+/**
+ * What a human view appends to a runner figure that has usage but no mark: the job completed before the
+ * mark was stored, so whether the figure is whole is UNKNOWN. Never shown as complete.
+ */
+export const COMPUTE_UNKNOWN_PARTIAL_NOTE = " (partial: unknown)";
+
+/**
+ * The clauses a runner total ends with, so a sum is never read as whole when it may not be: the jobs whose
+ * usage the runner marked partial (a lower bound) and those that reported with no mark (unknown). Empty when
+ * both counts are zero or absent.
+ */
+export function runnerMarkNotes(t: { partial_jobs: number; unmarked_jobs?: number }): string {
+  const lower =
+    t.partial_jobs > 0
+      ? `; usage of ${t.partial_jobs} job(s) is a lower bound${COMPUTE_PARTIAL_USAGE_NOTE}`
+      : "";
+  const unknown =
+    (t.unmarked_jobs ?? 0) > 0
+      ? `; usage of ${t.unmarked_jobs} job(s) has no partial mark${COMPUTE_UNKNOWN_PARTIAL_NOTE}`
+      : "";
+  return lower + unknown;
+}
 
 /** The last line of the runners' usage report: whose figures these are, and that they are not service units. */
 export const COMPUTE_RUNNER_USAGE_FOOTER = "Runner-reported usage; never service units.";
@@ -907,6 +934,9 @@ export const ComputeRunnersUsageResponseSchema = z
           core_hours: z.number(),
           max_rss_mb: z.number().int().nullable(),
           partial_jobs: z.number().int(),
+          // As in `runner_totals` of the account report: optional for an older Worker.
+          reported_jobs: z.number().int().optional(),
+          unmarked_jobs: z.number().int().optional(),
         })
         .passthrough(),
     ),
@@ -917,6 +947,8 @@ export const ComputeRunnersUsageResponseSchema = z
         cpu_seconds: z.number().int(),
         core_hours: z.number(),
         partial_jobs: z.number().int(),
+        reported_jobs: z.number().int().optional(),
+        unmarked_jobs: z.number().int().optional(),
       })
       .passthrough(),
   })
