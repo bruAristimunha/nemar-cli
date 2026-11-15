@@ -319,6 +319,7 @@ describe("a run", () => {
       recipe: "nemar-floor",
       recipe_version: floor?.version as string,
       engine: floor?.engine as string,
+      input: "bids",
       attempt: 1,
     });
     const other = await createJob(env, {

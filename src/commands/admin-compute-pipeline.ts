@@ -2,7 +2,7 @@
  * `nemar admin compute pipeline`: an administrator runs NEMAR's own processing recipes through the compute
  * gateway and reads the stamps they leave (epic #2005 phase A6, #2011; ADR 0118; design section 10).
  *
- *   nemar admin compute pipeline run <recipe> --dataset <id>[@version] [--executor tapis|runner] [--dry-run]
+ *   nemar admin compute pipeline run <recipe> --dataset <id>[@version] [--executor tapis|runner] [--input bids|zarr] [--dry-run]
  *   nemar admin compute pipeline run <recipe> --eligible [--limit <n>] [--dry-run]
  *   nemar admin compute pipeline status [--recipe <name>] [--dataset <id>] [--state <state>] [--limit <n>]
  *
@@ -17,6 +17,7 @@
  */
 
 import { Command } from "commander";
+import { RECIPE_INPUTS } from "../../shared/compute-recipes.js";
 import {
   COMPUTE_PIPELINE_RUN_LIMIT_DEFAULT,
   COMPUTE_PIPELINE_RUN_LIMIT_MAX,
@@ -145,8 +146,8 @@ function stampLine(s: ComputePipelineStampView): string {
   const job = s.job_id ? ` job ${word(s.job_id)}` : "";
   return (
     `${String(s.id).padStart(5)}  ${word(s.dataset_id)} ${word(s.version).padEnd(8)} ` +
-    `${word(s.recipe)} ${word(s.recipe_version)} ${word(s.engine)} attempt ${s.attempt}  ` +
-    `${word(s.state)}${tail}${job}`
+    `${word(s.recipe)} ${word(s.recipe_version)} ${word(s.engine)} ${word(s.input ?? "bids")} ` +
+    `attempt ${s.attempt}  ${word(s.state)}${tail}${job}`
   );
 }
 
@@ -194,12 +195,19 @@ Runs a processing recipe on NEMAR's own datasets through the compute gateway, or
                             bounded by the live cap of the pool, the daily cap and at most
                             ${COMPUTE_PIPELINE_RUN_PER_INVOCATION} per invocation, and says which one bounded it
   --executor <who>          tapis (the default) or runner. A recipe lists the executors it may be run
-                            on (nemar-floor on tapis, nemar-floor-zarr on a runner) and the Worker refuses
-                            another with invalid_body naming executor. A runner run names one dataset
+                            on (nemar-floor on both) and the Worker refuses another with invalid_body
+                            naming executor. A runner run names one dataset
                             (not --eligible), needs the runners switch (runners_disabled when it is off),
                             makes a job with no hold and no service units that a registered runner pulls,
                             and is bounded only by the owner's live cap for runners (over_concurrency),
                             never by the daily cap or the tenant ceiling
+  --input <kind>            what the run reads: bids (the dataset's files, on tapis) or zarr (its Zarr
+                            serving copy, on a runner). When none is given it is the executor's own, so
+                            the run on a runner reads zarr. A recipe lists the inputs it reads, and an
+                            input it does not list, or one the executor does not run (bids on a runner,
+                            zarr on tapis), is refused as invalid_spec naming input, before anything is
+                            written. A dataset's bids run and its zarr run are separate runs of the same
+                            version and do not block each other
   --dry-run                 read only: the datasets it would run, the estimated SU (none for a runner),
                             the room (for a runner, the runners' live cap), what a real run lacks, and what
                             blocks the rest; works against every Worker
@@ -243,6 +251,7 @@ pipelineCommand
   .description("Run a recipe over one dataset or the eligible ones, or dry-run it")
   .option("--dataset <id>", "One dataset, nm000104 or nm000104@1.0.2")
   .option("--executor <who>", "Who runs the job: tapis (default) or runner")
+  .option("--input <kind>", "What the run reads: bids (on tapis) or zarr (on a runner)")
   .option("--eligible", "The next eligible datasets the recipe has not been run over")
   .option("--limit <n>", "With --eligible: how many datasets at most")
   .option("--dry-run", "Say what would happen; write nothing")
@@ -254,6 +263,7 @@ pipelineCommand
       o: {
         dataset?: string;
         executor?: string;
+        input?: string;
         eligible?: boolean;
         limit?: string;
         dryRun?: boolean;
@@ -290,6 +300,13 @@ pipelineCommand
           return;
         }
         request.executor = o.executor;
+      }
+      if (o.input !== undefined) {
+        if (o.input !== "bids" && o.input !== "zarr") {
+          failMessage(`--input is ${RECIPE_INPUTS.join(" or ")}.`, { json, answered: true });
+          return;
+        }
+        request.input = o.input;
       }
       if (o.dataset !== undefined) {
         if (o.limit !== undefined) {

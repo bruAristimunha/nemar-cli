@@ -1197,7 +1197,7 @@ describe("--seed-fixture: a Zarr recipe is dispatched with the exact verdict", (
       });
       const made = await call(stack.url, "POST", "/admin/compute/pipeline/run", {
         bearer: stack.keys.admin,
-        body: { recipe: "nemar-floor-zarr", dataset: FIXTURE_DATASET_ID, executor: "runner" },
+        body: { recipe: "nemar-floor", dataset: FIXTURE_DATASET_ID, executor: "runner" },
       });
       expect(made.status).toBe(201);
       const jobId = made.body.results[0].job_id as string;
@@ -1237,7 +1237,7 @@ describe("the Zarr source check's seams follow the state database", () => {
       expect(new URL(seams.NEMAR_ZARR_INDEX_BASE as string).hostname).toBe("127.0.0.1");
       const made = await call(again.url, "POST", "/admin/compute/pipeline/run", {
         bearer: again.keys.admin,
-        body: { recipe: "nemar-floor-zarr", dataset: FIXTURE_DATASET_ID, executor: "runner" },
+        body: { recipe: "nemar-floor", dataset: FIXTURE_DATASET_ID, executor: "runner" },
       });
       expect(made.status).toBe(201);
     } finally {

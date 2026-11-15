@@ -25,13 +25,22 @@
  * is the caller's claim, and the Worker compares it with the launcher's `provenance.json` before it
  * accepts a result (`recipeImageDigestArg`).
  *
- * TWO INPUTS, TWO EXECUTORS (portable compute, ADR 0121, plan D12). A recipe's `input` is `bids` (the
- * dataset staged at `/data/<id>`, the arguments above) or `zarr` (nothing staged: the recipe streams the
- * dataset's Zarr serving copy from `--zarr-base`, the one origin it may open, and the Worker passes the commit
- * that copy was built from, the version's tag commit and how they are equivalent as `--source-commit`,
- * `--tag-commit`, `--commit-equivalence` and `--commit-delta-path`; `recipeZarrArguments`). `executors` lists where a recipe may
- * be dispatched: `tapis` (an allocation, a hold) or `runner` (a registered runner pulls it, no hold). A
- * dispatch to an executor a recipe does not list is refused.
+ * TWO INPUTS, TWO EXECUTORS (portable compute, ADR 0121, plan D12). A recipe lists the `inputs` it reads:
+ * `bids` (the dataset the launcher stages and binds read-only, the arguments above) or `zarr` (nothing
+ * staged: the recipe streams the dataset's Zarr serving copy from `--zarr-base`, the one origin it may open,
+ * and the Worker passes the commit that copy was built from, the version's tag commit and how they are
+ * equivalent as `--source-commit`, `--tag-commit`, `--commit-equivalence` and `--commit-delta-path`;
+ * `recipeZarrArguments`). The input is chosen in the COMMAND (`nemar-recipe run nemar-floor --input zarr`,
+ * `recipeCommand`), not in the arguments: a Zarr job's arguments are the fixed ones and the delta paths,
+ * which fill the 64 a job may carry (`ZARR_SOURCE_MAX_DELTA_PATHS`), so a BIDS run, whose command and
+ * arguments are what they always were, and a Zarr run differ only in the two words after the recipe's name.
+ * `executors` lists where a recipe may be dispatched: `tapis` (an allocation, a hold) or `runner` (a
+ * registered runner pulls it, no hold). A dispatch to an executor a recipe does not list is refused. ONE
+ * recipe, ONE registry entry, both inputs: `nemar-floor` is `bids` on Tapis and `zarr` on a runner, and
+ * {@link RECIPE_INPUT_EXECUTOR} says which input runs where. A dispatch names its input or takes the
+ * executor's ({@link defaultInput}); an input the recipe does not list, or one the executor does not run, is
+ * refused before anything is claimed ({@link recipeRunsInput}). The input is part of the stamp's claimed
+ * tuple, so a `bids` and a `zarr` run of one dataset version coexist.
  */
 
 /** The states of a stamp, declared once; the migration's CHECK is held to this list by a test. */
@@ -64,9 +73,12 @@ export type RecipeEligibility = "eeg";
 /**
  * What a recipe reads: `bids`, the dataset's own files bound read-only at `/data/<id>` (the launcher
  * stages them), or `zarr`, the dataset's Zarr serving copy streamed over HTTPS from `--zarr-base`, with
- * no dataset staged (portable compute, plan D12).
+ * no dataset staged (portable compute, plan D12). The words of the stamp's `input` column (migration 0141),
+ * which a test holds to this list.
  */
-export type RecipeInput = "bids" | "zarr";
+export const RECIPE_INPUTS = ["bids", "zarr"] as const;
+
+export type RecipeInput = (typeof RECIPE_INPUTS)[number];
 
 /**
  * Who may run a recipe: Tapis on an allocation, or a runner that polls NEMAR (ADR 0121). These are the
@@ -74,6 +86,35 @@ export type RecipeInput = "bids" | "zarr";
  * nothing; a test holds the two lists together.
  */
 export type RecipeExecutor = "tapis" | "runner";
+
+/**
+ * Which executors run which input, the one table of the pairing: `bids` runs on Tapis (the launcher stages
+ * the dataset) and `zarr` on a runner (nothing is staged and the recipe reads over HTTPS). Exactly these
+ * pairs; no other combination is run, whatever a recipe lists.
+ */
+export const RECIPE_INPUT_EXECUTOR: Readonly<Record<RecipeInput, readonly RecipeExecutor[]>> =
+  Object.freeze({
+    bids: Object.freeze(["tapis"] as const),
+    zarr: Object.freeze(["runner"] as const),
+  });
+
+/** The input an executor runs when a dispatch names none: `bids` for Tapis, `zarr` for a runner. */
+export function defaultInput(executor: RecipeExecutor): RecipeInput {
+  return RECIPE_INPUTS.find((i) => RECIPE_INPUT_EXECUTOR[i].includes(executor)) ?? "bids";
+}
+
+/**
+ * Whether the recipe reads this input and the executor runs it: the one decision a dispatch, a dry run
+ * and the route take before anything is claimed or written. False for an input the recipe does not list
+ * and for a pair {@link RECIPE_INPUT_EXECUTOR} does not name (`bids` on a runner, `zarr` on Tapis).
+ */
+export function recipeRunsInput(
+  recipe: Pick<ComputeRecipe, "inputs">,
+  input: RecipeInput,
+  executor: RecipeExecutor,
+): boolean {
+  return recipe.inputs.includes(input) && RECIPE_INPUT_EXECUTOR[input].includes(executor);
+}
 
 export interface ComputeRecipe {
   /** The recipe's name, as `nemar-recipe run <name>` takes it. */
@@ -91,8 +132,11 @@ export interface ComputeRecipe {
   memoryMb?: number;
   gpus: number;
   minutes: number;
-  /** What the recipe reads; a `zarr` recipe is dispatched with no dataset staged and a source commit. */
-  input: RecipeInput;
+  /**
+   * What the recipe reads, one or more of {@link RECIPE_INPUTS}; a `zarr` run is dispatched with no dataset
+   * staged and a source commit. The stamp's tuple names the one input a run read.
+   */
+  inputs: readonly RecipeInput[];
   /** The executors the recipe may be dispatched to; a dispatch to another is refused. */
   executors: readonly RecipeExecutor[];
   /** The daily dispatcher dispatches a recipe only while this is true. */
@@ -107,8 +151,11 @@ export interface ComputeRecipe {
 }
 
 /**
- * The recipes. `nemar-floor` annotates every EEG recording of a dataset and runs on a CPU partition;
- * `nemar-ica` needs a GPU and stays out of the daily dispatcher until the 20-dataset pilot has run.
+ * The recipes. `nemar-floor` annotates every EEG recording of a dataset and runs on a CPU partition: on
+ * Tapis over the dataset's files (`bids`) and on a runner over its Zarr serving copy (`zarr`), one entry for
+ * both (plan D12). On a runner the partition is a SIZING LABEL only (ADR 0121, decision 6): `shared`'s
+ * ceilings apply, nothing is submitted to it and no service unit is estimated. `nemar-ica` needs a GPU and
+ * stays out of the daily dispatcher until the 20-dataset pilot has run.
  */
 export const COMPUTE_RECIPES: readonly ComputeRecipe[] = Object.freeze([
   Object.freeze({
@@ -123,29 +170,9 @@ export const COMPUTE_RECIPES: readonly ComputeRecipe[] = Object.freeze([
     memoryMb: 16384,
     gpus: 0,
     minutes: 360,
-    input: "bids",
-    executors: Object.freeze(["tapis"] as const),
+    inputs: Object.freeze(["bids", "zarr"] as const),
+    executors: Object.freeze(["tapis", "runner"] as const),
     autoDispatch: true,
-    eligibility: "eeg",
-  }),
-  // A transition name (plan D12): nemar-floor's chain over the Zarr serving copy, on a runner. The
-  // partition is a SIZING LABEL only (ADR 0121, decision 6): `shared`'s ceilings apply, nothing is
-  // submitted to it and no service unit is estimated. Step Q0 folds it into `nemar-floor`.
-  Object.freeze({
-    name: "nemar-floor-zarr",
-    version: "1.0.0",
-    appId: "nemar-launch",
-    appVersion: "1.0.0",
-    engine: "eegprep@0.5.0",
-    partition: "shared",
-    nodes: 1,
-    cores: 4,
-    memoryMb: 16384,
-    gpus: 0,
-    minutes: 120,
-    input: "zarr",
-    executors: Object.freeze(["runner"] as const),
-    autoDispatch: false,
     eligibility: "eeg",
   }),
   Object.freeze({
@@ -159,7 +186,7 @@ export const COMPUTE_RECIPES: readonly ComputeRecipe[] = Object.freeze([
     cores: 10,
     gpus: 1,
     minutes: 720,
-    input: "bids",
+    inputs: Object.freeze(["bids"] as const),
     executors: Object.freeze(["tapis"] as const),
     autoDispatch: false,
     placeholder: true,
@@ -194,9 +221,22 @@ export function recipeRequiredOutputs(recipe: Pick<ComputeRecipe, "name">): {
   };
 }
 
-/** The command a recipe job runs; the arguments follow it. */
-export function recipeCommand(recipe: Pick<ComputeRecipe, "name">): string[] {
-  return ["nemar-recipe", "run", recipe.name];
+/**
+ * The command a recipe job runs; the arguments follow it. A BIDS run, the recipe's default input, is
+ * `nemar-recipe run <name>`, byte for byte what it was before a recipe had two inputs; any other input adds
+ * `--input <input>` after the name (`nemar-recipe run nemar-floor --input zarr`). The input is in the command
+ * and not in the arguments on purpose: see the header.
+ */
+export function recipeCommand(
+  recipe: Pick<ComputeRecipe, "name">,
+  input: RecipeInput = "bids",
+): string[] {
+  return [
+    "nemar-recipe",
+    "run",
+    recipe.name,
+    ...(input === "bids" ? [] : [RECIPE_INPUT_FLAG, input]),
+  ];
 }
 
 /**
@@ -224,6 +264,9 @@ export function recipeArguments(input: {
     input.imageDigest,
   ];
 }
+
+/** The flag of the command that names the input a recipe reads (`bids`, the default, passes none). */
+export const RECIPE_INPUT_FLAG = "--input";
 
 /** The origin a Zarr-input recipe reads, and the one network origin it may open (plan D12). */
 export const RECIPE_ZARR_BASE = "https://zarr.nemar.org";
@@ -382,6 +425,11 @@ export interface RecipeRecord {
   engine: string;
   /** The recordings that succeeded. */
   succeeded: number;
+  /**
+   * What the record says it read: `extensions.nemar.input.kind`, or `bids` when the record states none (a BIDS
+   * record has no input block). A plain word; compared with the stamp's `input` (a difference is a tuple mismatch).
+   */
+  inputKind: string;
 }
 
 function object(value: unknown): Record<string, unknown> | null {
@@ -392,9 +440,11 @@ function object(value: unknown): Record<string, unknown> | null {
 
 /**
  * The identity a recipe's dataset record states, or null when the record does not state it in the shape
- * the recipe writes (`extensions.nemar.recipe`, `.engine` and `.counts`). Nothing else is read, and
- * every word must be a short plain word, so a record can put nothing else into a stamp. The record is
- * written by the job, so this is the recipe's statement of what it is and never an accounting figure.
+ * the recipe writes (`extensions.nemar.recipe`, `.engine` and `.counts`, and, when present, a plain word for
+ * `extensions.nemar.input.kind`). Nothing else is read, and every word must be a short plain word, so a
+ * record can put nothing else into a stamp. The record is written by the job, so this is the recipe's
+ * statement of what it is and never an accounting figure. What the record says it read (the reader, the Zarr
+ * engine, the input digest) is read by {@link stampInputFields}, which checks each value against its column.
  */
 export function readRecipeRecord(value: unknown): RecipeRecord | null {
   const nemar = object(object(object(value)?.extensions)?.nemar);
@@ -402,6 +452,18 @@ export function readRecipeRecord(value: unknown): RecipeRecord | null {
   const engine = object(nemar?.engine);
   const counts = object(nemar?.counts);
   if (recipe === null || engine === null || counts === null) return null;
+  // The input block is absent from a BIDS record. A block that is there is an object, and the kind it names
+  // (absent means bids) is a plain word; anything else is not the shape the recipe writes.
+  let inputKind = "bids";
+  if (nemar?.input !== undefined) {
+    const block = object(nemar.input);
+    if (block === null) return null;
+    const kind = block.kind;
+    if (kind !== undefined) {
+      if (typeof kind !== "string" || !RECORD_WORD_RE.test(kind)) return null;
+      inputKind = kind;
+    }
+  }
   const { id, version } = recipe;
   const pkg = engine.package;
   const engineVersion = engine.version;
@@ -425,5 +487,168 @@ export function readRecipeRecord(value: unknown): RecipeRecord | null {
   // written, so the record is not read rather than left to throw at the update.
   const engineText = `${pkg}@${engineVersion}`;
   if (engineText.length > RECORD_ENGINE_MAX) return null;
-  return { recipe: id, version, engine: engineText, succeeded };
+  return { recipe: id, version, engine: engineText, succeeded, inputKind };
+}
+
+// --- What a run read, for the stamp ----------------------------------------------------------------------
+
+/**
+ * The stamp columns a finished run's record fills besides the tuple (migration 0141), by the name its log
+ * line and its refusals use.
+ */
+export const STAMP_INPUT_FIELDS = ["reader", "input_engine", "input_digest"] as const;
+
+export type StampInputField = (typeof STAMP_INPUT_FIELDS)[number];
+
+/**
+ * A reader or a Zarr engine as the stamp stores it: 1 to 128 plain characters (letters, digits and
+ * `. _ + @ -`), the rule of the columns `reader` and `input_engine`. `eegprep-lean@<version>+<commit>` fits.
+ */
+export const STAMP_WORD_RE = /^[0-9A-Za-z._+@-]{1,128}$/;
+
+/** The input digest of a Zarr run: `sha256:` and 64 lowercase hexadecimal digits (card V1's digest). */
+export const STAMP_ZARR_DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
+
+/** The input digest of a BIDS run: `git:` and the 40 lowercase hexadecimal digits of the source commit. */
+export const STAMP_GIT_DIGEST_RE = /^git:[0-9a-f]{40}$/;
+
+/**
+ * Why a value the record states was not stored, a fixed word for the log: `bad_shape` (it is not in the shape of
+ * its column), and, for a Zarr input digest that is well formed, the three ways the record does not show that
+ * the digest covers everything the run was given: `stores_unread` (the record's `stores_unread` is not an empty
+ * list), `no_stores_content` (`stores_content` is not a non-empty list of rows with a path) and `stores_differ`
+ * (the paths of its rows are not exactly `input.stores`).
+ */
+export const STAMP_REFUSAL_REASONS = [
+  "bad_shape",
+  "stores_unread",
+  "no_stores_content",
+  "stores_differ",
+] as const;
+
+export type StampRefusalReason = (typeof STAMP_REFUSAL_REASONS)[number];
+
+/** What a record says it read, each value as the stamp may store it, or null. */
+export interface StampInputFields {
+  reader: string | null;
+  input_engine: string | null;
+  input_digest: string | null;
+  /** The fields the record states but the stamp does not take: left null, never stored, and logged by name and reason. */
+  refused: StampInputField[];
+  /** The reason word of each refused field. */
+  reasons: Partial<Record<StampInputField, StampRefusalReason>>;
+  /** The fields a Zarr record does not state at all (an image from before they existed): null, and logged. */
+  absent: StampInputField[];
+}
+
+/**
+ * Whether a Zarr dataset record shows that its input digest covers every store the run was given, or the word
+ * of what it does not show. The digest names only the stores whose content was read in full
+ * (`stores_content`); it is the key of a derivative (plan D14), so it is stored only when nothing the run was
+ * given is missing from it: `stores_unread` is an empty list (a run that left stores unread, or that does not
+ * say, has a digest of less than its input), `stores_content` is a non-empty list, and the paths of its rows
+ * are exactly the stores the run named (`input.stores`), each once.
+ *
+ * What this does NOT check is that the stated digest is the digest of those rows: that recomputation belongs
+ * to the derivative store (card V1b), which holds the one shared definition of the input digest
+ * (`nemar.store-content.v1`); this file does not carry a second copy of it.
+ */
+function zarrCoverageRefusal(block: Record<string, unknown> | null): StampRefusalReason | null {
+  const unread = block?.stores_unread;
+  if (!Array.isArray(unread) || unread.length !== 0) return "stores_unread";
+  const rows = block?.stores_content;
+  if (!Array.isArray(rows) || rows.length === 0) return "no_stores_content";
+  const paths: string[] = [];
+  for (const row of rows) {
+    const path = object(row)?.path;
+    if (typeof path !== "string") return "no_stores_content";
+    paths.push(path);
+  }
+  const stores = block?.stores;
+  if (!Array.isArray(stores) || stores.some((p) => typeof p !== "string")) return "stores_differ";
+  const wanted = [...(stores as string[])].sort();
+  const got = [...paths].sort();
+  if (wanted.length !== got.length || wanted.some((p, i) => p !== got[i])) return "stores_differ";
+  // Each store once: two rows of one path are not a covering of a list of stores.
+  if (new Set(got).size !== got.length) return "stores_differ";
+  return null;
+}
+
+/**
+ * What a succeeded stamp records of what the run READ, from the recipe's dataset record (plan D12 and D14):
+ *  - `zarr`: the reader (`extensions.nemar.reader`, `eegprep-lean@<version>+<commit>`), the Zarr engine
+ *    (`extensions.nemar.input.zarr_engine_version`) and the input digest (`extensions.nemar.input.input_digest`,
+ *    `sha256:` and 64 hexadecimal digits), the digest only when the record shows it covers every store of the
+ *    run ({@link zarrCoverageRefusal});
+ *  - `bids`: the input digest `git:` and `extensions.nemar.dataset.source_commit`, when that is a full commit
+ *    (40 lowercase hexadecimal digits); no reader and no Zarr engine. A Worker-dispatched BIDS run is not given
+ *    a source commit, so its record carries none and its digest is null: an expected null, not logged as absent.
+ * A value that does not fit is left null and named in `refused` with its reason; a Zarr value the record does
+ * not state is null and named in `absent`. Nothing the record says is stored as it came: the record is the
+ * job's own statement and the columns hold fixed shapes only.
+ */
+export function stampInputFields(value: unknown, input: RecipeInput): StampInputFields {
+  const nemar = object(object(object(value)?.extensions)?.nemar);
+  const out: StampInputFields = {
+    reader: null,
+    input_engine: null,
+    input_digest: null,
+    refused: [],
+    reasons: {},
+    absent: [],
+  };
+  const refuse = (field: StampInputField, reason: StampRefusalReason): void => {
+    out.refused.push(field);
+    out.reasons[field] = reason;
+  };
+  /** A value the input must state: absent is named, a value that does not fit is refused. */
+  const take = (
+    field: StampInputField,
+    stated: unknown,
+    fits: (text: string) => boolean,
+    set: (text: string) => string = (text) => text,
+  ): void => {
+    if (stated === undefined || stated === null) {
+      out.absent.push(field);
+    } else if (typeof stated === "string" && fits(stated)) {
+      out[field] = set(stated);
+    } else {
+      refuse(field, "bad_shape");
+    }
+  };
+  if (input === "zarr") {
+    const block = object(nemar?.input);
+    take("reader", nemar?.reader, (t) => STAMP_WORD_RE.test(t));
+    take("input_engine", block?.zarr_engine_version, (t) => STAMP_WORD_RE.test(t));
+    take("input_digest", block?.input_digest, (t) => STAMP_ZARR_DIGEST_RE.test(t));
+    if (out.input_digest !== null) {
+      const reason = zarrCoverageRefusal(block);
+      if (reason !== null) {
+        out.input_digest = null;
+        refuse("input_digest", reason);
+      }
+    }
+  } else {
+    // The digest of a BIDS input is the commit the files were read at; a record that names none is the usual case.
+    const commit = object(nemar?.dataset)?.source_commit;
+    if (commit !== undefined && commit !== null) {
+      if (typeof commit === "string" && SOURCE_COMMIT_RE.test(commit)) {
+        out.input_digest = `git:${commit}`;
+      } else {
+        refuse("input_digest", "bad_shape");
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Whether a recipe lists the executor: the one decision the route, the dispatch and the dry run take of where a
+ * recipe may be dispatched, before the input is looked at ({@link recipeRunsInput}).
+ */
+export function recipeRunsOn(
+  recipe: Pick<ComputeRecipe, "executors">,
+  executor: RecipeExecutor,
+): boolean {
+  return recipe.executors.includes(executor);
 }

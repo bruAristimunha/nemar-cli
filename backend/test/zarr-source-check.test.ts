@@ -1,7 +1,7 @@
 /**
  * Does the Zarr serving copy describe the tagged data? (portable compute card DM-06b; plan D12)
  *
- * For a recipe whose input is `zarr`, `resolveRun` resolves the tag commit T and the serving index's commit S and
+ * For a run whose input is `zarr`, `resolveRun` resolves the tag commit T and the serving index's commit S and
  * decides `exact` (S is T) or `metadata_only` (GitHub's compare of `T...S` is `ahead`, `behind_by` 0, fewer than
  * 300 files, every changed path under `.nemar/` or `.github/`), refuses everything else with a fixed word, and
  * hands the recipe S, T, the verdict and the delta paths as flags. Everything here goes through the REAL admin
@@ -185,7 +185,7 @@ async function call(
 const run = (env: Bindings, extra: Record<string, unknown> = {}, id = ID) =>
   call(
     "/compute/pipeline/run",
-    { recipe: "nemar-floor-zarr", dataset: id, executor: "runner", ...extra },
+    { recipe: "nemar-floor", dataset: id, executor: "runner", ...extra },
     env,
   );
 
@@ -804,7 +804,7 @@ describe("the check runs for a Zarr recipe on the newest version of a ready copy
     for (const flag of ["--source-commit", "--tag-commit", "--commit-equivalence"]) {
       expect(args).not.toContain(flag);
     }
-    expect(recipe.input).toBe("bids");
+    expect(recipe.inputs).toContain("bids");
   });
 
   const TWO = [
