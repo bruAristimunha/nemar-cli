@@ -927,6 +927,7 @@ describe("a succeeded stamp records what the run read", () => {
       ["unread is a count, not a list", { unread: 2 }, "stores_unread"],
       ["unread is not stated", { unread: undefined }, "stores_unread"],
       ["no rows of content", { content: [] }, "no_stores_content"],
+      ["no stores and no rows", { stores: [], content: [] }, "no_stores_content"],
       ["content is not a list", { content: "all" }, "no_stores_content"],
       ["content is not stated", { content: undefined }, "no_stores_content"],
       [
@@ -944,6 +945,14 @@ describe("a succeeded stamp records what the run read", () => {
       [
         "a path twice",
         { content: rowsOf([STORES[0] as string, STORES[0] as string]) },
+        "stores_differ",
+      ],
+      [
+        "a store and its row twice",
+        {
+          stores: [STORES[0], STORES[0]],
+          content: rowsOf([STORES[0] as string, STORES[0] as string]),
+        },
         "stores_differ",
       ],
       ["stores is not stated", { stores: undefined }, "stores_differ"],
@@ -1027,10 +1036,15 @@ describe("a record whose input kind disagrees ends the stamp failed and holds th
     ]);
     expect(await tupleHeld(w.d1, floor, "zarr")).toBe(true);
     expect(await tupleHeld(w.d1, floor, "bids")).toBe(false);
-    // It holds no live slot and counts toward no cooldown: the word is the registry's, not the dataset's.
+    // It holds no live slot and counts toward no cooldown or cap: the word is the registry's, not the
+    // dataset's, so the dataset is still a candidate of its input (the hold, not the dataset, refuses it).
     expect(
       await count(w.d1, "compute_pipeline_stamps", "state IN ('dispatched', 'succeeded')"),
     ).toBe(0);
+    for (const input of RECIPE_INPUTS) {
+      const listed = await pipelineCandidates(w.env(), floor, 50, "", input);
+      expect([input, listed.map((c) => c.dataset_id).includes(id)]).toEqual([input, true]);
+    }
     // A second sync meets nothing of it.
     expect(await syncPipelineStamps(w.env())).toMatchObject({ examined: 0 });
     // On every path the Zarr input is refused and the BIDS input still runs.
@@ -1092,5 +1106,62 @@ describe("a record whose input kind disagrees ends the stamp failed and holds th
       ["failed", "record_unreadable"],
     ]);
     expect(await tupleHeld(w.d1, floor, "zarr")).toBe(false);
+  });
+});
+
+// --- (f) The retired name fails closed -----------------------------------------------------------------------
+
+describe("a stamp of the retired recipe name fails closed", () => {
+  const floor = findRecipe("nemar-floor") as NonNullable<ReturnType<typeof findRecipe>>;
+
+  test("a dispatched old-name stamp whose job finished ends failed recipe_unknown, holds nothing and leaves nemar-floor free for the dataset (MUTATION: look the recipe up with a fallback)", async () => {
+    const [w] = worlds() as [World];
+    await ready(w);
+    const id = await dataset(w);
+    const made = await dispatch(w.env(), id, asRunner);
+    if (!made.ok) throw new Error("not dispatched");
+    // What migration 0141 leaves of a stamp that was open when it landed: the old name, input zarr.
+    await w.d1
+      .prepare("UPDATE compute_pipeline_stamps SET recipe = 'nemar-floor-zarr' WHERE id = ?1")
+      .bind(made.stampId)
+      .run();
+    expect(findRecipe("nemar-floor-zarr")).toBeNull();
+    // Its job finishes, and the record names the recipe the registry now knows.
+    await finishRunnerJob(w, made.jobId, zarrRecord());
+    expect(await syncPipelineStamps(w.env())).toMatchObject({
+      examined: 1,
+      succeeded: 0,
+      failed: 1,
+    });
+    expect(
+      (await stampsOf(w.d1, id)).map((s) => [s.recipe, s.input, s.state, s.refusal_code]),
+    ).toEqual([["nemar-floor-zarr", "zarr", "failed", "recipe_unknown"]]);
+    // The old rows fail closed and leave the new name alone: no hold on either input, no live slot, and a
+    // nemar-floor Zarr run of the same dataset version is claimed.
+    for (const input of RECIPE_INPUTS) expect(await tupleHeld(w.d1, floor, input)).toBe(false);
+    const again = await dispatch(w.env(), id, asRunner);
+    expect(again).toMatchObject({ ok: true, attempt: 1 });
+    expect((await stampsOf(w.d1, id)).map((s) => [s.recipe, s.input, s.state])).toEqual([
+      ["nemar-floor-zarr", "zarr", "failed"],
+      ["nemar-floor", "zarr", "dispatched"],
+    ]);
+  });
+
+  test("the registry cannot be asked to run it: the name is not a recipe, through the route and the service", async () => {
+    const [w] = worlds() as [World];
+    const id = await dataset(w);
+    expect(await dispatch(w.env(), id, { recipe: "nemar-floor-zarr", ...asRunner })).toMatchObject({
+      ok: false,
+      code: "recipe_unknown",
+    });
+    const r = await call(
+      "POST",
+      "/compute/pipeline/run",
+      "admin",
+      { recipe: "nemar-floor-zarr", dataset: id, executor: "runner" },
+      w.env(),
+    );
+    expect([r.status, r.body.code]).toEqual([422, "recipe_unknown"]);
+    expect(await count(w.d1, "compute_pipeline_stamps")).toBe(0);
   });
 });

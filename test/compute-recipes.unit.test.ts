@@ -533,6 +533,13 @@ describe("what a run read, for the stamp", () => {
       ]);
     }
     // stores_content: a non-empty list of rows that each have a path.
+    // An empty list of rows is no content even when the run named no stores either (the two lists agree and
+    // cover nothing): the digest of nothing is not the digest of an input.
+    expect(refusal({ stores: [], content: [] })).toEqual([
+      null,
+      ["input_digest"],
+      "no_stores_content",
+    ]);
     for (const content of [[], "all", 3, null, undefined, [{ group: "eeg" }], [null], rows([7])]) {
       expect([content, refusal({ content })]).toEqual([
         content,
@@ -549,6 +556,8 @@ describe("what a run read, for the stamp", () => {
       [rows(STORES), undefined],
       [rows(STORES), "sub-01"],
       [rows(STORES), [1, 2]],
+      // A store named twice, and a row for it twice: the two lists agree, and still each store is once.
+      [rows([STORES[0], STORES[0]]), [STORES[0], STORES[0]]],
     ] as const) {
       expect([content, stores, refusal({ content, stores })]).toEqual([
         content,

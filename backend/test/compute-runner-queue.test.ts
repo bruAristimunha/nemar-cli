@@ -1257,6 +1257,53 @@ describe("records that never landed", () => {
   });
 });
 
+describe("a waiting job whose stamp carries the retired recipe name", () => {
+  test("cannot be rebuilt: the replay finds a mismatch and writes nothing, and a stale one is given up on, while the same job with the live name is replayed (MUTATION: fall back to nemar-floor when the stamp's recipe is unknown)", async () => {
+    const bad = fx.env({
+      ENVIRONMENT: "development",
+      COMPUTE_RUNNERS_ENABLED: "1",
+      API_BASE_URL: base,
+      COMPUTE_RECORDS: failing(4),
+    });
+    const wait = async () => {
+      const id = await dataset();
+      const made = await dispatchPipelineJob(bad, {
+        recipe: "nemar-floor",
+        datasetId: id,
+        actor: { kind: "admin", userId: ids.admin },
+        executor: "runner",
+      });
+      if (!made.ok) throw new Error("could not dispatch");
+      expect(made.recordsWritten).toBe(false);
+      return made.jobId;
+    };
+    const old = await wait();
+    const live = await wait();
+    // A job that was waiting when migration 0141 landed: its stamp says the old name, with input zarr.
+    await sql(
+      "UPDATE compute_pipeline_stamps SET recipe = 'nemar-floor-zarr' WHERE job_id = ?1",
+      old,
+    );
+    for (const jobId of [old, live]) await age(jobId, "created_at", "-6 minutes");
+
+    // The control is rebuilt and written; the old name is a mismatch (the registry has lost the recipe),
+    // which writes nothing and, being young, is left alone.
+    const first = await sweepRunnerLeases(env);
+    expect([first.replayed, first.records_lost]).toEqual([1, 0]);
+    expect((await row(live)).records_written_at).not.toBeNull();
+    expect((await row(old)).records_written_at).toBeNull();
+    expect(await fx.harness.records.head(recordKey(old, "spec.json"))).toBeNull();
+    expect((await row(old)).state).toBe("created");
+
+    // Past the window, only a mismatch is given up on (an unreachable source is not), so the job ends.
+    await age(old, "created_at", "-61 minutes");
+    await age(old, "examined_at", "-10 minutes");
+    const second = await sweepRunnerLeases(env);
+    expect(second.records_lost).toBe(1);
+    expect(await row(old)).toMatchObject({ state: "failed", failure_code: "records_unavailable" });
+  });
+});
+
 describe("the cancel of a waiting runner job", () => {
   test("ends in SQL: cancelled, settled with charge 0, the slot and the tuple freed (MUTATION: drop the stamp end, or the settled stamp)", async () => {
     const owner = ids.owner;
