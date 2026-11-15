@@ -8,7 +8,8 @@
  * ONE DEFINITION, TWO LANGUAGES. Everything below is byte-exact and language-neutral: text is
  * hashed as its UTF-8 bytes, numbers as IEEE-754 binary64, lines end in a line feed (LF, U+000A). The
  * test vectors in `./derivatives-vectors.json` are reproduced by this module and by the recipes in
- * `nemarOrg/nemar-process`; a change to either side that moves a vector is a change to the ADR.
+ * `nemarOrg/nemar-process`; a vector that moves is a change to the definition, which the maintainer
+ * decides, and is never edited to make code pass.
  *
  * WHAT A DIGEST CAN AND CANNOT SAY. Until the converter writes each store's content digest at commit,
  * the recipe computes it from what it read and records it; the platform records it and cannot verify
@@ -16,10 +17,20 @@
  * so it is for vectors and for groups that fit in memory; a real recording is hashed by the recipe,
  * which streams. This module owns the definition, not the production of a digest at scale.
  *
- * REFUSAL, NEVER A GUESS. Text the definition cannot carry unambiguously (a line feed or carriage
- * return in a label or unit, a lone surrogate in any text, a value outside a key field's rule) has no
- * digest: the function throws `DerivativeContractError`, or for the key fields the validator names
- * the field. A caller that meets one records "unkeyable" and moves on.
+ * REFUSAL, NEVER A GUESS. Anything the definition cannot carry unambiguously has no digest: the
+ * function throws `DerivativeContractError`, or for the key fields the validator names the field. A
+ * caller that meets one records "unkeyable" and moves on. The refusals are listed in ADR 0123
+ * decisions 2 to 4 and held by `./derivatives-vectors.json` (`refused`) and the tests: a line feed or
+ * carriage return in a label or unit, a lone surrogate in any text, a rate, scale, offset, digital
+ * value or product that is not finite, fewer than one channel or sample, no stores, a repeated path,
+ * an empty path or group, a tab in a path or group, a store digest that is not 64 lowercase
+ * hexadecimal digits, and a key field outside its rule.
+ *
+ * WHICH FIELD. `DerivativeContractError.field` names what `inputDigest` refused, so a caller maps a
+ * refusal to a fixed word without reading a message: `stores_content` (no rows, not a list, a row
+ * that is not an object), `path`, `group` or `content_sha256` (that field of a row, or for `path` a
+ * repeated one). The key functions carry the key field's name, as `validateDerivativeKeyFields`
+ * does. Errors from the store content functions carry no field.
  */
 
 /** The first line of a store content header, and the name of the digest. */
@@ -44,8 +55,9 @@ export const SUPERSEDED_GRACE_DAYS = 30;
 
 /**
  * The one sentence a `serving`-profile derivative carries about what it was computed on, declared
- * once. The serving copy is capped at 250 Hz and 16-bit; the archived recordings' rate is never
- * stated.
+ * once. The serving copy is 16-bit and its rate is capped per modality (EEG and MEG at 250 Hz, iEEG
+ * and EMG at 1000 Hz); this sentence names EEG only, which is an open point for the maintainer. The
+ * archived recordings' rate is never stated.
  */
 export const SERVING_PROFILE_SENTENCE =
   "Computed on NEMAR's Zarr serving copy (EEG capped at 250 Hz, 16-bit), not on the archived recordings.";
@@ -88,9 +100,9 @@ function hasLoneSurrogate(text: string): boolean {
  * surrogate is refused before any encoding, because `TextEncoder` would replace it with U+FFFD and
  * two different texts would then share a digest.
  */
-function refuseLoneSurrogate(text: string, what: string): void {
+function refuseLoneSurrogate(text: string, what: string, field?: string): void {
   if (hasLoneSurrogate(text)) {
-    throw new DerivativeContractError(`${what} holds a lone surrogate and has no digest`);
+    throw new DerivativeContractError(`${what} holds a lone surrogate and has no digest`, field);
   }
 }
 
@@ -321,16 +333,17 @@ function compareBytes(a: Uint8Array, b: Uint8Array): number {
 }
 
 /** A row's path or group: non-empty, one line, no tab (the separator), no lone surrogate. */
-function rowText(text: unknown, what: string): string {
+function rowText(text: unknown, what: string, field: string): string {
   if (typeof text !== "string" || text.length === 0) {
-    throw new DerivativeContractError(`${what} must be non-empty text`);
+    throw new DerivativeContractError(`${what} must be non-empty text`, field);
   }
   if (/[\r\n\t]/.test(text)) {
     throw new DerivativeContractError(
       `${what} holds a tab, carriage return or line feed and has no digest`,
+      field,
     );
   }
-  refuseLoneSurrogate(text, what);
+  refuseLoneSurrogate(text, what, field);
   return text;
 }
 
@@ -340,21 +353,27 @@ function rowText(text: unknown, what: string): string {
  * in code point order. Code point order is the order of the paths' UTF-8 bytes, which Python's
  * `sorted` gives; JavaScript's default `sort` compares UTF-16 units and disagrees above U+FFFF, so
  * this compares bytes. The rows may arrive in any order. No rows, a repeated path, or a row whose
- * text or digest is outside its rule has no digest: the order of equal paths would not be defined.
+ * text or digest is outside its rule has no digest: the order of equal paths would not be defined,
+ * and a tab in a path or group would let two different rows give one line. The refusal's `field`
+ * is described at the top of this file.
  *
  * A BIDS input's digest is not computed here: it is `git:` and the 40 hexadecimal digits of the
  * source commit the dataset version names (`validateDerivativeKeyFields` checks its shape).
  */
 export async function inputDigest(rows: readonly StoreContentRow[]): Promise<string> {
   if (!Array.isArray(rows) || rows.length === 0) {
-    throw new DerivativeContractError("an input digest needs at least one store");
+    throw new DerivativeContractError("an input digest needs at least one store", "stores_content");
   }
   const lines = rows.map((row, index) => {
-    const path = rowText(row?.path, `row ${index} path`);
-    const group = rowText(row?.group, `row ${index} group`);
+    if (typeof row !== "object" || row === null) {
+      throw new DerivativeContractError(`row ${index} is not an object`, "stores_content");
+    }
+    const path = rowText(row.path, `row ${index} path`, "path");
+    const group = rowText(row.group, `row ${index} group`, "group");
     if (typeof row.content_sha256 !== "string" || !CONTENT_SHA256_RE.test(row.content_sha256)) {
       throw new DerivativeContractError(
         `row ${index} content_sha256 must be 64 lowercase hexadecimal digits`,
+        "content_sha256",
       );
     }
     return {
@@ -366,7 +385,7 @@ export async function inputDigest(rows: readonly StoreContentRow[]): Promise<str
   lines.sort((a, b) => compareBytes(a.pathBytes, b.pathBytes));
   for (let i = 1; i < lines.length; i++) {
     if (lines[i].path === lines[i - 1].path) {
-      throw new DerivativeContractError(`the path ${lines[i].path} appears in two rows`);
+      throw new DerivativeContractError(`the path ${lines[i].path} appears in two rows`, "path");
     }
   }
   const text = lines.map((entry) => entry.line).join("");
