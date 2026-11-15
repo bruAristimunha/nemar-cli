@@ -14,6 +14,8 @@
  *  - `list` prints the registrations and `revoke` ends one; a second revoke says it changed nothing; a
  *    malformed id is refused before anything is sent and an unknown one exits 1;
  *  - an answer with keys the CLI does not know is shown, not refused (the listing's schema is open);
+ *  - `usage` (card S6) prints every runner's usage in the runners' own figures, marks partial usage, never
+ *    prints a service unit, ends with its one fixed line, and is an administrator's, not only the owner's;
  *  - every subcommand's help has an "Exit codes:" block.
  *
  * CI TIER: integration, like the other CLI suites that start the binary against a local server.
@@ -33,6 +35,7 @@ import {
   seedComputeUsers,
 } from "../backend/test/helpers/compute-app";
 import { freshDb } from "../backend/test/helpers/d1";
+import { ComputeRunnersUsageResponseSchema } from "../shared/contract/compute-admin";
 import { RUNNER_SECRET_RE, RunnerRegisterResponseSchema } from "../shared/contract/compute-runner";
 import { RunnerListResponseSchema } from "../src/lib/api/compute-runners";
 
@@ -304,9 +307,181 @@ describe("revoke", () => {
   });
 });
 
+describe("usage", () => {
+  const FOOTER = "Runner-reported usage; never service units.";
+  let made = 0;
+
+  /** A runner job, written by SQL the table accepts (the pattern of the other suites that count jobs). */
+  function runnerJob(
+    runnerId: string,
+    state: "finished" | "failed" | "created",
+    usage: { wall: number; cpu: number; rss: number; partial: 0 | 1 } | null,
+    createdAt = "2026-10-05 10:00:00",
+  ) {
+    db.run(
+      `INSERT INTO compute_jobs
+         (id, source, kind, state, app_id, app_version, spec_digest, partition, pool, nodes,
+          cores_per_node, gpus, minutes, executor, accounting, runner_backend, runner_id,
+          runner_claimed_at, runner_wall_seconds, runner_cpu_seconds, runner_max_rss_mb,
+          runner_usage_partial, created_at, ended_at, settled_provisional_at, failure_code)
+       VALUES (?, 'pipeline', 'batch', ?, 'nemar-launch', '1.0.0', ?, 'shared', 'cpu', 1, 4, 0, 60,
+               'runner', 'none', 'local', ?, ?, ?, ?, ?, ?, ?,
+               CASE WHEN ? IN ('finished', 'failed') THEN ? END,
+               CASE WHEN ? IN ('finished', 'failed') THEN ? END,
+               CASE WHEN ? = 'failed' THEN 'launch_failed' END)`,
+      [
+        `job_${(++made).toString(16).padStart(24, "0")}`,
+        state,
+        "a".repeat(64),
+        runnerId,
+        createdAt,
+        usage?.wall ?? null,
+        usage?.cpu ?? null,
+        usage?.rss ?? null,
+        usage?.partial ?? null,
+        createdAt,
+        state,
+        createdAt,
+        state,
+        createdAt,
+        state,
+      ] as never[],
+    );
+  }
+
+  /** Two registrations and the jobs of the first: a whole one, a partial one, and one not yet reported. */
+  async function world() {
+    await register("owner", "lab_a_cpu");
+    await register(
+      "owner",
+      "lab_b_cpu",
+      FLAGS.map((f) => (f === "lab_a" ? "lab_b" : f)),
+    );
+    const [first, second] = runnerRows().map((r) => r.id as string) as [string, string];
+    runnerJob(first, "finished", { wall: 120, cpu: 400, rss: 2048, partial: 0 });
+    runnerJob(first, "failed", { wall: 300, cpu: 7200, rss: 4096, partial: 1 });
+    runnerJob(first, "created", null);
+    return { first, second };
+  }
+
+  const RANGE = ["--from", "2026-10-01", "--to", "2026-10-31"];
+
+  test("prints each registration's figures in the runner's own words, marks partial usage, and ends with its one line (MUTATION: drop the partial note, or print charged SU)", async () => {
+    const { first, second } = await world();
+    const r = await runCli("admin", ["usage", ...RANGE]);
+    expect(r.exitCode).toBe(0);
+    const lines = r.stdout.trimEnd().split("\n");
+    expect(lines[0]).toBe("Runner usage, jobs created 2026-10-01 to 2026-10-31:");
+    const own = lines.find((l) => l.includes(first)) ?? "";
+    expect(own).toContain("live: 3 job(s) (");
+    expect(own).toContain("finished 1");
+    expect(own).toContain("failed 1");
+    expect(own).toContain("created 1");
+    expect(own).toContain("wall 420 s, cpu 7600 s, 2.111 runner-reported core-hours");
+    expect(own).toContain("max resident 4096 MB");
+    expect(own).toContain("usage of 1 job(s) is a lower bound (partial: Docker or Podman)");
+    const idle = lines.find((l) => l.includes(second)) ?? "";
+    expect(idle).toContain("live: 0 job(s), wall 0 s, cpu 0 s, 0.000 runner-reported core-hours");
+    expect(idle).toContain("max resident none reported");
+    expect(idle).not.toContain("partial");
+    expect(lines.find((l) => l.startsWith("All runners:"))).toBe(
+      "All runners: 3 job(s), wall 420 s, cpu 7600 s, 2.111 runner-reported core-hours; " +
+        "usage of 1 job(s) is a lower bound (partial: Docker or Podman)",
+    );
+    // The last line is the fixed one, and no service unit is printed anywhere.
+    expect(lines[lines.length - 1]).toBe(FOOTER);
+    expect(r.stdout.replace(FOOTER, "")).not.toMatch(/\bSU\b|service unit/i);
+    expect(r.stderr.trim()).toBe("");
+  });
+
+  test("a whole figure carries no partial note, and a revoked registration is shown as revoked", async () => {
+    await register("owner", "lab_a_cpu");
+    const id = runnerRows()[0]?.id as string;
+    runnerJob(id, "finished", { wall: 61, cpu: 240, rss: 100, partial: 0 });
+    expect((await runCli("owner", ["revoke", id])).exitCode).toBe(0);
+    const r = await runCli("admin", ["usage", ...RANGE]);
+    expect(r.exitCode).toBe(0);
+    const own = r.stdout.split("\n").find((l) => l.includes(id)) ?? "";
+    expect(own).toContain(
+      "revoked: 1 job(s) (finished 1), wall 61 s, cpu 240 s, 0.066 runner-reported",
+    );
+    expect(r.stdout).not.toContain("partial");
+  });
+
+  test("--json is the Worker's answer and only that, and a newer Worker's extra keys are kept", async () => {
+    const { first } = await world();
+    augment = true;
+    const r = await runCli("admin", ["usage", ...RANGE, "--json"]);
+    expect(r.exitCode).toBe(0);
+    const body = JSON.parse(r.stdout);
+    const parsed = ComputeRunnersUsageResponseSchema.parse(body);
+    expect(parsed.runners.find((x) => x.id === first)).toMatchObject({
+      jobs: 3,
+      cpu_seconds: 7600,
+      partial_jobs: 1,
+    });
+    expect(parsed.totals).toMatchObject({ jobs: 3, core_hours: 2.111, partial_jobs: 1 });
+    expect(body.future_top_level).toEqual({ added: "by a newer worker" });
+    expect(r.stdout).not.toContain(FOOTER);
+    expect(r.stderr.trim()).toBe("");
+    // The human view of the same answer is shown, not refused.
+    const human = await runCli("admin", ["usage", ...RANGE]);
+    expect(human.exitCode).toBe(0);
+    expect(human.stdout).toContain(first);
+  });
+
+  test("a date that is not one is refused before anything is sent; a range the Worker refuses exits 1 with its sentence", async () => {
+    await world();
+    const before = reached;
+    for (const args of [
+      ["--from", "yesterday", "--to", "2026-10-31"],
+      ["--from", "2026-10-01", "--to", "2026-13-01"],
+    ]) {
+      const r = await runCli("admin", ["usage", ...args]);
+      expect([args, r.exitCode]).toEqual([args, 1]);
+      expect(r.stdout + r.stderr).toContain("--from and --to are dates, YYYY-MM-DD");
+    }
+    expect((await runCli("admin", ["usage", "--from", "2026-10-01"])).exitCode).toBe(1);
+    expect(reached).toBe(before);
+
+    const long = await runCli("admin", ["usage", "--from", "2026-01-01", "--to", "2027-01-02"]);
+    expect(long.exitCode).toBe(1);
+    expect(long.stdout + long.stderr).toContain("a range is at most 366 days");
+    const backwards = await runCli("admin", [
+      "usage",
+      "--from",
+      "2026-10-31",
+      "--to",
+      "2026-10-01",
+    ]);
+    expect(backwards.exitCode).toBe(1);
+    expect(backwards.stdout + backwards.stderr).toContain("from is after to");
+    expect(reached).toBe(before + 2);
+  });
+
+  test("an administrator and an owner may read it; a member and no key may not", async () => {
+    await world();
+    for (const who of ["admin", "owner"] as const) {
+      expect([who, (await runCli(who, ["usage", ...RANGE])).exitCode]).toEqual([who, 0]);
+    }
+    for (const who of ["member", null] as const) {
+      const r = await runCli(who, ["usage", ...RANGE]);
+      expect([who, r.exitCode]).toEqual([who, 1]);
+      expect(r.stdout).not.toContain(FOOTER);
+    }
+  });
+
+  test("no registrations says so, and still ends with the fixed line", async () => {
+    const r = await runCli("admin", ["usage", ...RANGE]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("No runner is registered.");
+    expect(r.stdout.trimEnd().split("\n").pop()).toBe(FOOTER);
+  });
+});
+
 describe("help", () => {
   test("every subcommand's help has an Exit codes block, and register's names the secret rule", async () => {
-    for (const sub of ["register", "list", "revoke"]) {
+    for (const sub of ["register", "list", "revoke", "usage"]) {
       const r = await runCli("owner", [sub, "--help-all"]);
       expect(r.exitCode).toBe(0);
       expect(r.stdout).toContain("Exit codes:");
