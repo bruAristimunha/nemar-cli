@@ -934,7 +934,7 @@ describe("runner reporting (card S6)", () => {
     expect(r.stderr.trim()).toBe("");
   });
 
-  test("record marks partial usage on the runner-reported line", async () => {
+  test("record marks partial usage on the runner-reported line (MUTATION: drop the partial note from the record view)", async () => {
     const w = await world();
     const partial = await runCli("admin", ["record", w.partial]);
     expect(partial.exitCode).toBe(0);
@@ -946,7 +946,7 @@ describe("runner reporting (card S6)", () => {
     expect(whole.stdout).not.toContain("partial");
   });
 
-  test("report keeps the SU totals to the Tapis job and gives the runner jobs a line of their own, in runner-reported core-hours (MUTATION: drop the runner branch of the report's job lines)", async () => {
+  test("report keeps the SU totals to the Tapis job and gives the runner jobs a line of their own, in runner-reported core-hours (MUTATION: drop the runner branch of the report's job lines, or the runner totals line)", async () => {
     const w = await world();
     const r = await runCli("admin", [
       "report",

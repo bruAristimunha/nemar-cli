@@ -366,7 +366,7 @@ describe("usage", () => {
 
   const RANGE = ["--from", "2026-10-01", "--to", "2026-10-31"];
 
-  test("prints each registration's figures in the runner's own words, marks partial usage, and ends with its one line (MUTATION: drop the partial note, or print charged SU)", async () => {
+  test("prints each registration's figures in the runner's own words, marks partial usage, and ends with its one line (MUTATION: drop the partial note, or drop the closing line)", async () => {
     const { first, second } = await world();
     const r = await runCli("admin", ["usage", ...RANGE]);
     expect(r.exitCode).toBe(0);

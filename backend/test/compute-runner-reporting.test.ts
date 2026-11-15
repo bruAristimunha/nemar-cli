@@ -44,7 +44,7 @@ import { computeRoutes } from "../src/routes/compute";
 import { computeRunnerRoutes } from "../src/routes/compute-runners";
 import { dispatchPipelineJob } from "../src/services/compute-pipeline";
 import { sha256Hex } from "../src/services/compute-records";
-import { runnerCoreHours } from "../src/services/compute-reporting";
+import { runnerCoreHours, runnersUsageReport } from "../src/services/compute-reporting";
 import {
   exchangeRunnerSecret,
   registerRunner,
@@ -687,7 +687,7 @@ describe("the job list filters by executor, accounting and runner", () => {
 // --- (d) Every runner's usage ------------------------------------------------------------------------------------------
 
 describe("the runners' usage report", () => {
-  test("per registration: jobs by state, the sums, the largest memory and the partial count, never service units (MUTATION: sum the runners' seconds into charged_milli, or drop the partial count)", async () => {
+  test("per registration: jobs by state, the sums, the largest memory and the partial count, never service units (MUTATION: count no partial job in runnersUsageReport's SQL)", async () => {
     const s = await scenario();
     const unused = await runner({ site: "lab_b" });
     expect(await revokeRunner(unused.id)).toBe(200);
@@ -753,7 +753,7 @@ describe("the runners' usage report", () => {
     expect(first.jobs).toBe(2);
   });
 
-  test("the range is by the job's creation day, both ends whole (MUTATION: `created_at < date(?2, '+1 day')` to `created_at < ?2`; `created_at >= ?1` to `> ?1`)", async () => {
+  test("the range is by the job's creation day, both ends whole (MUTATION: `created_at < date(?2, '+1 day')` to `created_at < ?2`, or drop the `created_at >= ?1` term)", async () => {
     const s = await scenario();
     // The finished job was made at the last second of one day, the failed one at the first second of the next.
     await sql(
@@ -781,7 +781,7 @@ describe("the runners' usage report", () => {
     expect((report.body.jobs as Loose[]).map((j) => j.id)).toEqual([s.finished]);
   });
 
-  test("a range is at most 366 days, both ends counted, and the two dates are real and in order (MUTATION: `days > COMPUTE_RUNNER_REPORT_DAYS_MAX` to `days > 400`)", async () => {
+  test("a range is at most 366 days, both ends counted, and the two dates are real and in order (MUTATION: `days > COMPUTE_RUNNER_REPORT_DAYS_MAX` to `days > 400` in the route)", async () => {
     await scenario();
     expect(COMPUTE_RUNNER_REPORT_DAYS_MAX).toBe(366);
     const ok = [
@@ -811,6 +811,23 @@ describe("the runners' usage report", () => {
       const res = await admin(`/compute/reports/runners?${q}`);
       expect([q, res.status, res.body.code]).toEqual([q, 400, "invalid_query"]);
     }
+  });
+});
+
+describe("the service holds its own bound", () => {
+  test("a range the route would refuse is refused by the function too (MUTATION: `days > COMPUTE_RUNNER_REPORT_DAYS_MAX` to `days > 400` in runnersUsageReport)", async () => {
+    // A supplement to the route test above: the function is exported, so it must not rely on its caller.
+    const refused = [
+      ["2026-01-01", "2027-01-02"],
+      ["2026-03-11", "2026-03-10"],
+      ["2026-02-30", "2026-03-10"],
+    ] as const;
+    for (const [from, to] of refused) {
+      await expect(runnersUsageReport(env.DB, { from, to })).rejects.toThrow(RangeError);
+    }
+    expect(
+      (await runnersUsageReport(env.DB, { from: "2026-01-01", to: "2027-01-01" })).runners,
+    ).toEqual([]);
   });
 });
 
