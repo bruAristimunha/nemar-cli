@@ -10,14 +10,15 @@ It follows [ADR 0118](0118-the-compute-gateway-records-every-tenant-job-and-keep
 It supersedes nothing.
 
 The key and both digests are defined byte for byte in [`shared/contract/derivatives.ts`](../../shared/contract/derivatives.ts) and held to [`shared/contract/derivatives-vectors.json`](../../shared/contract/derivatives-vectors.json), which Python and TypeScript must both reproduce.
-Where this text, that module and a vector disagree, the defect is settled by amending this ADR, never by editing a vector to fit code.
+Where this text, that module and a vector disagree, one of them is wrong and the maintainer decides which; no one edits a vector to make code pass, and no one edits this ADR to excuse code that disagrees with it.
 
 ## Context
 
 A finished pipeline job's outputs sit in the results bucket, which expires them after 30 days by default (ADR 0118 decision 7).
 A product worth keeping needs a home with its own lifetime and a name that does not change when the same work is run again.
 Naming a derivative by the digest of the Zarr index would orphan every derivative at the next reconversion, because the index carries `updated_utc`: the name has to follow what the recipe read, not the file that describes it.
-The Zarr serving copy is capped at 250 hertz (Hz) and 16-bit, and [ADR 0027](0027-zarr-dispatch-is-raw-only-derivatives-sourcedata-code-excluded.md) keeps it to raw recordings, so a derivative of it must say so and must never be written into it.
+The Zarr serving copy is 16-bit and its rate is capped per modality: electroencephalography (EEG) and magnetoencephalography (MEG) at 250 hertz (Hz), intracranial EEG (iEEG) and electromyography (EMG) at 1000 Hz.
+And [ADR 0027](0027-zarr-dispatch-is-raw-only-derivatives-sourcedata-code-excluded.md) keeps it to raw recordings, so a derivative of it must say what it was computed on and must never be written into it.
 A Digital Object Identifier (DOI) cannot be withdrawn, and the registrar is EZID ([ADR 0007](0007-ezid-is-the-sole-doi-provider.md)).
 The owner decided on 2026-11-14 that derivatives live in a keyed store with three retention classes.
 
@@ -28,13 +29,15 @@ The owner decided on 2026-11-14 that derivatives live in a keyed store with thre
    They are never written into the serving copy, never committed into the dataset repository, and never kept in the results bucket, because each of those has a different purpose and, for the results bucket, a lifetime that would delete a kept derivative.
 2. **The derivative key is the Secure Hash Algorithm 256 (SHA-256) of `nemar.derivative-key.v1` and eight lines.**
    The lines are `dataset`, `version`, `recipe`, `recipe_version`, `engine`, `input`, `profile` and `input_digest`, in that order, each `name`, a space, the value and a line feed (LF).
-   The values are full-string matches: dataset `^[a-z]{2}[0-9]{6}$`; version and recipe version `^[0-9A-Za-z._+-]{1,64}$`; recipe `^[a-z0-9-]{1,64}$`; engine `^[0-9A-Za-z._+@-]{1,64}$`.
+   The values are full-string matches, so a Python consumer must use `re.fullmatch` (its `$` also matches before a trailing LF): dataset `^[a-z]{2}[0-9]{6}$`; version and recipe version `^[0-9A-Za-z._+-]{1,64}$`; recipe `^[a-z0-9-]{1,64}$`; engine `^[0-9A-Za-z._+@-]{1,64}$`.
    Input `zarr` goes with profile `serving` and a `sha256:` digest, input `bids` with profile `archive` and a `git:` digest, and any other value or pairing is refused, so a serving derivative can never pass for an archive one.
-   The image digest is recorded with a derivative and is never part of its key, so a rebuilt image does not orphan a derivative whose recipe version and engine are unchanged.
+   The image digest is recorded with a derivative and is never part of its key: it is provenance, so a rebuilt image does not orphan a derivative whose recipe version and engine are unchanged.
+   The price is a duty: an image change that can change a value must change `recipe_version` or `engine`, because a rebuild that changed numbers without a version bump would silently keep the old derivative.
 3. **The input digest names what was read, not what was indexed.**
    For a `zarr` input it is `sha256:` and the SHA-256 of the lines `path`, tab, `group`, tab, `content_sha256`, LF, one per store whose group was read in full, sorted by path in code point order, which is the order of the paths' bytes in Unicode Transformation Format 8-bit (UTF-8).
    Python's `sorted` gives that order; JavaScript's default `sort` compares UTF-16 units and disagrees above U+FFFF, so the TypeScript compares bytes.
    For a `bids` input it is `git:` and the 40 hexadecimal digits of the source commit the dataset version names.
+   `inputDigest` has no digest for no rows, a repeated path, an empty path or group, a tab, carriage return, line feed or lone surrogate in a path or group (a tab would let two different rows give one line), or a `content_sha256` that is not 64 lowercase hexadecimal digits.
    Keying on the index would orphan derivatives at every reconversion; a content digest changes only when a value the recipe read changes.
 4. **A store's content digest is `nemar.store-content.v1`, over one channel group of the level-0 array.**
    It is the SHA-256 of a UTF-8 header and then the physical values.
@@ -44,6 +47,7 @@ The owner decided on 2026-11-14 that derivatives live in a keyed store with thre
    The values are C times S little-endian binary64 numbers, channel-major, each `float64(digital) * float64(scale[c]) + float64(offset[c])` as two separately rounded operations, never fused.
    Text is hashed as its UTF-8 bytes exactly as given, with no Unicode normalization and no trimming, so U+00B5 and U+03BC are different units.
    Text that enters the header and holds a carriage return, a line feed or a lone surrogate has no digest: it is an error and never a guess.
+   A rate, scale, offset, digital value or product that is not finite has no digest, because the bytes of a NaN differ by processor (an x86 operation writes `fff8000000000000`, ARM `7ff8000000000000`), and neither has a group with fewer than one channel or one sample.
    The archived rate is never read, so a digest cannot state or depend on it.
 5. **Retention has three classes, and a DOI is never minted by code.**
    `canary` expires 30 days after it is stored.
@@ -52,8 +56,8 @@ The owner decided on 2026-11-14 that derivatives live in a keyed store with thre
    Every derivative starts as `canary`, and no code path mints a DOI: a future, separately reviewed, owner-only action does, for a `published` derivative only, because a DOI cannot be withdrawn.
 6. **Every derivative says what it is.**
    It carries `GeneratedBy` (recipe, version, image digest, job id and the nemar-process build) and `SourceDatasets` (dataset id, version, and the version DOI when there is one), and a citation string.
-   For the `serving` profile it also carries one sentence about electroencephalography (EEG), declared once in the module: "Computed on NEMAR's Zarr serving copy (EEG capped at 250 Hz, 16-bit), not on the archived recordings."
-   General statements say "capped at 250 Hz", quality control describes the serving copy, and the archived recordings' rate is never stated.
+   For the `serving` profile it also carries one sentence, declared once in the module, which names EEG only: "Computed on NEMAR's Zarr serving copy (EEG capped at 250 Hz, 16-bit), not on the archived recordings."
+   General statements about EEG say "capped at 250 Hz", quality control describes the serving copy, and the archived recordings' rate is never stated.
 7. **Known limit: a recorded digest is a claim the platform cannot yet verify.**
    Until the converter writes each store's content digest at commit, the recipe computes it from what it read and records it in its signalJourney record; the platform records it and cannot check it against the store.
    A recorded input digest therefore keys a derivative only when every check holds.
@@ -73,7 +77,7 @@ The owner decided on 2026-11-14 that derivatives live in a keyed store with thre
 - The definitions are hard to reverse, because a change orphans every key.
   A change is therefore a new format name (`v2`) and a new ADR, and old keys stay valid names.
 - The TypeScript digest function hashes a group in one call and is for vectors and groups that fit in memory; the recipes hash a real recording by streaming, and the two agree on the vectors.
-- A derivative of the serving copy is honest about its source, and a derivative of the archive can never carry the serving sentence.
+- A derivative of the serving copy says what it was computed on, and a derivative of the archive can never carry the serving sentence.
 - Until the converter writes the digests, the keying checks are the only guard against a partial or flaky run taking a full run's key, so a stamp that fails one is skipped and counted, not keyed.
 
 ## Alternatives considered
@@ -89,5 +93,5 @@ The owner decided on 2026-11-14 that derivatives live in a keyed store with thre
 ## Receipts
 
 - [ADR 0007](0007-ezid-is-the-sole-doi-provider.md) (EZID is the registrar), [ADR 0027](0027-zarr-dispatch-is-raw-only-derivatives-sourcedata-code-excluded.md) (the serving copy is raw-only), ADR 0118 decision 7 (the results bucket) and ADR 0121 decisions 8 and 9 (a derivative's own home; the recipe records what it read).
-- `shared/contract/derivatives.ts` and `shared/contract/derivatives-vectors.json`: the definitions and seven vectors, computed with Python `struct`, `hashlib` and NumPy and with Bun `node:crypto`, all equal; computed, not measured on any NEMAR data.
+- `shared/contract/derivatives.ts` and `shared/contract/derivatives-vectors.json`: the definitions, eight vectors and a list of refusals, computed with Python `struct`, `hashlib` and NumPy and with Bun `node:crypto`, all equal; computed, not measured on any NEMAR data.
 - The owner's decision of 2026-11-14 on keyed storage and the three retention classes, and the review finding that an index digest orphans derivatives at reconversion.
