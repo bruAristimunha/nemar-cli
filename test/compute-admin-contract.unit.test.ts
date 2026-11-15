@@ -161,7 +161,9 @@ const VALID: Record<string, unknown> = {
       wall_seconds: 420,
       cpu_seconds: 7600,
       core_hours: 2.111,
+      reported_jobs: 2,
       partial_jobs: 1,
+      unmarked_jobs: 0,
     },
     jobs: [{ id: "job_0123456789abcdef01234567" }],
     truncated: false,
@@ -182,10 +184,20 @@ const VALID: Record<string, unknown> = {
         cpu_seconds: 7600,
         core_hours: 2.111,
         max_rss_mb: 4096,
+        reported_jobs: 2,
         partial_jobs: 1,
+        unmarked_jobs: 0,
       },
     ],
-    totals: { jobs: 3, wall_seconds: 420, cpu_seconds: 7600, core_hours: 2.111, partial_jobs: 1 },
+    totals: {
+      jobs: 3,
+      wall_seconds: 420,
+      cpu_seconds: 7600,
+      core_hours: 2.111,
+      reported_jobs: 2,
+      partial_jobs: 1,
+      unmarked_jobs: 0,
+    },
   },
   ComputeAccessReportResponseSchema: {
     quarter: "2026Q4",
@@ -363,6 +375,16 @@ describe("compute-admin: every exported schema is open", () => {
       admin.ComputeAccountReportResponseSchema.safeParse({ ...old, runner_totals: { jobs: "3" } })
         .success,
     ).toBe(false);
+    // A Worker that predates the reported and unmarked counts sends the totals without them.
+    const counted = JSON.parse(JSON.stringify(VALID.ComputeRunnersUsageResponseSchema)) as {
+      runners: Array<Record<string, unknown>>;
+      totals: Record<string, unknown>;
+    };
+    for (const target of [...counted.runners, counted.totals]) {
+      target.reported_jobs = undefined;
+      target.unmarked_jobs = undefined;
+    }
+    expect(admin.ComputeRunnersUsageResponseSchema.safeParse(counted).success).toBe(true);
     // The mark is true, false or null; a Worker that predates it sends none.
     const view = JSON.parse(JSON.stringify(VALID.ComputeJobViewSchema)) as Record<string, unknown>;
     expect(admin.ComputeJobViewSchema.parse(view).runner_usage_partial).toBeUndefined();

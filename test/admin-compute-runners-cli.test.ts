@@ -53,6 +53,8 @@ let configDir: string;
 let reached = 0;
 /** When set, an answer with keys a newer Worker would add. */
 let augment = false;
+/** When set, every state count of a usage answer is text with a terminal control sequence in it. */
+let hostile = false;
 
 const server = Bun.serve({
   port: 0,
@@ -61,10 +63,19 @@ const server = Bun.serve({
     if (url.pathname === "/notices") return Response.json({ notices: [] });
     reached += 1;
     const res = await handle(req, computeEnv(db));
-    if (augment && res.ok) {
+    if ((augment || hostile) && res.ok) {
       const body = (await res.json()) as Loose;
-      body.future_top_level = { added: "by a newer worker" };
-      for (const r of body.runners ?? []) r.future_field = 7;
+      if (augment) {
+        body.future_top_level = { added: "by a newer worker" };
+        for (const r of body.runners ?? []) r.future_field = 7;
+      }
+      if (hostile) {
+        for (const r of body.runners ?? []) {
+          for (const state of Object.keys(r.by_state ?? {})) {
+            r.by_state[state] = "\u001b[31mred\u0007";
+          }
+        }
+      }
       return Response.json(body, { status: res.status });
     }
     return res;
@@ -81,6 +92,7 @@ beforeEach(async () => {
   await seedComputeUsers(db);
   reached = 0;
   augment = false;
+  hostile = false;
   configDir = mkdtempSync(join(tmpdir(), "nemar-runners-cli-"));
 });
 
@@ -315,7 +327,7 @@ describe("usage", () => {
   function runnerJob(
     runnerId: string,
     state: "finished" | "failed" | "created",
-    usage: { wall: number; cpu: number; rss: number; partial: 0 | 1 } | null,
+    usage: { wall: number; cpu: number; rss: number; partial: 0 | 1 | null } | null,
     createdAt = "2026-10-05 10:00:00",
   ) {
     db.run(
@@ -381,11 +393,13 @@ describe("usage", () => {
     expect(own).toContain("max resident 4096 MB");
     expect(own).toContain("usage of 1 job(s) is a lower bound (partial: Docker or Podman)");
     const idle = lines.find((l) => l.includes(second)) ?? "";
-    expect(idle).toContain("live: 0 job(s), wall 0 s, cpu 0 s, 0.000 runner-reported core-hours");
+    expect(idle).toContain(
+      "live: 0 job(s), 0 with usage reported, wall 0 s, cpu 0 s, 0.000 runner-reported core-hours",
+    );
     expect(idle).toContain("max resident none reported");
     expect(idle).not.toContain("partial");
     expect(lines.find((l) => l.startsWith("All runners:"))).toBe(
-      "All runners: 3 job(s), wall 420 s, cpu 7600 s, 2.111 runner-reported core-hours; " +
+      "All runners: 3 job(s), 2 with usage reported, wall 420 s, cpu 7600 s, 2.111 runner-reported core-hours; " +
         "usage of 1 job(s) is a lower bound (partial: Docker or Podman)",
     );
     // The last line is the fixed one, and no service unit is printed anywhere.
@@ -403,7 +417,7 @@ describe("usage", () => {
     expect(r.exitCode).toBe(0);
     const own = r.stdout.split("\n").find((l) => l.includes(id)) ?? "";
     expect(own).toContain(
-      "revoked: 1 job(s) (finished 1), wall 61 s, cpu 240 s, 0.066 runner-reported",
+      "revoked: 1 job(s) (finished 1), 1 with usage reported, wall 61 s, cpu 240 s, 0.066 runner-reported",
     );
     expect(r.stdout).not.toContain("partial");
   });
@@ -469,6 +483,52 @@ describe("usage", () => {
       expect([who, r.exitCode]).toEqual([who, 1]);
       expect(r.stdout).not.toContain(FOOTER);
     }
+  });
+
+  test("a registration whose jobs have reported nothing says so instead of printing zeros (MUTATION: drop the reported count and the no-usage phrase)", async () => {
+    await register("owner", "lab_a_cpu");
+    const id = runnerRows()[0]?.id as string;
+    runnerJob(id, "created", null);
+    const r = await runCli("admin", ["usage", ...RANGE]);
+    expect(r.exitCode).toBe(0);
+    const own = r.stdout.split("\n").find((l) => l.includes(id)) ?? "";
+    expect(own).toContain(
+      "live: 1 job(s) (created 1), 0 with usage reported, no usage reported yet",
+    );
+    expect(own).not.toContain("wall 0 s");
+    expect(r.stdout).toContain(
+      "All runners: 1 job(s), 0 with usage reported, no usage reported yet",
+    );
+    expect(r.stdout).not.toContain("0.000");
+  });
+
+  test("usage with no mark (a job completed before the mark was stored) is counted as unknown, never as whole (MUTATION: drop the unmarked clause from runnerMarkNotes)", async () => {
+    await register("owner", "lab_a_cpu");
+    const id = runnerRows()[0]?.id as string;
+    runnerJob(id, "finished", { wall: 61, cpu: 240, rss: 100, partial: null });
+    runnerJob(id, "finished", { wall: 120, cpu: 400, rss: 2048, partial: 0 });
+    const r = await runCli("admin", ["usage", ...RANGE]);
+    expect(r.exitCode).toBe(0);
+    const own = r.stdout.split("\n").find((l) => l.includes(id)) ?? "";
+    expect(own).toContain("2 with usage reported");
+    expect(own).toContain("; usage of 1 job(s) has no partial mark (partial: unknown)");
+    expect(own).not.toContain("lower bound");
+    expect(r.stdout).toContain(
+      "All runners: 2 job(s), 2 with usage reported, wall 181 s, cpu 640 s, 0.177 runner-reported core-hours; usage of 1 job(s) has no partial mark (partial: unknown)",
+    );
+  });
+
+  test("a state count the Worker sent is made plain before it is printed, and the help says the days are UTC (MUTATION: print the count unwrapped)", async () => {
+    const { first } = await world();
+    hostile = true;
+    const r = await runCli("admin", ["usage", ...RANGE]);
+    expect(r.exitCode).toBe(0);
+    const own = r.stdout.split("\n").find((l) => l.includes(first)) ?? "";
+    expect(own).toContain("finished");
+    expect(r.stdout).not.toContain("\u001b");
+    expect(r.stdout).not.toContain("\u0007");
+    const help = await runCli("admin", ["usage", "--help-all"]);
+    expect(help.stdout).toContain("UTC days: a job belongs to the day it was created, in UTC");
   });
 
   test("no registrations says so, and still ends with the fixed line", async () => {

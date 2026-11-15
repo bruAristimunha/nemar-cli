@@ -29,6 +29,7 @@ import { LAUNCHER_FILES } from "../../shared/contract/compute";
 import {
   COMPUTE_RUNNER_REPORT_DAYS_MAX,
   ComputeAccountReportResponseSchema,
+  ComputeJobAdminResponseSchema,
   ComputeJobsListResponseSchema,
   ComputeRecordResponseSchema,
   ComputeRunnersUsageResponseSchema,
@@ -358,10 +359,14 @@ async function uploadOutputs(entry: Claimed): Promise<number[]> {
 }
 
 /** The admin routes, as an owner, an administrator, a member or nobody. */
-async function admin(path: string, who: keyof typeof COMPUTE_KEYS | null = "admin") {
+async function admin(
+  path: string,
+  who: keyof typeof COMPUTE_KEYS | null = "admin",
+  method: "GET" | "POST" = "GET",
+) {
   const res = await handle(
     new Request(`http://api.test/admin${path}`, {
-      method: "GET",
+      method,
       headers: who === null ? {} : { Authorization: `Bearer ${COMPUTE_KEYS[who]}` },
     }),
     env,
@@ -523,7 +528,11 @@ describe("the account report keeps runner usage apart from service units", () =>
       wall_seconds: FINISHED_USAGE.wall_seconds + PARTIAL_USAGE.wall_seconds,
       cpu_seconds: FINISHED_USAGE.cpu_seconds + PARTIAL_USAGE.cpu_seconds,
       core_hours: 2.111,
+      // Two of the three have reported (the third is claimed and not completed): a sum over fewer jobs than
+      // `jobs` is said to be, and both that did report put a mark on it.
+      reported_jobs: 2,
       partial_jobs: 1,
+      unmarked_jobs: 0,
     });
     expect(report.truncated).toBe(false);
   });
@@ -570,7 +579,9 @@ describe("the account report keeps runner usage apart from service units", () =>
       wall_seconds: 0,
       cpu_seconds: 0,
       core_hours: 0,
+      reported_jobs: 0,
       partial_jobs: 0,
+      unmarked_jobs: 0,
     });
   });
 
@@ -709,7 +720,9 @@ describe("the runners' usage report", () => {
       cpu_seconds: 7600,
       core_hours: 2.111,
       max_rss_mb: 4096,
+      reported_jobs: 2,
       partial_jobs: 1,
+      unmarked_jobs: 0,
     });
     // Claimed and never completed: counted, with nothing reported.
     expect(byId.get(s.second.id)).toMatchObject({
@@ -720,7 +733,9 @@ describe("the runners' usage report", () => {
       cpu_seconds: 0,
       core_hours: 0,
       max_rss_mb: null,
+      reported_jobs: 0,
       partial_jobs: 0,
+      unmarked_jobs: 0,
     });
     // A revoked registration with no job stays listed, with zeros.
     expect(byId.get(unused.id)).toMatchObject({
@@ -730,14 +745,18 @@ describe("the runners' usage report", () => {
       by_state: {},
       wall_seconds: 0,
       max_rss_mb: null,
+      reported_jobs: 0,
       partial_jobs: 0,
+      unmarked_jobs: 0,
     });
     expect(report.totals).toEqual({
       jobs: 3,
       wall_seconds: 420,
       cpu_seconds: 7600,
       core_hours: 2.111,
+      reported_jobs: 2,
       partial_jobs: 1,
+      unmarked_jobs: 0,
     });
     // No service unit anywhere in the answer: a runner is never charged.
     expect(res.text).not.toContain("milli");
@@ -828,6 +847,87 @@ describe("the service holds its own bound", () => {
     expect(
       (await runnersUsageReport(env.DB, { from: "2026-01-01", to: "2027-01-01" })).runners,
     ).toEqual([]);
+  });
+});
+
+// --- (f) Review round: the cancel answer, jobs that have not reported, a missing mark, the accounting rule --------------
+
+describe("the cancel answer of a runner job its runner completed after the cancel", () => {
+  test("carries the partial mark of the usage the runner reported, in the answer's JSON (MUTATION: build the cancel answer with `jobView(job)` on the bare row)", async () => {
+    const r = await runner();
+    const cases = [
+      { usage: PARTIAL_USAGE, partial: true },
+      { usage: FINISHED_USAGE, partial: false },
+    ] as const;
+    for (const c of cases) {
+      const id = await dispatchRunnerJob();
+      const entry = await claimOne(r);
+      expect(entry.id).toBe(id);
+      // The cancel is recorded and the claimed job keeps going until its runner reports.
+      const asked = await admin(`/compute/jobs/${id}/cancel`, "admin", "POST");
+      expect([asked.status, asked.body.outcome]).toEqual([200, "cancel_requested"]);
+      expect(asked.body.job.runner_usage_partial).toBeNull();
+      // The runner finishes anyway: the job ends cancelled, with the usage and the mark it reported.
+      const done = await complete(r, id, entry.lease_id, {
+        usage: c.usage,
+        usage_partial: c.partial,
+      });
+      expect([done.status, done.body.state]).toEqual([200, "cancelled"]);
+      // The administrator cancels again: the job is already cancelled, and its figures carry their mark.
+      const again = await admin(`/compute/jobs/${id}/cancel`, "admin", "POST");
+      expect([again.status, again.body.outcome]).toEqual([200, "already_cancelled"]);
+      expect(again.body.job).toMatchObject({
+        state: "cancelled",
+        runner_wall_seconds: c.usage.wall_seconds,
+        runner_cpu_seconds: c.usage.cpu_seconds,
+        runner_usage_partial: c.partial,
+      });
+      expect(ComputeJobAdminResponseSchema.safeParse(again.body).success).toBe(true);
+    }
+  });
+});
+
+describe("a sum is never read as whole when it may not be", () => {
+  test("usage with no mark (a completion from before the mark was stored) is counted as unmarked, in the account report and the runners report (MUTATION: drop the unmarked count from accountReport, or from the runners report's SQL)", async () => {
+    const s = await scenario();
+    // The same row as a completion of that time left it: usage written, mark NULL.
+    await sql("UPDATE compute_jobs SET runner_usage_partial = NULL WHERE id = ?1", s.finished);
+
+    const account = await admin(`/compute/report?account=${s.account}&${RANGE()}`);
+    const rows = new Map<string, Loose>((account.body.jobs as Loose[]).map((j) => [j.id, j]));
+    expect(rows.get(s.finished)?.runner_usage).toEqual({
+      wall_seconds: 120,
+      cpu_seconds: 400,
+      max_rss_mb: 2048,
+      partial: null,
+    });
+    expect(account.body.runner_totals).toMatchObject({
+      jobs: 3,
+      reported_jobs: 2,
+      partial_jobs: 1,
+      unmarked_jobs: 1,
+    });
+
+    const runners = await admin(`/compute/reports/runners?${RANGE()}`);
+    const first = (runners.body.runners as Loose[]).find((x) => x.id === s.first.id) as Loose;
+    expect(first).toMatchObject({ reported_jobs: 2, partial_jobs: 1, unmarked_jobs: 1 });
+    const second = (runners.body.runners as Loose[]).find((x) => x.id === s.second.id) as Loose;
+    expect(second).toMatchObject({ jobs: 1, reported_jobs: 0, unmarked_jobs: 0 });
+    expect(runners.body.totals).toMatchObject({ reported_jobs: 2, unmarked_jobs: 1 });
+  });
+
+  test('a job is counted in service units by its accounting, not its executor (MUTATION: `r.accounting === "su"` to `r.executor === "tapis"` in accountReport)', async () => {
+    const s = await scenario();
+    const tapisCharged = (await row(s.tapis)).charged_milli as number;
+    // A runner job accounted in service units (a later phase's; the table accepts it) has SU, so it is in the
+    // SU totals, and it is still a runner job with the runner's figures: the two totals are never added.
+    await sql(
+      "UPDATE compute_jobs SET accounting = 'su', charged_milli = 2000 WHERE id = ?1",
+      s.finished,
+    );
+    const res = await admin(`/compute/report?account=${s.account}&${RANGE()}`);
+    expect(res.body.totals).toMatchObject({ jobs: 2, charged_milli: tapisCharged + 2000 });
+    expect(res.body.runner_totals).toMatchObject({ jobs: 3, cpu_seconds: 7600 });
   });
 });
 
