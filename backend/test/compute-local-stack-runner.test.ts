@@ -1,7 +1,7 @@
 /**
  * The local control-plane stack runs a runner job end to end, in process (portable compute, card DM-17; plan
  * D4, D6 and gate G2): `backend/scripts/compute-local-stack.ts` started for real over a temporary state
- * directory, and ONE `nemar-floor-zarr` job driven from its dispatch to a settled `finished` through NEMAR's
+ * directory, and ONE `nemar-floor` job on its Zarr input driven from its dispatch to a settled `finished` through NEMAR's
  * real routes, before any workstation is involved.
  *
  * NOTHING OF NEMAR IS STOOD IN FOR. The stack carries the real admin, compute and runner routers, a real
@@ -181,10 +181,10 @@ async function registerRunner(stack: LocalStack, name: string): Promise<Runner> 
   return { id: runner_id, token: RunnerTokenResponseSchema.parse(exchanged.body).access_token };
 }
 
-/** `nemar admin compute pipeline run nemar-floor-zarr --dataset <fixture> --executor runner`, as an administrator. */
+/** `nemar admin compute pipeline run nemar-floor --dataset <fixture> --executor runner`, as an administrator. */
 async function dispatch(stack: LocalStack): Promise<string> {
   const res = await call(stack, "POST", "/admin/compute/pipeline/run", stack.keys.admin, {
-    recipe: "nemar-floor-zarr",
+    recipe: "nemar-floor",
     dataset: FIXTURE_DATASET_ID,
     executor: "runner",
   });

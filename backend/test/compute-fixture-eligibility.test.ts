@@ -504,7 +504,7 @@ describe("a real dispatch, listing and claim", () => {
 
   const dispatch = (e: Bindings, id: string) =>
     dispatchPipelineJob(e, {
-      recipe: "nemar-floor-zarr",
+      recipe: "nemar-floor",
       datasetId: id,
       actor: { kind: "admin", userId: ids.admin },
       executor: "runner",
@@ -575,7 +575,7 @@ describe("a real dispatch, listing and claim", () => {
   test("the candidate listing offers the fixture outside production and never in production (MUTATION: use the widened text for every environment)", async () => {
     await dataset(FIXTURE, { sandbox: true });
     await dataset("nm000501");
-    const recipe = findRecipe("nemar-floor-zarr");
+    const recipe = findRecipe("nemar-floor");
     if (recipe === null) throw new Error("no recipe");
     expect((await pipelineCandidates(env, recipe, 10)).map((c) => c.dataset_id)).toEqual([
       "nm000501",
@@ -686,6 +686,7 @@ describe("the Zarr base of a recipe job", () => {
   const SPEC_INPUT = {
     datasetId: "nm099996",
     tag: "v1.0.0",
+    input: "zarr" as const,
     image: {
       ref: `ghcr.io/example/nemar-python@${RUNTIME_IMAGE_DIGEST}`,
       digest: RUNTIME_IMAGE_DIGEST,
@@ -762,7 +763,7 @@ describe("the Zarr base of a recipe job", () => {
   });
 
   test("the recipe job's vector carries the base the environment names, last (MUTATION: read RECIPE_ZARR_BASE in recipeJobSpec)", () => {
-    const recipe = findRecipe("nemar-floor-zarr");
+    const recipe = findRecipe("nemar-floor");
     if (recipe === null) throw new Error("no recipe");
     const zarrHostname = "zarr.staging.example";
     const staging = recipeJobSpec(recipe, {
@@ -816,7 +817,9 @@ describe("the Zarr base of a recipe job", () => {
 // Recorded from the statements at `02113b16` (the epic branch before this card), by calling the base
 // commit's `pipelineCandidates` against a database that kept the text it was asked to prepare, and by
 // reading `CLAIM_RUNNER_JOB_SQL` and `PIPELINE_ELIGIBLE_SQL`. They are literals on purpose: a test that
-// rebuilt them from the code under test could not notice a change to production's text.
+// rebuilt them from the code under test could not notice a change to production's text. The candidate
+// statement's three stamp subselects each gained one term, `input = ?8` (portable compute card Q0b: the input
+// is part of a stamp's tuple); nothing of the eligibility predicate or the claim changed.
 
 const BASE_ELIGIBLE_SQL = `d.status = 'active'
     AND d.visibility = 'public'
@@ -944,7 +947,7 @@ const BASE_CANDIDATES_SQL = `SELECT d.dataset_id, d.status, d.visibility, d.anon
               AND NOT EXISTS (
                 SELECT 1 FROM compute_pipeline_stamps s
                  WHERE s.dataset_id = d.dataset_id AND s.recipe = ?2 AND s.recipe_version = ?3
-                   AND s.engine = ?4 AND s.state IN ('dispatched', 'succeeded')
+                   AND s.engine = ?4 AND s.input = ?8 AND s.state IN ('dispatched', 'succeeded')
                    AND s.version = (CASE WHEN substr((SELECT dv.version FROM dataset_versions dv WHERE dv.dataset_id = s.dataset_id
      ORDER BY dv.created_at DESC, dv.id DESC LIMIT 1), 1, 1) BETWEEN '0' AND '9' THEN 'v' || (SELECT dv.version FROM dataset_versions dv WHERE dv.dataset_id = s.dataset_id
      ORDER BY dv.created_at DESC, dv.id DESC LIMIT 1) ELSE (SELECT dv.version FROM dataset_versions dv WHERE dv.dataset_id = s.dataset_id
@@ -952,7 +955,7 @@ const BASE_CANDIDATES_SQL = `SELECT d.dataset_id, d.status, d.visibility, d.anon
               AND NOT EXISTS (
                 SELECT 1 FROM compute_pipeline_stamps f
                  WHERE f.dataset_id = d.dataset_id AND f.recipe = ?2 AND f.recipe_version = ?3
-                   AND f.engine = ?4 AND f.state = 'failed'
+                   AND f.engine = ?4 AND f.input = ?8 AND f.state = 'failed'
                    AND (f.refusal_code NOT IN ('code_fetch_failed', 'dataset_fetch_failed', 'tapis_submit_failed', 'submit_timeout', 'staging_failed', 'launch_failed', 'archive_failed', 'tapis_error', 'records_unavailable', 'runner_lost', 'job_cancelled', 'no_job', 'job_missing', 'create_failed', 'recipe_unknown', 'tuple_mismatch', 'tuple_already_stamped', 'tuple_attempt_taken', 'zarr_source_unverifiable')
     OR EXISTS (SELECT 1 FROM compute_jobs cj
                 WHERE cj.id = f.job_id AND cj.state = 'failed' AND cj.charged_milli > 0))
@@ -964,7 +967,7 @@ const BASE_CANDIDATES_SQL = `SELECT d.dataset_id, d.status, d.visibility, d.anon
               AND (
                 SELECT COUNT(*) FROM compute_pipeline_stamps c
                  WHERE c.dataset_id = d.dataset_id AND c.recipe = ?2 AND c.recipe_version = ?3
-                   AND c.engine = ?4 AND c.state = 'failed'
+                   AND c.engine = ?4 AND c.input = ?8 AND c.state = 'failed'
                    AND (c.refusal_code NOT IN ('code_fetch_failed', 'dataset_fetch_failed', 'tapis_submit_failed', 'submit_timeout', 'staging_failed', 'launch_failed', 'archive_failed', 'tapis_error', 'records_unavailable', 'runner_lost', 'job_cancelled', 'no_job', 'job_missing', 'create_failed', 'recipe_unknown', 'tuple_mismatch', 'tuple_already_stamped', 'tuple_attempt_taken', 'zarr_source_unverifiable')
     OR EXISTS (SELECT 1 FROM compute_jobs cj
                 WHERE cj.id = c.job_id AND cj.state = 'failed' AND cj.charged_milli > 0))

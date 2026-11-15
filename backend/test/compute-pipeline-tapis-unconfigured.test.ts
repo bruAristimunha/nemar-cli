@@ -310,21 +310,27 @@ describe("(e) the order of the refusals and the dry run", () => {
       recipe: string,
       actor: PipelineActor,
       executor?: "tapis" | "runner",
-    ) => dispatchPipelineJob(on, { recipe, datasetId: FIRST, actor, executor });
+      input?: "bids" | "zarr",
+    ) => dispatchPipelineJob(on, { recipe, datasetId: FIRST, actor, executor, input });
     const off = fx.env({ ...NO_TAPIS, COMPUTE_ENABLED: undefined });
 
     expect(await asked(off, "nemar-floor", admin)).toMatchObject({ code: "compute_disabled" });
     expect(await asked(env, "nemar-nope", admin)).toMatchObject({ code: "recipe_unknown" });
-    expect(await asked(env, "nemar-floor-zarr", cron)).toMatchObject({
+    // The cron is the Tapis queue's: a runner run is an administrator's.
+    expect(await asked(env, "nemar-floor", cron, "runner")).toMatchObject({
       code: "recipe_not_automatic",
     });
     expect(await asked(env, "nemar-ica", admin)).toMatchObject({ code: "recipe_placeholder" });
-    // The registry's executor list, and the runners switch: a runner run never reaches the Tapis check.
-    expect(await asked(env, "nemar-floor", admin, "runner")).toMatchObject({
+    // The input the executor does not run, then the runners switch: a runner run never reaches the Tapis check.
+    expect(await asked(env, "nemar-floor", admin, "runner", "bids")).toMatchObject({
       code: "invalid_spec",
-      field: "executor",
+      field: "input",
     });
-    expect(await asked(env, "nemar-floor-zarr", admin, "runner")).toMatchObject({
+    expect(await asked(env, "nemar-floor", admin, "tapis", "zarr")).toMatchObject({
+      code: "invalid_spec",
+      field: "input",
+    });
+    expect(await asked(env, "nemar-floor", admin, "runner")).toMatchObject({
       code: "runners_disabled",
     });
     // And the Tapis executor, the default, is the one that is refused for Tapis.
@@ -379,7 +385,7 @@ describe("(e) the order of the refusals and the dry run", () => {
         await seedEegDataset(env, FIRST);
       }
       const res = await run(
-        { recipe: "nemar-floor-zarr", dataset: FIRST, executor: "runner", dry_run: true },
+        { recipe: "nemar-floor", dataset: FIRST, executor: "runner", dry_run: true },
         env,
       );
       expect(res.status).toBe(200);

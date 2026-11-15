@@ -44,7 +44,11 @@
  * Logs carry fixed words and counts only: no job id, token, address, specification or name.
  */
 
-import { type ZarrCommitAttestation, findRecipe } from "../../../shared/compute-recipes.js";
+import {
+  type RecipeInput,
+  type ZarrCommitAttestation,
+  findRecipe,
+} from "../../../shared/compute-recipes.js";
 import {
   type ComputeFailureCode,
   type ComputeFailureDetail,
@@ -927,9 +931,10 @@ const emptySweep = (): RunnerSweepResult => ({
 
 /**
  * A waiting job's specification, rebuilt the way the dispatch built it from the job's own stamp (the tuple the
- * dispatch claimed: dataset, version tag and recipe), the configured runtime image and, for a Zarr recipe, the
- * commit attestation the source check gives NOW (a call to GitHub and the serving index). Null when any of it
- * is gone. Only a candidate: the caller accepts it only when its digest is the one the row holds.
+ * dispatch claimed: dataset, version tag, recipe and the input it reads), the configured runtime image and,
+ * for a Zarr input, the commit attestation the source check gives NOW (a call to GitHub and the serving
+ * index). Null when any of it is gone. Only a candidate: the caller accepts it only when its digest is the
+ * one the row holds.
  */
 async function rebuiltSpec(
   env: Bindings,
@@ -938,17 +943,17 @@ async function rebuiltSpec(
   { kind: "spec"; spec: ReturnType<typeof recipeJobSpec> } | { kind: "mismatch" | "unreachable" }
 > {
   const stamp = await env.DB.prepare(
-    "SELECT dataset_id, version, recipe FROM compute_pipeline_stamps WHERE job_id = ?1",
+    "SELECT dataset_id, version, recipe, input FROM compute_pipeline_stamps WHERE job_id = ?1",
   )
     .bind(jobId)
-    .first<{ dataset_id: string; version: string; recipe: string }>();
+    .first<{ dataset_id: string; version: string; recipe: string; input: RecipeInput }>();
   const recipe = stamp === null ? null : findRecipe(stamp.recipe);
   // A job no stamp names, or a recipe the registry lost, can never be rebuilt: a real mismatch.
   if (stamp === null || recipe === null) return { kind: "mismatch" };
   const image = readRuntimeImage(env);
   if (image.state !== "ok") return { kind: "unreachable" };
   let zarrSource: ZarrCommitAttestation | null = null;
-  if (recipe.input === "zarr") {
+  if (stamp.input === "zarr") {
     const checked = await checkZarrSource(env, stamp.dataset_id, stamp.version);
     if (!checked.ok) {
       // A source that could not be reached or read is not a mismatch: nothing is decided from it.
@@ -967,6 +972,7 @@ async function rebuiltSpec(
       spec: recipeJobSpec(recipe, {
         datasetId: stamp.dataset_id,
         tag: stamp.version,
+        input: stamp.input,
         image: { ref: image.ref, digest: image.digest },
         zarrSource,
         env,

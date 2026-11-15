@@ -1,25 +1,44 @@
 /**
- * Migration 0117_compute_pipeline_stamps.sql (epic #2005 phase A6, #2011; ADR 0118), on two engines:
+ * Migrations 0117_compute_pipeline_stamps.sql (epic #2005 phase A6, #2011; ADR 0118) and
+ * 0141_compute_pipeline_stamps_input.sql (portable compute, card Q0b; plan D12 and D14), on two engines:
  * bun:sqlite and Miniflare's D1, the implementation `wrangler --local` runs. bun:sqlite is more
  * permissive than the SQLite D1 ships, so a CHECK or an index proven only on the first is not proven.
  *
  * What is pinned: the states in the file are the shared words; every CHECK refuses its violating row by
  * name and accepts its valid one; the live index lets exactly one `dispatched` or `succeeded` row hold a
- * tuple while a `failed` or `refused` row never blocks a retry; attempt numbers of a tuple are distinct;
- * a failed or refused stamp always says why and the other two never carry a word; a success has its job
- * and a refusal has none; no column is named for a person; and the file's GLOB patterns are within D1's
- * 50 characters.
+ * tuple (and input) while a `failed` or `refused` row never blocks a retry; attempt numbers of a tuple are
+ * distinct; a failed or refused stamp always says why and the other two never carry a word; a success has
+ * its job and a refusal has none; no column is named for a person; and the files' GLOB patterns are within
+ * D1's 50 characters. The second migration: the input column and the three fields of what a run read, each
+ * CHECK refusing its bad values; a `bids` and a `zarr` stamp of one dataset version coexist and two of the
+ * same input do not; and a database that holds rows when the migration lands (a `nemar-floor-zarr` stamp, a
+ * `nemar-floor` stamp of the same dataset version, a hold, a failed history) ends with them renamed and
+ * their other columns untouched.
  */
 
+import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { PIPELINE_LIVE_STAMP_STATES, PIPELINE_STAMP_STATES } from "../../shared/compute-recipes";
+import { Miniflare } from "miniflare";
+import {
+  PIPELINE_LIVE_STAMP_STATES,
+  PIPELINE_STAMP_STATES,
+  RECIPE_INPUTS,
+} from "../../shared/compute-recipes";
+import { HOLD_TUPLE_SQL, TUPLE_HELD_SQL } from "../src/services/compute-pipeline";
 import { type Engine, startEngines } from "./helpers/compute-engines";
-import { MIGRATIONS_DIR } from "./helpers/miniflare-d1";
+import {
+  MIGRATIONS_DIR,
+  applyMigrations,
+  migrationCall,
+  migrationFiles,
+} from "./helpers/miniflare-d1";
 
 const FILE = "0117_compute_pipeline_stamps.sql";
 const SQL = readFileSync(join(MIGRATIONS_DIR, FILE), "utf-8");
+const INPUT_FILE = "0141_compute_pipeline_stamps_input.sql";
+const INPUT_SQL = readFileSync(join(MIGRATIONS_DIR, INPUT_FILE), "utf-8");
 
 type Row = Record<string, unknown>;
 
@@ -95,14 +114,79 @@ describe("the file says the shared words", () => {
   });
 
   test("no GLOB pattern is longer than D1 takes (50 characters)", () => {
-    const patterns = [...SQL.matchAll(/GLOB\s+'([^']*)'/g)].map((m) => m[1] as string);
-    expect(patterns.length).toBeGreaterThan(5);
-    for (const p of patterns) expect([p, p.length <= 50]).toEqual([p, true]);
+    for (const text of [SQL, INPUT_SQL]) {
+      const patterns = [...text.matchAll(/GLOB\s+'([^']*)'/g)].map((m) => m[1] as string);
+      expect(patterns.length).toBeGreaterThan(3);
+      for (const p of patterns) expect([p, p.length <= 50]).toEqual([p, true]);
+    }
   });
 
   test("the table has no foreign key and nothing cascades into it", () => {
-    expect(SQL).not.toMatch(/REFERENCES/i);
-    expect(SQL).not.toMatch(/ON DELETE/i);
+    for (const text of [SQL, INPUT_SQL]) {
+      expect(text).not.toMatch(/REFERENCES/i);
+      expect(text).not.toMatch(/ON DELETE/i);
+    }
+  });
+
+  test("the inputs in the file are RECIPE_INPUTS, in its order", () => {
+    const m = /CONSTRAINT compute_pipeline_stamps_input CHECK \(input IN \(([^)]*)\)\)/.exec(
+      INPUT_SQL,
+    );
+    expect([...(m?.[1] ?? "").matchAll(/'([a-z0-9_]+)'/g)].map((x) => x[1])).toEqual([
+      ...RECIPE_INPUTS,
+    ]);
+  });
+
+  test("the recreated live index holds exactly the live states and names the input after the engine", () => {
+    const m =
+      /CREATE UNIQUE INDEX compute_pipeline_stamps_live\s+ON compute_pipeline_stamps \(([^)]*)\)\s+WHERE state IN \(([^)]*)\)/.exec(
+        INPUT_SQL,
+      );
+    expect([...(m?.[2] ?? "").matchAll(/'([a-z0-9_]+)'/g)].map((x) => x[1])).toEqual([
+      ...PIPELINE_LIVE_STAMP_STATES,
+    ]);
+    expect((m?.[1] ?? "").split(",").map((c) => c.trim())).toEqual([
+      "dataset_id",
+      "version",
+      "recipe",
+      "recipe_version",
+      "engine",
+      "input",
+    ]);
+    const a =
+      /CREATE UNIQUE INDEX compute_pipeline_stamps_attempt\s+ON compute_pipeline_stamps \(([^)]*)\)/.exec(
+        INPUT_SQL,
+      );
+    expect((a?.[1] ?? "").split(",").map((c) => c.trim())).toEqual([
+      "dataset_id",
+      "version",
+      "recipe",
+      "recipe_version",
+      "engine",
+      "input",
+      "attempt",
+    ]);
+  });
+
+  test("the old name keeps its rows: the migration sets input on them and never renames a stamp (MUTATION: rename them to nemar-floor)", () => {
+    const updates = [...INPUT_SQL.matchAll(/^UPDATE compute_pipeline_stamps[^;]*;/gm)].map(
+      (m) => m[0],
+    );
+    expect(updates).toEqual([
+      "UPDATE compute_pipeline_stamps SET input = 'zarr' WHERE recipe = 'nemar-floor-zarr';",
+    ]);
+    expect(INPUT_SQL).not.toMatch(/SET\s+recipe\s*=/);
+  });
+
+  test("the old indexes are dropped and the new ones created after the update", () => {
+    const at = (needle: string) => INPUT_SQL.indexOf(needle);
+    expect(at("DROP INDEX compute_pipeline_stamps_live")).toBeGreaterThan(-1);
+    expect(at("DROP INDEX compute_pipeline_stamps_attempt")).toBeGreaterThan(-1);
+    const update = at("UPDATE compute_pipeline_stamps SET input = 'zarr'");
+    expect(update).toBeGreaterThan(at("DROP INDEX compute_pipeline_stamps_live"));
+    expect(update).toBeGreaterThan(at("DROP INDEX compute_pipeline_stamps_attempt"));
+    expect(at("CREATE UNIQUE INDEX compute_pipeline_stamps_live")).toBeGreaterThan(update);
+    expect(at("CREATE UNIQUE INDEX compute_pipeline_stamps_attempt")).toBeGreaterThan(update);
   });
 });
 
@@ -119,6 +203,10 @@ describe("the table", () => {
       job_id: null,
       refusal_code: null,
       attempt: 1,
+      input: "bids",
+      reader: null,
+      input_engine: null,
+      input_digest: null,
     });
     expect(String(got?.created_at)).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
     expect(String(got?.updated_at)).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
@@ -155,6 +243,82 @@ describe("the table", () => {
       NAMED("compute_pipeline_stamps_version"),
     );
   });
+
+  onEveryEngine("the input is bids or zarr, and nothing else", async (e) => {
+    for (const input of ["", "BIDS", "parquet", "bids ", "zarr1", 1]) {
+      expect([input, await insertStamp(e, stamp({ input }))]).toEqual([
+        input,
+        expect.stringMatching(NAMED("compute_pipeline_stamps_input")),
+      ]);
+    }
+    for (const input of RECIPE_INPUTS) {
+      expect([input, await insertStamp(e, stamp({ input }))]).toEqual([input, null]);
+    }
+    // NOT NULL, with the default the existing rows took.
+    expect(await insertStamp(e, stamp({ input: null }))).toMatch(/NOT NULL constraint failed/);
+  });
+
+  onEveryEngine(
+    "what a run read is checked by shape: the reader and the engine, and the input digest",
+    async (e) => {
+      const sha = `sha256:${"0123456789abcdef".repeat(4)}`;
+      const git = `git:${"0123456789abcdef0123456789abcdef01234567"}`;
+      const words: Array<[string, string, unknown[], unknown[]]> = [
+        [
+          "compute_pipeline_stamps_reader",
+          "reader",
+          ["", "x".repeat(129), "eegprep lean", "a/b", "é", "a\nb"],
+          ["eegprep-lean@0.3.1+0123456789abcdef0123456789abcdef01234567", "x".repeat(128), "a"],
+        ],
+        [
+          "compute_pipeline_stamps_input_engine",
+          "input_engine",
+          ["", "x".repeat(129), "0.4 2", "0/4", "é"],
+          ["0.4.2", "zarr-python@3.1.0", "x".repeat(128)],
+        ],
+        [
+          "compute_pipeline_stamps_input_digest",
+          "input_digest",
+          [
+            "",
+            sha.toUpperCase(),
+            sha.slice(1),
+            `${sha}0`,
+            `sha256:${"g".repeat(64)}`,
+            `sha256:${"A".repeat(64)}`,
+            `sha512:${"a".repeat(64)}`,
+            git.slice(1),
+            `${git}0`,
+            `git:${"G".repeat(40)}`,
+            `git:${"A".repeat(40)}`,
+            `GIT:${"a".repeat(40)}`,
+            `sha256:${"a".repeat(40)}`,
+            `git:${"a".repeat(64)}`,
+            "0123456789abcdef".repeat(4),
+          ],
+          [sha, git],
+        ],
+      ];
+      for (const [name, column, bad, good] of words) {
+        for (const value of bad) {
+          expect([column, value, await insertStamp(e, stamp({ [column]: value }))]).toEqual([
+            column,
+            value,
+            expect.stringMatching(NAMED(name)),
+          ]);
+        }
+        for (const value of good) {
+          expect([column, value, await insertStamp(e, stamp({ [column]: value }))]).toEqual([
+            column,
+            value,
+            null,
+          ]);
+        }
+        // Absent is allowed: a stamp that has not succeeded, or whose record did not say.
+        expect(await insertStamp(e, stamp({ [column]: null }))).toBeNull();
+      }
+    },
+  );
 
   onEveryEngine("the attempt is a whole number from 1", async (e) => {
     for (const attempt of [0, -1, 1.5, "x", 1_000_001]) {
@@ -271,9 +435,60 @@ describe("the rule: one live or succeeded stamp per tuple", () => {
       { recipe: "nemar-ica" },
       { recipe_version: "1.0.1" },
       { engine: "eegprep@0.6.0" },
+      { input: "zarr" },
     ]) {
       expect([over, await insertStamp(e, { ...t, ...over })]).toEqual([over, null]);
     }
+  });
+
+  onEveryEngine(
+    "a bids and a zarr stamp of one dataset version coexist, and two of one input do not (MUTATION: leave input out of the live index)",
+    async (e) => {
+      const t = stamp();
+      expect(await insertStamp(e, { ...t, input: "bids" })).toBeNull();
+      expect(await insertStamp(e, { ...t, input: "zarr" })).toBeNull();
+      expect(await insertStamp(e, { ...t, input: "zarr", attempt: 2 })).toMatch(UNIQUE);
+      expect(await insertStamp(e, { ...t, input: "bids", attempt: 2 })).toMatch(UNIQUE);
+      expect(
+        await insertStamp(e, {
+          ...t,
+          input: "zarr",
+          attempt: 3,
+          state: "succeeded",
+          job_id: jobId(),
+        }),
+      ).toMatch(UNIQUE);
+      // A failed attempt of either never blocks it, and a succeeded one blocks only its own input.
+      expect(
+        await insertStamp(e, {
+          ...t,
+          input: "zarr",
+          attempt: 2,
+          state: "failed",
+          refusal_code: "x",
+        }),
+      ).toBeNull();
+      const u = stamp();
+      expect(
+        await insertStamp(e, { ...u, input: "bids", state: "succeeded", job_id: jobId() }),
+      ).toBeNull();
+      expect(await insertStamp(e, { ...u, input: "zarr" })).toBeNull();
+      expect(await insertStamp(e, { ...u, input: "bids", attempt: 2 })).toMatch(UNIQUE);
+    },
+  );
+
+  onEveryEngine("an attempt number is used once per tuple and input", async (e) => {
+    const t = stamp();
+    expect(
+      await insertStamp(e, { ...t, input: "bids", state: "failed", refusal_code: "no_job" }),
+    ).toBeNull();
+    // The other input starts at 1 too: its attempts are its own.
+    expect(
+      await insertStamp(e, { ...t, input: "zarr", state: "failed", refusal_code: "no_job" }),
+    ).toBeNull();
+    expect(
+      await insertStamp(e, { ...t, input: "zarr", state: "failed", refusal_code: "no_job" }),
+    ).toMatch(UNIQUE);
   });
 
   onEveryEngine("an attempt number of a tuple is used once, whatever became of it", async (e) => {
@@ -321,7 +536,11 @@ describe("the rule: one live or succeeded stamp per tuple", () => {
         "dataset_id",
         "engine",
         "id",
+        "input",
+        "input_digest",
+        "input_engine",
         "job_id",
+        "reader",
         "recipe",
         "recipe_version",
         "refusal_code",
@@ -331,5 +550,245 @@ describe("the rule: one live or succeeded stamp per tuple", () => {
       ].sort(),
     );
     for (const c of cols) expect(c).not.toMatch(/name|email|orcid|country|affiliation|user/i);
+  });
+});
+
+// --- A database that holds rows when the migration lands -------------------------------------------------
+
+/**
+ * Both engines with every migration BEFORE 0141 applied, so a case can write rows the way the Worker wrote them
+ * before inputs existed and then run the migration file as D1 would: bun:sqlite from the file's text,
+ * Miniflare's D1 through the same call the other migrations reach it by.
+ */
+interface Pre extends Engine {
+  /** Apply migration 0141 to this engine; the error text when it was refused. */
+  migrate(): Promise<string | null>;
+}
+
+async function preMigrationEngines(): Promise<{ engines: Pre[]; dispose(): Promise<void> }> {
+  const before = migrationFiles().filter((f) => f < INPUT_FILE);
+  const db = new Database(":memory:");
+  for (const f of before) db.exec(readFileSync(join(MIGRATIONS_DIR, f), "utf-8"));
+  const mf = new Miniflare({
+    modules: true,
+    script: "export default { fetch() { return new Response(null, { status: 204 }); } };",
+    compatibilityDate: "2024-12-01",
+    d1Databases: ["DB"],
+  });
+  const d1 = await mf.getD1Database("DB");
+  await applyMigrations(d1, before);
+  const engines: Pre[] = [
+    {
+      name: "bun:sqlite",
+      d1: undefined as never,
+      async run(sql, ...binds) {
+        try {
+          db.prepare(sql).run(...(binds as never[]));
+          return null;
+        } catch (err) {
+          return String(err);
+        }
+      },
+      async all<T>(sql: string, ...binds: unknown[]) {
+        return db.prepare(sql).all(...(binds as never[])) as T[];
+      },
+      async migrate() {
+        try {
+          db.exec(INPUT_SQL);
+          return null;
+        } catch (err) {
+          return String(err);
+        }
+      },
+    },
+    {
+      name: "Miniflare D1",
+      d1,
+      async run(sql, ...binds) {
+        try {
+          await d1
+            .prepare(sql)
+            .bind(...binds)
+            .run();
+          return null;
+        } catch (err) {
+          return String(err);
+        }
+      },
+      async all<T>(sql: string, ...binds: unknown[]) {
+        return (
+          await d1
+            .prepare(sql)
+            .bind(...binds)
+            .all<T>()
+        ).results;
+      },
+      async migrate() {
+        try {
+          await d1.prepare(migrationCall(INPUT_SQL)).run();
+          return null;
+        } catch (err) {
+          return String(err);
+        }
+      },
+    },
+  ];
+  return { engines, dispose: () => mf.dispose() };
+}
+
+describe("migration 0141 over rows that exist", () => {
+  const ROW_JOB = (n: number) => `job_${n.toString(16).padStart(24, "0")}`;
+  const D = "nm000104";
+  const base = (over: Row) => ({
+    dataset_id: D,
+    version: "v1.0.0",
+    recipe: "nemar-floor",
+    recipe_version: "1.0.0",
+    engine: "eegprep@0.5.0",
+    attempt: 1,
+    ...over,
+  });
+  /** What the Worker wrote before inputs: no input, reader, engine or digest column. */
+  const before: Row[] = [
+    // The Zarr transition name, live: a runner job in flight.
+    base({ recipe: "nemar-floor-zarr", state: "dispatched", job_id: ROW_JOB(1) }),
+    // The same dataset version, recipe version and engine under the BIDS recipe, succeeded.
+    base({ recipe: "nemar-floor", state: "succeeded", job_id: ROW_JOB(2) }),
+    // Failed history of the Zarr name: attempt numbers 2 and 3 of its tuple.
+    base({ recipe: "nemar-floor-zarr", attempt: 2, state: "failed", refusal_code: "no_job" }),
+    base({ recipe: "nemar-floor-zarr", attempt: 3, state: "refused", refusal_code: "suspended" }),
+    // A hold the Zarr name had (a result named another tuple): it holds the old name and nothing else.
+    base({
+      dataset_id: "nm000105",
+      recipe: "nemar-floor-zarr",
+      state: "failed",
+      job_id: ROW_JOB(3),
+      refusal_code: "tuple_mismatch",
+    }),
+    // A recipe the migration does not touch.
+    base({ dataset_id: "nm000106", recipe: "nemar-ica", state: "dispatched", job_id: ROW_JOB(4) }),
+    // A demo-era success under the Zarr name: it must not occupy the live slot of a nemar-floor Zarr run.
+    base({
+      dataset_id: "nm000108",
+      recipe: "nemar-floor-zarr",
+      state: "succeeded",
+      job_id: ROW_JOB(6),
+    }),
+  ];
+
+  let started: Awaited<ReturnType<typeof preMigrationEngines>>;
+  beforeAll(async () => {
+    started = await preMigrationEngines();
+  }, 60_000);
+  afterAll(async () => {
+    await started?.dispose();
+  }, 30_000);
+
+  const insert = (e: Engine, row: Row) => {
+    const cols = Object.keys(row);
+    return e.run(
+      `INSERT INTO compute_pipeline_stamps (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`,
+      ...cols.map((c) => row[c]),
+    );
+  };
+
+  test("a pre-migration nemar-floor-zarr row keeps its name and gets input zarr, every other column untouched (MUTATION: drop the UPDATE, or rename the rows)", async () => {
+    expect(started.engines).toHaveLength(2);
+    for (const e of started.engines) {
+      try {
+        for (const row of before) expect(await insert(e, row)).toBeNull();
+        const readAll = () => e.all<Row>("SELECT * FROM compute_pipeline_stamps ORDER BY id");
+        const was = await readAll();
+        expect(was).toHaveLength(before.length);
+        expect(was.every((r) => !("input" in r))).toBe(true);
+
+        // The migration lands over those rows.
+        expect(await e.migrate()).toBeNull();
+
+        const now = await readAll();
+        expect(now).toHaveLength(was.length);
+        expect(now.map((r) => [r.recipe, r.input])).toEqual([
+          ["nemar-floor-zarr", "zarr"],
+          ["nemar-floor", "bids"],
+          ["nemar-floor-zarr", "zarr"],
+          ["nemar-floor-zarr", "zarr"],
+          ["nemar-floor-zarr", "zarr"],
+          ["nemar-ica", "bids"],
+          ["nemar-floor-zarr", "zarr"],
+        ]);
+        // Nothing else moved, the recipe name included: ids, tuples, attempts, states, jobs, words and both
+        // timestamps are as they were, and the new columns are empty (nothing had said what it read).
+        for (const [i, row] of now.entries()) {
+          const old = was[i] as Row;
+          for (const c of Object.keys(old)) expect([i, c, row[c]]).toEqual([i, c, old[c]]);
+          expect([row.reader, row.input_engine, row.input_digest]).toEqual([null, null, null]);
+        }
+
+        // The recreated indexes hold the rule: the succeeded BIDS stamp of nm000104 refuses a second BIDS
+        // stamp of its tuple, and attempt numbers of one tuple and input are distinct.
+        const t = base({});
+        expect(await insert(e, { ...t, input: "bids", attempt: 9 })).toMatch(UNIQUE);
+        expect(
+          await insert(e, { ...t, input: "bids", attempt: 1, state: "failed", refusal_code: "x" }),
+        ).toMatch(UNIQUE);
+        // The old name's own tuple is held by its own live stamp, per input.
+        const old = { ...t, recipe: "nemar-floor-zarr", input: "zarr" };
+        expect(await insert(e, { ...old, attempt: 9 })).toMatch(UNIQUE);
+        expect(await insert(e, { ...old, attempt: 3, state: "failed", refusal_code: "x" })).toMatch(
+          UNIQUE,
+        );
+        expect(
+          await insert(e, { ...old, attempt: 4, state: "failed", refusal_code: "x" }),
+        ).toBeNull();
+      } catch (err) {
+        throw new Error(`${e.name}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  });
+
+  test("an old nemar-floor-zarr stamp, live or succeeded, does not block a nemar-floor zarr claim (MUTATION: rename the rows)", async () => {
+    for (const e of started.engines) {
+      // nm000104 holds a LIVE old-name stamp and a succeeded BIDS stamp; nm000108 a succeeded old-name one.
+      for (const [dataset, attempt] of [
+        [D, 1],
+        ["nm000108", 1],
+      ] as const) {
+        const claim = base({ dataset_id: dataset, input: "zarr", attempt, state: "dispatched" });
+        expect([e.name, dataset, await insert(e, claim)]).toEqual([e.name, dataset, null]);
+        // ... and now the live slot of that nemar-floor zarr tuple is taken, as it must be.
+        expect(await insert(e, { ...claim, attempt: 2 })).toMatch(UNIQUE);
+      }
+    }
+  });
+
+  test("a hold under the old name holds the old name only: nemar-floor is not held on either input, through the Worker's own statements", async () => {
+    for (const e of started.engines) {
+      const asked = async (recipe: string, input: string) =>
+        (await e.all(TUPLE_HELD_SQL, recipe, "1.0.0", "eegprep@0.5.0", input)).length;
+      // The row is still there, under the name it was written with, and the registry cannot ask for that name.
+      expect([e.name, await asked("nemar-floor-zarr", "zarr")]).toEqual([e.name, 1]);
+      expect([
+        e.name,
+        await asked("nemar-floor", "zarr"),
+        await asked("nemar-floor", "bids"),
+      ]).toEqual([e.name, 0, 0]);
+      // A new hold is written for the claimed input, with the input's own next attempt number.
+      const none = await e.run(
+        HOLD_TUPLE_SQL,
+        "nm000107",
+        "v1.0.0",
+        "nemar-floor",
+        "1.0.0",
+        "eegprep@0.5.0",
+        ROW_JOB(5),
+        "bids",
+      );
+      expect([e.name, none]).toEqual([e.name, null]);
+      expect([
+        e.name,
+        await asked("nemar-floor", "bids"),
+        await asked("nemar-floor", "zarr"),
+      ]).toEqual([e.name, 1, 0]);
+    }
   });
 });

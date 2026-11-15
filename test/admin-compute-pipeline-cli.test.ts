@@ -484,7 +484,7 @@ describe("status", () => {
     const lines = r.stdout.trim().split("\n");
     expect(lines).toHaveLength(3);
     expect(lines[0]).toMatch(
-      /nm000106 v1\.0\.0\s+nemar-floor 1\.0\.0 eegprep@0\.5\.0 attempt 1\s+dispatched job job_[0-9a-f]{24}/,
+      /nm000106 v1\.0\.0\s+nemar-floor 1\.0\.0 eegprep@0\.5\.0 bids attempt 1\s+dispatched job job_[0-9a-f]{24}/,
     );
     expect(lines[2]).toContain("nm000104");
   });
@@ -626,7 +626,10 @@ describe("run --executor runner (portable compute, ADR 0121)", () => {
     const text = r.stdout.replace(/\s+/g, " ");
     for (const phrase of [
       "--executor <who>",
-      "nemar-floor-zarr on a runner",
+      "(nemar-floor on both)",
+      "--input <kind>",
+      "bids (the dataset's files, on tapis) or zarr (its Zarr serving copy, on a runner)",
+      "refused as invalid_spec naming input",
       "runners_disabled",
       "never by the daily cap or the tenant ceiling",
     ]) {
@@ -639,7 +642,7 @@ describe("run --executor runner (portable compute, ADR 0121)", () => {
     const env = await zarrWorld();
     const r = await runCli("admin", [
       "run",
-      "nemar-floor-zarr",
+      "nemar-floor",
       "--dataset",
       "nm000104",
       "--executor",
@@ -647,7 +650,7 @@ describe("run --executor runner (portable compute, ADR 0121)", () => {
       "--dry-run",
     ]);
     expect(r.exitCode).toBe(0);
-    expect(r.stdout).toContain("dry run of nemar-floor-zarr on a runner: nothing was written");
+    expect(r.stdout).toContain("dry run of nemar-floor on a runner: nothing was written");
     expect(r.stdout).toContain(
       "executor: runner (no hold, no service units; a runner pulls the job)",
     );
@@ -659,7 +662,7 @@ describe("run --executor runner (portable compute, ADR 0121)", () => {
     expect(await count(env, "compute_jobs")).toBe(0);
     const json = await runCli("admin", [
       "run",
-      "nemar-floor-zarr",
+      "nemar-floor",
       "--dataset",
       "nm000104",
       "--executor",
@@ -680,14 +683,14 @@ describe("run --executor runner (portable compute, ADR 0121)", () => {
     const ledger = await count(env, "compute_ledger");
     const r = await runCli("admin", [
       "run",
-      "nemar-floor-zarr",
+      "nemar-floor",
       "--dataset",
       "nm000104",
       "--executor",
       "runner",
     ]);
     expect(r.exitCode).toBe(0);
-    expect(r.stdout).toContain("nemar-floor-zarr (runner): dispatched 1 of 1 tried");
+    expect(r.stdout).toContain("nemar-floor (runner): dispatched 1 of 1 tried");
     expect(r.stdout).toContain("submit waiting_for_runner");
     expect(await count(env, "compute_jobs")).toBe(1);
     expect(await count(env, "compute_ledger")).toBe(ledger);
@@ -714,7 +717,7 @@ describe("run --executor runner (portable compute, ADR 0121)", () => {
     await zarrWorld();
     const r = await runCli("admin", [
       "run",
-      "nemar-floor-zarr",
+      "nemar-floor",
       "--dataset",
       "nm000104",
       "--executor",
@@ -733,7 +736,7 @@ describe("run --executor runner (portable compute, ADR 0121)", () => {
     ).run();
     const r = await runCli("admin", [
       "run",
-      "nemar-floor-zarr",
+      "nemar-floor",
       "--dataset",
       "nm000104",
       "--executor",
@@ -751,7 +754,7 @@ describe("run --executor runner (portable compute, ADR 0121)", () => {
     const other = "89abcdef0123456789abcdef0123456789abcdef";
     github.index("nm000104", { source_commit: other, store_count: 3 });
     github.compare("nm000104", COMMIT, other, { status: "behind", behind_by: 1, files: [] });
-    const args = ["run", "nemar-floor-zarr", "--dataset", "nm000104", "--executor", "runner"];
+    const args = ["run", "nemar-floor", "--dataset", "nm000104", "--executor", "runner"];
     const live = await runCli("admin", args);
     expect(live.exitCode).toBe(1);
     expect(live.stderr + live.stdout).toContain("zarr_source_mismatch, reason compare_behind");
@@ -778,7 +781,7 @@ describe("run --executor runner (portable compute, ADR 0121)", () => {
     const env = await zarrWorld();
     const r = await runCli("admin", [
       "run",
-      "nemar-floor-zarr",
+      "nemar-floor",
       "--dataset",
       "nm000104",
       "--executor",
@@ -789,23 +792,69 @@ describe("run --executor runner (portable compute, ADR 0121)", () => {
     expect(await count(env, "compute_jobs")).toBe(0);
   });
 
-  test("a recipe on an executor it does not list exits 1 as invalid_body naming executor", async () => {
+  test("an input the executor does not run exits 1 as invalid_spec naming input, and writes nothing (MUTATION: allow bids on a runner)", async () => {
     workerEnv = { ...ZARR_WORKER, COMPUTE_RUNNERS_ENABLED: "1" };
-    await zarrWorld();
-    const r = await runCli("admin", ["run", "nemar-floor-zarr", "--dataset", "nm000104"]);
-    expect(r.exitCode).toBe(1);
-    expect(r.stderr + r.stdout).toContain("executor");
-    expect(r.stderr + r.stdout).toContain("invalid_body");
-  });
-
-  test("a runner run over --eligible, and an executor that is not a word, are refused before anything is sent (MUTATION: drop the local check)", async () => {
+    const env = await zarrWorld();
     for (const args of [
-      ["run", "nemar-floor-zarr", "--eligible", "--executor", "runner"],
-      ["run", "nemar-floor-zarr", "--dataset", "nm000104", "--executor", "ssh"],
+      ["run", "nemar-floor", "--dataset", "nm000104", "--input", "zarr"],
+      ["run", "nemar-floor", "--dataset", "nm000104", "--executor", "runner", "--input", "bids"],
+      [
+        "run",
+        "nemar-floor",
+        "--dataset",
+        "nm000104",
+        "--executor",
+        "runner",
+        "--input",
+        "bids",
+        "--dry-run",
+      ],
     ]) {
       const r = await runCli("admin", args);
       expect([args, r.exitCode]).toEqual([args, 1]);
-      expect(r.stderr + r.stdout).toMatch(/--executor|runner run names one dataset/);
+      expect(r.stderr + r.stdout).toContain("input");
+      expect(r.stderr + r.stdout).toContain("invalid_spec");
+    }
+    expect(await count(env, "compute_jobs")).toBe(0);
+    expect(await count(env, "compute_pipeline_stamps")).toBe(0);
+  });
+
+  test("--input zarr on a runner is the default's own word: the run is made and the stamp reads zarr", async () => {
+    workerEnv = { ...ZARR_WORKER, COMPUTE_RUNNERS_ENABLED: "1" };
+    const env = await zarrWorld();
+    const r = await runCli("admin", [
+      "run",
+      "nemar-floor",
+      "--dataset",
+      "nm000104",
+      "--executor",
+      "runner",
+      "--input",
+      "zarr",
+      "--json",
+    ]);
+    expect(r.exitCode).toBe(0);
+    expect(JSON.parse(r.stdout)).toMatchObject({
+      executor: "runner",
+      input: "zarr",
+      dispatched: 1,
+    });
+    expect(await count(env, "compute_pipeline_stamps")).toBe(1);
+    const status = await runCli("admin", ["status", "--dataset", "nm000104"]);
+    expect(status.stdout).toMatch(
+      /nemar-floor 1\.0\.0 eegprep@0\.5\.0 zarr attempt 1\s+dispatched/,
+    );
+  });
+
+  test("a runner run over --eligible, an executor that is not a word and an input that is not a word are refused before anything is sent (MUTATION: drop the local check)", async () => {
+    for (const args of [
+      ["run", "nemar-floor", "--eligible", "--executor", "runner"],
+      ["run", "nemar-floor", "--dataset", "nm000104", "--executor", "ssh"],
+      ["run", "nemar-floor", "--dataset", "nm000104", "--input", "parquet"],
+    ]) {
+      const r = await runCli("admin", args);
+      expect([args, r.exitCode]).toEqual([args, 1]);
+      expect(r.stderr + r.stdout).toMatch(/--executor|--input|runner run names one dataset/);
     }
     expect(seen).toEqual([]);
   });

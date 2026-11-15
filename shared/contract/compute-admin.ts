@@ -18,7 +18,7 @@
  */
 
 import { z } from "zod";
-import { PIPELINE_STAMP_STATES } from "../compute-recipes.js";
+import { PIPELINE_STAMP_STATES, type RecipeInput } from "../compute-recipes.js";
 import {
   COMPUTE_REFUSAL_STATUS,
   type ComputeExecutor,
@@ -508,6 +508,13 @@ export interface ComputePipelineRunRequest {
    * be dispatched to, and a runner run names one dataset, not the queue.
    */
   executor?: ComputeExecutor;
+  /**
+   * What the run reads (plan D12): `bids` (the dataset's files, on Tapis) or `zarr` (its Zarr serving copy, on a
+   * runner). The executor's own when absent: `bids` for `tapis`, `zarr` for `runner`. An input the recipe does
+   * not list, or one the executor does not run, is refused `invalid_spec` naming `input`, before anything is
+   * written.
+   */
+  input?: RecipeInput;
   dataset?: string;
   version?: string;
   eligible?: boolean;
@@ -646,6 +653,8 @@ export const ComputePipelineRunResponseSchema = z
     room: ComputePipelineRoomSchema.optional(),
     /** Who the run was for (`tapis` or `runner`); absent from an older Worker, which has only Tapis. */
     executor: z.string().optional(),
+    /** What the run read (`bids` or `zarr`); absent from a Worker from before inputs, whose runs all read `bids`. */
+    input: z.string().optional(),
     /** For a runner run, live or dry: the room under the runners' live cap (there is no `room`). */
     runner_room: ComputePipelineRunnerRoomSchema.optional(),
     /** True when the run was made and the Worker could not write its audit row: nothing is lost but the row. */
@@ -691,10 +700,21 @@ export const ComputePipelineStampViewSchema = z
     recipe: z.string(),
     recipe_version: z.string(),
     engine: z.string(),
+    /**
+     * What the run reads, the fifth word of the tuple (`bids` or `zarr`). Optional so a CLI that reads a
+     * Worker from before inputs still parses its answer; every stamp that Worker made read `bids`.
+     */
+    input: z.string().optional(),
     attempt: z.number().int(),
     state: z.string(),
     job_id: nullableString,
     refusal_code: nullableString,
+    /** A succeeded Zarr stamp: the reader that decoded the stores (`eegprep-lean@<version>+<commit>`). */
+    reader: nullableString.optional(),
+    /** A succeeded Zarr stamp: the Zarr engine version of the serving index the run read. */
+    input_engine: nullableString.optional(),
+    /** A succeeded stamp: `sha256:` and what a Zarr run read, or `git:` and the commit a BIDS run read. */
+    input_digest: nullableString.optional(),
     created_at: z.string(),
     /** While `dispatched`: when the Worker last examined the stamp. Once ended: when it ended. */
     updated_at: z.string(),

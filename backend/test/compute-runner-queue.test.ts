@@ -166,6 +166,13 @@ const count = async (statement: string, ...binds: unknown[]) =>
 // --- Seeds ---------------------------------------------------------------------------------------------
 
 const COMMIT = "0123456789abcdef0123456789abcdef01234567";
+
+/**
+ * The minutes a job of the Zarr input is sized for: the registry's, so a number the owner adjusts there is
+ * the number these cases age by (the runner's deadline is these minutes plus a 15-minute grace).
+ */
+const FLOOR_MINUTES = (findRecipe("nemar-floor") as NonNullable<ReturnType<typeof findRecipe>>)
+  .minutes;
 let seq = 0;
 
 /** A public EEG dataset with a ready Zarr serving copy, and its id. */
@@ -187,7 +194,7 @@ async function dispatch(e: Bindings = env, datasetId?: string): Promise<string> 
   const id = datasetId ?? (await dataset(e));
   const admin = ids?.admin ?? 1;
   const r = await dispatchPipelineJob(e, {
-    recipe: "nemar-floor-zarr",
+    recipe: "nemar-floor",
     datasetId: id,
     actor: { kind: "admin", userId: admin },
     executor: "runner",
@@ -482,7 +489,7 @@ describe("the claim", () => {
       memory_mb: number;
       minutes: number;
     };
-    expect(entry).toMatchObject({ id: jobId, cores: 4, memory_mb: 16384, minutes: 120 });
+    expect(entry).toMatchObject({ id: jobId, cores: 4, memory_mb: 16384, minutes: FLOOR_MINUTES });
     expect(entry.image.digest).toBe(RUNTIME_IMAGE_DIGEST);
     const job = await row(jobId);
     expect(job).toMatchObject({
@@ -1013,11 +1020,11 @@ describe("leases and deadlines", () => {
   test("a started job past its minutes plus the grace fails deadline_exceeded, even with its lease current (MUTATION: drop the grace)", async () => {
     const { r, jobId, entry } = await claimed();
     await heartbeat(r, jobId, entry.lease_id, "started");
-    // 120 minutes plus 15: not yet at 134, past at 136.
-    await age(jobId, "started_at", "-134 minutes");
+    // The recipe's minutes plus 15: not yet one minute short of it, past one minute over it.
+    await age(jobId, "started_at", `-${FLOOR_MINUTES + 14} minutes`);
     await sweepRunnerLeases(env);
     expect((await row(jobId)).state).toBe("running");
-    await age(jobId, "started_at", "-136 minutes");
+    await age(jobId, "started_at", `-${FLOOR_MINUTES + 16} minutes`);
     await sweepRunnerLeases(env);
     expect(await row(jobId)).toMatchObject({
       state: "failed",
@@ -1205,7 +1212,7 @@ describe("records that never landed", () => {
     });
     const id = await dataset();
     const made = await dispatchPipelineJob(bad, {
-      recipe: "nemar-floor-zarr",
+      recipe: "nemar-floor",
       datasetId: id,
       actor: { kind: "admin", userId: ids.admin },
       executor: "runner",
@@ -1234,7 +1241,7 @@ describe("records that never landed", () => {
     });
     const id = await dataset();
     const made = await dispatchPipelineJob(bad, {
-      recipe: "nemar-floor-zarr",
+      recipe: "nemar-floor",
       datasetId: id,
       actor: { kind: "admin", userId: ids.admin },
       executor: "runner",
@@ -1250,6 +1257,53 @@ describe("records that never landed", () => {
   });
 });
 
+describe("a waiting job whose stamp carries the retired recipe name", () => {
+  test("cannot be rebuilt: the replay finds a mismatch and writes nothing, and a stale one is given up on, while the same job with the live name is replayed (MUTATION: fall back to nemar-floor when the stamp's recipe is unknown)", async () => {
+    const bad = fx.env({
+      ENVIRONMENT: "development",
+      COMPUTE_RUNNERS_ENABLED: "1",
+      API_BASE_URL: base,
+      COMPUTE_RECORDS: failing(4),
+    });
+    const wait = async () => {
+      const id = await dataset();
+      const made = await dispatchPipelineJob(bad, {
+        recipe: "nemar-floor",
+        datasetId: id,
+        actor: { kind: "admin", userId: ids.admin },
+        executor: "runner",
+      });
+      if (!made.ok) throw new Error("could not dispatch");
+      expect(made.recordsWritten).toBe(false);
+      return made.jobId;
+    };
+    const old = await wait();
+    const live = await wait();
+    // A job that was waiting when migration 0141 landed: its stamp says the old name, with input zarr.
+    await sql(
+      "UPDATE compute_pipeline_stamps SET recipe = 'nemar-floor-zarr' WHERE job_id = ?1",
+      old,
+    );
+    for (const jobId of [old, live]) await age(jobId, "created_at", "-6 minutes");
+
+    // The control is rebuilt and written; the old name is a mismatch (the registry has lost the recipe),
+    // which writes nothing and, being young, is left alone.
+    const first = await sweepRunnerLeases(env);
+    expect([first.replayed, first.records_lost]).toEqual([1, 0]);
+    expect((await row(live)).records_written_at).not.toBeNull();
+    expect((await row(old)).records_written_at).toBeNull();
+    expect(await fx.harness.records.head(recordKey(old, "spec.json"))).toBeNull();
+    expect((await row(old)).state).toBe("created");
+
+    // Past the window, only a mismatch is given up on (an unreachable source is not), so the job ends.
+    await age(old, "created_at", "-61 minutes");
+    await age(old, "examined_at", "-10 minutes");
+    const second = await sweepRunnerLeases(env);
+    expect(second.records_lost).toBe(1);
+    expect(await row(old)).toMatchObject({ state: "failed", failure_code: "records_unavailable" });
+  });
+});
+
 describe("the cancel of a waiting runner job", () => {
   test("ends in SQL: cancelled, settled with charge 0, the slot and the tuple freed (MUTATION: drop the stamp end, or the settled stamp)", async () => {
     const owner = ids.owner;
@@ -1258,7 +1312,7 @@ describe("the cancel of a waiting runner job", () => {
     const first = await dispatch(env, id);
     // The cap is full: a second job is refused.
     const second = await dispatchPipelineJob(env, {
-      recipe: "nemar-floor-zarr",
+      recipe: "nemar-floor",
       datasetId: await dataset(),
       actor: { kind: "admin", userId: ids.admin },
       executor: "runner",
@@ -1266,7 +1320,7 @@ describe("the cancel of a waiting runner job", () => {
     expect(second).toMatchObject({ ok: false, code: "over_concurrency" });
     // The tuple is held: the same dataset again is a live attempt.
     const again = await dispatchPipelineJob(env, {
-      recipe: "nemar-floor-zarr",
+      recipe: "nemar-floor",
       datasetId: id,
       actor: { kind: "admin", userId: ids.admin },
       executor: "runner",
@@ -1296,7 +1350,7 @@ describe("the cancel of a waiting runner job", () => {
 
     // The slot is free: a second runner job fits; the tuple is free: a new dispatch of it succeeds.
     const fits = await dispatchPipelineJob(env, {
-      recipe: "nemar-floor-zarr",
+      recipe: "nemar-floor",
       datasetId: id,
       actor: { kind: "admin", userId: ids.admin },
       executor: "runner",
@@ -1420,7 +1474,9 @@ describe("the two attention words", () => {
 
 describe("the recipe of a runner job is the recipe's", () => {
   test("the registry entry the queue relies on", () => {
-    expect(findRecipe("nemar-floor-zarr")?.executors).toEqual(["runner"]);
+    const floor = findRecipe("nemar-floor");
+    expect(floor?.executors).toEqual(["tapis", "runner"]);
+    expect(floor?.inputs).toEqual(["bids", "zarr"]);
   });
 });
 
@@ -1795,7 +1851,7 @@ describe("the sweep cannot be starved", () => {
     for (let i = 0; i < n; i++) {
       const id = await dataset();
       const r = await dispatchPipelineJob(bad, {
-        recipe: "nemar-floor-zarr",
+        recipe: "nemar-floor",
         datasetId: id,
         actor: { kind: "admin", userId: ids.admin },
         executor: "runner",
@@ -1897,7 +1953,7 @@ describe("a runner that ignores a cancel", () => {
     const { r, jobId, entry } = await claimed();
     await heartbeat(r, jobId, entry.lease_id, "started");
     await admin("POST", `/compute/jobs/${jobId}/cancel`);
-    await age(jobId, "started_at", "-136 minutes");
+    await age(jobId, "started_at", `-${FLOOR_MINUTES + 16} minutes`);
     expect((await heartbeat(r, jobId, entry.lease_id, "uploading")).body.cancel).toBe(true);
     await sweepRunnerLeases(env);
     expect(await row(jobId)).toMatchObject({
@@ -2007,7 +2063,7 @@ describe("the replay of records is throttled, bounded and last", () => {
     for (let i = 0; i < n; i++) {
       const id = await dataset();
       const r = await dispatchPipelineJob(bad, {
-        recipe: "nemar-floor-zarr",
+        recipe: "nemar-floor",
         datasetId: id,
         actor: { kind: "admin", userId: ids.admin },
         executor: "runner",

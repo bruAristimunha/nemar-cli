@@ -1,8 +1,8 @@
 /**
  * NEMAR's own pipeline dispatch (epic #2005 phase A6, #2011; ADR 0118; design section 10): run a
  * processing recipe over one version of one public EEG dataset through the compute gateway, leave one
- * stamp per dataset version, recipe, recipe version and engine so the queue knows what is current, and
- * read the stamps back to their end.
+ * stamp per dataset version, recipe, recipe version, engine and input so the queue knows what is current,
+ * and read the stamps back to their end.
  *
  *   `dispatchPipelineJob`   claim the stamp, resolve the recipe into a complete job, make the job and
  *                           its hold (`createJob`), link the stamp, and submit (`submitComputeJob`)
@@ -27,14 +27,20 @@
  *    launcher's provenance before it accepts a result (`verifyResults`).
  *  - THE STAMP IS CLAIMED FIRST. A `dispatched` row for the tuple is inserted before anything else is
  *    written, and a partial unique index refuses a second live or succeeded row for one tuple, so two
- *    runs racing for a tuple produce one stamp and one job. A refused hold ends the stamp `refused`
- *    with the ledger's word; nothing else is left (the job's creation is atomic with its hold).
+ *    runs racing for a tuple produce one stamp and one job. The tuple names the INPUT the run reads
+ *    (`bids` or `zarr`, plan D12): a recipe's two inputs are two tuples, so a BIDS run and a Zarr run of
+ *    one dataset version coexist. A refused hold ends the stamp `refused` with the ledger's word; nothing
+ *    else is left (the job's creation is atomic with its hold).
  *  - ONE KEY FOR ONE ATTEMPT. The job's idempotency key is made from the tuple and the attempt number,
  *    so a crash between the job's creation and the stamp's link is found again by the key: the sync
  *    links the job instead of failing the stamp.
  *  - THE STAMP SAYS WHAT RAN. It is claimed with the recipe table's version and engine and, when the
- *    job succeeds, rewritten from the recipe's own dataset record (`readRecipeRecord`). A record that
- *    is missing, unreadable, or names another recipe ends the stamp `failed`; the job is untouched.
+ *    job succeeds, rewritten from the recipe's own dataset record (`readRecipeRecord`), which also gives it
+ *    what the run READ: the reader, the Zarr engine and the input digest of a Zarr run, the source commit
+ *    of a BIDS run (`stampInputFields`; a value that does not fit its column is never stored). A record
+ *    that is missing, unreadable, or names another recipe ends the stamp `failed`; the job is untouched. A
+ *    record that names another input than the stamp claimed ends the stamp `failed` with `tuple_mismatch`, which
+ *    holds the claimed tuple (a stamp that says what ran never says "read zarr" of a run that read another input).
  *  - NOTHING HERE TOUCHES GITHUB OR MAIL. A run reaches D1, the compute buckets and Tapis, all through
  *    the gateway's own services.
  */
@@ -42,14 +48,20 @@
 import {
   type ComputeRecipe,
   type RecipeExecutor,
+  type RecipeInput,
+  type RecipeRecord,
   type ZarrCommitAttestation,
+  defaultInput,
   findRecipe,
   readRecipeRecord,
   recipeArguments,
   recipeCommand,
   recipeRequiredOutputs,
+  recipeRunsInput,
+  recipeRunsOn,
   recipeZarrArguments,
   recipeZarrBase,
+  stampInputFields,
 } from "../../../shared/compute-recipes.js";
 import { PLATFORM_FAILURE_CODES } from "../../../shared/compute-state.js";
 import {
@@ -227,6 +239,12 @@ export interface DispatchInput {
    * job is made with no hold and no ledger entry, is never submitted, and waits for a runner to pull it.
    */
   executor?: RecipeExecutor;
+  /**
+   * What the run reads (plan D12): `bids` or `zarr`, the executor's default when absent (`defaultInput`:
+   * `bids` for Tapis, `zarr` for a runner). An input the recipe does not list, or one the executor does not
+   * run, is `invalid_spec` naming `input`, refused before anything is claimed.
+   */
+  input?: RecipeInput;
 }
 
 export type DispatchResult =
@@ -274,28 +292,36 @@ export interface StampRow {
   recipe: string;
   recipe_version: string;
   engine: string;
+  /** What the run reads: the fifth word of the tuple's claim, `bids` for every stamp made before inputs existed. */
+  input: RecipeInput;
   attempt: number;
   state: "dispatched" | "succeeded" | "failed" | "refused";
   job_id: string | null;
   refusal_code: string | null;
+  /** A succeeded Zarr stamp: the reader that decoded the stores, from the recipe's record; null otherwise. */
+  reader: string | null;
+  /** A succeeded Zarr stamp: the Zarr engine version of the serving index the run read; null otherwise. */
+  input_engine: string | null;
+  /** A succeeded stamp: `sha256:` and what a Zarr run read, or `git:` and the commit a BIDS run read; null otherwise. */
+  input_digest: string | null;
   created_at: string;
   updated_at: string;
 }
 
-export const STAMP_COLUMNS = `id, dataset_id, version, recipe, recipe_version, engine, attempt, state,
-  job_id, refusal_code, created_at, updated_at`;
+export const STAMP_COLUMNS = `id, dataset_id, version, recipe, recipe_version, engine, input, attempt,
+  state, job_id, refusal_code, reader, input_engine, input_digest, created_at, updated_at`;
 
 /**
- * Claim a tuple: `?1` dataset, `?2` version tag, `?3` recipe, `?4` recipe version, `?5` engine. The
- * attempt number is read INSIDE the statement, so it is atomic with the insert; a live or succeeded
- * stamp for the tuple makes the insert fail on the partial unique index.
+ * Claim a tuple: `?1` dataset, `?2` version tag, `?3` recipe, `?4` recipe version, `?5` engine, `?6` input.
+ * The attempt number is read INSIDE the statement, over the same tuple and input, so it is atomic with the
+ * insert; a live or succeeded stamp for the tuple and input makes the insert fail on the partial unique index.
  */
 export const CLAIM_STAMP_SQL = `INSERT INTO compute_pipeline_stamps
-  (dataset_id, version, recipe, recipe_version, engine, attempt, state)
-  SELECT ?1, ?2, ?3, ?4, ?5,
+  (dataset_id, version, recipe, recipe_version, engine, input, attempt, state)
+  SELECT ?1, ?2, ?3, ?4, ?5, ?6,
          COALESCE((SELECT MAX(s.attempt) FROM compute_pipeline_stamps s
                     WHERE s.dataset_id = ?1 AND s.version = ?2 AND s.recipe = ?3
-                      AND s.recipe_version = ?4 AND s.engine = ?5), 0) + 1,
+                      AND s.recipe_version = ?4 AND s.engine = ?5 AND s.input = ?6), 0) + 1,
          'dispatched'`;
 
 const STAMP_BY_ID_SQL = `SELECT ${STAMP_COLUMNS} FROM compute_pipeline_stamps WHERE id = ?1`;
@@ -311,12 +337,14 @@ export const END_STAMP_SQL = `UPDATE compute_pipeline_stamps
  WHERE id = ?1 AND state = 'dispatched'`;
 
 /**
- * End an open stamp `succeeded` with the recipe's own version and engine: `?2` version, `?3` engine.
- * May meet the partial unique index, which the caller handles.
+ * End an open stamp `succeeded` with the recipe's own version and engine, and what the run read: `?2`
+ * version, `?3` engine, `?4` reader, `?5` Zarr engine version, `?6` input digest (each of the last three NULL
+ * or in the shape of its column: `stampInputFields` made it so). The stamp's `input` is the claim's and is
+ * never rewritten. May meet the partial unique index, which the caller handles.
  */
 export const SUCCEED_STAMP_SQL = `UPDATE compute_pipeline_stamps
    SET state = 'succeeded', recipe_version = ?2, engine = ?3, refusal_code = NULL,
-       updated_at = datetime('now')
+       reader = ?4, input_engine = ?5, input_digest = ?6, updated_at = datetime('now')
  WHERE id = ?1 AND state = 'dispatched' AND job_id IS NOT NULL`;
 
 const looksUnique = (err: unknown) => /UNIQUE constraint failed/i.test(String(err));
@@ -327,13 +355,17 @@ export async function getStamp(db: D1Database, id: number): Promise<StampRow | n
 }
 
 /**
- * The one key of an attempt: `pl:` and 40 hex digits of the SHA-256 of the tuple and the attempt. A
- * pure function of the stamp, so the sync can find a job whose creation committed and whose link did not.
+ * The one key of an attempt: `pl:` and 40 hex digits of the SHA-256 of the tuple, the input and the attempt.
+ * A pure function of the stamp, so the sync can find a job whose creation committed and whose link did not.
+ * The input is part of the text for every input but `bids`: a `bids` stamp's key is what it was before
+ * stamps had an input (a stamp claimed then still finds its job), and a `zarr` stamp of the same dataset,
+ * version, recipe, recipe version, engine and attempt number gets a key of its own (the attempt numbers of
+ * two inputs both start at 1).
  */
 export async function pipelineKey(
   stamp: Pick<
     StampRow,
-    "dataset_id" | "version" | "recipe" | "recipe_version" | "engine" | "attempt"
+    "dataset_id" | "version" | "recipe" | "recipe_version" | "engine" | "input" | "attempt"
   >,
 ): Promise<string> {
   const text = [
@@ -342,6 +374,7 @@ export async function pipelineKey(
     stamp.recipe,
     stamp.recipe_version,
     stamp.engine,
+    ...(stamp.input === "bids" ? [] : [stamp.input]),
     String(stamp.attempt),
   ].join("|");
   return `pl:${(await sha256Hex(new TextEncoder().encode(text))).slice(0, 40)}`;
@@ -384,31 +417,38 @@ const partitionOf = (recipe: ComputeRecipe) => recipe.partition as PartitionName
  * Parsed with the strict schema, so a registry entry that is not a valid job is a programming error that
  * a test also catches.
  *
- * A `zarr` recipe stages no dataset (`datasets: []`): its arguments carry the commit attestation that
- * `resolveRun` verified (`zarrSource`: the serving index's commit, the tag's commit, how they are equivalent
- * and the paths between them) and the one origin it may read, which is the ENVIRONMENT's own Zarr host
- * ({@link pipelineZarrBase}, from `env`, never from a request or a dataset row). A `zarr` recipe with no
- * verified attestation is a programming error here, never a job.
+ * A `zarr` run stages no dataset (`datasets: []`): its command names the input (`nemar-recipe run <name> --input
+ * zarr`, `recipeCommand`; a BIDS run's command is what it always was) and its arguments carry the commit
+ * attestation that `resolveRun` verified (`zarrSource`: the serving index's commit, the tag's commit, how they
+ * are equivalent and the paths between them) and the one origin it may read, which is the ENVIRONMENT's own
+ * Zarr host ({@link pipelineZarrBase}, from `env`, never from a request or a dataset row). A `zarr` run with
+ * no verified attestation is a programming error here, never a job, and so is an input the recipe does not
+ * list.
  */
 export function recipeJobSpec(
   recipe: ComputeRecipe,
   input: {
     datasetId: string;
     tag: string;
+    /** What the job reads; one the recipe lists (the stamp's claimed input, the dispatch's, or the default). */
+    input: RecipeInput;
     image: { ref: string; digest: string };
-    /** Required for a `zarr` recipe, never read for a `bids` one. */
+    /** Required for a `zarr` input, never read for a `bids` one. */
     zarrSource?: ZarrCommitAttestation | null;
-    /** The Worker's bindings the Zarr origin is read from; only a `zarr` recipe reads them. */
+    /** The Worker's bindings the Zarr origin is read from; only a `zarr` input reads them. */
     env: Pick<Bindings, "ENVIRONMENT" | "ZARR_HOSTNAME">;
   },
 ) {
-  const zarr = recipe.input === "zarr";
+  if (!recipe.inputs.includes(input.input)) {
+    throw new RangeError("the recipe does not read that input");
+  }
+  const zarr = input.input === "zarr";
   return JobSpecSchema.parse({
     name: `${recipe.name} ${input.datasetId} ${input.tag}`.slice(0, 80),
     runtime: "image",
     image: input.image.ref,
     recipe: recipe.name,
-    command: recipeCommand(recipe),
+    command: recipeCommand(recipe, input.input),
     args: zarr
       ? recipeZarrArguments({
           datasetId: input.datasetId,
@@ -485,14 +525,16 @@ const ZARR_COPY_SQL = "SELECT zarr_status, zarr_store_count FROM datasets WHERE 
  * or the one named) with a data-plane tag, and the manifest bound. It is the one place a Zarr recipe's identity
  * is decided, so the dry run and the run cannot disagree.
  *
- * A Zarr recipe reads the dataset's ONE serving copy, which describes the NEWEST version, so it is run only for
+ * A run over the `zarr` input reads the dataset's ONE serving copy, which describes the NEWEST version, so it is run only for
  * the newest (`zarr_version_not_newest`) and only while the copy is `ready` with at least one store
  * (`zarr_copy_not_ready`: a `pending` or `failed` conversion leaves the previous copy's row values in place);
  * both refusals come before any index read or GitHub request. Then `checkZarrSource` proves the copy's own
  * commit S is the tag's commit T, or differs from it by metadata only (`zarr_source_mismatch` when it is
  * not, `zarr_source_unverifiable` when GitHub or the index could not be read), and the verified attestation is
  * what the recipe is given. Nothing is written by a refusal, so no stamp, hold or job comes of one. The manifest
- * bound (`too_many_files`) is a BIDS staging limit: a Zarr recipe stages no files.
+ * bound (`too_many_files`) is a BIDS staging limit: a Zarr run stages no files. The input is the LAST
+ * parameter (the order of the others is another card's merge checklist). A caller refuses an input the recipe
+ * does not list before it gets here, so meeting one is a programming error and a throw.
  */
 async function resolveRun(
   db: D1Database,
@@ -500,7 +542,11 @@ async function resolveRun(
   wanted: string | undefined,
   recipe: ComputeRecipe | undefined,
   env: Bindings,
+  input: RecipeInput,
 ): Promise<ResolvedRun> {
+  if (recipe !== undefined && !recipe.inputs.includes(input)) {
+    throw new RangeError("the recipe does not read that input");
+  }
   const loaded = await loadPipelineRow(db, datasetId, env);
   if (!loaded.eligible) {
     return { ok: false, code: "dataset_not_eligible", extra: { blockedBy: loaded.blockedBy } };
@@ -509,7 +555,7 @@ async function resolveRun(
     .results;
   const picked = pickVersion(versions, wanted);
   if (!picked.ok) return { ok: false, code: picked.code, extra: {} };
-  const zarr = recipe?.input === "zarr";
+  const zarr = input === "zarr";
   if (
     !zarr &&
     picked.version.total_files !== null &&
@@ -557,33 +603,43 @@ async function resolveRun(
 /** The word of the stamp that holds a registry tuple: a finished result named another tuple than its stamp claimed. */
 export const TUPLE_MISMATCH_WORD = "tuple_mismatch";
 
-/** Is a registry tuple (`?1` recipe, `?2` version, `?3` engine) held? A hold is a failed stamp with the mismatch word. */
+/**
+ * Is a registry tuple (`?1` recipe, `?2` version, `?3` engine, `?4` input) held? A hold is a failed stamp with
+ * the mismatch word. The input is part of the tuple: a Zarr run that showed a wrong engine or a wrong input
+ * holds the Zarr tuple and leaves the BIDS tuple of the same recipe free. One runtime image serves both
+ * executors (`COMPUTE_RUNTIME_IMAGE`), so a wrong image can show itself on either input; the hold is the
+ * claimed input's alone, and a run that shows the drift on the other input holds that one when it finishes.
+ */
 export const TUPLE_HELD_SQL = `SELECT 1 FROM compute_pipeline_stamps
-  WHERE recipe = ?1 AND recipe_version = ?2 AND engine = ?3
+  WHERE recipe = ?1 AND recipe_version = ?2 AND engine = ?3 AND input = ?4
     AND state = 'failed' AND refusal_code = '${TUPLE_MISMATCH_WORD}' LIMIT 1`;
 
 /**
  * Hold the tuple a stamp CLAIMED (`?1` dataset, `?2` version, `?3` recipe, `?4` claimed version, `?5`
- * claimed engine, `?6` the job). The hold is a `failed` stamp of the claimed tuple with the job that
- * showed the mismatch, and is written once per job. It does not clear by time. It clears when the registry
- * declares another tuple (a version bump), or when its rows are deleted, which deleting the dataset they
- * name does (the cascade is the rule); the next mismatch on any dataset holds the tuple again.
+ * claimed engine, `?6` the job, `?7` the claimed input). The hold is a `failed` stamp of the claimed tuple
+ * with the job that showed the mismatch, and is written once per job. It does not clear by time. It clears
+ * when the registry declares another tuple (a version bump), or when its rows are deleted, which deleting the
+ * dataset they name does (the cascade is the rule); the next mismatch on any dataset holds the tuple again.
  */
 export const HOLD_TUPLE_SQL = `INSERT INTO compute_pipeline_stamps
-  (dataset_id, version, recipe, recipe_version, engine, attempt, state, job_id, refusal_code)
-  SELECT ?1, ?2, ?3, ?4, ?5,
+  (dataset_id, version, recipe, recipe_version, engine, input, attempt, state, job_id, refusal_code)
+  SELECT ?1, ?2, ?3, ?4, ?5, ?7,
          COALESCE((SELECT MAX(s.attempt) FROM compute_pipeline_stamps s
                     WHERE s.dataset_id = ?1 AND s.version = ?2 AND s.recipe = ?3
-                      AND s.recipe_version = ?4 AND s.engine = ?5), 0) + 1,
+                      AND s.recipe_version = ?4 AND s.engine = ?5 AND s.input = ?7), 0) + 1,
          'failed', ?6, '${TUPLE_MISMATCH_WORD}'
    WHERE NOT EXISTS (SELECT 1 FROM compute_pipeline_stamps h
                       WHERE h.job_id = ?6 AND h.refusal_code = '${TUPLE_MISMATCH_WORD}')`;
 
-/** Whether the registry's tuple for a recipe is held. */
-export async function tupleHeld(db: D1Database, recipe: ComputeRecipe): Promise<boolean> {
+/** Whether the registry's tuple for a recipe, over one input, is held. */
+export async function tupleHeld(
+  db: D1Database,
+  recipe: ComputeRecipe,
+  input: RecipeInput,
+): Promise<boolean> {
   const row = await db
     .prepare(TUPLE_HELD_SQL)
-    .bind(recipe.name, recipe.version, recipe.engine)
+    .bind(recipe.name, recipe.version, recipe.engine, input)
     .first();
   return row !== null;
 }
@@ -621,14 +677,26 @@ export async function dispatchPipelineJob(
   if (input.actor.kind === "cron" && !recipe.autoDispatch) {
     return fail("recipe_not_automatic", datasetId);
   }
-  // A placeholder is on no path: not an administrator's run, not the queue, not the cron.
-  if (recipe.placeholder === true) return fail("recipe_placeholder", datasetId);
   // The executor, decided from the registry: a recipe is run only where it lists, and a runner needs its
   // switch. The route has said so already in its own words; this is the boundary that holds if another caller
-  // reaches the service (the cron passes none, so it is always `tapis`).
+  // reaches the service (the cron passes none, so it is always `tapis`). It is asked before the placeholder, so
+  // that where a recipe may run is answered for every recipe in the registry, a placeholder included.
   const executor = input.executor ?? "tapis";
-  if (!recipe.executors.includes(executor)) {
+  if (!recipeRunsOn(recipe, executor)) {
     return fail("invalid_spec", datasetId, { field: "executor" });
+  }
+  // A placeholder is on no path: not an administrator's run, not the queue, not the cron.
+  if (recipe.placeholder === true) return fail("recipe_placeholder", datasetId);
+  // The cron is the Tapis queue's: `autoDispatch` says a recipe may be run automatically on Tapis, and a runner
+  // run is an administrator's (the daily dispatcher never names an executor, so this holds for any other caller).
+  if (input.actor.kind === "cron" && executor !== "tapis") {
+    return fail("recipe_not_automatic", datasetId);
+  }
+  // The input, named or the executor's own: one the recipe does not list, or one the executor does not run
+  // (`bids` on a runner, `zarr` on Tapis), is refused here, before any switch, read or claim.
+  const recipeInput = input.input ?? defaultInput(executor);
+  if (!recipeRunsInput(recipe, recipeInput, executor)) {
+    return fail("invalid_spec", datasetId, { field: "input" });
   }
   if (executor === "runner" && !computeRunnersEnabled(env)) {
     return fail("runners_disabled", datasetId);
@@ -640,10 +708,10 @@ export async function dispatchPipelineJob(
     return fail("tapis_unconfigured", datasetId);
   }
   // The registry names a tuple that a finished result has shown is not what runs: nothing is claimed.
-  if (await tupleHeld(db, recipe)) return fail("registry_drift", datasetId);
+  if (await tupleHeld(db, recipe, recipeInput)) return fail("registry_drift", datasetId);
 
   // The dataset and its version, decided from the rows (ADR 0065): nothing a caller said is read.
-  const resolved = await resolveRun(db, datasetId, input.version, recipe, env);
+  const resolved = await resolveRun(db, datasetId, input.version, recipe, env, recipeInput);
   if (!resolved.ok) return fail(resolved.code, datasetId, resolved.extra);
   const { tag } = resolved;
 
@@ -659,6 +727,7 @@ export async function dispatchPipelineJob(
     spec = recipeJobSpec(recipe, {
       datasetId,
       tag,
+      input: recipeInput,
       image,
       zarrSource: resolved.zarrSource,
       env,
@@ -675,7 +744,7 @@ export async function dispatchPipelineJob(
   try {
     const claimed = await db
       .prepare(CLAIM_STAMP_SQL)
-      .bind(datasetId, tag, recipe.name, recipe.version, recipe.engine)
+      .bind(datasetId, tag, recipe.name, recipe.version, recipe.engine, recipeInput)
       .run();
     const id = claimed.meta?.last_row_id;
     if (typeof id !== "number") throw new Error("a stamp that was just claimed has no id");
@@ -851,7 +920,15 @@ function failureWord(job: JobEnd): string {
 const RECORD_READ_MAX_BYTES = 512 * 1024;
 
 type RecordRead =
-  | { kind: "ok"; version: string; engine: string }
+  | {
+      kind: "ok";
+      version: string;
+      engine: string;
+      /** The input the record says it read (`bids` when it states none). */
+      inputKind: string;
+      /** What the run read, each value in the shape of its stamp column or null, for the INPUT the stamp claimed. */
+      fields: ReturnType<typeof stampInputFields>;
+    }
   | { kind: "failed"; word: "outputs_missing" | "record_unreadable" | "record_mismatch" }
   | { kind: "later"; reason: "results_unbound" | "read_failed" };
 
@@ -864,6 +941,7 @@ async function readFinishedRecord(
   env: Bindings,
   recipe: ComputeRecipe,
   jobId: string,
+  input: RecipeInput,
 ): Promise<RecordRead> {
   const bucket = env.COMPUTE_RESULTS;
   if (!bucket) return { kind: "later", reason: "results_unbound" };
@@ -881,10 +959,16 @@ async function readFinishedRecord(
     } catch {
       return { kind: "failed", word: "record_unreadable" };
     }
-    const record = readRecipeRecord(value);
+    const record: RecipeRecord | null = readRecipeRecord(value);
     if (record === null) return { kind: "failed", word: "record_unreadable" };
     if (record.recipe !== recipe.name) return { kind: "failed", word: "record_mismatch" };
-    return { kind: "ok", version: record.version, engine: record.engine };
+    return {
+      kind: "ok",
+      version: record.version,
+      engine: record.engine,
+      inputKind: record.inputKind,
+      fields: stampInputFields(value, input),
+    };
   } catch {
     return { kind: "later", reason: "read_failed" };
   }
@@ -964,7 +1048,7 @@ export async function syncPipelineStamps(
         result.failed++;
         continue;
       }
-      const read = await readFinishedRecord(env, recipe, job.id);
+      const read = await readFinishedRecord(env, recipe, job.id, stamp.input);
       if (read.kind === "later") {
         // Nothing is decided from what could not be read; say so, with ids and the reason only.
         console.error(
@@ -975,6 +1059,19 @@ export async function syncPipelineStamps(
       }
       if (read.kind === "failed") {
         await finishStamp(db, stamp.id, "failed", read.word);
+        result.failed++;
+        continue;
+      }
+      // The input the record says it read is part of the tuple, and a stamp says what ran: a record of another
+      // input than the stamp claimed ends the stamp `failed` with `tuple_mismatch`, never `succeeded`. That
+      // stamp IS the hold of the claimed tuple (a failed `tuple_mismatch` stamp of its recipe, version, engine
+      // and input), so no separate hold row is written; a stamp that says "read zarr" of a run that read
+      // something else would keep the tuple's live slot and could be keyed from. Nothing it read is stored.
+      if (read.inputKind !== stamp.input) {
+        await finishStamp(db, stamp.id, "failed", TUPLE_MISMATCH_WORD);
+        console.error(
+          `[compute-pipeline] tuple_mismatch stamp=${stamp.id} dataset=${stamp.dataset_id} job=${job.id} input_kind_differs`,
+        );
         result.failed++;
         continue;
       }
@@ -990,16 +1087,38 @@ export async function syncPipelineStamps(
             stamp.recipe_version,
             stamp.engine,
             job.id,
+            stamp.input,
           )
           .run();
         console.error(
           `[compute-pipeline] tuple_mismatch stamp=${stamp.id} dataset=${stamp.dataset_id} job=${job.id}`,
         );
       }
+      // What the run read: each value is stored only in the shape of its column, and a value that is not (or
+      // that the record does not show covers the whole input) is named in the log (a field name and a fixed
+      // reason word, never the value) and left null.
+      const fields = read.fields;
+      for (const field of fields.refused) {
+        console.error(
+          `[compute-pipeline] stamp_field_refused field=${field} reason=${fields.reasons[field] ?? "bad_shape"} stamp=${stamp.id} dataset=${stamp.dataset_id} job=${job.id}`,
+        );
+      }
+      for (const field of fields.absent) {
+        console.error(
+          `[compute-pipeline] stamp_field_absent field=${field} stamp=${stamp.id} dataset=${stamp.dataset_id} job=${job.id}`,
+        );
+      }
       try {
         const moved = await db
           .prepare(SUCCEED_STAMP_SQL)
-          .bind(stamp.id, read.version, read.engine)
+          .bind(
+            stamp.id,
+            read.version,
+            read.engine,
+            fields.reader,
+            fields.input_engine,
+            fields.input_digest,
+          )
           .run();
         if ((moved.meta?.changes ?? 0) > 0) result.succeeded++;
       } catch (err) {
@@ -1068,7 +1187,7 @@ export async function listPipelineStamps(
 
 // --- The queue and the dry run ----------------------------------------------------------------------------
 
-/** A dataset that is eligible and whose newest version has no live or succeeded stamp for the recipe's tuple. */
+/** A dataset that is eligible and whose newest version has no live or succeeded stamp for the recipe's tuple and input. */
 export interface Candidate {
   dataset_id: string;
   version: string;
@@ -1078,8 +1197,10 @@ export interface Candidate {
 /**
  * The candidate statement, over a predicate (`eligible`): the eligible datasets whose newest version has no live
  * or succeeded stamp for the tuple and whose failures are inside the cooldown and the cap. `?1` the cursor,
- * `?2` recipe, `?3` recipe version, `?4` engine, `?5` page size, `?6` the cooldown, `?7` the cap. Built twice at
- * module load, once per predicate, and never at call time: a call picks one with {@link pipelineCandidatesSql}.
+ * `?2` recipe, `?3` recipe version, `?4` engine, `?5` page size, `?6` the cooldown, `?7` the cap, `?8` the
+ * input (a dataset a Zarr run has stamped is still a candidate of the BIDS run, and the other way round).
+ * Built twice at module load, once per predicate, and never at call time: a call picks one with
+ * {@link pipelineCandidatesSql}.
  */
 const candidatesSql = (eligible: string): string => `SELECT ${PIPELINE_ROW_COLUMNS},
                   (${NEWEST_VERSION_SQL("d")}) AS newest_version,
@@ -1090,19 +1211,19 @@ const candidatesSql = (eligible: string): string => `SELECT ${PIPELINE_ROW_COLUM
               AND NOT EXISTS (
                 SELECT 1 FROM compute_pipeline_stamps s
                  WHERE s.dataset_id = d.dataset_id AND s.recipe = ?2 AND s.recipe_version = ?3
-                   AND s.engine = ?4 AND s.state IN ('dispatched', 'succeeded')
+                   AND s.engine = ?4 AND s.input = ?8 AND s.state IN ('dispatched', 'succeeded')
                    AND s.version = ${VERSION_TAG_SQL(`(${NEWEST_VERSION_SQL("s")})`)})
               AND NOT EXISTS (
                 SELECT 1 FROM compute_pipeline_stamps f
                  WHERE f.dataset_id = d.dataset_id AND f.recipe = ?2 AND f.recipe_version = ?3
-                   AND f.engine = ?4 AND f.state = 'failed'
+                   AND f.engine = ?4 AND f.input = ?8 AND f.state = 'failed'
                    AND ${COUNTS_AS_FAILURE_SQL("f")}
                    AND f.updated_at >= datetime('now', ?6)
                    AND f.version = ${VERSION_TAG_SQL(`(${NEWEST_VERSION_SQL("f")})`)})
               AND (
                 SELECT COUNT(*) FROM compute_pipeline_stamps c
                  WHERE c.dataset_id = d.dataset_id AND c.recipe = ?2 AND c.recipe_version = ?3
-                   AND c.engine = ?4 AND c.state = 'failed'
+                   AND c.engine = ?4 AND c.input = ?8 AND c.state = 'failed'
                    AND ${COUNTS_AS_FAILURE_SQL("c")}
                    AND c.version = ${VERSION_TAG_SQL(`(${NEWEST_VERSION_SQL("c")})`)}) < ?7
             ORDER BY d.dataset_id LIMIT ?5`;
@@ -1119,7 +1240,8 @@ export function pipelineCandidatesSql(env: Pick<Bindings, "ENVIRONMENT">): strin
 }
 
 /**
- * The eligible datasets a recipe has not been run over at the newest version, by id, at most `limit`.
+ * The eligible datasets a recipe has not been run over at the newest version, over one input (`bids`, the
+ * input of the Tapis queue, unless a caller names another), by id, at most `limit`.
  * The SQL selects (the predicate and the absence of a live or succeeded stamp); the TypeScript re-checks
  * every row it returns, and a version with no data-plane tag is skipped. A dataset the sync has not
  * caught up with is not a candidate: its open stamp holds the tuple. A tuple whose stamp FAILED is not a
@@ -1136,6 +1258,7 @@ export async function pipelineCandidates(
   recipe: ComputeRecipe,
   limit: number,
   after = "",
+  input: RecipeInput = defaultInput("tapis"),
 ): Promise<Candidate[]> {
   const out: Candidate[] = [];
   let cursor = after;
@@ -1152,6 +1275,7 @@ export async function pipelineCandidates(
           Math.max(limit, 25),
           `-${RETRY_COOLDOWN_DAYS} days`,
           MAX_FAILED_ATTEMPTS,
+          input,
         )
         .all<PipelineRow & { newest_version: string | null; newest_total_files: number | null }>()
     ).results;
@@ -1188,6 +1312,8 @@ export interface DryRunInput {
   limit?: number;
   /** Who the run would be for; `tapis` when absent. A runner run names one dataset. */
   executor?: RecipeExecutor;
+  /** What the run would read; the executor's default when absent (`defaultInput`). */
+  input?: RecipeInput;
 }
 
 export interface DryRunConfig {
@@ -1207,12 +1333,19 @@ export interface DryRunConfig {
 }
 
 export type DryRunResult =
-  | { ok: false; code: "recipe_unknown" | "recipe_placeholder" | "invalid_spec" }
+  | {
+      ok: false;
+      code: "recipe_unknown" | "recipe_placeholder" | "invalid_spec";
+      /** For `invalid_spec`: the field that is invalid, when the refusal names one (`input`). */
+      field?: string;
+    }
   | {
       ok: true;
       recipe: string;
       /** Who the run would be for. */
       executor: RecipeExecutor;
+      /** What the run would read. */
+      input: RecipeInput;
       /** For a runner run: the room under the runners' live cap (a runner run has no `room`). */
       runner_room?: RunnerRoom;
       /** What the hold of one job is, in milli-SU; 0 for a runner job, which has none. */
@@ -1242,15 +1375,21 @@ export type DryRunResult =
       blocked_by_term?: Record<string, number>;
     };
 
-/** A live or succeeded stamp for the tuple of a recipe over one dataset version: the claim would be refused. */
-const liveStamp = (db: D1Database, datasetId: string, tag: string, recipe: ComputeRecipe) =>
+/** A live or succeeded stamp for the tuple of a recipe over one dataset version and input: the claim would be refused. */
+const liveStamp = (
+  db: D1Database,
+  datasetId: string,
+  tag: string,
+  recipe: ComputeRecipe,
+  input: RecipeInput,
+) =>
   db
     .prepare(
       `SELECT 1 FROM compute_pipeline_stamps
         WHERE dataset_id = ?1 AND version = ?2 AND recipe = ?3 AND recipe_version = ?4
-          AND engine = ?5 AND state IN ('dispatched', 'succeeded')`,
+          AND engine = ?5 AND input = ?6 AND state IN ('dispatched', 'succeeded')`,
     )
-    .bind(datasetId, tag, recipe.name, recipe.version, recipe.engine)
+    .bind(datasetId, tag, recipe.name, recipe.version, recipe.engine, input)
     .first();
 
 /**
@@ -1265,6 +1404,7 @@ async function runnerDryRun(
     ok: true;
     recipe: string;
     executor: RecipeExecutor;
+    input: RecipeInput;
     estimate_milli_per_job: number;
     config: DryRunConfig;
   },
@@ -1274,7 +1414,7 @@ async function runnerDryRun(
   const db = env.DB;
   const datasetId = input.datasetId as string;
   const shown = { ...base, runner_room: room, estimate_milli_total: 0 };
-  const resolved = await resolveRun(db, datasetId, input.version, recipe, env);
+  const resolved = await resolveRun(db, datasetId, input.version, recipe, env, base.input);
   if (!resolved.ok) {
     return {
       ...shown,
@@ -1292,7 +1432,9 @@ async function runnerDryRun(
     would_dispatch: [],
     blocked: { code, blocked_by: [] as PipelineTermId[], version: resolved.tag },
   });
-  if (await liveStamp(db, datasetId, resolved.tag, recipe)) return blocked("live_attempt_exists");
+  if (await liveStamp(db, datasetId, resolved.tag, recipe, base.input)) {
+    return blocked("live_attempt_exists");
+  }
   if (room.live_left <= 0) return blocked("over_concurrency");
   return { ...shown, would_dispatch: [{ dataset_id: datasetId, version: resolved.tag }] };
 }
@@ -1311,10 +1453,17 @@ const DRY_RUN_SCAN_ROWS = 5000;
 export async function pipelineDryRun(env: Bindings, input: DryRunInput): Promise<DryRunResult> {
   const recipe = findRecipe(input.recipe);
   if (recipe === null) return { ok: false, code: "recipe_unknown" };
-  if (recipe.placeholder === true) return { ok: false, code: "recipe_placeholder" };
   const executor = input.executor ?? "tapis";
-  // The route refuses these in its own words; a direct caller meets the boundary here.
-  if (!recipe.executors.includes(executor)) return { ok: false, code: "invalid_spec" };
+  // The route refuses these in its own words; a direct caller meets the boundary here. The executor is asked
+  // before the placeholder, as `dispatchPipelineJob` asks it.
+  if (!recipeRunsOn(recipe, executor)) {
+    return { ok: false, code: "invalid_spec", field: "executor" };
+  }
+  if (recipe.placeholder === true) return { ok: false, code: "recipe_placeholder" };
+  const recipeInput = input.input ?? defaultInput(executor);
+  if (!recipeRunsInput(recipe, recipeInput, executor)) {
+    return { ok: false, code: "invalid_spec", field: "input" };
+  }
   if (executor === "runner" && input.datasetId === undefined) {
     return { ok: false, code: "invalid_spec" };
   }
@@ -1334,10 +1483,11 @@ export async function pipelineDryRun(env: Bindings, input: DryRunInput): Promise
     ok: true as const,
     recipe: recipe.name,
     executor,
+    input: recipeInput,
     estimate_milli_per_job: perJob,
     config,
   };
-  if (await tupleHeld(db, recipe)) {
+  if (await tupleHeld(db, recipe, recipeInput)) {
     return {
       ...base,
       estimate_milli_total: 0,
@@ -1370,7 +1520,7 @@ export async function pipelineDryRun(env: Bindings, input: DryRunInput): Promise
             ? ("tenant" as const)
             : ("limit" as const),
     };
-    const resolved = await resolveRun(db, input.datasetId, input.version, recipe, env);
+    const resolved = await resolveRun(db, input.datasetId, input.version, recipe, env, recipeInput);
     if (!resolved.ok) {
       return {
         ...base,
@@ -1385,7 +1535,7 @@ export async function pipelineDryRun(env: Bindings, input: DryRunInput): Promise
         },
       };
     }
-    const live = await liveStamp(db, input.datasetId, resolved.tag, recipe);
+    const live = await liveStamp(db, input.datasetId, resolved.tag, recipe, recipeInput);
     if (live) {
       return {
         ...base,
@@ -1423,7 +1573,8 @@ export async function pipelineDryRun(env: Bindings, input: DryRunInput): Promise
   }
 
   const room = clampRun(input.limit ?? 20, caps);
-  const candidates = room.attempts > 0 ? await pipelineCandidates(env, recipe, room.attempts) : [];
+  const candidates =
+    room.attempts > 0 ? await pipelineCandidates(env, recipe, room.attempts, "", recipeInput) : [];
   // Everything else: what the datasets that are not eligible fail, counted per term.
   const rows = (
     await db
@@ -1666,7 +1817,9 @@ export async function dispatchEligible(
     return run;
   }
   if (input.sync !== false) await syncPipelineStamps(env);
-  if (await tupleHeld(env.DB, recipe)) {
+  // The queue is the Tapis executor's (a runner run names one dataset), so it reads the input Tapis runs.
+  const recipeInput = defaultInput("tapis");
+  if (await tupleHeld(env.DB, recipe, recipeInput)) {
     run.results.push(fail("registry_drift", ""));
     run.stoppedBy = "registry_drift";
     return run;
@@ -1681,13 +1834,21 @@ export async function dispatchEligible(
     return run;
   }
   try {
-    for (const candidate of await pipelineCandidates(env, recipe, room.attempts, input.after)) {
+    for (const candidate of await pipelineCandidates(
+      env,
+      recipe,
+      room.attempts,
+      input.after,
+      recipeInput,
+    )) {
       if (run.dispatched >= room.attempts) break;
       const result = await dispatchPipelineJob(env, {
         recipe: recipe.name,
         datasetId: candidate.dataset_id,
         version: candidate.tag,
         actor: input.actor,
+        executor: "tapis",
+        input: recipeInput,
       });
       run.results.push(result);
       if (result.ok) {

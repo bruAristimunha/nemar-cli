@@ -5,9 +5,10 @@
  * A runner job is a job with NO HOLD and NO LEDGER ENTRY (`executor = 'runner'`, `accounting = 'none'`) that
  * a registered runner pulls. What is pinned, each group with a one-line mutation named in its tests:
  *
- *  (a) the registry: `nemar-floor-zarr` reads the Zarr serving copy, runs on a runner only, is sized with
- *      `shared` as a label inside its ceilings and the queue's memory; the BIDS recipes are Tapis only; the
- *      Zarr argument vector is exact and a commit is 40 lowercase hex digits or an error;
+ *  (a) the registry: `nemar-floor` reads BIDS on Tapis and the Zarr serving copy on a runner (one entry,
+ *      two inputs, one table of which input runs where), is sized with `shared` as a label inside its
+ *      ceilings and the queue's memory; `nemar-ica` is BIDS on Tapis only; the Zarr argument vector is exact
+ *      and a commit is 40 lowercase hex digits or an error;
  *  (b) the policy: `runners.maxLiveJobs` defaults to 64 and 8 when the key is absent and is validated
  *      strictly when stored;
  *  (c) what did NOT change: the text of `JOB_INSERT_SQL`, `GATEWAY_USER_INSERT_SQL` and the hold statement,
@@ -20,7 +21,7 @@
  *      `over_concurrency` and writes nothing, two requests racing for the last slot make one job, a pool's
  *      cap does not count another pool's jobs or ended jobs, and twenty live runner jobs leave the tenant
  *      room, the pipelines' live room and the daily room exactly as they were;
- *  (f) the refusals: an executor the recipe does not list, a runner run over the queue, the switch off
+ *  (f) the refusals: an input the executor does not run, a runner run over the queue, the switch off
  *      (nothing written), a dataset with no serving copy, and a non-pipeline runner job, which is an
  *      argument error;
  *  (g) NO TAPIS PATH TOUCHES A RUNNER ROW: the 30-minute tick, the cancel sweep, the admin advance, the
@@ -35,6 +36,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import {
   COMPUTE_RECIPES,
+  RECIPE_INPUTS,
   RECIPE_ZARR_BASE,
   findRecipe,
   recipeArguments,
@@ -288,7 +290,7 @@ const runRunner = (id: string, env?: Bindings, extra: Record<string, unknown> = 
     "POST",
     "/compute/pipeline/run",
     "admin",
-    { recipe: "nemar-floor-zarr", dataset: id, executor: "runner", ...extra },
+    { recipe: "nemar-floor", dataset: id, executor: "runner", ...extra },
     zarrEnv(env),
   );
 
@@ -305,11 +307,12 @@ const row = async (env: Bindings, id: string) =>
 function zarrSpec(env: Bindings, datasetId = "nm000104") {
   const image = readRuntimeImage(env);
   if (image.state !== "ok") throw new Error("no runtime image");
-  const recipe = findRecipe("nemar-floor-zarr");
-  if (recipe === null) throw new Error("no nemar-floor-zarr");
+  const recipe = findRecipe("nemar-floor");
+  if (recipe === null) throw new Error("no nemar-floor");
   return recipeJobSpec(recipe, {
     datasetId,
     tag: "v1.0.0",
+    input: "zarr",
     image: { ref: image.ref, digest: image.digest },
     zarrSource: EXACT,
     env,
@@ -368,24 +371,27 @@ const capOf = (cpu: number, gpu = 8) => ({ runners: { maxLiveJobs: { cpu, gpu } 
 // --- (a) The registry -----------------------------------------------------------------------------------
 
 describe("the recipe registry", () => {
-  test("nemar-floor-zarr reads Zarr, runs on a runner only, and is the shared label sized inside its ceilings (MUTATION: executors [tapis])", () => {
-    const r = findRecipe("nemar-floor-zarr");
+  test("nemar-floor reads BIDS and Zarr, runs on Tapis and on a runner, and is the shared label sized inside its ceilings (MUTATION: executors [tapis])", () => {
+    const r = findRecipe("nemar-floor");
     expect(r).toMatchObject({
-      name: "nemar-floor-zarr",
+      name: "nemar-floor",
       version: "1.0.0",
       engine: "eegprep@0.5.0",
-      input: "zarr",
       partition: "shared",
       nodes: 1,
       cores: 4,
       memoryMb: 16384,
       gpus: 0,
-      minutes: 120,
-      autoDispatch: false,
+      minutes: 360,
+      autoDispatch: true,
       eligibility: "eeg",
     });
-    expect([...(r?.executors ?? [])]).toEqual(["runner"]);
+    expect([...(r?.inputs ?? [])]).toEqual(["bids", "zarr"]);
+    expect([...(r?.executors ?? [])]).toEqual(["tapis", "runner"]);
     expect(Object.isFrozen(r?.executors)).toBe(true);
+    expect(Object.isFrozen(r?.inputs)).toBe(true);
+    // The transition name is gone: one recipe, two inputs.
+    expect(findRecipe("nemar-floor-zarr")).toBeNull();
     expect(PARTITIONS.shared.pool).toBe("cpu");
     const ceiling = PARTITIONS.shared.ceiling;
     expect(ceiling).toMatchObject({ maxCoresPerNode: 64, maxMinutes: 2880 });
@@ -394,19 +400,18 @@ describe("the recipe registry", () => {
     expect(r?.memoryMb).toBeLessThanOrEqual(QUEUE_MAX_MEMORY_MB.shared);
   });
 
-  test("nemar-floor and nemar-ica read BIDS and list Tapis only (MUTATION: nemar-floor lists runner)", () => {
-    for (const name of ["nemar-floor", "nemar-ica"]) {
-      const r = findRecipe(name);
-      expect([name, r?.input]).toEqual([name, "bids"]);
-      expect([name, [...(r?.executors ?? [])]]).toEqual([name, ["tapis"]]);
-    }
+  test("nemar-ica reads BIDS and lists Tapis only (MUTATION: nemar-ica lists runner)", () => {
+    const r = findRecipe("nemar-ica");
+    expect([...(r?.inputs ?? [])]).toEqual(["bids"]);
+    expect([...(r?.executors ?? [])]).toEqual(["tapis"]);
   });
 
   test("every executor a recipe lists is a word of the contract, and every recipe lists one", () => {
     for (const r of COMPUTE_RECIPES) {
       expect(r.executors.length).toBeGreaterThan(0);
       for (const e of r.executors) expect(COMPUTE_EXECUTORS as readonly string[]).toContain(e);
-      expect(["bids", "zarr"]).toContain(r.input);
+      expect(r.inputs.length).toBeGreaterThan(0);
+      for (const i of r.inputs) expect(RECIPE_INPUTS as readonly string[]).toContain(i);
     }
   });
 
@@ -465,15 +470,16 @@ describe("the recipe registry", () => {
     }
   });
 
-  test("a Zarr recipe's job has no dataset and the vector; a BIDS recipe's job is what it was (MUTATION: stage the dataset anyway)", () => {
+  test("a Zarr input's job has no dataset and the vector; a BIDS input's job is what it was (MUTATION: stage the dataset anyway)", () => {
     const image = {
       ref: `ghcr.io/example/nemar-python@sha256:${"b".repeat(64)}`,
       digest: `sha256:${"b".repeat(64)}`,
     };
     const production = { ENVIRONMENT: "production" as const };
-    const zarr = recipeJobSpec(findRecipe("nemar-floor-zarr") as never, {
+    const zarr = recipeJobSpec(findRecipe("nemar-floor") as never, {
       datasetId: "nm000104",
       tag: "v1.0.0",
+      input: "zarr",
       image,
       zarrSource: EXACT,
       env: production,
@@ -488,22 +494,35 @@ describe("the recipe registry", () => {
         zarrBase: RECIPE_ZARR_BASE,
       }),
     );
-    expect(zarr.command).toEqual(["nemar-recipe", "run", "nemar-floor-zarr"]);
+    expect(zarr.command).toEqual(["nemar-recipe", "run", "nemar-floor", "--input", "zarr"]);
     expect(launchSpecFits(zarr)).toBe(true);
-    // A Zarr recipe with no verified attestation is a programming error.
+    // A Zarr input with no verified attestation is a programming error.
     expect(() =>
-      recipeJobSpec(findRecipe("nemar-floor-zarr") as never, {
+      recipeJobSpec(findRecipe("nemar-floor") as never, {
         datasetId: "nm000104",
         tag: "v1.0.0",
+        input: "zarr",
         image,
         env: production,
       }),
     ).toThrow();
+    // So is an input the recipe does not list.
+    expect(() =>
+      recipeJobSpec(findRecipe("nemar-ica") as never, {
+        datasetId: "nm000104",
+        tag: "v1.0.0",
+        input: "zarr",
+        image,
+        zarrSource: EXACT,
+        env: production,
+      }),
+    ).toThrow(RangeError);
     const bids = recipeJobSpec(findRecipe("nemar-floor") as never, {
       datasetId: "nm000104",
       tag: "v1.0.0",
+      input: "bids",
       image,
-      // Never read for a BIDS recipe.
+      // Never read for a BIDS input.
       zarrSource: EXACT,
       env: production,
     });
@@ -512,6 +531,8 @@ describe("the recipe registry", () => {
       recipeArguments({ datasetId: "nm000104", tag: "v1.0.0", imageDigest: image.digest }),
     );
     expect(bids.args).not.toContain("--source-commit");
+    // The BIDS input is the recipe's default: its command is what it was before a recipe had two inputs.
+    expect(bids.command).toEqual(["nemar-recipe", "run", "nemar-floor"]);
   });
 });
 
@@ -779,8 +800,9 @@ describe("a runner job through the admin route", () => {
     expect(r.body).toMatchObject({
       ok: true,
       dry_run: false,
-      recipe: "nemar-floor-zarr",
+      recipe: "nemar-floor",
       executor: "runner",
+      input: "zarr",
       dispatched: 1,
     });
     const result = r.body.results[0];
@@ -804,7 +826,7 @@ describe("a runner job through the admin route", () => {
       cores_per_node: 4,
       memory_mb: 16384,
       gpus: 0,
-      minutes: 120,
+      minutes: 360,
       hold_ledger_id: null,
       held_milli: 0,
       charged_milli: 0,
@@ -823,13 +845,14 @@ describe("a runner job through the admin route", () => {
     expect(await n(env, "compute_pools")).toBe(pools);
     // The stamp is linked to the job, and the Tapis stand-in has seen nothing.
     const stamp = await env.DB.prepare(
-      "SELECT state, job_id, recipe, engine FROM compute_pipeline_stamps",
+      "SELECT state, job_id, recipe, engine, input FROM compute_pipeline_stamps",
     ).first<Record<string, string>>();
     expect(stamp).toEqual({
       state: "dispatched",
       job_id: job.id,
-      recipe: "nemar-floor-zarr",
+      recipe: "nemar-floor",
       engine: "eegprep@0.5.0",
+      input: "zarr",
     });
     expect(fx.tapis.log).toEqual([]);
   });
@@ -867,7 +890,7 @@ describe("a runner job through the admin route", () => {
     const spec = JobSpecSchema.parse(JSON.parse(text));
     expect(spec.datasets).toEqual([]);
     expect(spec.runtime).toBe("image");
-    expect(spec.command).toEqual(["nemar-recipe", "run", "nemar-floor-zarr"]);
+    expect(spec.command).toEqual(["nemar-recipe", "run", "nemar-floor", "--input", "zarr"]);
     expect(spec.args).toEqual([
       "--out",
       "/work/outputs/product",
@@ -1250,7 +1273,7 @@ describe("the runners' live cap", () => {
 // --- (f) The refusals --------------------------------------------------------------------------------------------
 
 describe("refusals through the route", () => {
-  test("a Zarr recipe on tapis is invalid_body naming executor, and nothing is written (MUTATION: skip the executors check)", async () => {
+  test("the Zarr input on tapis is invalid_spec naming input, and nothing is written (MUTATION: skip the input and executor pair check)", async () => {
     const env = runnerEnv();
     await seedPipelinesAccount(env);
     await fundPipelines(env);
@@ -1258,20 +1281,30 @@ describe("refusals through the route", () => {
     // Funding the pool wrote its grant entries; what must not change is the count from here.
     const ledger = await n(env, "compute_ledger");
     for (const body of [
-      { recipe: "nemar-floor-zarr", dataset: "nm000104", executor: "tapis" },
-      { recipe: "nemar-floor-zarr", dataset: "nm000104" },
-      { recipe: "nemar-floor-zarr", dataset: "nm000104", executor: "tapis", dry_run: true },
+      { recipe: "nemar-floor", dataset: "nm000104", executor: "tapis", input: "zarr" },
+      { recipe: "nemar-floor", dataset: "nm000104", input: "zarr" },
+      {
+        recipe: "nemar-floor",
+        dataset: "nm000104",
+        executor: "tapis",
+        input: "zarr",
+        dry_run: true,
+      },
     ]) {
       const r = await call("POST", "/compute/pipeline/run", "admin", body, env);
-      expect([body, r.status, r.body.code]).toEqual([body, 400, "invalid_body"]);
-      expect(r.body.error).toContain("executor");
+      expect([body, r.status, r.body.code, r.body.field]).toEqual([
+        body,
+        400,
+        "invalid_spec",
+        "input",
+      ]);
     }
     expect(await n(env, "compute_jobs")).toBe(0);
     expect(await n(env, "compute_pipeline_stamps")).toBe(0);
     expect(await n(env, "compute_ledger")).toBe(ledger);
   });
 
-  test("a BIDS recipe on a runner is invalid_body naming executor (MUTATION: list runner on nemar-floor)", async () => {
+  test("the BIDS input on a runner is invalid_spec naming input (MUTATION: allow bids on a runner)", async () => {
     const env = runnerEnv();
     await seedPipelinesAccount(env);
     await seedEegDataset(env, "nm000104");
@@ -1283,11 +1316,11 @@ describe("refusals through the route", () => {
         recipe: "nemar-floor",
         dataset: "nm000104",
         executor: "runner",
+        input: "bids",
       },
       env,
     );
-    expect([r.status, r.body.code]).toEqual([400, "invalid_body"]);
-    expect(r.body.error).toContain("executor");
+    expect([r.status, r.body.code, r.body.field]).toEqual([400, "invalid_spec", "input"]);
     expect(await n(env, "compute_jobs")).toBe(0);
   });
 
@@ -1300,7 +1333,7 @@ describe("refusals through the route", () => {
       "/compute/pipeline/run",
       "admin",
       {
-        recipe: "nemar-floor-zarr",
+        recipe: "nemar-floor",
         eligible: true,
         executor: "runner",
       },
@@ -1318,7 +1351,7 @@ describe("refusals through the route", () => {
       "/compute/pipeline/run",
       "admin",
       {
-        recipe: "nemar-floor-zarr",
+        recipe: "nemar-floor",
         dataset: "nm000104",
         executor: "ssh",
       },
@@ -1396,17 +1429,22 @@ describe("refusals through the route", () => {
     expect(stamp).toEqual({ state: "refused", refusal_code: "over_concurrency" });
   });
 
-  test("the service holds the same boundary when called directly: the executor a recipe does not list, and the switch", async () => {
+  test("the service holds the same boundary when called directly: the input the executor does not run, the switch, and the cron", async () => {
     const env = runnerEnv();
     await seedPipelinesAccount(env);
     await zarrDataset(env, "nm000104");
     const actor = { kind: "admin", userId: 1 } as const;
     expect(
-      await dispatchPipelineJob(env, { recipe: "nemar-floor-zarr", datasetId: "nm000104", actor }),
+      await dispatchPipelineJob(env, {
+        recipe: "nemar-floor",
+        datasetId: "nm000104",
+        actor,
+        input: "zarr",
+      }),
     ).toMatchObject({
       ok: false,
       code: "invalid_spec",
-      field: "executor",
+      field: "input",
     });
     expect(
       await dispatchPipelineJob(env, {
@@ -1414,14 +1452,16 @@ describe("refusals through the route", () => {
         datasetId: "nm000104",
         actor,
         executor: "runner",
+        input: "bids",
       }),
     ).toMatchObject({
       ok: false,
       code: "invalid_spec",
+      field: "input",
     });
     expect(
       await dispatchPipelineJob(fx.env(), {
-        recipe: "nemar-floor-zarr",
+        recipe: "nemar-floor",
         datasetId: "nm000104",
         actor,
         executor: "runner",
@@ -1430,10 +1470,10 @@ describe("refusals through the route", () => {
       ok: false,
       code: "runners_disabled",
     });
-    // The cron may not dispatch it: it is not automatic.
+    // The cron may not dispatch a runner run: automatic means automatic on Tapis.
     expect(
       await dispatchPipelineJob(env, {
-        recipe: "nemar-floor-zarr",
+        recipe: "nemar-floor",
         datasetId: "nm000104",
         actor: { kind: "cron" },
         executor: "runner",
