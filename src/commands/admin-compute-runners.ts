@@ -19,9 +19,9 @@
 import { Command } from "commander";
 import { RUNNER_BACKENDS } from "../../shared/compute-state.js";
 import {
-  COMPUTE_PARTIAL_USAGE_NOTE,
   COMPUTE_RUNNER_REPORT_DAYS_MAX,
   COMPUTE_RUNNER_USAGE_FOOTER,
+  runnerMarkNotes,
 } from "../../shared/contract/compute-admin.js";
 import {
   RUNNER_ARCHES,
@@ -96,14 +96,16 @@ Exit codes:
 
 const USAGE_HELP = `
 Every runner registration's usage over the jobs created from --from to the end of --to (dates,
-YYYY-MM-DD; a range is at most ${COMPUTE_RUNNER_REPORT_DAYS_MAX} days): its id, name, site and trust, whether it is revoked, its jobs by
-state, the wall and CPU seconds the runner measured, the runner-reported core-hours (CPU seconds over 3600,
-rounded down to three decimals) and the largest resident memory. A registration with no job in the range is
-listed with zeros.
+YYYY-MM-DD, UTC days: a job belongs to the day it was created, in UTC; a range is at most ${COMPUTE_RUNNER_REPORT_DAYS_MAX} days, both
+ends counted): its id, name, site and trust, whether it is revoked, its jobs by state, how many of them have
+usage reported, the wall and CPU seconds the runner measured, the runner-reported core-hours (CPU seconds
+over 3600, rounded down to three decimals) and the largest resident memory. A registration with no job in
+the range is listed with zeros; one whose jobs have reported nothing yet says so instead of showing zeros.
 
 These are the runners' OWN figures and are never service units, so no SU is shown and nothing here is added
 to an SU total. Usage a runner marked partial (Docker or Podman could not measure all of it) is marked
-"(partial: Docker or Podman)": the sums are then a lower bound. No identity is shown.
+"(partial: Docker or Podman)": the sums are then a lower bound. Usage with no mark (a job completed before
+the mark was stored) is marked "(partial: unknown)", never as whole. No identity is shown.
 
 Admin or owner. --json prints the Worker's answer as it is.
 
@@ -290,22 +292,32 @@ runnersCommand
       say(`Runner usage, jobs created ${plain(res.from)} to ${plain(res.to)}:`);
       if (res.runners.length === 0) say("  No runner is registered.");
       for (const r of res.runners) {
+        // The count in each state is a value the Worker sent: plain, like every other word it sent.
         const states = Object.entries(r.by_state)
-          .map(([state, n]) => `${plain(state)} ${n}`)
+          .map(([state, n]) => `${plain(state)} ${plain(String(n))}`)
           .join(", ");
+        // A zero sum over jobs that have not reported is not zero usage: say so, and how many have reported.
+        const reported =
+          r.reported_jobs === undefined ? "" : `${r.reported_jobs} with usage reported, `;
+        const figures =
+          r.jobs > 0 && r.reported_jobs === 0
+            ? "no usage reported yet"
+            : `wall ${r.wall_seconds} s, cpu ${r.cpu_seconds} s, ${r.core_hours.toFixed(3)} runner-reported core-hours, ` +
+              `max resident ${r.max_rss_mb === null ? "none reported" : `${r.max_rss_mb} MB`}`;
         say(
           `  ${plain(r.id)}  ${clip(r.name, 24).padEnd(24)} ${clip(r.site, 16)} ${plain(r.trust)}  ` +
             `${r.revoked ? "revoked" : "live"}: ${r.jobs} job(s)${states === "" ? "" : ` (${states})`}, ` +
-            `wall ${r.wall_seconds} s, cpu ${r.cpu_seconds} s, ${r.core_hours.toFixed(3)} runner-reported core-hours, ` +
-            `max resident ${r.max_rss_mb === null ? "none reported" : `${r.max_rss_mb} MB`}` +
-            `${r.partial_jobs > 0 ? `; usage of ${r.partial_jobs} job(s) is a lower bound${COMPUTE_PARTIAL_USAGE_NOTE}` : ""}`,
+            `${reported}${figures}${runnerMarkNotes(r)}`,
         );
       }
       const t = res.totals;
       say(
-        `All runners: ${t.jobs} job(s), wall ${t.wall_seconds} s, cpu ${t.cpu_seconds} s, ` +
-          `${t.core_hours.toFixed(3)} runner-reported core-hours` +
-          `${t.partial_jobs > 0 ? `; usage of ${t.partial_jobs} job(s) is a lower bound${COMPUTE_PARTIAL_USAGE_NOTE}` : ""}`,
+        `All runners: ${t.jobs} job(s), ${t.reported_jobs === undefined ? "" : `${t.reported_jobs} with usage reported, `}` +
+          `${
+            t.jobs > 0 && t.reported_jobs === 0
+              ? "no usage reported yet"
+              : `wall ${t.wall_seconds} s, cpu ${t.cpu_seconds} s, ${t.core_hours.toFixed(3)} runner-reported core-hours`
+          }${runnerMarkNotes(t)}`,
       );
       say(COMPUTE_RUNNER_USAGE_FOOTER);
     } catch (err) {

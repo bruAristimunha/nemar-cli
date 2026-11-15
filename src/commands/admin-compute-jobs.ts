@@ -40,8 +40,10 @@ import {
   COMPUTE_PARTIAL_USAGE_NOTE,
   COMPUTE_RECORD_REASON_MAX,
   COMPUTE_RECORD_REASON_MIN,
+  COMPUTE_UNKNOWN_PARTIAL_NOTE,
   type ComputeJobAdminResponse,
   type ComputeJobView,
+  runnerMarkNotes,
 } from "../../shared/contract/compute-admin.js";
 import { RUNNER_ID_RE } from "../../shared/contract/compute-runner.js";
 import { COMPUTE_JOB_ID_RE } from "../../shared/contract/compute.js";
@@ -67,10 +69,19 @@ import { plain } from "../lib/terminal-text.js";
 
 const say = (line: string): void => console.log(line);
 
-/** The note a runner figure carries when the runner marked it partial, and nothing otherwise. */
-function partialNote(partial: unknown): string {
-  return partial === true ? COMPUTE_PARTIAL_USAGE_NOTE : "";
+/**
+ * The note a runner figure carries. Partial when the runner said so; nothing when it said the usage is whole;
+ * and UNKNOWN when there is usage but no mark (the job completed before the mark was stored, or the Worker
+ * predates it), because a figure with no mark is never shown as complete. No usage, no note.
+ */
+function partialNote(partial: unknown, usagePresent: boolean): string {
+  if (partial === true) return COMPUTE_PARTIAL_USAGE_NOTE;
+  if (partial === false) return "";
+  return usagePresent ? COMPUTE_UNKNOWN_PARTIAL_NOTE : "";
 }
+
+/** How a job is accounted: a service-unit figure is shown for every job except one accounted `none`. */
+const inServiceUnits = (accounting: unknown): boolean => accounting !== "none";
 
 /** A whole number a Worker sent for a runner figure, or `?` when it has not been reported. */
 function figure(value: unknown): string {
@@ -89,7 +100,7 @@ function runnerPhrase(
   if (typeof usage.wall !== "number" && typeof usage.cpu !== "number") {
     return `${who}, no usage reported yet`;
   }
-  return `${who}, runner-reported wall ${figure(usage.wall)} s, cpu ${figure(usage.cpu)} s${partialNote(usage.partial)}`;
+  return `${who}, runner-reported wall ${figure(usage.wall)} s, cpu ${figure(usage.cpu)} s${partialNote(usage.partial, true)}`;
 }
 
 /** The job as lines for a terminal; everything the Worker sent is made plain first. */
@@ -123,7 +134,7 @@ function printJob(res: ComputeJobAdminResponse): void {
     );
     say(
       `  runner-reported: wall ${job.runner_wall_seconds ?? "?"} s, cpu ${job.runner_cpu_seconds ?? "?"} s, ` +
-        `max resident ${job.runner_max_rss_mb ?? "?"} MB${partialNote(job.runner_usage_partial)}`,
+        `max resident ${job.runner_max_rss_mb ?? "?"} MB${partialNote(job.runner_usage_partial, typeof job.runner_wall_seconds === "number")}`,
     );
   } else {
     say(
@@ -379,15 +390,20 @@ jobsCommand
         for (const j of res.jobs) {
           say(
             `${plain(j.id)}  ${plain(j.state).padEnd(10)} ${plain(j.source).padEnd(8)} ${plain(j.partition)}/${plain(j.pool)}  ` +
-              `${
+              `${[
+                inServiceUnits(j.accounting)
+                  ? `${formatSu(j.charged_milli)} SU${j.settled ? "" : " (not settled)"}`
+                  : "",
                 j.executor === "runner"
                   ? runnerPhrase(j.runner_id, {
                       wall: j.runner_wall_seconds,
                       cpu: j.runner_cpu_seconds,
                       partial: j.runner_usage_partial,
                     })
-                  : `${formatSu(j.charged_milli)} SU${j.settled ? "" : " (not settled)"}`
-              }  ` +
+                  : "",
+              ]
+                .filter((part) => part !== "")
+                .join(", ")}  ` +
               `${j.flags.length > 0 ? `[${j.flags.map(plain).join(",")}]  ` : ""}${plain(j.created_at)}`,
           );
         }
@@ -595,9 +611,13 @@ jobsCommand
               "runner_usage_partial",
             ],
             ...jobs.map((j) => {
-              // A runner job has no SU: its three SU cells are empty, never a zero.
-              const ranOnRunner = j.executor === "runner";
-              const usage = (ranOnRunner ? j.runner_usage : null) as Record<string, unknown> | null;
+              // A job accounted `none` has no SU, as the Worker's totals count it: its three SU cells are
+              // empty, never a zero. The runner columns follow the executor.
+              const noSu = !inServiceUnits(j.accounting);
+              const usage = (j.executor === "runner" ? j.runner_usage : null) as Record<
+                string,
+                unknown
+              > | null;
               return [
                 String(j.id),
                 String(j.created_at),
@@ -606,9 +626,9 @@ jobsCommand
                 String(j.partition),
                 String(j.pool),
                 String(j.source),
-                ranOnRunner ? "" : formatSu(Number(j.charged_milli)),
-                ranOnRunner ? "" : j.settled === false ? "no" : "yes",
-                ranOnRunner ? "" : formatSu(Number(j.open_hold_milli ?? 0)),
+                noSu ? "" : formatSu(Number(j.charged_milli)),
+                noSu ? "" : j.settled === false ? "no" : "yes",
+                noSu ? "" : formatSu(Number(j.open_hold_milli ?? 0)),
                 Array.isArray(j.flags) ? j.flags.join(" ") : "",
                 typeof j.executor === "string" ? j.executor : "",
                 typeof j.accounting === "string" ? j.accounting : "",
@@ -616,50 +636,63 @@ jobsCommand
                 typeof usage?.wall_seconds === "number" ? usage.wall_seconds : "",
                 typeof usage?.cpu_seconds === "number" ? usage.cpu_seconds : "",
                 typeof usage?.max_rss_mb === "number" ? usage.max_rss_mb : "",
-                usage?.partial === true ? "yes" : usage?.partial === false ? "no" : "",
+                usage?.partial === true
+                  ? "yes"
+                  : usage?.partial === false
+                    ? "no"
+                    : typeof usage?.wall_seconds === "number"
+                      ? "unknown"
+                      : "",
               ];
             }),
           ]);
           return;
         }
         say(
-          `account ${res.account_id}, ${plain(res.from)} to ${plain(res.to)}: ${res.totals.jobs} job(s), ${formatSu(res.totals.charged_milli)} SU charged${unsettledNote(res.totals)}`,
+          `account ${res.account_id}, ${plain(res.from)} to ${plain(res.to)}: ${res.totals.jobs} SU job(s), ${formatSu(res.totals.charged_milli)} SU charged${unsettledNote(res.totals)}`,
         );
         for (const [pool, t] of Object.entries(res.by_pool)) {
           const row = t as Record<string, unknown>;
           say(
-            `  ${plain(pool)}: ${Number(row.jobs)} job(s), ${formatSu(Number(row.charged_milli))} SU charged${unsettledNote(row)}`,
+            `  ${plain(pool)}: ${Number(row.jobs)} SU job(s), ${formatSu(Number(row.charged_milli))} SU charged${unsettledNote(row)}`,
           );
         }
         const runnerTotals = res.runner_totals;
         if (runnerTotals !== undefined && runnerTotals.jobs > 0) {
           // Apart from the SU above, and never added to it.
+          // A zero sum over jobs that have not reported is not zero usage, so the count that reported is said.
+          const reported = runnerTotals.reported_jobs;
           say(
             `  runner jobs (runner-reported, never service units): ${runnerTotals.jobs} job(s), ` +
-              `wall ${runnerTotals.wall_seconds} s, cpu ${runnerTotals.cpu_seconds} s, ` +
-              `${runnerTotals.core_hours.toFixed(3)} runner-reported core-hours` +
-              `${runnerTotals.partial_jobs > 0 ? `; usage of ${runnerTotals.partial_jobs} job(s) is a lower bound${COMPUTE_PARTIAL_USAGE_NOTE}` : ""}`,
+              `${reported === undefined ? "" : `${reported} with usage reported, `}` +
+              `${
+                reported === 0
+                  ? "no usage reported yet"
+                  : `wall ${runnerTotals.wall_seconds} s, cpu ${runnerTotals.cpu_seconds} s, ` +
+                    `${runnerTotals.core_hours.toFixed(3)} runner-reported core-hours`
+              }${runnerMarkNotes(runnerTotals)}`,
           );
         }
         for (const j of jobs) {
-          if (j.executor === "runner") {
-            const usage = (j.runner_usage ?? {}) as Record<string, unknown>;
-            say(
-              `  ${plain(String(j.id))}  ${plain(String(j.state))}  ${plain(String(j.partition))}  ` +
-                `${runnerPhrase(j.runner_id, {
-                  wall: usage.wall_seconds,
-                  cpu: usage.cpu_seconds,
-                  partial: usage.partial,
-                })}  ${plain(String(j.created_at))}`,
-            );
-            continue;
-          }
+          // The SU figure is for a job accounted in SU; the runner's figures for a job a runner ran. A job
+          // accounted `none` never has an SU figure next to it.
           const note =
             j.settled === false
               ? `  (not settled, ${formatSu(Number(j.open_hold_milli ?? 0))} SU held)`
               : "";
+          const usage = (j.runner_usage ?? {}) as Record<string, unknown>;
+          const parts = [
+            inServiceUnits(j.accounting) ? `${formatSu(Number(j.charged_milli))} SU${note}` : "",
+            j.executor === "runner"
+              ? runnerPhrase(j.runner_id, {
+                  wall: usage.wall_seconds,
+                  cpu: usage.cpu_seconds,
+                  partial: usage.partial,
+                })
+              : "",
+          ].filter((part) => part !== "");
           say(
-            `  ${plain(String(j.id))}  ${plain(String(j.state))}  ${plain(String(j.partition))}  ${formatSu(Number(j.charged_milli))} SU${note}  ${plain(String(j.created_at))}`,
+            `  ${plain(String(j.id))}  ${plain(String(j.state))}  ${plain(String(j.partition))}  ${parts.join(", ")}  ${plain(String(j.created_at))}`,
           );
         }
         if (res.truncated) say("  (the list is cut at 5,000 jobs; narrow the range)");
