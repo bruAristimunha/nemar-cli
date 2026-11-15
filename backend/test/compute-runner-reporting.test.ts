@@ -160,7 +160,7 @@ async function zarrDataset(): Promise<string> {
 /** A runner job dispatched the way an administrator dispatches one. Its id. */
 async function dispatchRunnerJob(): Promise<string> {
   const r = await dispatchPipelineJob(env, {
-    recipe: "nemar-floor-zarr",
+    recipe: "nemar-floor",
     datasetId: await zarrDataset(),
     actor: { kind: "admin", userId: ids.admin },
     executor: "runner",
