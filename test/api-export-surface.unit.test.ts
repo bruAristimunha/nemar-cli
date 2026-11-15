@@ -278,11 +278,13 @@ const MODULE_EXPORTS: Record<string, string[]> = {
     "requeueComputeAccessReport",
     "runComputePipeline",
   ],
-  // Portable compute, card DM-05: the owner's runner registry (`nemar admin compute runners`).
+  // Portable compute, card DM-05: the owner's runner registry (`nemar admin compute runners`), and card S6's
+  // usage report (`nemar admin compute runners usage`).
   "compute-runners": [
     "RunnerListResponseSchema",
     "RunnerRevokeResponseSchema",
     "RunnerViewSchema",
+    "getComputeRunnersUsage",
     "listComputeRunners",
     "registerComputeRunner",
     "revokeComputeRunner",
@@ -419,6 +421,7 @@ const POST_SPLIT_ADDITIONS = [
   "registerComputeRunner", // portable compute, DM-05: POST /admin/compute/runners
   "listComputeRunners", // portable compute, DM-05: GET /admin/compute/runners
   "revokeComputeRunner", // portable compute, DM-05: POST /admin/compute/runners/:id/revoke
+  "getComputeRunnersUsage", // portable compute, S6: GET /admin/compute/reports/runners
   "RunnerViewSchema", // portable compute, DM-05: the open schema of one registration (the listing's row)
   "RunnerListResponseSchema", // portable compute, DM-05: the open schema of the listing
   "RunnerRevokeResponseSchema", // portable compute, DM-05: the open schema of a revoke's answer

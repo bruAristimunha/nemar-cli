@@ -416,6 +416,12 @@ export const ComputeJobViewSchema = z
     runner_wall_seconds: z.number().int().nullable().optional(),
     runner_cpu_seconds: z.number().int().nullable().optional(),
     runner_max_rss_mb: z.number().int().nullable().optional(),
+    /**
+     * Whether the runner marked its usage partial (Docker or Podman cannot always measure all of it): true
+     * or false once it reported, null for a Tapis job or a runner job that has not completed. Carried by
+     * the report views (`jobs list`, `jobs record`); absent from an older Worker.
+     */
+    runner_usage_partial: z.boolean().nullable().optional(),
   })
   .passthrough();
 
@@ -839,12 +845,116 @@ export const ComputeAccountReportResponseSchema = z
       .passthrough(),
     // Each value is an open object (`jobs`, `charged_milli`, `unsettled`, `open_hold_milli`): a word the Worker adds is kept.
     by_pool: z.record(z.object({}).passthrough()),
+    /**
+     * Runner jobs, kept APART from the service-unit totals above (ADR 0121: a runner-reported core-hour is
+     * never added to an SU total): `totals` and `by_pool` count `accounting = 'su'` jobs only. `core_hours`
+     * is the runners' own CPU seconds over 3600, rounded down to three decimals, and `partial_jobs` counts
+     * the jobs whose usage the runner marked partial (a lower bound). Optional so a CLI that reads an
+     * older Worker still parses its answer.
+     */
+    runner_totals: z
+      .object({
+        jobs: z.number().int(),
+        wall_seconds: z.number().int(),
+        cpu_seconds: z.number().int(),
+        core_hours: z.number(),
+        partial_jobs: z.number().int(),
+        // How many of `jobs` have reported usage (below `jobs`, a zero sum is not zero usage) and how many of
+        // those reported with no partial mark (completed before it was stored). Optional: an older Worker.
+        reported_jobs: z.number().int().optional(),
+        unmarked_jobs: z.number().int().optional(),
+      })
+      .passthrough()
+      .optional(),
     jobs: z.array(z.object({}).passthrough()),
     truncated: z.boolean(),
   })
   .passthrough();
 
 export type ComputeAccountReportResponse = z.infer<typeof ComputeAccountReportResponseSchema>;
+
+/** The longest range, in days (both ends counted), `GET /admin/compute/reports/runners` answers for. */
+export const COMPUTE_RUNNER_REPORT_DAYS_MAX = 366;
+
+/**
+ * What a human view appends to every runner figure the runner marked PARTIAL: under Docker or Podman it
+ * cannot always measure all of a job's usage, so the figure is a lower bound (risk K14).
+ */
+export const COMPUTE_PARTIAL_USAGE_NOTE = " (partial: Docker or Podman)";
+
+/**
+ * What a human view appends to a runner figure that has usage but no mark: the job completed before the
+ * mark was stored, so whether the figure is whole is UNKNOWN. Never shown as complete.
+ */
+export const COMPUTE_UNKNOWN_PARTIAL_NOTE = " (partial: unknown)";
+
+/**
+ * The clauses a runner total ends with, so a sum is never read as whole when it may not be: the jobs whose
+ * usage the runner marked partial (a lower bound) and those that reported with no mark (unknown). Empty when
+ * both counts are zero or absent.
+ */
+export function runnerMarkNotes(t: { partial_jobs: number; unmarked_jobs?: number }): string {
+  const lower =
+    t.partial_jobs > 0
+      ? `; usage of ${t.partial_jobs} job(s) is a lower bound${COMPUTE_PARTIAL_USAGE_NOTE}`
+      : "";
+  const unknown =
+    (t.unmarked_jobs ?? 0) > 0
+      ? `; usage of ${t.unmarked_jobs} job(s) has no partial mark${COMPUTE_UNKNOWN_PARTIAL_NOTE}`
+      : "";
+  return lower + unknown;
+}
+
+/** The last line of the runners' usage report: whose figures these are, and that they are not service units. */
+export const COMPUTE_RUNNER_USAGE_FOOTER = "Runner-reported usage; never service units.";
+
+/**
+ * `GET /admin/compute/reports/runners?from=&to=` (administrator): every runner registration's usage over a
+ * date range, in the RUNNER'S OWN FIGURES (wall and CPU seconds, the largest resident memory) and never in
+ * service units. A registration is named by its id and its fixed words; no identity is carried. OPEN, so a
+ * field the Worker adds is kept.
+ */
+export const ComputeRunnersUsageResponseSchema = z
+  .object({
+    from: z.string(),
+    to: z.string(),
+    runners: z.array(
+      z
+        .object({
+          id: z.string(),
+          name: z.string(),
+          site: z.string(),
+          trust: z.string(),
+          revoked: z.boolean(),
+          jobs: z.number().int(),
+          // Fixed state word to count; open, so a state the Worker adds is kept as it came.
+          by_state: z.record(z.unknown()),
+          wall_seconds: z.number().int(),
+          cpu_seconds: z.number().int(),
+          core_hours: z.number(),
+          max_rss_mb: z.number().int().nullable(),
+          partial_jobs: z.number().int(),
+          // As in `runner_totals` of the account report: optional for an older Worker.
+          reported_jobs: z.number().int().optional(),
+          unmarked_jobs: z.number().int().optional(),
+        })
+        .passthrough(),
+    ),
+    totals: z
+      .object({
+        jobs: z.number().int(),
+        wall_seconds: z.number().int(),
+        cpu_seconds: z.number().int(),
+        core_hours: z.number(),
+        partial_jobs: z.number().int(),
+        reported_jobs: z.number().int().optional(),
+        unmarked_jobs: z.number().int().optional(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+export type ComputeRunnersUsageResponse = z.infer<typeof ComputeRunnersUsageResponseSchema>;
 
 /** `GET /admin/compute/access-report`: for ACCESS, distinct gateway users and jobs by partition and source. */
 export const ComputeAccessReportResponseSchema = z

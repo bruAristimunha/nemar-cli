@@ -4,14 +4,18 @@
  * the router's middleware (authentication, the admin role, the cookie-origin guard) is the gate; the
  * owner-only routes check the role HERE, before the body is read, and say so (403 `owner_only`).
  *
- *   GET    /compute/jobs                          admin  jobs by flag, state and account; `unmatched=1`
- *                                                       lists Expanse's rows that no job claims
+ *   GET    /compute/jobs                          admin  jobs by flag, state, account, executor,
+ *                                                       accounting and runner; `unmatched=1` lists
+ *                                                       Expanse's rows that no job claims
  *   GET    /compute/records/:ref                  admin  one job (NEMAR id, Tapis uuid or Slurm id):
  *                                                       index row, ledger entries, provenance, manifest
  *                                                       summary. No identity.
  *   POST   /compute/records/:ref/read             owner  one record, with a stated reason, audited first
  *                                                       (the identity snapshot or the specification)
- *   GET    /compute/report                        admin  one account's jobs and charge in a date range
+ *   GET    /compute/report                        admin  one account's jobs and charge in a date range;
+ *                                                       runner jobs are totaled apart, never in SU
+ *   GET    /compute/reports/runners               admin  every runner registration's usage in a date
+ *                                                       range, in the runner's own figures, never in SU
  *   GET    /compute/access-report                 admin  a quarter's distinct gateway users and jobs
  *   GET    /compute/holds                         admin  the active legal holds
  *   POST   /compute/holds                         owner  place a hold on `job:<id>` or `account:<id>`
@@ -30,15 +34,20 @@
 import { z } from "zod";
 import {
   COMPUTE_ACCESS_REPORT_STATES,
+  COMPUTE_ACCOUNTING,
+  COMPUTE_EXECUTORS,
   COMPUTE_HOLD_SCOPES,
   COMPUTE_JOB_FLAGS,
   COMPUTE_STATES,
   COMPUTE_WORD_RE,
 } from "../../../../shared/compute-state";
 import { COMPUTE_JOB_ID_RE } from "../../../../shared/contract/compute";
-import { COMPUTE_REPORT_PAGE_MAX } from "../../../../shared/contract/compute-admin";
+import {
+  COMPUTE_REPORT_PAGE_MAX,
+  COMPUTE_RUNNER_REPORT_DAYS_MAX,
+} from "../../../../shared/contract/compute-admin";
+import { RUNNER_ID_RE } from "../../../../shared/contract/compute-runner";
 import { listActiveHolds, placeHold, releaseHold } from "../../services/compute-legal-holds";
-import { jobView } from "../../services/compute-lifecycle";
 import { mintObserverRun } from "../../services/compute-observer";
 import { fieldPath } from "../../services/compute-policy";
 import { readRecordObject } from "../../services/compute-records";
@@ -50,8 +59,11 @@ import {
   listUnmatchedSacct,
   quarterBounds,
   recordSummary,
+  reportRangeDays,
+  reportedJobView,
   requeueAccessReport,
   resolveJobRef,
+  runnersUsageReport,
 } from "../../services/compute-reporting";
 import { type Ctx, fail, invalidBody, readJson, refuse, requireOwner } from "./compute";
 import type { AdminRouter } from "./shared";
@@ -65,6 +77,9 @@ const jobsQuery = z.object({
   flag: z.enum(COMPUTE_JOB_FLAGS).optional(),
   state: z.enum(COMPUTE_STATES).optional(),
   account: z.coerce.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
+  executor: z.enum(COMPUTE_EXECUTORS).optional(),
+  accounting: z.enum(COMPUTE_ACCOUNTING).optional(),
+  runner: z.string().regex(RUNNER_ID_RE).optional(),
   limit: z.coerce.number().int().min(1).max(COMPUTE_REPORT_PAGE_MAX).default(50),
   after: z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
   unmatched: bool.optional(),
@@ -73,6 +88,11 @@ const jobsQuery = z.object({
 const DATE_RE = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
 const reportQuery = z.object({
   account: z.coerce.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+  from: z.string().regex(DATE_RE),
+  to: z.string().regex(DATE_RE),
+});
+
+const runnersReportQuery = z.object({
   from: z.string().regex(DATE_RE),
   to: z.string().regex(DATE_RE),
 });
@@ -117,10 +137,13 @@ export function registerComputeReportingRoutes(admin: AdminRouter): void {
         flag: query.data.flag,
         state: query.data.state,
         account: query.data.account,
+        executor: query.data.executor,
+        accounting: query.data.accounting,
+        runner: query.data.runner,
         limit: query.data.limit,
         after: query.data.after,
       });
-      return c.json({ jobs: page.jobs.map(jobView), next_after: page.next_after });
+      return c.json({ jobs: page.jobs.map(reportedJobView), next_after: page.next_after });
     } catch (err) {
       return fail(c, err);
     }
@@ -192,6 +215,34 @@ export function registerComputeReportingRoutes(admin: AdminRouter): void {
     if (!query.success) return badQuery(c, query.error);
     try {
       return c.json(await accountReport(c.env.DB, query.data));
+    } catch (err) {
+      return fail(c, err);
+    }
+  });
+
+  admin.get("/compute/reports/runners", async (c) => {
+    const query = runnersReportQuery.safeParse(c.req.query());
+    if (!query.success) return badQuery(c, query.error);
+    const days = reportRangeDays(query.data.from, query.data.to);
+    if (days === null) {
+      return refuse(
+        c,
+        "invalid_query",
+        "The query is not valid: from and to are real dates, YYYY-MM-DD.",
+      );
+    }
+    if (days < 1) {
+      return refuse(c, "invalid_query", "The query is not valid: from is after to.");
+    }
+    if (days > COMPUTE_RUNNER_REPORT_DAYS_MAX) {
+      return refuse(
+        c,
+        "invalid_query",
+        `The query is not valid: a range is at most ${COMPUTE_RUNNER_REPORT_DAYS_MAX} days.`,
+      );
+    }
+    try {
+      return c.json(await runnersUsageReport(c.env.DB, query.data));
     } catch (err) {
       return fail(c, err);
     }

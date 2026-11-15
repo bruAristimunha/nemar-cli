@@ -75,6 +75,9 @@ const EXPECTED_ENTRIES: Record<string, number> = {
   "GET /compute/records/:ref": 1,
   "POST /compute/records/:ref/read": 2,
   "GET /compute/report": 1,
+  // Portable compute, card S6: every runner's usage in a date range. Admin-only through the router's
+  // middleware; one handler.
+  "GET /compute/reports/runners": 1,
   "GET /compute/access-report": 1,
   "GET /compute/holds": 1,
   "POST /compute/holds": 2,
@@ -373,7 +376,7 @@ describe("admin route inventory", () => {
   });
 
   test("entry total is pinned", () => {
-    expect(adminRoutes.routes.length).toBe(253);
+    expect(adminRoutes.routes.length).toBe(254);
   });
 
   // The count pin above can't see a SWAP of the router-level middleware

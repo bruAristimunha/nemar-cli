@@ -253,6 +253,12 @@ export interface ComputeJobsQuery {
   flag?: string;
   state?: string;
   account?: number;
+  /** `tapis` or `runner`. */
+  executor?: string;
+  /** `su` or `none`. */
+  accounting?: string;
+  /** A runner registration's id. */
+  runner?: string;
   limit?: number;
   after?: number;
 }
@@ -265,6 +271,9 @@ export async function listComputeJobs(q: ComputeJobsQuery = {}): Promise<Compute
   if (q.flag) params.set("flag", q.flag);
   if (q.state) params.set("state", q.state);
   if (q.account !== undefined) params.set("account", String(q.account));
+  if (q.executor) params.set("executor", q.executor);
+  if (q.accounting) params.set("accounting", q.accounting);
+  if (q.runner) params.set("runner", q.runner);
   if (q.limit !== undefined) params.set("limit", String(q.limit));
   if (q.after !== undefined) params.set("after", String(q.after));
   return request(

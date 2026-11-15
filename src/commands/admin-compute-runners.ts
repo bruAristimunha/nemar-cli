@@ -5,9 +5,11 @@
  *   nemar admin compute runners register <name> --pool --cores --memory-mb --scratch-gb --runtime ...
  *   nemar admin compute runners list [--json]
  *   nemar admin compute runners revoke <id> [--json]
+ *   nemar admin compute runners usage --from <date> --to <date> [--json]
  *
- * All three are the owner's. Every command exits 1 on any failure and keeps standard output pure JSON
- * under `--json`. A registration is accounted `none` (runner-reported usage); `su` is not built yet.
+ * The first three are the owner's; `usage` is an administrator's (it reads and changes nothing). Every
+ * command exits 1 on any failure and keeps standard output pure JSON under `--json`. A registration is
+ * accounted `none` (runner-reported usage); `su` is not built yet, and `usage` never shows service units.
  *
  * THE SECRET IS SHOWN ONCE. `register` prints it and the Worker keeps only its hash, so a lost secret is
  * a revoked registration and a new one. It is the only thing a runner needs to start: keep it in a file
@@ -16,6 +18,11 @@
 
 import { Command } from "commander";
 import { RUNNER_BACKENDS } from "../../shared/compute-state.js";
+import {
+  COMPUTE_RUNNER_REPORT_DAYS_MAX,
+  COMPUTE_RUNNER_USAGE_FOOTER,
+  runnerMarkNotes,
+} from "../../shared/contract/compute-admin.js";
 import {
   RUNNER_ARCHES,
   RUNNER_ID_RE,
@@ -27,6 +34,7 @@ import {
 import { COMPUTE_POOLS } from "../../shared/contract/compute.js";
 import { failMessage, failWith, requireSignedIn } from "../lib/admin-command.js";
 import {
+  getComputeRunnersUsage,
   listComputeRunners,
   registerComputeRunner,
   revokeComputeRunner,
@@ -85,6 +93,28 @@ Exit codes:
   0  revoked, or already revoked.
   1  the id is not a runner id (nothing was sent), the Worker refused (you are not an owner, or there is
      no such runner) or the write failed.`;
+
+const USAGE_HELP = `
+Every runner registration's usage over the jobs created from --from to the end of --to (dates,
+YYYY-MM-DD, UTC days: a job belongs to the day it was created, in UTC; a range is at most ${COMPUTE_RUNNER_REPORT_DAYS_MAX} days, both
+ends counted): its id, name, site and trust, whether it is revoked, its jobs by state, how many of them have
+usage reported, the wall and CPU seconds the runner measured, the runner-reported core-hours (CPU seconds
+over 3600, rounded down to three decimals) and the largest resident memory. A registration with no job in
+the range is listed with zeros; one whose jobs have reported nothing yet says so instead of showing zeros.
+
+These are the runners' OWN figures and are never service units, so no SU is shown and nothing here is added
+to an SU total. Usage a runner marked partial (Docker or Podman could not measure all of it) is marked
+"(partial: Docker or Podman)": the sums are then a lower bound. Usage with no mark (a job completed before
+the mark was stored) is marked "(partial: unknown)", never as whole. No identity is shown.
+
+Admin or owner. --json prints the Worker's answer as it is.
+
+Exit codes:
+  0  reported.
+  1  an option is not valid (nothing was sent), the Worker refused (a range too long, from after to) or the
+     read failed.`;
+
+const DATE_RE = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
 
 /** A whole number option, or undefined after the schema says why it is not one. */
 function whole(raw: string | undefined): number | undefined {
@@ -236,5 +266,61 @@ runnersCommand
       );
     } catch (err) {
       failWith(err, null, "Could not revoke the runner.", undefined, { json });
+    }
+  });
+
+runnersCommand
+  .command("usage")
+  .description("Every runner's usage over a date range, in the runners' own figures (never SU)")
+  .requiredOption("--from <date>", "First day, YYYY-MM-DD")
+  .requiredOption("--to <date>", "Last day, YYYY-MM-DD")
+  .option("--json", "Print the Worker's answer as JSON")
+  .addHelpText("after", USAGE_HELP)
+  .action(async (o: { from: string; to: string; json?: boolean }) => {
+    const json = o.json === true;
+    if (!requireSignedIn(json)) return;
+    if (!DATE_RE.test(o.from) || !DATE_RE.test(o.to)) {
+      failMessage("--from and --to are dates, YYYY-MM-DD.", { json, answered: true });
+      return;
+    }
+    try {
+      const res = await getComputeRunnersUsage({ from: o.from, to: o.to });
+      if (json) {
+        console.log(JSON.stringify(res, null, 2));
+        return;
+      }
+      say(`Runner usage, jobs created ${plain(res.from)} to ${plain(res.to)}:`);
+      if (res.runners.length === 0) say("  No runner is registered.");
+      for (const r of res.runners) {
+        // The count in each state is a value the Worker sent: plain, like every other word it sent.
+        const states = Object.entries(r.by_state)
+          .map(([state, n]) => `${plain(state)} ${plain(String(n))}`)
+          .join(", ");
+        // A zero sum over jobs that have not reported is not zero usage: say so, and how many have reported.
+        const reported =
+          r.reported_jobs === undefined ? "" : `${r.reported_jobs} with usage reported, `;
+        const figures =
+          r.jobs > 0 && r.reported_jobs === 0
+            ? "no usage reported yet"
+            : `wall ${r.wall_seconds} s, cpu ${r.cpu_seconds} s, ${r.core_hours.toFixed(3)} runner-reported core-hours, ` +
+              `max resident ${r.max_rss_mb === null ? "none reported" : `${r.max_rss_mb} MB`}`;
+        say(
+          `  ${plain(r.id)}  ${clip(r.name, 24).padEnd(24)} ${clip(r.site, 16)} ${plain(r.trust)}  ` +
+            `${r.revoked ? "revoked" : "live"}: ${r.jobs} job(s)${states === "" ? "" : ` (${states})`}, ` +
+            `${reported}${figures}${runnerMarkNotes(r)}`,
+        );
+      }
+      const t = res.totals;
+      say(
+        `All runners: ${t.jobs} job(s), ${t.reported_jobs === undefined ? "" : `${t.reported_jobs} with usage reported, `}` +
+          `${
+            t.jobs > 0 && t.reported_jobs === 0
+              ? "no usage reported yet"
+              : `wall ${t.wall_seconds} s, cpu ${t.cpu_seconds} s, ${t.core_hours.toFixed(3)} runner-reported core-hours`
+          }${runnerMarkNotes(t)}`,
+      );
+      say(COMPUTE_RUNNER_USAGE_FOOTER);
+    } catch (err) {
+      failWith(err, null, "Could not read the runners' usage.", undefined, { json });
     }
   });
