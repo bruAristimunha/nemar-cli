@@ -1073,7 +1073,7 @@ describe("runner reporting (card S6)", () => {
     "2026-10-31",
   ];
 
-  test("cancel on a runner job that ended cancelled after its runner reported prints the mark, in text and in JSON (MUTATION: drop the partial note from the record line, or the mark from the cancel answer)", async () => {
+  test("cancel on a runner job that ended canceled after its runner reported prints the mark, in text and in JSON (MUTATION: drop the partial note from the record line, or the mark from the cancel answer)", async () => {
     const partial = runnerJob({
       runnerId: RUNNER_A,
       state: "cancelled",

@@ -867,13 +867,13 @@ describe("the cancel answer of a runner job its runner completed after the cance
       const asked = await admin(`/compute/jobs/${id}/cancel`, "admin", "POST");
       expect([asked.status, asked.body.outcome]).toEqual([200, "cancel_requested"]);
       expect(asked.body.job.runner_usage_partial).toBeNull();
-      // The runner finishes anyway: the job ends cancelled, with the usage and the mark it reported.
+      // The runner finishes anyway: the job ends canceled (state `cancelled`), with the usage and mark it reported.
       const done = await complete(r, id, entry.lease_id, {
         usage: c.usage,
         usage_partial: c.partial,
       });
       expect([done.status, done.body.state]).toEqual([200, "cancelled"]);
-      // The administrator cancels again: the job is already cancelled, and its figures carry their mark.
+      // The administrator cancels again: the job is already canceled, and its figures carry their mark.
       const again = await admin(`/compute/jobs/${id}/cancel`, "admin", "POST");
       expect([again.status, again.body.outcome]).toEqual([200, "already_cancelled"]);
       expect(again.body.job).toMatchObject({
