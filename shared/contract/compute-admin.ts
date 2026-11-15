@@ -416,6 +416,12 @@ export const ComputeJobViewSchema = z
     runner_wall_seconds: z.number().int().nullable().optional(),
     runner_cpu_seconds: z.number().int().nullable().optional(),
     runner_max_rss_mb: z.number().int().nullable().optional(),
+    /**
+     * Whether the runner marked its usage partial (Docker or Podman cannot always measure all of it): true
+     * or false once it reported, null for a Tapis job or a runner job that has not completed. Carried by
+     * the report views (`jobs list`, `jobs record`); absent from an older Worker.
+     */
+    runner_usage_partial: z.boolean().nullable().optional(),
   })
   .passthrough();
 
@@ -819,12 +825,83 @@ export const ComputeAccountReportResponseSchema = z
       .passthrough(),
     // Each value is an open object (`jobs`, `charged_milli`, `unsettled`, `open_hold_milli`): a word the Worker adds is kept.
     by_pool: z.record(z.object({}).passthrough()),
+    /**
+     * Runner jobs, kept APART from the service-unit totals above (ADR 0121: a runner-reported core-hour is
+     * never added to an SU total): `totals` and `by_pool` count `accounting = 'su'` jobs only. `core_hours`
+     * is the runners' own CPU seconds over 3600, rounded down to three decimals, and `partial_jobs` counts
+     * the jobs whose usage the runner marked partial (a lower bound). Optional so a CLI that reads an
+     * older Worker still parses its answer.
+     */
+    runner_totals: z
+      .object({
+        jobs: z.number().int(),
+        wall_seconds: z.number().int(),
+        cpu_seconds: z.number().int(),
+        core_hours: z.number(),
+        partial_jobs: z.number().int(),
+      })
+      .passthrough()
+      .optional(),
     jobs: z.array(z.object({}).passthrough()),
     truncated: z.boolean(),
   })
   .passthrough();
 
 export type ComputeAccountReportResponse = z.infer<typeof ComputeAccountReportResponseSchema>;
+
+/** The longest range, in days (both ends counted), `GET /admin/compute/reports/runners` answers for. */
+export const COMPUTE_RUNNER_REPORT_DAYS_MAX = 366;
+
+/**
+ * What a human view appends to every runner figure the runner marked PARTIAL: under Docker or Podman it
+ * cannot always measure all of a job's usage, so the figure is a lower bound (risk K14).
+ */
+export const COMPUTE_PARTIAL_USAGE_NOTE = " (partial: Docker or Podman)";
+
+/** The last line of the runners' usage report: whose figures these are, and that they are not service units. */
+export const COMPUTE_RUNNER_USAGE_FOOTER = "Runner-reported usage; never service units.";
+
+/**
+ * `GET /admin/compute/reports/runners?from=&to=` (administrator): every runner registration's usage over a
+ * date range, in the RUNNER'S OWN FIGURES (wall and CPU seconds, the largest resident memory) and never in
+ * service units. A registration is named by its id and its fixed words; no identity is carried. OPEN, so a
+ * field the Worker adds is kept.
+ */
+export const ComputeRunnersUsageResponseSchema = z
+  .object({
+    from: z.string(),
+    to: z.string(),
+    runners: z.array(
+      z
+        .object({
+          id: z.string(),
+          name: z.string(),
+          site: z.string(),
+          trust: z.string(),
+          revoked: z.boolean(),
+          jobs: z.number().int(),
+          by_state: z.record(z.number().int()),
+          wall_seconds: z.number().int(),
+          cpu_seconds: z.number().int(),
+          core_hours: z.number(),
+          max_rss_mb: z.number().int().nullable(),
+          partial_jobs: z.number().int(),
+        })
+        .passthrough(),
+    ),
+    totals: z
+      .object({
+        jobs: z.number().int(),
+        wall_seconds: z.number().int(),
+        cpu_seconds: z.number().int(),
+        core_hours: z.number(),
+        partial_jobs: z.number().int(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+export type ComputeRunnersUsageResponse = z.infer<typeof ComputeRunnersUsageResponseSchema>;
 
 /** `GET /admin/compute/access-report`: for ACCESS, distinct gateway users and jobs by partition and source. */
 export const ComputeAccessReportResponseSchema = z
