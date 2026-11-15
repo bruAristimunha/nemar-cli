@@ -9,6 +9,10 @@
 
 import { z } from "zod";
 import {
+  type ComputeRunnersUsageResponse,
+  ComputeRunnersUsageResponseSchema,
+} from "../../../shared/contract/compute-admin.js";
+import {
   type RunnerRegisterRequest,
   type RunnerRegisterResponse,
   RunnerRegisterResponseSchema,
@@ -76,5 +80,22 @@ export async function revokeComputeRunner(id: string): Promise<RunnerRevokeRespo
     { method: "POST", body: "{}" },
     true,
     RunnerRevokeResponseSchema,
+  );
+}
+
+/**
+ * `GET /admin/compute/reports/runners` (admin): every runner registration's usage over a date range, in the
+ * runners' own figures and never in service units. The answer is parsed OPEN (unknown keys kept).
+ */
+export async function getComputeRunnersUsage(q: {
+  from: string;
+  to: string;
+}): Promise<ComputeRunnersUsageResponse> {
+  const params = new URLSearchParams({ from: q.from, to: q.to });
+  return request(
+    `/admin/compute/reports/runners?${params.toString()}`,
+    {},
+    true,
+    ComputeRunnersUsageResponseSchema,
   );
 }
