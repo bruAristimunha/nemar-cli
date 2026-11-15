@@ -155,8 +155,37 @@ const VALID: Record<string, unknown> = {
     to: "2026-10-31",
     totals: { jobs: 2, charged_milli: 5000 },
     by_pool: { cpu: { jobs: 2, charged_milli: 5000 } },
+    // Runner jobs, apart from the service units above (card S6).
+    runner_totals: {
+      jobs: 3,
+      wall_seconds: 420,
+      cpu_seconds: 7600,
+      core_hours: 2.111,
+      partial_jobs: 1,
+    },
     jobs: [{ id: "job_0123456789abcdef01234567" }],
     truncated: false,
+  },
+  ComputeRunnersUsageResponseSchema: {
+    from: "2026-10-01",
+    to: "2026-10-31",
+    runners: [
+      {
+        id: `rnr_${"a".repeat(24)}`,
+        name: "lab_a_cpu",
+        site: "lab_a",
+        trust: "lab",
+        revoked: false,
+        jobs: 3,
+        by_state: { finished: 1, failed: 1, created: 1 },
+        wall_seconds: 420,
+        cpu_seconds: 7600,
+        core_hours: 2.111,
+        max_rss_mb: 4096,
+        partial_jobs: 1,
+      },
+    ],
+    totals: { jobs: 3, wall_seconds: 420, cpu_seconds: 7600, core_hours: 2.111, partial_jobs: 1 },
   },
   ComputeAccessReportResponseSchema: {
     quarter: "2026Q4",
@@ -321,6 +350,31 @@ describe("compute-admin: every exported schema is open", () => {
       admin.ComputeStatusResponseSchema.safeParse({ ...old, runtime_image: { set: "yes" } })
         .success,
     ).toBe(false);
+  });
+
+  test("an account report and a job view from a Worker that predate the runner report still parse, and a malformed one is refused", () => {
+    const old = JSON.parse(JSON.stringify(VALID.ComputeAccountReportResponseSchema)) as Record<
+      string,
+      unknown
+    >;
+    old.runner_totals = undefined;
+    expect(admin.ComputeAccountReportResponseSchema.parse(old).runner_totals).toBeUndefined();
+    expect(
+      admin.ComputeAccountReportResponseSchema.safeParse({ ...old, runner_totals: { jobs: "3" } })
+        .success,
+    ).toBe(false);
+    // The mark is true, false or null; a Worker that predates it sends none.
+    const view = JSON.parse(JSON.stringify(VALID.ComputeJobViewSchema)) as Record<string, unknown>;
+    expect(admin.ComputeJobViewSchema.parse(view).runner_usage_partial).toBeUndefined();
+    for (const mark of [true, false, null]) {
+      expect(
+        admin.ComputeJobViewSchema.parse({ ...view, runner_usage_partial: mark })
+          .runner_usage_partial,
+      ).toBe(mark);
+    }
+    expect(admin.ComputeJobViewSchema.safeParse({ ...view, runner_usage_partial: 1 }).success).toBe(
+      false,
+    );
   });
 
   test("a status answer from a Worker that predates `resource_name_configured` still parses, and its absence is kept as absence", () => {
