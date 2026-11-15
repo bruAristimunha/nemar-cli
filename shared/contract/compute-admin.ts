@@ -880,7 +880,8 @@ export const ComputeRunnersUsageResponseSchema = z
           trust: z.string(),
           revoked: z.boolean(),
           jobs: z.number().int(),
-          by_state: z.record(z.number().int()),
+          // Fixed state word to count; open, so a state the Worker adds is kept as it came.
+          by_state: z.record(z.unknown()),
           wall_seconds: z.number().int(),
           cpu_seconds: z.number().int(),
           core_hours: z.number(),
