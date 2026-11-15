@@ -526,6 +526,8 @@ describe("report and access-report", () => {
       "2026-10-31",
     ]);
     expect(text.exitCode).toBe(0);
+    // The header counts SU jobs, and says so (the pool line below repeats the figure, so it is anchored here).
+    expect(text.stdout).toContain("2026-10-31: 1 SU job(s), 1.5 SU charged");
     // The job is held and unsettled: the total says so, so a running account does not look cheaper.
     expect(text.stdout).toMatch(
       /1 SU job\(s\), 1\.5 SU charged, 1 not settled \([0-9.]+ SU still held\)/,
@@ -955,7 +957,7 @@ describe("runner reporting (card S6)", () => {
     expect(whole.stdout).not.toContain("partial");
   });
 
-  test("report keeps the SU totals to the Tapis job and gives the runner jobs a line of their own, in runner-reported core-hours (MUTATION: drop the runner branch of the report's job lines, or the runner totals line)", async () => {
+  test("report keeps the SU totals to the Tapis job and gives the runner jobs a line of their own, in runner-reported core-hours (MUTATION: drop the runner branch of the report's job lines, the runner totals line, or the SU word in the report header or pool line)", async () => {
     const w = await world();
     const r = await runCli("admin", [
       "report",
@@ -968,7 +970,7 @@ describe("runner reporting (card S6)", () => {
     ]);
     expect(r.exitCode).toBe(0);
     // The SU line is the Tapis job's alone.
-    expect(r.stdout).toMatch(/1 SU job\(s\), 1\.5 SU charged, 1 not settled/);
+    expect(r.stdout).toContain("2026-10-31: 1 SU job(s), 1.5 SU charged, 1 not settled");
     expect(r.stdout).toContain("  cpu: 1 SU job(s), 1.5 SU charged");
     // The runner jobs, apart: 7600 CPU seconds is 2.111 runner-reported core-hours, one job partial.
     expect(r.stdout).toContain(
