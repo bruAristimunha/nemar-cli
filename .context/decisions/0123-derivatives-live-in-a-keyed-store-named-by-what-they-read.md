@@ -56,7 +56,9 @@ The owner decided on 2026-11-14 that derivatives live in a keyed store with thre
    Every derivative starts as `canary`, and no code path mints a DOI: a future, separately reviewed, owner-only action does, for a `published` derivative only, because a DOI cannot be withdrawn.
 6. **Every derivative says what it is.**
    It carries `GeneratedBy` (recipe, version, image digest, job id and the nemar-process build) and `SourceDatasets` (dataset id, version, and the version DOI when there is one), and a citation string.
-   For the `serving` profile it also carries one sentence, declared once in the module, which names EEG only: "Computed on NEMAR's Zarr serving copy (EEG capped at 250 Hz, 16-bit), not on the archived recordings."
+   For the `serving` profile it also carries one sentence, declared once in the module: "Computed on NEMAR's Zarr serving copy (EEG capped at 250 Hz, 16-bit), not on the archived recordings."
+   The sentence names EEG only, which is true of every derivative the store can take today because the only Zarr-input recipe reads just a store's EEG group, while the cap is per modality (EEG and MEG at 250 Hz, iEEG and EMG at 1000 Hz):
+   the change that first lets a recipe read an iEEG, EMG or MEG group adds that modality's sentence to the module, with an amendment to this ADR, before any such derivative is stored, and since the sentence is in no key or digest, adding it orphans nothing.
    General statements about EEG say "capped at 250 Hz", quality control describes the serving copy, and the archived recordings' rate is never stated.
 7. **Known limit: a recorded digest is a claim the platform cannot yet verify.**
    Until the converter writes each store's content digest at commit, the recipe computes it from what it read and records it in its signalJourney record; the platform records it and cannot check it against the store.
