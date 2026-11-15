@@ -56,8 +56,11 @@ export const SUPERSEDED_GRACE_DAYS = 30;
 /**
  * The one sentence a `serving`-profile derivative carries about what it was computed on, declared
  * once. The serving copy is 16-bit and its rate is capped per modality (EEG and MEG at 250 Hz, iEEG
- * and EMG at 1000 Hz); this sentence names EEG only, which is an open point for the maintainer. The
- * archived recordings' rate is never stated.
+ * and EMG at 1000 Hz). This sentence names EEG only, which is true of every derivative the store can
+ * take today: the one Zarr-input recipe reads only a store's EEG group. THE RULE: the change that
+ * first lets a recipe read an iEEG, EMG or MEG group adds that modality's sentence here, with an
+ * amendment to ADR 0123, before any such derivative is stored. The sentence is in no key or digest,
+ * so adding one orphans nothing. The archived recordings' rate is never stated.
  */
 export const SERVING_PROFILE_SENTENCE =
   "Computed on NEMAR's Zarr serving copy (EEG capped at 250 Hz, 16-bit), not on the archived recordings.";
