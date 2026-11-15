@@ -1,6 +1,6 @@
 {
   "format": "nemar.derivative-vectors.v1",
-  "note": "Test vectors for the derivative store contract (ADR 0123), byte-exact and language-neutral: Python and TypeScript must both reproduce every one. Computed from the definition with Python struct, hashlib and NumPy, and again with Bun node:crypto, all equal; computed, not measured on any NEMAR data. Never change a vector to make code pass: a disagreement is decided by the ADR.",
+  "note": "Test vectors for the derivative store contract (ADR 0123), byte-exact and language-neutral: Python and TypeScript must both reproduce every one. Computed from the definition with Python struct, hashlib and NumPy, and again with Bun node:crypto, all equal; computed, not measured on any NEMAR data. Never change a vector to make code pass: the maintainer decides whether the vector or the code is wrong. The key fields are full-string matches, so a Python consumer must use re.fullmatch (its $ also matches before a trailing line feed). In `refused`, the JSON string NaN stands for a NaN number, which JSON cannot hold.",
   "store_content": [
     {
       "name": "labeled with a unit",
@@ -39,6 +39,19 @@
         { "units": ["\u00b5V", "mV"], "labels": [null, null] },
         { "units": ["", ""], "labels": ["Fz", ""] }
       ]
+    },
+    {
+      "name": "two roundings, never fused",
+      "note": "digital 3 times scale 0.1 plus offset -0.3: two separately rounded operations give 5.551115123125783e-17; a fused multiply-add gives 2.7755575615628914e-17 and the digest in fused_sha256. A language that can fuse (C, C++, Go on arm64, GPU code) must not.",
+      "digital": [[3]],
+      "scale": [0.1],
+      "offset": [-0.3],
+      "rate": 250.0,
+      "units": [null],
+      "labels": [null],
+      "header": "nemar.store-content.v1\nshape 1 1\nrate 406f400000000000\nunit\nlabel\ndata float64-le\n",
+      "sha256": "2aa312ed5d306f1f4e3331f7eff09a23972ae2b8bf8792732a79c6e156c3cb0b",
+      "fused_sha256": "ebb90d19f4a23ee757676711f168ad69e2564e98267005d526941eb49dffc536"
     }
   ],
   "input_digest": [
@@ -51,10 +64,10 @@
     },
     {
       "name": "code point order",
-      "note": "U+FF61 sorts before U+1F600 by code point (UTF-8 bytes); UTF-16 units put U+1F600 first. The rows may arrive in either order.",
+      "note": "U+FF61 sorts before U+1F600 by code point (UTF-8 bytes); UTF-16 units put U+1F600 first. The rows may arrive in either order; they are stored with U+1F600 first, so one pass catches both a missing sort and a UTF-16 sort.",
       "rows": [
-        {"path": "sub-01/\uff61", "group": "eeg", "content_sha256": "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd"},
-        {"path": "sub-01/\ud83d\ude00", "group": "eeg", "content_sha256": "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd"}
+        {"path": "sub-01/\ud83d\ude00", "group": "eeg", "content_sha256": "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd"},
+        {"path": "sub-01/\uff61", "group": "eeg", "content_sha256": "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd"}
       ],
       "digest": "sha256:4bf7b0ab0a746ebe769759f4989df1ac1c810eaea360c891d76abd6162508c53"
     }
@@ -90,5 +103,52 @@
       "text": "nemar.derivative-key.v1\ndataset xx099999\nversion v1.0.0\nrecipe nemar-floor\nrecipe_version 1.0.0\nengine eegprep@0.5.0\ninput bids\nprofile archive\ninput_digest git:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
       "key": "da56eaa8eb746589c8bd6cb98114ceb5555db6d14a1092707869526d9aba15e1"
     }
-  ]
+  ],
+  "refused": {
+    "store_content": [
+      {
+        "name": "a NaN rate",
+        "digital": [[1, -2, 3], [32767, -32768, 0]],
+        "scale": [0.1, 0.25],
+        "offset": [0.0, -12.5],
+        "rate": "NaN",
+        "units": [null, null],
+        "labels": [null, null]
+      },
+      {
+        "name": "a label holding a line feed that enters the header",
+        "digital": [[1, -2, 3], [32767, -32768, 0]],
+        "scale": [0.1, 0.25],
+        "offset": [0.0, -12.5],
+        "rate": 250.0,
+        "units": [null, null],
+        "labels": ["Fz\nCz", "Cz"]
+      }
+    ],
+    "input_digest": [
+      {
+        "name": "a tab in a path",
+        "rows": [{"path": "sub-01/a\tb", "group": "eeg", "content_sha256": "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd"}]
+      },
+      {
+        "name": "a tab in a group",
+        "rows": [{"path": "sub-01/eeg.edf", "group": "e\teg", "content_sha256": "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd"}]
+      }
+    ],
+    "derivative_key": [
+      {
+        "name": "a trailing line feed in version",
+        "fields": {
+          "dataset": "xx099999",
+          "version": "v1.0.0\n",
+          "recipe": "nemar-floor",
+          "recipe_version": "1.0.0",
+          "engine": "eegprep@0.5.0",
+          "input": "zarr",
+          "profile": "serving",
+          "input_digest": "sha256:bea77ea8a233ae2507f192e48548af37b8acf01c8abb0e65143ac3178e44bc0b"
+        }
+      }
+    ]
+  }
 }

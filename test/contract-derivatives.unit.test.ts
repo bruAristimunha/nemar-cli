@@ -3,12 +3,15 @@
  * input digest and the derivative key, held to the vectors in
  * `shared/contract/derivatives-vectors.json`. The vectors are byte-exact and language-neutral: the
  * recipes in `nemarOrg/nemar-process` reproduce the same ones in Python, so a drift on either side
- * fails here or there. Never change a vector to make code pass; a disagreement is decided by the ADR.
+ * fails here or there. Never change a vector to make code pass: the maintainer decides whether the
+ * vector or the code is wrong.
  *
  * Real code, no mocks: the module is pure, so every test calls it.
  */
 
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import vectors from "../shared/contract/derivatives-vectors.json";
 import {
   CANARY_DAYS,
@@ -38,9 +41,28 @@ const E_DECOMPOSED = `e${String.fromCodePoint(0x0301)}`;
 const HALFWIDTH_FULL_STOP = String.fromCodePoint(0xff61);
 const GRINNING_FACE = String.fromCodePoint(0x1f600);
 
+/** A store content vector as the file states it; the optional keys belong to one entry each. */
+interface StoreVector {
+  name: string;
+  note?: string;
+  digital: number[][];
+  scale: number[];
+  offset: number[];
+  rate: number;
+  units: ChannelText[];
+  labels: ChannelText[];
+  header: string;
+  sha256: string;
+  also_equal_to?: string;
+  also_with?: Array<{ units: ChannelText[]; labels: ChannelText[] }>;
+  fused_sha256?: string;
+}
+
+const STORE_VECTORS: StoreVector[] = vectors.store_content;
+
 /** The store content vector named `name`, as the inputs of `storeContentSha256`. */
-function storeVector(name: string) {
-  const vector = vectors.store_content.find((entry) => entry.name === name);
+function storeVector(name: string): StoreVector {
+  const vector = STORE_VECTORS.find((entry) => entry.name === name);
   if (!vector) throw new Error(`no store content vector named ${name}`);
   return vector;
 }
@@ -82,19 +104,25 @@ function refused(call: () => unknown): DerivativeContractError {
 }
 
 describe("the vector file", () => {
-  test("holds the seven vectors, so a pass cannot be vacuous", () => {
-    expect(vectors.store_content.map((v) => v.name)).toEqual([
+  test("holds the eight vectors, so a pass cannot be vacuous", () => {
+    expect(STORE_VECTORS.map((v) => v.name)).toEqual([
       "labeled with a unit",
       "no unit and no labels",
       "partly labeled",
+      "two roundings, never fused",
     ]);
     expect(vectors.input_digest.map((v) => v.name)).toEqual(["one store", "code point order"]);
     expect(vectors.derivative_key.map((v) => v.name)).toEqual(["zarr serving", "bids archive"]);
+    expect(Object.keys(vectors.refused)).toEqual([
+      "store_content",
+      "input_digest",
+      "derivative_key",
+    ]);
   });
 });
 
-describe("store content digest (vectors 1 to 3)", () => {
-  for (const vector of vectors.store_content) {
+describe("store content digest (vectors 1 to 3 and the two roundings)", () => {
+  for (const vector of STORE_VECTORS) {
     test(`${vector.name}: header text and digest`, async () => {
       const input = {
         digital: vector.digital,
@@ -118,7 +146,7 @@ describe("store content digest (vectors 1 to 3)", () => {
   }
 
   test("the header opens with the format name and ends in a line feed", () => {
-    for (const vector of vectors.store_content) {
+    for (const vector of STORE_VECTORS) {
       expect(vector.header.startsWith(`${STORE_CONTENT_FORMAT}\n`)).toBe(true);
       expect(vector.header.endsWith("data float64-le\n")).toBe(true);
     }
@@ -151,18 +179,15 @@ describe("store content digest (vectors 1 to 3)", () => {
     expect(digest).toBe(vector.sha256);
   });
 
-  test("a vector that cannot tell the two roundings apart is not enough: 3 * 0.1 + -0.3", async () => {
-    // Computed with Python (struct, hashlib; math.fma for the fused value, which gives ebb90d19...):
-    // 3.0 * 0.1 is 0.30000000000000004 before the offset, and the unfused sum is 5.551115123125783e-17.
-    const digest = await storeContentSha256({
-      digital: [[3]],
-      scale: [0.1],
-      offset: [-0.3],
-      rate: 250,
-      units: [null],
-      labels: [null],
-    });
-    expect(digest).toBe("2aa312ed5d306f1f4e3331f7eff09a23972ae2b8bf8792732a79c6e156c3cb0b");
+  test("the two roundings vector tells a fused multiply-add from two separate roundings", () => {
+    // The first three vectors have exact products, so they cannot tell the two apart; this one can.
+    // Computed with Python (struct, hashlib; math.fma for the fused value).
+    const vector = storeVector("two roundings, never fused");
+    expect(vector.sha256).toBe("2aa312ed5d306f1f4e3331f7eff09a23972ae2b8bf8792732a79c6e156c3cb0b");
+    expect(vector.fused_sha256).toBe(
+      "ebb90d19f4a23ee757676711f168ad69e2564e98267005d526941eb49dffc536",
+    );
+    expect(vector.fused_sha256).not.toBe(vector.sha256);
   });
 
   test("values are channel-major: swapping the channels changes the digest", async () => {
@@ -201,10 +226,10 @@ describe("labels are all or none, the unit is shared or none (vector 3)", () => 
 
   test("the cases that carry no text give the digest of the vector with none", async () => {
     const plain = storeVector("no unit and no labels").sha256;
-    const partly = vectors.store_content[2];
-    expect(partly.name).toBe("partly labeled");
+    const partly = storeVector("partly labeled");
     expect(partly.also_equal_to).toBe("no unit and no labels");
-    for (const variant of partly.also_with) {
+    expect(partly.also_with?.length).toBe(2);
+    for (const variant of partly.also_with ?? []) {
       expect(await digestWith(variant.units, variant.labels)).toBe(plain);
     }
   });
@@ -326,6 +351,19 @@ describe("text with no digest is refused, never guessed", () => {
     }
   });
 
+  test("a high surrogate followed by a code unit that is not a low surrogate is lone", async () => {
+    // U+E000 and U+FFFF sit just above the low surrogate range: a pair needs 0xDC00 to 0xDFFF.
+    for (const next of [0xe000, 0xffff, 0xdbff, 0x0041]) {
+      const bad = `Fz\ud800${String.fromCodePoint(next)}`;
+      const label = await rejects(digestWith([null, null], [bad, "Cz"]));
+      expect(label.message).toContain("lone surrogate");
+    }
+    // The last low surrogate completes a pair, so this label is accepted.
+    expect(await digestWith([null, null], [`\ud800${String.fromCharCode(0xdfff)}`, "Cz"])).toMatch(
+      /^[0-9a-f]{64}$/,
+    );
+  });
+
   test("a lone surrogate the two rules drop is never examined", async () => {
     const plain = storeVector("no unit and no labels").sha256;
     expect(await digestWith([null, null], ["\ud800", null])).toBe(plain);
@@ -378,8 +416,16 @@ describe("text with no digest is refused, never guessed", () => {
         ],
       }),
     );
-    await rejects(storeContentSha256({ ...base, scale: [0.1] }));
-    await rejects(storeContentSha256({ ...base, offset: [0, 0, 0] }));
+    // One scale and one offset per channel: too short, too long, and absent, for each list.
+    // The message is checked too: a short list would otherwise be caught later, by its missing number.
+    for (const wrong of [[0.1], [0.1, 0.25, 0.5], [], undefined]) {
+      const error = await rejects(storeContentSha256({ ...base, scale: wrong as number[] }));
+      expect(error.message).toBe("scale must hold one number per channel");
+    }
+    for (const wrong of [[0], [0, 0, 0], [], undefined]) {
+      const error = await rejects(storeContentSha256({ ...base, offset: wrong as number[] }));
+      expect(error.message).toBe("offset must hold one number per channel");
+    }
     await rejects(storeContentSha256({ ...base, digital: [] }));
     await rejects(storeContentSha256({ ...base, digital: [[], []] }));
     await rejects(
@@ -405,7 +451,8 @@ describe("input digest (vectors 4 and 5)", () => {
 
   test("the code point vector separates code point order from UTF-16 order", () => {
     // If JavaScript's default sort gave code point order this vector would prove nothing.
-    const [low, high] = vectors.input_digest[1].rows.map((row) => row.path);
+    // The file stores U+1F600 first, so one pass catches a missing sort and a UTF-16 sort alike.
+    const [high, low] = vectors.input_digest[1].rows.map((row) => row.path);
     expect(low).toBe(`sub-01/${HALFWIDTH_FULL_STOP}`);
     expect(high).toBe(`sub-01/${GRINNING_FACE}`);
     expect([low, high].sort()[0]).toBe(high);
@@ -431,6 +478,40 @@ describe("input digest (vectors 4 and 5)", () => {
     expect(both).toBe(await inputDigest([b, a]));
     expect(both).not.toBe(await inputDigest([a]));
     expect(both).not.toBe(await inputDigest([b]));
+  });
+
+  test("a path that is a byte prefix of another sorts first, whatever order the rows come in", async () => {
+    // Computed with Python: the lines `a`, then `a/b`; the other order would give 83675576...
+    const short = { path: "a", group: "eeg", content_sha256: "a".repeat(64) };
+    const long = { path: "a/b", group: "eeg", content_sha256: "b".repeat(64) };
+    const expected = "sha256:64dd089953b9a23a8e1dbeb794257d64c81efdde7a6a5bfa94fdfcb5c976289a";
+    expect(await inputDigest([short, long])).toBe(expected);
+    expect(await inputDigest([long, short])).toBe(expected);
+  });
+
+  test("each refusal names the field a caller maps to a fixed word", async () => {
+    const row: StoreContentRow = vectors.input_digest[0].rows[0];
+    const fieldOf = async (rows: unknown) =>
+      (await rejects(inputDigest(rows as StoreContentRow[]))).field;
+    for (const rows of [[], null, undefined, "rows", [null], ["row"], [1], [row, null]]) {
+      expect(await fieldOf(rows)).toBe("stores_content");
+    }
+    const { path: _path, ...noPath } = row;
+    const { group: _group, ...noGroup } = row;
+    const { content_sha256: _digest, ...noDigest } = row;
+    expect(await fieldOf([noPath])).toBe("path");
+    expect(await fieldOf([noGroup])).toBe("group");
+    expect(await fieldOf([noDigest])).toBe("content_sha256");
+    for (const path of ["", "a\tb", "a\nb", "a\rb", "a\ud800"]) {
+      expect(await fieldOf([{ ...row, path }])).toBe("path");
+    }
+    expect(await fieldOf([row, row])).toBe("path");
+    for (const group of ["", "e\teg", "e\neg", "e\reg", "eeg\udc00"]) {
+      expect(await fieldOf([{ ...row, group }])).toBe("group");
+    }
+    for (const content_sha256 of ["", "A".repeat(64), "a".repeat(63), "a".repeat(65), 5]) {
+      expect(await fieldOf([{ ...row, content_sha256 }])).toBe("content_sha256");
+    }
   });
 
   test("a row set with no digest is refused", async () => {
@@ -611,6 +692,92 @@ describe("the key fields are validated", () => {
       input_digest: `git:${"0123456789abcdef".repeat(2)}01234567`,
     };
     expect(validateDerivativeKeyFields(edge).ok).toBe(true);
+  });
+});
+
+describe("a bids input's git digest is exactly 40 lowercase hexadecimal digits", () => {
+  const bids = vectors.derivative_key[1].fields;
+
+  test("39 or 41 digits, uppercase digits, or nothing after `git:` are refused", () => {
+    for (const bad of [
+      `git:${"a".repeat(39)}`,
+      `git:${"a".repeat(41)}`,
+      `git:${"A".repeat(40)}`,
+      `git:${"a".repeat(39)}A`,
+      `git:${"a".repeat(39)}g`,
+      "git:",
+      `GIT:${"a".repeat(40)}`,
+      `git: ${"a".repeat(40)}`,
+      `git:${"a".repeat(40)}\n`,
+      "a".repeat(40),
+      `sha256:${"a".repeat(64)}`,
+    ]) {
+      const checked = validateDerivativeKeyFields({ ...bids, input_digest: bad });
+      expect(checked.ok).toBe(false);
+      if (!checked.ok) expect(checked.field).toBe("input_digest");
+    }
+    expect(
+      validateDerivativeKeyFields({
+        ...bids,
+        input_digest: `git:${"0123456789abcdef".repeat(2)}01234567`,
+      }).ok,
+    ).toBe(true);
+  });
+});
+
+describe("the vectors' refused list: every entry has no digest", () => {
+  for (const entry of vectors.refused.store_content) {
+    test(`store content: ${entry.name}`, async () => {
+      // JSON cannot hold a NaN, so the file writes the string NaN.
+      const rate = entry.rate === "NaN" ? Number.NaN : Number(entry.rate);
+      await rejects(storeContentSha256({ ...entry, rate }));
+    });
+  }
+
+  for (const entry of vectors.refused.input_digest) {
+    test(`input digest: ${entry.name}`, async () => {
+      await rejects(inputDigest(entry.rows));
+    });
+  }
+
+  for (const entry of vectors.refused.derivative_key) {
+    test(`derivative key: ${entry.name}`, async () => {
+      expect(validateDerivativeKeyFields(entry.fields).ok).toBe(false);
+      await rejects(derivativeKey(entry.fields));
+    });
+  }
+});
+
+describe("ADR 0123 states what the module does", () => {
+  const adr = readFileSync(
+    join(
+      import.meta.dir,
+      "../.context/decisions/0123-derivatives-live-in-a-keyed-store-named-by-what-they-read.md",
+    ),
+    "utf8",
+  );
+
+  test("the serving sentence is the module's, word for word", () => {
+    expect(adr).toContain(SERVING_PROFILE_SENTENCE);
+  });
+
+  test("the refusals beyond a line feed and a lone surrogate are written down", () => {
+    for (const phrase of [
+      "not finite",
+      "fewer than one channel or one sample",
+      "no rows, a repeated path, an empty path or group",
+      "a tab, carriage return, line feed or lone surrogate in a path or group",
+      "64 lowercase hexadecimal digits",
+      "re.fullmatch",
+    ]) {
+      expect(adr).toContain(phrase);
+    }
+  });
+
+  test("an image change that can change a value must change a version", () => {
+    expect(adr).toContain(
+      "an image change that can change a value must change `recipe_version` or `engine`",
+    );
   });
 });
 
