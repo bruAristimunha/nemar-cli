@@ -1972,6 +1972,49 @@ class TestElectrodePositionsFor(unittest.TestCase):
             self.assertEqual(result["coordinate_system"], paired)
             self.assertEqual(warnings, [])
 
+    def test_a_coordsystem_file_that_gives_no_system_warns_and_is_still_named(self):
+        """Resolved but unusable: the positions stand, the system and units are empty,
+        `coordsystem_file` still names the file (a fact about the dataset), and one
+        warning says why."""
+        elec = "sub-01/eeg/sub-01_electrodes.tsv"
+        cs = "sub-01/eeg/sub-01_coordsystem.json"
+        cases = {
+            "unreadable": (None, "could not read"),
+            "invalid JSON": ("{not json", "is not valid JSON"),
+            "empty": ("", "is not valid JSON"),
+            "not an object": ("[1, 2]", "is not a JSON object"),
+        }
+        for name, (body, wording) in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as d:
+                generate_zarr._ELECTRODE_WARNED.clear()  # the same file path in each case
+                head = self._put(d, [elec])
+                head.add(cs)
+                if body is not None:
+                    self._write(d, cs, body)
+                result, warnings = self._run(d, self.REC, head)
+                self.assertIsNotNone(result)
+                self.assertEqual(set(result["positions"]), {elec})
+                self.assertEqual(result["coordinate_system"], "")
+                self.assertEqual(result["coordinate_units"], "")
+                self.assertEqual(result["coordsystem_file"], cs)
+                self.assertEqual(len(warnings), 1, warnings)
+                self.assertIn(repr(cs), warnings[0])
+                self.assertIn(repr(self.REC), warnings[0])
+                self.assertIn(wording, warnings[0])
+
+    def test_a_usable_coordsystem_file_without_a_system_stays_quiet(self):
+        """A JSON object that names no system is a dataset that declares none."""
+        elec = "sub-01/eeg/sub-01_electrodes.tsv"
+        cs = "sub-01/eeg/sub-01_coordsystem.json"
+        with tempfile.TemporaryDirectory() as d:
+            head = self._put(d, [elec])
+            head.add(cs)
+            self._write_json(d, cs, {"EEGCoordinateUnits": "mm"})
+            result, warnings = self._run(d, self.REC, head)
+            self.assertEqual(result["coordinate_system"], "")
+            self.assertEqual(result["coordinate_units"], "mm")
+            self.assertEqual(warnings, [])
+
     # -- where the positions came from -----------------------------------------
 
     def test_the_source_word_follows_the_file_name_not_its_directory(self):
@@ -2058,19 +2101,40 @@ class TestElectrodePositionsFor(unittest.TestCase):
         forged = "::error::forged"
         rec = f"sub-01/eeg/sub-01_task-rest\n{forged}_eeg.edf"
         cases = {
-            "two coordinate systems": [
-                f"sub-01/eeg/sub-01_space-A\n{forged}_electrodes.tsv",
-                f"sub-01/eeg/sub-01_space-B\r{forged}_electrodes.tsv",
-            ],
-            "an unreadable electrodes file": [
-                f"sub-01/eeg/sub-01_space-A\n{forged}_electrodes.tsv",
-            ],
+            "two coordinate systems": (
+                [f"sub-01/eeg/sub-01_space-A\n{forged}_electrodes.tsv",
+                 f"sub-01/eeg/sub-01_space-B\r{forged}_electrodes.tsv"],
+                {},
+            ),
+            "an unreadable electrodes file": (
+                [f"sub-01/eeg/sub-01_space-C\n{forged}_electrodes.tsv"],
+                {},
+            ),
+            # A readable electrodes file; its coordsystem is missing, invalid, or no object.
+            "an unreadable coordsystem file": (
+                [f"sub-01/eeg/sub-01_space-D\n{forged}_electrodes.tsv",
+                 f"sub-01/eeg/sub-01_space-D\n{forged}_coordsystem.json"],
+                {"electrodes": True},
+            ),
+            "an invalid coordsystem file": (
+                [f"sub-01/eeg/sub-01_space-E\r{forged}_electrodes.tsv",
+                 f"sub-01/eeg/sub-01_space-E\r{forged}_coordsystem.json"],
+                {"electrodes": True, "coordsystem": "{"},
+            ),
+            "a coordsystem file that is no object": (
+                [f"sub-01/eeg/sub-01_space-F\n{forged}_electrodes.tsv",
+                 f"sub-01/eeg/sub-01_space-F\n{forged}_coordsystem.json"],
+                {"electrodes": True, "coordsystem": "[]"},
+            ),
         }
-        for name, head in cases.items():
+        for name, (head, on_disk) in cases.items():
             with self.subTest(name), tempfile.TemporaryDirectory() as d:
+                if on_disk.get("electrodes"):
+                    self._write(d, head[0], self._elec("Cz"))
+                if "coordsystem" in on_disk:
+                    self._write(d, head[1], on_disk["coordsystem"])
                 with contextlib.redirect_stdout(io.StringIO()) as out:
-                    result = electrode_positions_for(d, rec, set(head), "HEAD")
-                self.assertIsNone(result)
+                    electrode_positions_for(d, rec, set(head), "HEAD")
                 lines = out.getvalue().splitlines()
                 self.assertEqual(len(lines), 1, lines)
                 self.assertTrue(lines[0].startswith("::warning::"), lines)

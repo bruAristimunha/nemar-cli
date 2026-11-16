@@ -8171,7 +8171,10 @@ def electrode_positions_for(
     The coordsystem: `_coordsystem.json` is resolved the same way, among only the files
     whose `space` equals the chosen electrodes file's (both absent counts as equal); none
     left gives an empty system and units. The system and units are the file's own
-    words, verbatim.
+    words, verbatim. A resolved coordsystem file that cannot be read, is not valid JSON
+    (an empty file included) or is not a JSON object also gives an empty system and
+    units, with a `::warning::` naming it and the recording; `coordsystem_file` still
+    names it, so it may name a file that supplied no system or units.
 
     The TSV is parsed by its header row to find the `name`/`x`/`y`/`z` columns (robust to
     extra columns like type/impedance and to column-order variation). A row whose x, y or z
@@ -8278,20 +8281,35 @@ def electrode_positions_for(
     cs_path = _most_specific_sidecars(paired)[-1][3] if paired else None
     if cs_path is not None:
         cs_text = _read_repo_text(repo_dir, head, cs_path)
-        if cs_text:
+        cs_data: object = None
+        if cs_text is None:
+            cs_problem = f"could not read {cs_path!r}"
+        else:
             try:
                 cs_data = json.loads(cs_text)
-                if isinstance(cs_data, dict):
-                    sys_val = cs_data.get("EEGCoordinateSystem") or cs_data.get(
-                        "iEEGCoordinateSystem"
-                    ) or cs_data.get("MEGCoordinateSystem") or ""
-                    units_val = cs_data.get("EEGCoordinateUnits") or cs_data.get(
-                        "iEEGCoordinateUnits"
-                    ) or cs_data.get("MEGCoordinateUnits") or ""
-                    coord_system = str(sys_val) if sys_val else ""
-                    coord_units = str(units_val) if units_val else ""
             except ValueError:
-                pass
+                cs_problem = f"{cs_path!r} is not valid JSON"
+            else:
+                cs_problem = (
+                    None if isinstance(cs_data, dict) else f"{cs_path!r} is not a JSON object"
+                )
+        if cs_problem is not None:
+            # The positions stand, with no system or units; `coordsystem_file` still
+            # names the file, which is a fact about the dataset.
+            _warn_electrode_once(
+                [cs_path],
+                f"{cs_problem}; the electrode coordinate system and units are left "
+                f"empty for {primary_path!r}",
+            )
+        elif isinstance(cs_data, dict):
+            sys_val = cs_data.get("EEGCoordinateSystem") or cs_data.get(
+                "iEEGCoordinateSystem"
+            ) or cs_data.get("MEGCoordinateSystem") or ""
+            units_val = cs_data.get("EEGCoordinateUnits") or cs_data.get(
+                "iEEGCoordinateUnits"
+            ) or cs_data.get("MEGCoordinateUnits") or ""
+            coord_system = str(sys_val) if sys_val else ""
+            coord_units = str(units_val) if units_val else ""
 
     found: dict = {
         "positions": positions,
