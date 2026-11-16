@@ -8091,65 +8091,98 @@ def fetch_dataset_row(api_base: str, dataset_id: str) -> tuple[dict | None, bool
     return None, True
 
 
+def _sidecar_candidates(
+    primary_path: str, head_files: set[str], needle: str
+) -> list[tuple[int, int, str | None, str]]:
+    """The electrodes or coordsystem files that apply to a recording, as
+    `(directory depth, entity count, space, path)`.
+
+    `needle` is an entity-prefixed suffix such as ``_electrodes.tsv``. A file
+    matches when its basename ends with `needle` (``sub-01_task-rest_electrodes.tsv``)
+    or is exactly the bare form (``electrodes.tsv``). It applies when it sits in the
+    recording's directory or an ancestor and every entity in its name equals the
+    recording's, EXCEPT `space`: BIDS names the coordinate system with it and it
+    selects no recording, so the recording (which has none) never rejects a file for
+    carrying one. `space` is returned as its own field (None when the name has none)
+    and is not counted in the entity count, so a file's specificity is the same with
+    or without it.
+    """
+    rec_dir = os.path.dirname(primary_path)
+    rec_ents = _bids_entities(filename_stem(primary_path))
+    bare = needle.lstrip("_")  # "electrodes.tsv" from "_electrodes.tsv"
+    candidates: list[tuple[int, int, str | None, str]] = []
+    for f in head_files:
+        if not (f.endswith(needle) or os.path.basename(f) == bare):
+            continue
+        cdir = os.path.dirname(f)
+        if cdir and rec_dir != cdir and not rec_dir.startswith(cdir + "/"):
+            continue
+        cents = _bids_entities(filename_stem(f))
+        space = cents.pop("space", None)
+        if any(rec_ents.get(k) != v for k, v in cents.items()):
+            continue
+        depth = cdir.count("/") + (1 if cdir else 0)
+        candidates.append((depth, len(cents), space, f))
+    return candidates
+
+
+def _most_specific_sidecars(
+    candidates: list[tuple[int, int, str | None, str]],
+) -> list[tuple[int, int, str | None, str]]:
+    """The candidates tied for the most specific, by directory depth and then entity
+    count, sorted by path: the last is the base's choice among them."""
+    if not candidates:
+        return []
+    best = max((depth, count) for depth, count, _, _ in candidates)
+    return sorted((c for c in candidates if c[:2] == best), key=lambda c: c[3])
+
+
 def electrode_positions_for(
     repo_dir: str, primary_path: str, head_files: set[str], head: str
 ) -> dict | None:
-    """BIDS electrode positions for a recording, resolved via the inheritance
-    principle: among the `_electrodes.tsv` sidecars in the recording's directory
-    or an ancestor whose entities are a subset of the recording's, the most
-    specific one wins. A sibling `_coordsystem.json` is resolved the same way.
+    """BIDS electrode positions for a recording.
 
-    The TSV is parsed by its header row to find the `name`/`x`/`y`/`z` columns
-    (robust to extra columns like type/impedance and to column-order variation).
-    Rows where any of x/y/z is missing, non-numeric, "n/a" or not finite (`NaN`,
-    `inf`, any case or sign) are skipped: a non-finite number would reach the store's
-    root `zarr.json` as a bare token that `JSON.parse` refuses.
+    Which file (BIDS inheritance, `_sidecar_candidates`): among the `_electrodes.tsv`
+    files in the recording's directory or an ancestor whose entities equal the
+    recording's, the most specific wins (deepest directory, then most entities, then
+    the last by path). `space`, the entity that names the coordinate system, is the one
+    entity not compared with the recording's and not counted. If the most specific files
+    hold more than one distinct `space` value (a file with none counts as a value), the
+    recording has two coordinate systems and the converter does not choose: it prints one
+    `::warning::` naming those files and returns None.
+
+    The coordsystem: `_coordsystem.json` is resolved the same way, among only the files
+    whose `space` equals the chosen electrodes file's (both absent counts as equal); none
+    left gives an empty system and units. The system and units are the file's own
+    words, verbatim.
+
+    The TSV is parsed by its header row to find the `name`/`x`/`y`/`z` columns (robust to
+    extra columns like type/impedance and to column-order variation). A row whose x, y or z
+    is missing, `n/a`, not a number, or a number that is not finite (`NaN`, `inf`, any
+    case or sign) gives no position: a non-finite number would reach the store's root
+    `zarr.json` as a bare token that `JSON.parse` refuses.
 
     An applicable electrodes file that cannot be read prints one `::warning::` naming
     it and the recording, and gives no positions: that is a failure, not a dataset
-    that declares none. An empty file gives none quietly.
+    that declares none. An empty file, or one with no valid row, gives none quietly.
 
     Returns ``{"positions": {label: [x, y, z]}, "coordinate_system": str,
-    "coordinate_units": str}`` or None when no `_electrodes.tsv` resolves or it
-    contains no valid rows.
+    "coordinate_units": str}`` or None.
     """
-    stem = filename_stem(primary_path)
-    rec_dir = os.path.dirname(primary_path)
-    rec_ents = _bids_entities(stem)
-
-    def _resolve_sidecar(needle: str) -> str | None:
-        """Return the most-specific applicable sidecar path, or None.
-
-        `needle` is an entity-prefixed suffix like ``_electrodes.tsv``.
-        A file matches when its basename ends with `needle` (e.g.
-        ``sub-01_task-rest_electrodes.tsv``) or its basename is exactly
-        the bare form without the leading underscore (e.g. ``electrodes.tsv``
-        at the dataset root). Both forms carry empty entities, so the entity
-        subset check still applies correctly.
-        """
-        bare = needle.lstrip("_")  # "electrodes.tsv" from "_electrodes.tsv"
-        candidates: list[tuple[int, int, str]] = []
-        for f in head_files:
-            bname = os.path.basename(f)
-            if not (f.endswith(needle) or bname == bare):
-                continue
-            cdir = os.path.dirname(f)
-            if cdir and rec_dir != cdir and not rec_dir.startswith(cdir + "/"):
-                continue
-            cents = _bids_entities(filename_stem(f))
-            if any(rec_ents.get(k) != v for k, v in cents.items()):
-                continue
-            depth = cdir.count("/") + (1 if cdir else 0)
-            candidates.append((depth, len(cents), f))
-        if not candidates:
-            return None
-        candidates.sort()
-        # most specific = last after ascending sort
-        return candidates[-1][2]
-
-    elec_path = _resolve_sidecar("_electrodes.tsv")
-    if elec_path is None:
+    most_specific = _most_specific_sidecars(
+        _sidecar_candidates(primary_path, head_files, "_electrodes.tsv")
+    )
+    if not most_specific:
         return None
+    if len({space for _, _, space, _ in most_specific}) > 1:
+        print(
+            f"::warning::{', '.join(path for _, _, _, path in most_specific)} all apply to "
+            f"{primary_path} with different coordinate systems (space entities); no "
+            f"electrode positions are embedded",
+            flush=True,
+        )
+        return None
+    _, _, elec_space, elec_path = most_specific[-1]
     elec_text = _read_repo_text(repo_dir, head, elec_path)
     if elec_text is None:
         # NOT the same as "this dataset declares no positions": an electrodes file
@@ -8203,10 +8236,15 @@ def electrode_positions_for(
     if not positions:
         return None
 
-    # Resolve the sibling coordsystem.json for coordinate metadata.
+    # Resolve the coordsystem.json of the same coordinate system for the metadata.
     coord_system = ""
     coord_units = ""
-    cs_path = _resolve_sidecar("_coordsystem.json")
+    paired = [
+        c
+        for c in _sidecar_candidates(primary_path, head_files, "_coordsystem.json")
+        if c[2] == elec_space
+    ]
+    cs_path = _most_specific_sidecars(paired)[-1][3] if paired else None
     if cs_path is not None:
         cs_text = _read_repo_text(repo_dir, head, cs_path)
         if cs_text:

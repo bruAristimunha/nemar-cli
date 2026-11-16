@@ -1467,6 +1467,24 @@ class TestElectrodePositionsFor(unittest.TestCase):
 
     REC = "sub-01/eeg/sub-01_task-rest_eeg.edf"
 
+    def _elec(self, label: str) -> str:
+        """An electrodes file holding one electrode, named `label`."""
+        return self._tsv(("name", "x", "y", "z"), (label, 1.0, 2.0, 3.0))
+
+    def _put(self, root: str, rels: list[str]) -> set[str]:
+        """Write one electrodes file or coordsystem file per path, and return the
+        head file set. Each electrodes file holds a single electrode named for its
+        file, so a result says which file it came from; each coordsystem file names
+        its own file as its system."""
+        for rel in rels:
+            if rel.endswith("_coordsystem.json"):
+                self._write_json(
+                    root, rel, {"EEGCoordinateSystem": rel, "EEGCoordinateUnits": "mm"}
+                )
+            else:
+                self._write(root, rel, self._elec(rel))
+        return set(rels)
+
     def _run(self, root: str, rec: str, head: set[str]) -> tuple[dict | None, list[str]]:
         """`electrode_positions_for` and the `::warning::` lines it printed."""
         with contextlib.redirect_stdout(io.StringIO()) as out:
@@ -1806,6 +1824,143 @@ class TestElectrodePositionsFor(unittest.TestCase):
             self.assertAlmostEqual(result["positions"]["FP1"][0], 80.784)
             self.assertEqual(result["coordinate_system"], "EEGLAB")
             self.assertEqual(result["coordinate_units"], "mm")
+
+    # -- the `space` entity ----------------------------------------------------
+    #
+    # BIDS names electrodes and coordsystem files with an optional `space` entity
+    # that names the coordinate system and selects no recording, so a recording
+    # (which has none) must not reject a file for carrying one.
+
+    def test_a_space_named_electrodes_file_applies(self):
+        elec = "sub-01/eeg/sub-01_space-CapTrak_electrodes.tsv"
+        cs = "sub-01/eeg/sub-01_space-CapTrak_coordsystem.json"
+        with tempfile.TemporaryDirectory() as d:
+            head = self._put(d, [elec, cs])
+            result, warnings = self._run(d, self.REC, head)
+            self.assertIsNotNone(result)
+            self.assertEqual(set(result["positions"]), {elec})
+            # The pairing found that coordsystem: its system names its own file.
+            self.assertEqual(result["coordinate_system"], cs)
+            self.assertEqual(result["coordinate_units"], "mm")
+            self.assertEqual(warnings, [])
+
+    def test_every_other_entity_is_still_compared(self):
+        """Only `space` is left out of the comparison: another subject or task still
+        rejects the file, whether or not it names a space."""
+        with tempfile.TemporaryDirectory() as d:
+            head = self._put(d, [
+                "sub-01/eeg/sub-02_space-CapTrak_electrodes.tsv",
+                "sub-01/eeg/sub-01_task-other_space-CapTrak_electrodes.tsv",
+            ])
+            result, warnings = self._run(d, self.REC, head)
+            self.assertIsNone(result)
+            self.assertEqual(warnings, [])
+
+    def test_two_most_specific_coordinate_systems_give_no_positions_and_one_warning(self):
+        """Two coordinate systems for one recording is a choice the converter does not
+        make. The most specific files (same directory depth, same entity count with
+        `space` not counted) hold two `space` values, the absence of one counting as
+        a value."""
+        cases = {
+            "two named spaces": [
+                "sub-01/eeg/sub-01_space-CapTrak_electrodes.tsv",
+                "sub-01/eeg/sub-01_space-MNI152NLin2009cAsym_electrodes.tsv",
+            ],
+            "a named space and none": [
+                "sub-01/eeg/sub-01_electrodes.tsv",
+                "sub-01/eeg/sub-01_space-CapTrak_electrodes.tsv",
+            ],
+            "space does not count as an entity": [
+                "sub-01/eeg/sub-01_task-rest_electrodes.tsv",
+                "sub-01/eeg/sub-01_task-rest_space-CapTrak_electrodes.tsv",
+            ],
+        }
+        for name, files in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as d:
+                head = self._put(d, files)
+                result, warnings = self._run(d, self.REC, head)
+                self.assertIsNone(result)
+                self.assertEqual(len(warnings), 1, warnings)
+                self.assertIn(self.REC, warnings[0])
+                for f in files:
+                    self.assertIn(f, warnings[0])
+
+    def test_a_more_specific_file_beats_a_space_file_without_a_warning(self):
+        """Ambiguity is judged among the MOST specific files only: a `space` file in
+        the subject directory, or with fewer entities, loses to the sibling, and a
+        deeper `space` file beats a root file."""
+        cases = {
+            "shallower directory": (
+                ["sub-01/sub-01_space-CapTrak_electrodes.tsv",
+                 "sub-01/eeg/sub-01_task-rest_electrodes.tsv"],
+                "sub-01/eeg/sub-01_task-rest_electrodes.tsv",
+            ),
+            "fewer entities": (
+                ["sub-01/eeg/sub-01_space-CapTrak_electrodes.tsv",
+                 "sub-01/eeg/sub-01_task-rest_electrodes.tsv"],
+                "sub-01/eeg/sub-01_task-rest_electrodes.tsv",
+            ),
+            "deeper directory": (
+                ["electrodes.tsv", "sub-01/eeg/sub-01_space-CapTrak_electrodes.tsv"],
+                "sub-01/eeg/sub-01_space-CapTrak_electrodes.tsv",
+            ),
+        }
+        for name, (files, expected) in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as d:
+                head = self._put(d, files)
+                result, warnings = self._run(d, self.REC, head)
+                self.assertIsNotNone(result)
+                self.assertEqual(set(result["positions"]), {expected})
+                self.assertEqual(warnings, [])
+
+    def test_the_same_space_among_the_most_specific_files_takes_the_last_by_path(self):
+        """No two coordinate systems, so no refusal: the base's choice stands."""
+        rec = "sub-01/eeg/sub-01_ses-1_task-rest_eeg.edf"
+        by_ses = "sub-01/eeg/sub-01_ses-1_space-CapTrak_electrodes.tsv"
+        by_task = "sub-01/eeg/sub-01_task-rest_space-CapTrak_electrodes.tsv"
+        with tempfile.TemporaryDirectory() as d:
+            head = self._put(d, [by_ses, by_task])
+            result, warnings = self._run(d, rec, head)
+            self.assertIsNotNone(result)
+            self.assertEqual(set(result["positions"]), {max(by_ses, by_task)})
+            self.assertEqual(warnings, [])
+
+    # -- pairing the coordsystem with the electrodes file ----------------------
+
+    def test_a_coordsystem_with_another_space_is_not_paired(self):
+        elec = "sub-01/eeg/sub-01_space-CapTrak_electrodes.tsv"
+        cases = {
+            "another space": ["sub-01/eeg/sub-01_space-MNI152NLin2009cAsym_coordsystem.json"],
+            "no space, for a space file": ["sub-01/eeg/sub-01_coordsystem.json"],
+        }
+        for name, others in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as d:
+                head = self._put(d, [elec, *others])
+                result, _ = self._run(d, self.REC, head)
+                self.assertIsNotNone(result)
+                self.assertEqual(result["coordinate_system"], "")
+                self.assertEqual(result["coordinate_units"], "")
+        with self.subTest("a space coordsystem, for a file with no space"), \
+                tempfile.TemporaryDirectory() as d:
+            head = self._put(d, [
+                "sub-01/eeg/sub-01_electrodes.tsv",
+                "sub-01/eeg/sub-01_space-CapTrak_coordsystem.json",
+            ])
+            result, _ = self._run(d, self.REC, head)
+            self.assertEqual(result["coordinate_system"], "")
+
+    def test_the_paired_coordsystem_wins_over_a_more_specific_one_for_another_space(self):
+        """The restriction comes first: the coordsystem of the chosen file's space is
+        taken even when a file for another space has more entities."""
+        elec = "sub-01/eeg/sub-01_space-CapTrak_electrodes.tsv"
+        paired = "sub-01/eeg/sub-01_space-CapTrak_coordsystem.json"
+        other = "sub-01/eeg/sub-01_task-rest_space-MNI152NLin2009cAsym_coordsystem.json"
+        with tempfile.TemporaryDirectory() as d:
+            head = self._put(d, [elec, paired, other])
+            result, warnings = self._run(d, self.REC, head)
+            self.assertIsNotNone(result)
+            self.assertEqual(result["coordinate_system"], paired)
+            self.assertEqual(warnings, [])
 
     # -- an applicable file that cannot be read --------------------------------
 
