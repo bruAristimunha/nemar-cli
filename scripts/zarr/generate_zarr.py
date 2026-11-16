@@ -8101,7 +8101,9 @@ def electrode_positions_for(
 
     The TSV is parsed by its header row to find the `name`/`x`/`y`/`z` columns
     (robust to extra columns like type/impedance and to column-order variation).
-    Rows where any of x/y/z is missing, non-numeric, or "n/a" are skipped.
+    Rows where any of x/y/z is missing, non-numeric, "n/a" or not finite (`NaN`,
+    `inf`, any case or sign) are skipped: a non-finite number would reach the store's
+    root `zarr.json` as a bare token that `JSON.parse` refuses.
 
     Returns ``{"positions": {label: [x, y, z]}, "coordinate_system": str,
     "coordinate_units": str}`` or None when no `_electrodes.tsv` resolves or it
@@ -8177,9 +8179,12 @@ def electrode_positions_for(
             zv = cols[z_i].strip()
             if xv.lower() == "n/a" or yv.lower() == "n/a" or zv.lower() == "n/a":
                 continue
-            positions[label] = [float(xv), float(yv), float(zv)]
+            xyz = [float(xv), float(yv), float(zv)]
         except (ValueError, IndexError):
             continue
+        if not all(math.isfinite(v) for v in xyz):
+            continue  # `float` parses NaN and inf; a store's root JSON must not hold them
+        positions[label] = xyz
 
     if not positions:
         return None

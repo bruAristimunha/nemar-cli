@@ -1465,6 +1465,12 @@ class TestElectrodePositionsFor(unittest.TestCase):
     def _tsv(self, *rows: tuple) -> str:
         return "\n".join("\t".join(str(c) for c in row) for row in rows) + "\n"
 
+    def _run(self, root: str, rec: str, head: set[str]) -> tuple[dict | None, list[str]]:
+        """`electrode_positions_for` and the `::warning::` lines it printed."""
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            result = electrode_positions_for(root, rec, head, "HEAD")
+        return result, [ln for ln in out.getvalue().splitlines() if ln.startswith("::warning::")]
+
     # -- TSV parsing -----------------------------------------------------------
 
     def test_standard_tsv_parses_positions(self):
@@ -1571,6 +1577,42 @@ class TestElectrodePositionsFor(unittest.TestCase):
             self._write(d, "sub-01/eeg/sub-01_electrodes.tsv", tsv)
             head = {"sub-01/eeg/sub-01_electrodes.tsv"}
             result = electrode_positions_for(d, rec, head, "HEAD")
+            self.assertIsNone(result)
+
+    # -- non-finite cells ------------------------------------------------------
+
+    NON_FINITE_CELLS = (
+        "NaN", "nan", "NAN", "-nan", "inf", "-inf", "+inf", "INF", "Infinity",
+        "-Infinity", "1e999", "-1e999",
+    )
+
+    def test_non_finite_cells_are_skipped_like_na(self):
+        """`float()` parses `NaN` and the infinities, and `json.dump` then writes a
+        bare token that `JSON.parse` refuses. A cell that is not a finite number,
+        in any of the three coordinates, gives no position, exactly as `n/a` does."""
+        rows = [("Cz", "0.0", "0.0", "88.0")]
+        for cell in self.NON_FINITE_CELLS:
+            rows.append((f"x:{cell}", cell, "2.0", "3.0"))
+            rows.append((f"y:{cell}", "1.0", cell, "3.0"))
+            rows.append((f"z:{cell}", "1.0", "2.0", cell))
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_eeg.set"
+            elec = "sub-01/eeg/sub-01_electrodes.tsv"
+            self._write(d, elec, self._tsv(("name", "x", "y", "z"), *rows))
+            result, warnings = self._run(d, rec, {elec})
+            self.assertIsNotNone(result)
+            self.assertEqual(result["positions"], {"Cz": [0.0, 0.0, 88.0]})
+            self.assertEqual(warnings, [])  # skipped quietly, as `n/a` is
+            json.dumps(result["positions"], allow_nan=False)  # a strict encoder agrees
+
+    def test_all_non_finite_rows_return_none(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_eeg.set"
+            elec = "sub-01/eeg/sub-01_electrodes.tsv"
+            self._write(d, elec, self._tsv(
+                ("name", "x", "y", "z"), ("A", "NaN", "NaN", "NaN"), ("B", "inf", "0", "0"),
+            ))
+            result, _ = self._run(d, rec, {elec})
             self.assertIsNone(result)
 
     # -- BIDS inheritance ------------------------------------------------------
@@ -11920,6 +11962,49 @@ class TestDuplicateLabelsThroughConvertOne(unittest.TestCase):
         self.assertEqual(positions["Fp1-1"], [-0.03, 0.08, 0.0])
         self.assertEqual(positions["F7"], [-0.07, 0.04, 0.0])
         self.assertIn("Fp1", positions)  # the sidecar's own key is kept
+
+    # -- where a store's electrode positions came from (card ZP1) ---------------
+    #
+    # Real EDF, real `convert_one`, the root `zarr.json` the converter wrote.
+
+    def declare_electrodes(self, files: dict[str, str]) -> None:
+        """A three-channel EDF whose dataset tree holds `files` (path -> body)."""
+        build_labeled_edf(os.path.join(self.repo, self.PRIMARY), ["Fp1", "F7", "Fz"])
+        for rel, body in files.items():
+            os.makedirs(os.path.dirname(os.path.join(self.repo, rel)), exist_ok=True)
+            with open(os.path.join(self.repo, rel), "w", encoding="utf-8") as fh:
+                fh.write(body)
+        self.extra_head_files = set(files)
+
+    def converted_root(self, files: dict[str, str]) -> tuple[str, dict]:
+        """Convert with `files` declared; the root `zarr.json` text and its attributes."""
+        self.declare_electrodes(files)
+        result, out = self.convert(None)
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertNotIn("::warning::could not read", out)
+        path = os.path.join(self.synced_dir, os.path.basename(result["entry"]["zarr"]), "zarr.json")
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        return text, json.loads(text)["attributes"]
+
+    @staticmethod
+    def parse_strictly(text: str) -> dict:
+        """Parse as `JSON.parse` does: a bare `NaN` or `Infinity` token is an error."""
+
+        def refuse(token: str):
+            raise ValueError(f"{token} is not a JSON token")
+
+        return json.loads(text, parse_constant=refuse)
+
+    def test_a_nan_cell_never_reaches_the_store_root(self):
+        """`float("NaN")` parses, and `json.dump` writes a bare `NaN` that `JSON.parse`
+        (the viewer's reader, and the scrub stage's) refuses."""
+        text, attrs = self.converted_root({
+            "sub-01/eeg/sub-01_electrodes.tsv":
+                "name\tx\ty\tz\nFp1\tNaN\t0.08\t0.0\nF7\t-0.07\tinf\t0.0\nFz\t0.0\t0.05\t0.09\n",
+        })
+        self.assertEqual(self.parse_strictly(text)["attributes"], attrs)
+        self.assertEqual(attrs["electrode_positions"], {"Fz": [0.0, 0.05, 0.09]})
 
     def entry_is_published(self, result: dict) -> None:
         """The entry validates inside a real merged index, the way `main`
