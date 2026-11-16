@@ -1092,11 +1092,14 @@ describe("input digest, version 2 (rows of four fields)", () => {
     expect(INPUT_DIGEST_V2_FORMAT).toBe("nemar.input-digest.v2");
     expect(LOCATIONS_NONE).toBe("none");
     for (const vector of DIGEST_V2_VECTORS) {
-      const lines = vector.text.split("\n");
-      expect(lines[0]).toBe(INPUT_DIGEST_V2_FORMAT);
-      expect(lines.at(-1)).toBe("");
-      expect(lines.length).toBe(vector.rows.length + 2);
-      for (const line of lines.slice(1, -1)) expect(line.split("\t").length).toBe(4);
+      // The file's text and the text the module writes for the same rows are both checked.
+      for (const text of [vector.text, inputDigestV2Text(vector.rows)]) {
+        const lines = text.split("\n");
+        expect(lines[0]).toBe(INPUT_DIGEST_V2_FORMAT);
+        expect(lines.at(-1)).toBe("");
+        expect(lines.length).toBe(vector.rows.length + 2);
+        for (const line of lines.slice(1, -1)) expect(line.split("\t").length).toBe(4);
+      }
     }
   });
 
@@ -1120,7 +1123,17 @@ describe("input digest, version 2 (rows of four fields)", () => {
         content_sha256,
       }));
       expect(await inputDigestV2(vector.rows)).not.toBe(await inputDigest(rowsV1));
-      expect(vector.text.split("\n")[0]).toBe("nemar.input-digest.v2");
+      // The version 2 text is the header and then each row's version 1 line with a field added: the
+      // header is what keeps the two from ever being the same bytes, and without it the first line
+      // of a version 2 text would be a row.
+      const v2Lines = inputDigestV2Text(vector.rows).split("\n");
+      expect(v2Lines[0]).toBe("nemar.input-digest.v2");
+      const v1Text = v2Lines
+        .slice(1)
+        .map((line) => line.split("\t").slice(0, 3).join("\t"))
+        .join("\n");
+      expect(`sha256:${sha256Of(v1Text)}`).toBe(await inputDigest(rowsV1));
+      expect(inputDigestV2Text(vector.rows)).not.toBe(v1Text);
     }
     // Version 1 does not read a locations field at all.
     const one = DIGEST_V2_VECTORS[0].rows[0];
