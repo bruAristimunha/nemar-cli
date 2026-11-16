@@ -8137,6 +8137,23 @@ def _most_specific_sidecars(
     return sorted((c for c in candidates if c[:2] == best), key=lambda c: c[3])
 
 
+# File sets `electrode_positions_for` has already warned about in this process. One
+# inherited file reaches every recording of a dataset, and a line per recording would
+# bury the log (GitHub also caps annotations). Keyed by the sorted file paths, so the
+# first warning names the first recording.
+_ELECTRODE_WARNED: set[tuple[str, ...]] = set()
+
+
+def _warn_electrode_once(paths: list[str], message: str) -> None:
+    """Print `::warning::<message>` once per process for this set of files. `message`
+    names files and recordings with `repr`, so no name can start a log line."""
+    key = tuple(sorted(paths))
+    if key in _ELECTRODE_WARNED:
+        return
+    _ELECTRODE_WARNED.add(key)
+    print(f"::warning::{message}", flush=True)
+
+
 def electrode_positions_for(
     repo_dir: str, primary_path: str, head_files: set[str], head: str
 ) -> dict | None:
@@ -8148,7 +8165,7 @@ def electrode_positions_for(
     the last by path). `space`, the entity that names the coordinate system, is the one
     entity not compared with the recording's and not counted. If the most specific files
     hold more than one distinct `space` value (a file with none counts as a value), the
-    recording has two coordinate systems and the converter does not choose: it prints one
+    recording has two coordinate systems and the converter does not choose: it prints a
     `::warning::` naming those files and returns None.
 
     The coordsystem: `_coordsystem.json` is resolved the same way, among only the files
@@ -8162,9 +8179,15 @@ def electrode_positions_for(
     case or sign) gives no position: a non-finite number would reach the store's root
     `zarr.json` as a bare token that `JSON.parse` refuses.
 
-    An applicable electrodes file that cannot be read prints one `::warning::` naming
-    it and the recording, and gives no positions: that is a failure, not a dataset
-    that declares none. An empty file, or one with no valid row, gives none quietly.
+    An applicable electrodes file that cannot be read prints a `::warning::` naming it
+    and the recording, and gives no positions: that is a failure, not a dataset that
+    declares none. An empty file, or one with no valid row, gives none quietly.
+
+    Each warning is given once per process for its set of files (`_warn_electrode_once`),
+    naming the first recording it was met for: one inherited file reaches every
+    recording of a dataset, and a line per recording would bury the log. File and
+    recording names are printed with `repr`, so a newline in a name cannot start a line
+    of its own (GitHub reads a line that starts with `::` as a workflow command).
 
     Returns ``{"positions": {label: [x, y, z]}, "coordinate_system": str,
     "coordinate_units": str, "positions_source": "subject" | "dataset",
@@ -8182,11 +8205,12 @@ def electrode_positions_for(
     if not most_specific:
         return None
     if len({space for _, _, space, _ in most_specific}) > 1:
-        print(
-            f"::warning::{', '.join(repr(path) for _, _, _, path in most_specific)} all "
-            f"apply to {primary_path!r} with different coordinate systems (space "
-            f"entities); no electrode positions are embedded",
-            flush=True,
+        paths = [path for _, _, _, path in most_specific]
+        _warn_electrode_once(
+            paths,
+            f"{', '.join(repr(path) for path in paths)} all apply to {primary_path!r} "
+            f"with different coordinate systems (space entities); no electrode "
+            f"positions are embedded",
         )
         return None
     _, _, elec_space, elec_path = most_specific[-1]
@@ -8195,10 +8219,10 @@ def electrode_positions_for(
         # NOT the same as "this dataset declares no positions": an electrodes file
         # that applies is present at HEAD and we failed to read it. Same wording as
         # the channels file's warning in `convert_one`.
-        print(
-            f"::warning::could not read {elec_path!r}; electrode positions are NOT "
-            f"embedded for {primary_path!r}",
-            flush=True,
+        _warn_electrode_once(
+            [elec_path],
+            f"could not read {elec_path!r}; electrode positions are NOT embedded for "
+            f"{primary_path!r}",
         )
         return None
     if not elec_text:

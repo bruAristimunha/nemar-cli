@@ -1453,6 +1453,11 @@ class TestEventDescriptionsFor(unittest.TestCase):
 class TestElectrodePositionsFor(unittest.TestCase):
     """Tests for electrode_positions_for -- TSV parsing, BIDS inheritance, coordsystem."""
 
+    def setUp(self):
+        # Warnings are given once per process per file set: each test starts unwarned.
+        generate_zarr._ELECTRODE_WARNED.clear()
+        self.addCleanup(generate_zarr._ELECTRODE_WARNED.clear)
+
     def _write(self, root: str, rel: str, body: str) -> None:
         p = os.path.join(root, rel)
         os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -2022,6 +2027,29 @@ class TestElectrodePositionsFor(unittest.TestCase):
             self.assertEqual(len(warnings), 1, warnings)
             self.assertIn(elec, warnings[0])
             self.assertIn(self.REC, warnings[0])
+
+    def test_a_warning_is_given_once_per_file_set_and_names_the_first_recording(self):
+        """One inherited file reaches every recording of a dataset: one line per
+        recording would bury the log (and GitHub caps annotations)."""
+        recs = ["sub-01/eeg/sub-01_task-rest_eeg.edf", "sub-02/eeg/sub-02_task-rest_eeg.edf"]
+        cases = {
+            "two coordinate systems": {"space-A_electrodes.tsv", "space-B_electrodes.tsv"},
+            "an unreadable file": {"electrodes.tsv"},
+        }
+        for name, head in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as d:
+                first, first_warnings = self._run(d, recs[0], head)
+                again, again_warnings = self._run(d, recs[1], head)
+                self.assertIsNone(first)
+                self.assertIsNone(again)  # the refusal stands for every recording
+                self.assertEqual(len(first_warnings), 1, first_warnings)
+                self.assertIn(recs[0], first_warnings[0])
+                self.assertEqual(again_warnings, [])
+        # Another set of files is its own condition and is warned about.
+        with tempfile.TemporaryDirectory() as d:
+            _, warnings = self._run(d, recs[1], {"sub-02/eeg/sub-02_electrodes.tsv"})
+            self.assertEqual(len(warnings), 1, warnings)
+            self.assertIn(recs[1], warnings[0])
 
     def test_file_names_cannot_forge_a_workflow_command(self):
         """GitHub reads a log line that starts with `::` as a workflow command, and a
