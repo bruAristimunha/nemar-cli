@@ -1453,6 +1453,11 @@ class TestEventDescriptionsFor(unittest.TestCase):
 class TestElectrodePositionsFor(unittest.TestCase):
     """Tests for electrode_positions_for -- TSV parsing, BIDS inheritance, coordsystem."""
 
+    def setUp(self):
+        # Warnings are given once per process per file set: each test starts unwarned.
+        generate_zarr._ELECTRODE_WARNED.clear()
+        self.addCleanup(generate_zarr._ELECTRODE_WARNED.clear)
+
     def _write(self, root: str, rel: str, body: str) -> None:
         p = os.path.join(root, rel)
         os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -1464,6 +1469,32 @@ class TestElectrodePositionsFor(unittest.TestCase):
 
     def _tsv(self, *rows: tuple) -> str:
         return "\n".join("\t".join(str(c) for c in row) for row in rows) + "\n"
+
+    REC = "sub-01/eeg/sub-01_task-rest_eeg.edf"
+
+    def _elec(self, label: str) -> str:
+        """An electrodes file holding one electrode, named `label`."""
+        return self._tsv(("name", "x", "y", "z"), (label, 1.0, 2.0, 3.0))
+
+    def _put(self, root: str, rels: list[str]) -> set[str]:
+        """Write one electrodes file or coordsystem file per path, and return the
+        head file set. Each electrodes file holds a single electrode named for its
+        file, so a result says which file it came from; each coordsystem file names
+        its own file as its system."""
+        for rel in rels:
+            if rel.endswith("_coordsystem.json"):
+                self._write_json(
+                    root, rel, {"EEGCoordinateSystem": rel, "EEGCoordinateUnits": "mm"}
+                )
+            else:
+                self._write(root, rel, self._elec(rel))
+        return set(rels)
+
+    def _run(self, root: str, rec: str, head: set[str]) -> tuple[dict | None, list[str]]:
+        """`electrode_positions_for` and the `::warning::` lines it printed."""
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            result = electrode_positions_for(root, rec, head, "HEAD")
+        return result, [ln for ln in out.getvalue().splitlines() if ln.startswith("::warning::")]
 
     # -- TSV parsing -----------------------------------------------------------
 
@@ -1571,6 +1602,42 @@ class TestElectrodePositionsFor(unittest.TestCase):
             self._write(d, "sub-01/eeg/sub-01_electrodes.tsv", tsv)
             head = {"sub-01/eeg/sub-01_electrodes.tsv"}
             result = electrode_positions_for(d, rec, head, "HEAD")
+            self.assertIsNone(result)
+
+    # -- non-finite cells ------------------------------------------------------
+
+    NON_FINITE_CELLS = (
+        "NaN", "nan", "NAN", "-nan", "inf", "-inf", "+inf", "INF", "Infinity",
+        "-Infinity", "1e999", "-1e999",
+    )
+
+    def test_non_finite_cells_are_skipped_like_na(self):
+        """`float()` parses `NaN` and the infinities, and `json.dump` then writes a
+        bare token that `JSON.parse` refuses. A cell that is not a finite number,
+        in any of the three coordinates, gives no position, exactly as `n/a` does."""
+        rows = [("Cz", "0.0", "0.0", "88.0")]
+        for cell in self.NON_FINITE_CELLS:
+            rows.append((f"x:{cell}", cell, "2.0", "3.0"))
+            rows.append((f"y:{cell}", "1.0", cell, "3.0"))
+            rows.append((f"z:{cell}", "1.0", "2.0", cell))
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_eeg.set"
+            elec = "sub-01/eeg/sub-01_electrodes.tsv"
+            self._write(d, elec, self._tsv(("name", "x", "y", "z"), *rows))
+            result, warnings = self._run(d, rec, {elec})
+            self.assertIsNotNone(result)
+            self.assertEqual(result["positions"], {"Cz": [0.0, 0.0, 88.0]})
+            self.assertEqual(warnings, [])  # skipped quietly, as `n/a` is
+            json.dumps(result["positions"], allow_nan=False)  # a strict encoder agrees
+
+    def test_all_non_finite_rows_return_none(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_eeg.set"
+            elec = "sub-01/eeg/sub-01_electrodes.tsv"
+            self._write(d, elec, self._tsv(
+                ("name", "x", "y", "z"), ("A", "NaN", "NaN", "NaN"), ("B", "inf", "0", "0"),
+            ))
+            result, _ = self._run(d, rec, {elec})
             self.assertIsNone(result)
 
     # -- BIDS inheritance ------------------------------------------------------
@@ -1762,6 +1829,320 @@ class TestElectrodePositionsFor(unittest.TestCase):
             self.assertAlmostEqual(result["positions"]["FP1"][0], 80.784)
             self.assertEqual(result["coordinate_system"], "EEGLAB")
             self.assertEqual(result["coordinate_units"], "mm")
+
+    # -- the `space` entity ----------------------------------------------------
+    #
+    # BIDS names electrodes and coordsystem files with an optional `space` entity
+    # that names the coordinate system and selects no recording, so a recording
+    # (which has none) must not reject a file for carrying one.
+
+    def test_a_space_named_electrodes_file_applies(self):
+        elec = "sub-01/eeg/sub-01_space-CapTrak_electrodes.tsv"
+        cs = "sub-01/eeg/sub-01_space-CapTrak_coordsystem.json"
+        with tempfile.TemporaryDirectory() as d:
+            head = self._put(d, [elec, cs])
+            result, warnings = self._run(d, self.REC, head)
+            self.assertIsNotNone(result)
+            self.assertEqual(set(result["positions"]), {elec})
+            # The pairing found that coordsystem: its system names its own file.
+            self.assertEqual(result["coordinate_system"], cs)
+            self.assertEqual(result["coordinate_units"], "mm")
+            self.assertEqual(warnings, [])
+
+    def test_every_other_entity_is_still_compared(self):
+        """Only `space` is left out of the comparison: another subject or task still
+        rejects the file, whether or not it names a space."""
+        with tempfile.TemporaryDirectory() as d:
+            head = self._put(d, [
+                "sub-01/eeg/sub-02_space-CapTrak_electrodes.tsv",
+                "sub-01/eeg/sub-01_task-other_space-CapTrak_electrodes.tsv",
+            ])
+            result, warnings = self._run(d, self.REC, head)
+            self.assertIsNone(result)
+            self.assertEqual(warnings, [])
+
+    def test_two_most_specific_coordinate_systems_give_no_positions_and_one_warning(self):
+        """Two coordinate systems for one recording is a choice the converter does not
+        make. The most specific files (same directory depth, same entity count with
+        `space` not counted) hold two `space` values, the absence of one counting as
+        a value."""
+        cases = {
+            "two named spaces": [
+                "sub-01/eeg/sub-01_space-CapTrak_electrodes.tsv",
+                "sub-01/eeg/sub-01_space-MNI152NLin2009cAsym_electrodes.tsv",
+            ],
+            "a named space and none": [
+                "sub-01/eeg/sub-01_electrodes.tsv",
+                "sub-01/eeg/sub-01_space-CapTrak_electrodes.tsv",
+            ],
+            "space does not count as an entity": [
+                "sub-01/eeg/sub-01_task-rest_electrodes.tsv",
+                "sub-01/eeg/sub-01_task-rest_space-CapTrak_electrodes.tsv",
+            ],
+        }
+        for name, files in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as d:
+                head = self._put(d, files)
+                result, warnings = self._run(d, self.REC, head)
+                self.assertIsNone(result)
+                self.assertEqual(len(warnings), 1, warnings)
+                self.assertIn(self.REC, warnings[0])
+                for f in files:
+                    self.assertIn(f, warnings[0])
+
+    def test_a_more_specific_file_beats_a_space_file_without_a_warning(self):
+        """Ambiguity is judged among the MOST specific files only: a `space` file in
+        the subject directory, or with fewer entities, loses to the sibling, and a
+        deeper `space` file beats a root file."""
+        cases = {
+            "shallower directory": (
+                ["sub-01/sub-01_space-CapTrak_electrodes.tsv",
+                 "sub-01/eeg/sub-01_task-rest_electrodes.tsv"],
+                "sub-01/eeg/sub-01_task-rest_electrodes.tsv",
+            ),
+            "fewer entities": (
+                ["sub-01/eeg/sub-01_space-CapTrak_electrodes.tsv",
+                 "sub-01/eeg/sub-01_task-rest_electrodes.tsv"],
+                "sub-01/eeg/sub-01_task-rest_electrodes.tsv",
+            ),
+            "deeper directory": (
+                ["electrodes.tsv", "sub-01/eeg/sub-01_space-CapTrak_electrodes.tsv"],
+                "sub-01/eeg/sub-01_space-CapTrak_electrodes.tsv",
+            ),
+        }
+        for name, (files, expected) in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as d:
+                head = self._put(d, files)
+                result, warnings = self._run(d, self.REC, head)
+                self.assertIsNotNone(result)
+                self.assertEqual(set(result["positions"]), {expected})
+                self.assertEqual(result["positions_file"], expected)
+                self.assertEqual(warnings, [])
+
+    def test_the_same_space_among_the_most_specific_files_takes_the_last_by_path(self):
+        """No two coordinate systems, so no refusal: the base's choice stands."""
+        rec = "sub-01/eeg/sub-01_ses-1_task-rest_eeg.edf"
+        by_ses = "sub-01/eeg/sub-01_ses-1_space-CapTrak_electrodes.tsv"
+        by_task = "sub-01/eeg/sub-01_task-rest_space-CapTrak_electrodes.tsv"
+        with tempfile.TemporaryDirectory() as d:
+            head = self._put(d, [by_ses, by_task])
+            result, warnings = self._run(d, rec, head)
+            self.assertIsNotNone(result)
+            self.assertEqual(result["positions_file"], max(by_ses, by_task))
+            self.assertEqual(warnings, [])
+
+    # -- pairing the coordsystem with the electrodes file ----------------------
+
+    def test_a_coordsystem_with_another_space_is_not_paired(self):
+        elec = "sub-01/eeg/sub-01_space-CapTrak_electrodes.tsv"
+        cases = {
+            "another space": ["sub-01/eeg/sub-01_space-MNI152NLin2009cAsym_coordsystem.json"],
+            "no space, for a space file": ["sub-01/eeg/sub-01_coordsystem.json"],
+        }
+        for name, others in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as d:
+                head = self._put(d, [elec, *others])
+                result, _ = self._run(d, self.REC, head)
+                self.assertIsNotNone(result)
+                self.assertEqual(result["coordinate_system"], "")
+                self.assertEqual(result["coordinate_units"], "")
+                self.assertNotIn("coordsystem_file", result)
+        with self.subTest("a space coordsystem, for a file with no space"), \
+                tempfile.TemporaryDirectory() as d:
+            head = self._put(d, [
+                "sub-01/eeg/sub-01_electrodes.tsv",
+                "sub-01/eeg/sub-01_space-CapTrak_coordsystem.json",
+            ])
+            result, _ = self._run(d, self.REC, head)
+            self.assertEqual(result["coordinate_system"], "")
+            self.assertNotIn("coordsystem_file", result)
+
+    def test_the_paired_coordsystem_wins_over_a_more_specific_one_for_another_space(self):
+        """The restriction comes first: the coordsystem of the chosen file's space is
+        taken even when a file for another space has more entities."""
+        elec = "sub-01/eeg/sub-01_space-CapTrak_electrodes.tsv"
+        paired = "sub-01/eeg/sub-01_space-CapTrak_coordsystem.json"
+        other = "sub-01/eeg/sub-01_task-rest_space-MNI152NLin2009cAsym_coordsystem.json"
+        with tempfile.TemporaryDirectory() as d:
+            head = self._put(d, [elec, paired, other])
+            result, warnings = self._run(d, self.REC, head)
+            self.assertIsNotNone(result)
+            self.assertEqual(result["coordsystem_file"], paired)
+            self.assertEqual(result["coordinate_system"], paired)
+            self.assertEqual(warnings, [])
+
+    def test_a_coordsystem_file_that_gives_no_system_warns_and_is_still_named(self):
+        """Resolved but unusable: the positions stand, the system and units are empty,
+        `coordsystem_file` still names the file (a fact about the dataset), and one
+        warning says why."""
+        elec = "sub-01/eeg/sub-01_electrodes.tsv"
+        cs = "sub-01/eeg/sub-01_coordsystem.json"
+        cases = {
+            "unreadable": (None, "could not read"),
+            "invalid JSON": ("{not json", "is not valid JSON"),
+            "empty": ("", "is not valid JSON"),
+            "not an object": ("[1, 2]", "is not a JSON object"),
+        }
+        for name, (body, wording) in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as d:
+                generate_zarr._ELECTRODE_WARNED.clear()  # the same file path in each case
+                head = self._put(d, [elec])
+                head.add(cs)
+                if body is not None:
+                    self._write(d, cs, body)
+                result, warnings = self._run(d, self.REC, head)
+                self.assertIsNotNone(result)
+                self.assertEqual(set(result["positions"]), {elec})
+                self.assertEqual(result["coordinate_system"], "")
+                self.assertEqual(result["coordinate_units"], "")
+                self.assertEqual(result["coordsystem_file"], cs)
+                self.assertEqual(len(warnings), 1, warnings)
+                self.assertIn(repr(cs), warnings[0])
+                self.assertIn(repr(self.REC), warnings[0])
+                self.assertIn(wording, warnings[0])
+
+    def test_a_usable_coordsystem_file_without_a_system_stays_quiet(self):
+        """A JSON object that names no system is a dataset that declares none."""
+        elec = "sub-01/eeg/sub-01_electrodes.tsv"
+        cs = "sub-01/eeg/sub-01_coordsystem.json"
+        with tempfile.TemporaryDirectory() as d:
+            head = self._put(d, [elec])
+            head.add(cs)
+            self._write_json(d, cs, {"EEGCoordinateUnits": "mm"})
+            result, warnings = self._run(d, self.REC, head)
+            self.assertEqual(result["coordinate_system"], "")
+            self.assertEqual(result["coordinate_units"], "mm")
+            self.assertEqual(warnings, [])
+
+    # -- where the positions came from -----------------------------------------
+
+    def test_the_source_word_follows_the_file_name_not_its_directory(self):
+        """`subject` when the chosen file's NAME carries the `sub` entity, `dataset`
+        otherwise: the directory says nothing (a file in the subject directory named
+        without `sub` is shared, and a root file named for the subject is not)."""
+        cases = [
+            ("sub-01/eeg/sub-01_electrodes.tsv", "subject"),
+            ("sub-01/eeg/sub-01_task-rest_electrodes.tsv", "subject"),
+            ("sub-01/eeg/sub-01_space-CapTrak_electrodes.tsv", "subject"),
+            ("electrodes.tsv", "dataset"),
+            ("space-CapTrak_electrodes.tsv", "dataset"),
+            ("task-rest_electrodes.tsv", "dataset"),
+            ("sub-01/electrodes.tsv", "dataset"),
+            ("sub-01/eeg/space-CapTrak_electrodes.tsv", "dataset"),
+            ("sub-01_electrodes.tsv", "subject"),
+        ]
+        for rel, word in cases:
+            with self.subTest(rel), tempfile.TemporaryDirectory() as d:
+                head = self._put(d, [rel])
+                result, _ = self._run(d, self.REC, head)
+                self.assertIsNotNone(result)
+                self.assertEqual(result["positions_source"], word)
+                self.assertEqual(result["positions_file"], rel)
+
+    def test_the_coordsystem_path_is_given_only_when_one_resolved(self):
+        elec = "sub-01/eeg/sub-01_electrodes.tsv"
+        cs = "sub-01/eeg/sub-01_coordsystem.json"
+        with tempfile.TemporaryDirectory() as d:
+            result, _ = self._run(d, self.REC, self._put(d, [elec, cs]))
+            self.assertEqual(result["coordsystem_file"], cs)
+            self.assertEqual(result["positions_file"], elec)
+        with tempfile.TemporaryDirectory() as d:
+            result, _ = self._run(d, self.REC, self._put(d, [elec]))
+            self.assertNotIn("coordsystem_file", result)
+            self.assertEqual(result["coordinate_system"], "")
+
+    # -- an applicable file that cannot be read --------------------------------
+
+    def test_an_unreadable_applicable_electrodes_file_warns_once(self):
+        """Listed at the head but neither on disk nor in a repository: that is not a
+        dataset that declares no positions, so it must not look like one."""
+        elec = "sub-01/eeg/sub-01_electrodes.tsv"
+        with tempfile.TemporaryDirectory() as d:
+            result, warnings = self._run(d, self.REC, {elec})
+            self.assertIsNone(result)
+            self.assertEqual(len(warnings), 1, warnings)
+            self.assertIn(elec, warnings[0])
+            self.assertIn(self.REC, warnings[0])
+
+    def test_a_warning_is_given_once_per_file_set_and_names_the_first_recording(self):
+        """One inherited file reaches every recording of a dataset: one line per
+        recording would bury the log (and GitHub caps annotations)."""
+        recs = ["sub-01/eeg/sub-01_task-rest_eeg.edf", "sub-02/eeg/sub-02_task-rest_eeg.edf"]
+        cases = {
+            "two coordinate systems": {"space-A_electrodes.tsv", "space-B_electrodes.tsv"},
+            "an unreadable file": {"electrodes.tsv"},
+        }
+        for name, head in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as d:
+                first, first_warnings = self._run(d, recs[0], head)
+                again, again_warnings = self._run(d, recs[1], head)
+                self.assertIsNone(first)
+                self.assertIsNone(again)  # the refusal stands for every recording
+                self.assertEqual(len(first_warnings), 1, first_warnings)
+                self.assertIn(recs[0], first_warnings[0])
+                self.assertEqual(again_warnings, [])
+        # Another set of files is its own condition and is warned about.
+        with tempfile.TemporaryDirectory() as d:
+            _, warnings = self._run(d, recs[1], {"sub-02/eeg/sub-02_electrodes.tsv"})
+            self.assertEqual(len(warnings), 1, warnings)
+            self.assertIn(recs[1], warnings[0])
+
+    def test_file_names_cannot_forge_a_workflow_command(self):
+        """GitHub reads a log line that starts with `::` as a workflow command, and a
+        newline or carriage return in a dataset's file name would start one. Names are
+        printed as `repr` does, so each warning stays one line."""
+        forged = "::error::forged"
+        rec = f"sub-01/eeg/sub-01_task-rest\n{forged}_eeg.edf"
+        cases = {
+            "two coordinate systems": (
+                [f"sub-01/eeg/sub-01_space-A\n{forged}_electrodes.tsv",
+                 f"sub-01/eeg/sub-01_space-B\r{forged}_electrodes.tsv"],
+                {},
+            ),
+            "an unreadable electrodes file": (
+                [f"sub-01/eeg/sub-01_space-C\n{forged}_electrodes.tsv"],
+                {},
+            ),
+            # A readable electrodes file; its coordsystem is missing, invalid, or no object.
+            "an unreadable coordsystem file": (
+                [f"sub-01/eeg/sub-01_space-D\n{forged}_electrodes.tsv",
+                 f"sub-01/eeg/sub-01_space-D\n{forged}_coordsystem.json"],
+                {"electrodes": True},
+            ),
+            "an invalid coordsystem file": (
+                [f"sub-01/eeg/sub-01_space-E\r{forged}_electrodes.tsv",
+                 f"sub-01/eeg/sub-01_space-E\r{forged}_coordsystem.json"],
+                {"electrodes": True, "coordsystem": "{"},
+            ),
+            "a coordsystem file that is no object": (
+                [f"sub-01/eeg/sub-01_space-F\n{forged}_electrodes.tsv",
+                 f"sub-01/eeg/sub-01_space-F\n{forged}_coordsystem.json"],
+                {"electrodes": True, "coordsystem": "[]"},
+            ),
+        }
+        for name, (head, on_disk) in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as d:
+                if on_disk.get("electrodes"):
+                    self._write(d, head[0], self._elec("Cz"))
+                if "coordsystem" in on_disk:
+                    self._write(d, head[1], on_disk["coordsystem"])
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    electrode_positions_for(d, rec, set(head), "HEAD")
+                lines = out.getvalue().splitlines()
+                self.assertEqual(len(lines), 1, lines)
+                self.assertTrue(lines[0].startswith("::warning::"), lines)
+                self.assertEqual([ln for ln in lines if ln.startswith("::")], lines)
+
+    def test_no_electrodes_file_and_an_empty_one_stay_quiet(self):
+        elec = "sub-01/eeg/sub-01_electrodes.tsv"
+        with tempfile.TemporaryDirectory() as d:
+            result, warnings = self._run(d, self.REC, set())
+            self.assertIsNone(result)
+            self.assertEqual(warnings, [])
+            self._write(d, elec, "")
+            result, warnings = self._run(d, self.REC, {elec})
+            self.assertIsNone(result)
+            self.assertEqual(warnings, [])
 
 
 class TestKitAndCtf(unittest.TestCase):
@@ -11920,6 +12301,106 @@ class TestDuplicateLabelsThroughConvertOne(unittest.TestCase):
         self.assertEqual(positions["Fp1-1"], [-0.03, 0.08, 0.0])
         self.assertEqual(positions["F7"], [-0.07, 0.04, 0.0])
         self.assertIn("Fp1", positions)  # the sidecar's own key is kept
+
+    # -- where a store's electrode positions came from ---------------------------
+    #
+    # Real EDF, real `convert_one`, the root `zarr.json` the converter wrote.
+
+    ELECTRODE_ATTRS = (
+        "electrode_positions",
+        "electrode_coordinate_system",
+        "electrode_coordinate_units",
+        "electrode_positions_source",
+        "electrode_positions_file",
+        "electrode_coordsystem_file",
+    )
+
+    def declare_electrodes(self, files: dict[str, str]) -> None:
+        """A three-channel EDF whose dataset tree holds `files` (path -> body)."""
+        build_labeled_edf(os.path.join(self.repo, self.PRIMARY), ["Fp1", "F7", "Fz"])
+        for rel, body in files.items():
+            os.makedirs(os.path.dirname(os.path.join(self.repo, rel)), exist_ok=True)
+            with open(os.path.join(self.repo, rel), "w", encoding="utf-8") as fh:
+                fh.write(body)
+        self.extra_head_files = set(files)
+
+    def converted_root(self, files: dict[str, str]) -> tuple[str, dict]:
+        """Convert with `files` declared; the root `zarr.json` text and its attributes."""
+        self.declare_electrodes(files)
+        result, out = self.convert(None)
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertNotIn("::warning::could not read", out)
+        path = os.path.join(self.synced_dir, os.path.basename(result["entry"]["zarr"]), "zarr.json")
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        return text, json.loads(text)["attributes"]
+
+    @staticmethod
+    def parse_strictly(text: str) -> dict:
+        """Parse as `JSON.parse` does: a bare `NaN` or `Infinity` token is an error."""
+
+        def refuse(token: str):
+            raise ValueError(f"{token} is not a JSON token")
+
+        return json.loads(text, parse_constant=refuse)
+
+    def test_a_nan_cell_never_reaches_the_store_root(self):
+        """`float("NaN")` parses, and `json.dump` writes a bare `NaN` that `JSON.parse`
+        (the viewer's reader, and the scrub stage's) refuses."""
+        text, attrs = self.converted_root({
+            "sub-01/eeg/sub-01_electrodes.tsv":
+                "name\tx\ty\tz\nFp1\tNaN\t0.08\t0.0\nF7\t-0.07\tinf\t0.0\nFz\t0.0\t0.05\t0.09\n",
+        })
+        self.assertEqual(self.parse_strictly(text)["attributes"], attrs)
+        self.assertEqual(attrs["electrode_positions"], {"Fz": [0.0, 0.05, 0.09]})
+
+    def test_a_subject_file_says_subject_and_names_its_files(self):
+        elec = "sub-01/eeg/sub-01_electrodes.tsv"
+        cs = "sub-01/eeg/sub-01_coordsystem.json"
+        _, attrs = self.converted_root({
+            elec: "name\tx\ty\tz\nFp1\t-0.03\t0.08\t0.0\nF7\t-0.07\t0.04\t0.0\n",
+            cs: json.dumps({"EEGCoordinateSystem": "CapTrak", "EEGCoordinateUnits": "m"}),
+        })
+        self.assertEqual(attrs["electrode_positions"], {"Fp1": [-0.03, 0.08, 0.0], "F7": [-0.07, 0.04, 0.0]})
+        self.assertEqual(attrs["electrode_coordinate_system"], "CapTrak")
+        self.assertEqual(attrs["electrode_coordinate_units"], "m")
+        self.assertEqual(attrs["electrode_positions_source"], "subject")
+        self.assertEqual(attrs["electrode_positions_file"], elec)
+        self.assertEqual(attrs["electrode_coordsystem_file"], cs)
+        # The three existing attributes keep their place; the new ones follow, in order.
+        written = [k for k in attrs if k in self.ELECTRODE_ATTRS]
+        self.assertEqual(written, list(self.ELECTRODE_ATTRS))
+
+    def test_a_dataset_file_says_dataset_and_has_no_coordsystem_attribute(self):
+        _, attrs = self.converted_root({
+            "space-CapTrak_electrodes.tsv": "name\tx\ty\tz\nFz\t0.0\t0.05\t0.09\n",
+        })
+        self.assertEqual(attrs["electrode_positions"], {"Fz": [0.0, 0.05, 0.09]})
+        self.assertEqual(attrs["electrode_positions_source"], "dataset")
+        self.assertEqual(attrs["electrode_positions_file"], "space-CapTrak_electrodes.tsv")
+        self.assertNotIn("electrode_coordsystem_file", attrs)
+        self.assertEqual(attrs["electrode_coordinate_system"], "")
+        self.assertEqual(attrs["electrode_coordinate_units"], "")
+
+    def test_a_space_file_with_a_nan_cell_reaches_the_store_as_valid_json(self):
+        elec = "sub-01/eeg/sub-01_space-CapTrak_electrodes.tsv"
+        cs = "sub-01/eeg/sub-01_space-CapTrak_coordsystem.json"
+        text, attrs = self.converted_root({
+            elec: "name\tx\ty\tz\nFp1\tNaN\t0.08\t0.0\nF7\t-0.07\tinf\t0.0\nFz\t0.0\t0.05\t0.09\n",
+            cs: json.dumps({"EEGCoordinateSystem": "CapTrak", "EEGCoordinateUnits": "m"}),
+        })
+        # The store root parses the way a browser parses it, whatever the cells said.
+        root = self.parse_strictly(text)["attributes"]
+        self.assertEqual(root, attrs)
+        self.assertEqual(attrs["electrode_positions"], {"Fz": [0.0, 0.05, 0.09]})
+        self.assertEqual(attrs["electrode_coordinate_system"], "CapTrak")
+        self.assertEqual(attrs["electrode_positions_source"], "subject")
+        self.assertEqual(attrs["electrode_positions_file"], elec)
+        self.assertEqual(attrs["electrode_coordsystem_file"], cs)
+
+    def test_no_electrodes_file_writes_no_electrode_attribute(self):
+        _, attrs = self.converted_root({})
+        self.assertEqual([k for k in attrs if k in self.ELECTRODE_ATTRS], [])
 
     def entry_is_published(self, result: dict) -> None:
         """The entry validates inside a real merged index, the way `main`
