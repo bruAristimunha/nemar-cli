@@ -1465,6 +1465,8 @@ class TestElectrodePositionsFor(unittest.TestCase):
     def _tsv(self, *rows: tuple) -> str:
         return "\n".join("\t".join(str(c) for c in row) for row in rows) + "\n"
 
+    REC = "sub-01/eeg/sub-01_task-rest_eeg.edf"
+
     def _run(self, root: str, rec: str, head: set[str]) -> tuple[dict | None, list[str]]:
         """`electrode_positions_for` and the `::warning::` lines it printed."""
         with contextlib.redirect_stdout(io.StringIO()) as out:
@@ -1804,6 +1806,30 @@ class TestElectrodePositionsFor(unittest.TestCase):
             self.assertAlmostEqual(result["positions"]["FP1"][0], 80.784)
             self.assertEqual(result["coordinate_system"], "EEGLAB")
             self.assertEqual(result["coordinate_units"], "mm")
+
+    # -- an applicable file that cannot be read --------------------------------
+
+    def test_an_unreadable_applicable_electrodes_file_warns_once(self):
+        """Listed at the head but neither on disk nor in a repository: that is not a
+        dataset that declares no positions, so it must not look like one."""
+        elec = "sub-01/eeg/sub-01_electrodes.tsv"
+        with tempfile.TemporaryDirectory() as d:
+            result, warnings = self._run(d, self.REC, {elec})
+            self.assertIsNone(result)
+            self.assertEqual(len(warnings), 1, warnings)
+            self.assertIn(elec, warnings[0])
+            self.assertIn(self.REC, warnings[0])
+
+    def test_no_electrodes_file_and_an_empty_one_stay_quiet(self):
+        elec = "sub-01/eeg/sub-01_electrodes.tsv"
+        with tempfile.TemporaryDirectory() as d:
+            result, warnings = self._run(d, self.REC, set())
+            self.assertIsNone(result)
+            self.assertEqual(warnings, [])
+            self._write(d, elec, "")
+            result, warnings = self._run(d, self.REC, {elec})
+            self.assertIsNone(result)
+            self.assertEqual(warnings, [])
 
 
 class TestKitAndCtf(unittest.TestCase):

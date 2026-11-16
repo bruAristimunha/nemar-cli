@@ -8105,6 +8105,10 @@ def electrode_positions_for(
     `inf`, any case or sign) are skipped: a non-finite number would reach the store's
     root `zarr.json` as a bare token that `JSON.parse` refuses.
 
+    An applicable electrodes file that cannot be read prints one `::warning::` naming
+    it and the recording, and gives no positions: that is a failure, not a dataset
+    that declares none. An empty file gives none quietly.
+
     Returns ``{"positions": {label: [x, y, z]}, "coordinate_system": str,
     "coordinate_units": str}`` or None when no `_electrodes.tsv` resolves or it
     contains no valid rows.
@@ -8147,6 +8151,16 @@ def electrode_positions_for(
     if elec_path is None:
         return None
     elec_text = _read_repo_text(repo_dir, head, elec_path)
+    if elec_text is None:
+        # NOT the same as "this dataset declares no positions": an electrodes file
+        # that applies is present at HEAD and we failed to read it. Same wording as
+        # the channels file's warning in `convert_one`.
+        print(
+            f"::warning::could not read {elec_path}; electrode positions are NOT "
+            f"embedded for {primary_path}",
+            flush=True,
+        )
+        return None
     if not elec_text:
         return None
 
