@@ -31,10 +31,34 @@
  * that is not an object), `path`, `group` or `content_sha256` (that field of a row, or for `path` a
  * repeated one). The key functions carry the key field's name, as `validateDerivativeKeyFields`
  * does. Errors from the store content functions carry no field.
+ *
+ * VERSION 2 OF THE INPUT DIGEST (ADR 0123, amendment 2026-11-16). A recipe that hands electrode
+ * positions to eegprep depends on them, and the store content digest holds none, so a Zarr input is
+ * keyed by `inputDigestV2`: rows of four fields, the fourth a store's `nemar.store-locations.v1`
+ * digest (`storeLocationsSha256`) or `none` when the recipe by design handed eegprep no positions
+ * from that store. A Zarr derivative is keyed under version 2 only (the code that writes one
+ * recomputes `inputDigestV2`), and version 1 stays defined, unchanged, because nemar-process records
+ * written before the Python side of version 2 existed state a version 1 digest; no derivative was
+ * ever keyed under version 1. The key keeps `nemar.derivative-key.v1` and its validator: a version 2
+ * digest is a valid `sha256:` input digest, and the header line of each version makes a version 1
+ * text and a version 2 text different bytes. The refusal field `locations` is `inputDigestV2`'s own.
  */
 
 /** The first line of a store content header, and the name of the digest. */
 export const STORE_CONTENT_FORMAT = "nemar.store-content.v1";
+
+/** The first line of a store locations text, and the name of the digest. */
+export const STORE_LOCATIONS_FORMAT = "nemar.store-locations.v1";
+
+/** The first line of a version 2 input digest text, and the name of the digest. */
+export const INPUT_DIGEST_V2_FORMAT = "nemar.input-digest.v2";
+
+/**
+ * The `locations` field of a version 2 input digest row when the recipe by design handed eegprep no
+ * positions from that store. It never means that the store had none: a store without positions has
+ * the digest of the text `storeLocationsText` writes for it.
+ */
+export const LOCATIONS_NONE = "none";
 
 /** The first line of a derivative key's text, and the name of the key. */
 export const DERIVATIVE_KEY_FORMAT = "nemar.derivative-key.v1";
@@ -362,6 +386,9 @@ function rowText(text: unknown, what: string, field: string): string {
  *
  * A BIDS input's digest is not computed here: it is `git:` and the 40 hexadecimal digits of the
  * source commit the dataset version names (`validateDerivativeKeyFields` checks its shape).
+ *
+ * Version 1: a Zarr derivative is keyed by `inputDigestV2` below, which also names the electrode
+ * positions a recipe was handed.
  */
 export async function inputDigest(rows: readonly StoreContentRow[]): Promise<string> {
   if (!Array.isArray(rows) || rows.length === 0) {
@@ -393,6 +420,217 @@ export async function inputDigest(rows: readonly StoreContentRow[]): Promise<str
   }
   const text = lines.map((entry) => entry.line).join("");
   return `sha256:${await sha256Hex(encodeText(text))}`;
+}
+
+// --- Store locations digest (version 2 of the input digest names it) -------------------------
+
+export interface StoreLocationsInput {
+  /** The read group's channel labels in stored order, as `storeContentHeader` takes them. */
+  labels: readonly ChannelText[];
+  /** The store root's attribute object; three of its keys are read, see `storeLocationsText`. */
+  attributes: unknown;
+}
+
+/** Whether a value is an object a JSON reader makes: not null, not a list, not a class instance. */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/** An own property of an object, with null as absent; an inherited name is never read. */
+function ownAttribute(attributes: Record<string, unknown>, key: string): unknown {
+  const value = Object.hasOwn(attributes, key) ? attributes[key] : undefined;
+  return value === null ? undefined : value;
+}
+
+/** A system or units value as text: a string as it is, anything else the empty string. */
+function statedText(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+/**
+ * The three coordinates of a position entry: an array of exactly three numbers, each finite and none
+ * a boolean (a number is `typeof` number; Python's `True` is an `int` and is excluded there too), or
+ * nothing. A number that is not finite as a binary64 has no position: a NaN, an infinity, and an
+ * integer literal so large that `JSON.parse` reads Infinity (Python's `float()` raises
+ * `OverflowError` on it, which the Python side catches for the same answer).
+ */
+function coordinatesOf(entry: unknown): [number, number, number] | undefined {
+  if (!Array.isArray(entry) || entry.length !== 3) return undefined;
+  for (let i = 0; i < 3; i++) {
+    const value: unknown = entry[i];
+    if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  }
+  return entry as [number, number, number];
+}
+
+/**
+ * The 16 lowercase hexadecimal digits of a coordinate as an IEEE-754 binary64, big-endian, as
+ * `rateHex` writes a rate. A zero is written as positive zero whatever its sign, because Python
+ * reads the JSON number `-0` as the integer 0 and `-0.0` as negative zero, where `JSON.parse` reads
+ * both as negative zero: without the rule one store would have two digests.
+ */
+function coordinateHex(value: number): string {
+  const view = new DataView(new ArrayBuffer(8));
+  view.setFloat64(0, value === 0 ? 0 : value, false);
+  return hex(new Uint8Array(view.buffer));
+}
+
+/**
+ * The text of a store locations digest, `nemar.store-locations.v1`: what a reader handed eegprep for
+ * one read group, as the store states it (before any unit change, axis change or recentering). The
+ * lines, each ending in a line feed:
+ * the format name; `system` and, after a space, the coordinate system text; `units` and the unit
+ * text; one `position` line per channel in stored order, with after it a space and the 16
+ * hexadecimal digits of each of x, y and z (see `coordinateHex`), or `position` alone.
+ *
+ * Reads exactly three keys of `attributes`, through own-property reads, and a key that is absent or
+ * null is absent: `electrode_positions` (an object of label to `[x, y, z]`), `electrode_coordinate_system`
+ * and `electrode_coordinate_units`. The system and units lines carry text only when positions are
+ * present and the text is a non-empty string; a value that is not a string is the empty string. A
+ * channel gets coordinates only when EVERY channel of the group has a non-empty label (the all-or-none
+ * rule of the store content digest, so an unlabeled group joins nothing), positions are present, they
+ * hold an OWN entry under exactly that label (no case fold, no trimming, no normalization, no
+ * inherited name such as `constructor`), and that entry is three finite numbers (`coordinatesOf`).
+ * Labels are not written: the store content digest of the same group fixes them and their order.
+ *
+ * Not hashed: `electrode_positions_source`, `electrode_positions_file`, `electrode_coordsystem_file`
+ * (the converter's provenance), any other root attribute, and an entry under a label the group does
+ * not have. They do not change what eegprep receives, so a recipe that branches on one must first
+ * change this definition.
+ *
+ * Refused (`DerivativeContractError`, no field): `labels` not a list of at least one entry, or an
+ * entry that is not text, null or undefined; `attributes` not a plain object; positions present and
+ * not a plain object; a system or units text that enters the text and holds a carriage return, a
+ * line feed or a lone surrogate. Text that is dropped is never examined.
+ */
+export function storeLocationsText(input: StoreLocationsInput): string {
+  const labels = input?.labels;
+  if (!Array.isArray(labels) || labels.length === 0) {
+    throw new DerivativeContractError("labels must be a list of at least one entry");
+  }
+  for (let i = 0; i < labels.length; i++) {
+    const label: unknown = labels[i];
+    if (label !== null && label !== undefined && typeof label !== "string") {
+      throw new DerivativeContractError("labels holds an entry that is not text");
+    }
+  }
+  const attributes = input.attributes;
+  if (!isPlainObject(attributes)) {
+    throw new DerivativeContractError("attributes must be an object");
+  }
+  const stated = ownAttribute(attributes, "electrode_positions");
+  if (stated !== undefined && !isPlainObject(stated)) {
+    throw new DerivativeContractError("electrode_positions must be an object");
+  }
+  const positions = stated as Record<string, unknown> | undefined;
+  const system = statedText(ownAttribute(attributes, "electrode_coordinate_system"));
+  const units = statedText(ownAttribute(attributes, "electrode_coordinate_units"));
+
+  const lines = [
+    STORE_LOCATIONS_FORMAT,
+    positions !== undefined && system !== ""
+      ? `system ${headerText(system, "the coordinate system")}`
+      : "system",
+    positions !== undefined && units !== ""
+      ? `units ${headerText(units, "the coordinate units")}`
+      : "units",
+  ];
+  const named = allNonEmpty(labels);
+  for (let c = 0; c < labels.length; c++) {
+    const label = labels[c] as string;
+    const entry =
+      positions !== undefined && named && Object.hasOwn(positions, label)
+        ? positions[label]
+        : undefined;
+    const found = coordinatesOf(entry);
+    lines.push(
+      found
+        ? `position ${coordinateHex(found[0])} ${coordinateHex(found[1])} ${coordinateHex(found[2])}`
+        : "position",
+    );
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+/**
+ * The store locations digest: SHA-256 of `storeLocationsText` as 64 lowercase hexadecimal digits.
+ * A store that states no position still has one (the text of a group with every `position` alone),
+ * which is not `none`: `none` is for a store the recipe handed eegprep no positions from by design.
+ */
+export async function storeLocationsSha256(input: StoreLocationsInput): Promise<string> {
+  return sha256Hex(encodeText(storeLocationsText(input)));
+}
+
+// --- Input digest, version 2 -----------------------------------------------------------------
+
+/**
+ * One store whose group was read in full, as a row of a record's `stores_content`: a
+ * `StoreContentRow` and the store's locations digest, 64 lowercase hexadecimal digits, or exactly
+ * `none` (`LOCATIONS_NONE`).
+ */
+export interface StoreRowV2 extends StoreContentRow {
+  locations: string;
+}
+
+/**
+ * The text a version 2 input digest hashes: `nemar.input-digest.v2` and a line feed, then one line
+ * `path TAB group TAB content_sha256 TAB locations LF` per row, sorted by path in code point order
+ * as in version 1 (`compareBytes`). `locations` is a store locations digest or exactly `none`: the
+ * recipe by design handed eegprep no positions from that store, never "the store had none". The
+ * header line means a version 1 text and a version 2 text are never the same bytes.
+ *
+ * Every refusal of `inputDigest` holds, with the same `field`, and a `locations` that is missing,
+ * not text, or neither shape is refused with the field `locations` (checked after the other fields
+ * of its row). The rows may arrive in any order.
+ */
+export function inputDigestV2Text(rows: readonly StoreRowV2[]): string {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    throw new DerivativeContractError("an input digest needs at least one store", "stores_content");
+  }
+  const lines = rows.map((row, index) => {
+    if (typeof row !== "object" || row === null) {
+      throw new DerivativeContractError(`row ${index} is not an object`, "stores_content");
+    }
+    const path = rowText(row.path, `row ${index} path`, "path");
+    const group = rowText(row.group, `row ${index} group`, "group");
+    if (typeof row.content_sha256 !== "string" || !CONTENT_SHA256_RE.test(row.content_sha256)) {
+      throw new DerivativeContractError(
+        `row ${index} content_sha256 must be 64 lowercase hexadecimal digits`,
+        "content_sha256",
+      );
+    }
+    if (
+      typeof row.locations !== "string" ||
+      (row.locations !== LOCATIONS_NONE && !CONTENT_SHA256_RE.test(row.locations))
+    ) {
+      throw new DerivativeContractError(
+        `row ${index} locations must be none or 64 lowercase hexadecimal digits`,
+        "locations",
+      );
+    }
+    return {
+      path,
+      pathBytes: encoder.encode(path),
+      line: `${path}\t${group}\t${row.content_sha256}\t${row.locations}\n`,
+    };
+  });
+  lines.sort((a, b) => compareBytes(a.pathBytes, b.pathBytes));
+  for (let i = 1; i < lines.length; i++) {
+    if (lines[i].path === lines[i - 1].path) {
+      throw new DerivativeContractError(`the path ${lines[i].path} appears in two rows`, "path");
+    }
+  }
+  return `${INPUT_DIGEST_V2_FORMAT}\n${lines.map((entry) => entry.line).join("")}`;
+}
+
+/**
+ * The input digest of a Zarr input, version 2: `sha256:` and the SHA-256 of `inputDigestV2Text`. A
+ * Zarr derivative is keyed by this and by no other input digest.
+ */
+export async function inputDigestV2(rows: readonly StoreRowV2[]): Promise<string> {
+  return `sha256:${await sha256Hex(encodeText(inputDigestV2Text(rows)))}`;
 }
 
 // --- Derivative key --------------------------------------------------------------------------
