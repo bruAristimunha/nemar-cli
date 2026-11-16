@@ -2023,6 +2023,31 @@ class TestElectrodePositionsFor(unittest.TestCase):
             self.assertIn(elec, warnings[0])
             self.assertIn(self.REC, warnings[0])
 
+    def test_file_names_cannot_forge_a_workflow_command(self):
+        """GitHub reads a log line that starts with `::` as a workflow command, and a
+        newline or carriage return in a dataset's file name would start one. Names are
+        printed as `repr` does, so each warning stays one line."""
+        forged = "::error::forged"
+        rec = f"sub-01/eeg/sub-01_task-rest\n{forged}_eeg.edf"
+        cases = {
+            "two coordinate systems": [
+                f"sub-01/eeg/sub-01_space-A\n{forged}_electrodes.tsv",
+                f"sub-01/eeg/sub-01_space-B\r{forged}_electrodes.tsv",
+            ],
+            "an unreadable electrodes file": [
+                f"sub-01/eeg/sub-01_space-A\n{forged}_electrodes.tsv",
+            ],
+        }
+        for name, head in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as d:
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    result = electrode_positions_for(d, rec, set(head), "HEAD")
+                self.assertIsNone(result)
+                lines = out.getvalue().splitlines()
+                self.assertEqual(len(lines), 1, lines)
+                self.assertTrue(lines[0].startswith("::warning::"), lines)
+                self.assertEqual([ln for ln in lines if ln.startswith("::")], lines)
+
     def test_no_electrodes_file_and_an_empty_one_stay_quiet(self):
         elec = "sub-01/eeg/sub-01_electrodes.tsv"
         with tempfile.TemporaryDirectory() as d:

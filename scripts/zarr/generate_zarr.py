@@ -8183,9 +8183,9 @@ def electrode_positions_for(
         return None
     if len({space for _, _, space, _ in most_specific}) > 1:
         print(
-            f"::warning::{', '.join(path for _, _, _, path in most_specific)} all apply to "
-            f"{primary_path} with different coordinate systems (space entities); no "
-            f"electrode positions are embedded",
+            f"::warning::{', '.join(repr(path) for _, _, _, path in most_specific)} all "
+            f"apply to {primary_path!r} with different coordinate systems (space "
+            f"entities); no electrode positions are embedded",
             flush=True,
         )
         return None
@@ -8196,8 +8196,8 @@ def electrode_positions_for(
         # that applies is present at HEAD and we failed to read it. Same wording as
         # the channels file's warning in `convert_one`.
         print(
-            f"::warning::could not read {elec_path}; electrode positions are NOT "
-            f"embedded for {primary_path}",
+            f"::warning::could not read {elec_path!r}; electrode positions are NOT "
+            f"embedded for {primary_path!r}",
             flush=True,
         )
         return None
