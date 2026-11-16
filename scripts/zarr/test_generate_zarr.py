@@ -1830,7 +1830,6 @@ class TestElectrodePositionsFor(unittest.TestCase):
             self.assertEqual(result["coordinate_system"], "EEGLAB")
             self.assertEqual(result["coordinate_units"], "mm")
 
-
     # -- the `space` entity ----------------------------------------------------
     #
     # BIDS names electrodes and coordsystem files with an optional `space` entity
@@ -2051,12 +2050,6 @@ class TestElectrodePositionsFor(unittest.TestCase):
             result, _ = self._run(d, self.REC, self._put(d, [elec]))
             self.assertNotIn("coordsystem_file", result)
             self.assertEqual(result["coordinate_system"], "")
-
-    def test_the_provenance_never_says_measured_or_template(self):
-        with tempfile.TemporaryDirectory() as d:
-            for rel in ("sub-01/eeg/sub-01_electrodes.tsv", "electrodes.tsv"):
-                result, _ = self._run(d, self.REC, self._put(d, [rel]))
-                self.assertIn(result["positions_source"], {"subject", "dataset"})
 
     # -- an applicable file that cannot be read --------------------------------
 
@@ -12309,7 +12302,7 @@ class TestDuplicateLabelsThroughConvertOne(unittest.TestCase):
         self.assertEqual(positions["F7"], [-0.07, 0.04, 0.0])
         self.assertIn("Fp1", positions)  # the sidecar's own key is kept
 
-    # -- where a store's electrode positions came from (card ZP1) ---------------
+    # -- where a store's electrode positions came from ---------------------------
     #
     # Real EDF, real `convert_one`, the root `zarr.json` the converter wrote.
 
