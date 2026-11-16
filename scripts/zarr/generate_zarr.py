@@ -8140,7 +8140,7 @@ def _most_specific_sidecars(
 def electrode_positions_for(
     repo_dir: str, primary_path: str, head_files: set[str], head: str
 ) -> dict | None:
-    """BIDS electrode positions for a recording.
+    """BIDS electrode positions for a recording, and where they came from.
 
     Which file (BIDS inheritance, `_sidecar_candidates`): among the `_electrodes.tsv`
     files in the recording's directory or an ancestor whose entities equal the
@@ -8167,7 +8167,14 @@ def electrode_positions_for(
     that declares none. An empty file, or one with no valid row, gives none quietly.
 
     Returns ``{"positions": {label: [x, y, z]}, "coordinate_system": str,
-    "coordinate_units": str}`` or None.
+    "coordinate_units": str, "positions_source": "subject" | "dataset",
+    "positions_file": str, "coordsystem_file": str}`` or None. `positions_source` is
+    `subject` when the electrodes file's NAME carries the `sub` entity and `dataset`
+    when it does not (one file applied to every subject it reaches): where the dataset
+    declares the positions, never whether they were measured (a per-subject file may
+    hold template coordinates), and never a template of the converter's own.
+    `positions_file` is the electrodes file's path in `head_files`; `coordsystem_file`
+    the coordsystem file's, present only when one resolved.
     """
     most_specific = _most_specific_sidecars(
         _sidecar_candidates(primary_path, head_files, "_electrodes.tsv")
@@ -8262,11 +8269,18 @@ def electrode_positions_for(
             except ValueError:
                 pass
 
-    return {
+    found: dict = {
         "positions": positions,
         "coordinate_system": coord_system,
         "coordinate_units": coord_units,
+        "positions_source": (
+            "subject" if "sub" in _bids_entities(filename_stem(elec_path)) else "dataset"
+        ),
+        "positions_file": elec_path,
     }
+    if cs_path is not None:
+        found["coordsystem_file"] = cs_path
+    return found
 
 
 def event_descriptions_for(
@@ -8950,6 +8964,12 @@ def convert_recording(
         )
         embed_root_attr(store_path, "electrode_coordinate_system", electrode_positions["coordinate_system"])
         embed_root_attr(store_path, "electrode_coordinate_units", electrode_positions["coordinate_units"])
+        # Where the dataset declares the positions (never "measured", never a template:
+        # `electrode_positions_for` says why), and the files they came from.
+        embed_root_attr(store_path, "electrode_positions_source", electrode_positions["positions_source"])
+        embed_root_attr(store_path, "electrode_positions_file", electrode_positions["positions_file"])
+        if "coordsystem_file" in electrode_positions:
+            embed_root_attr(store_path, "electrode_coordsystem_file", electrode_positions["coordsystem_file"])
 
 
 # --- Parallel conversion ------------------------------------------------------

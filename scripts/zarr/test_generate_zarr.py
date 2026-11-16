@@ -1825,6 +1825,7 @@ class TestElectrodePositionsFor(unittest.TestCase):
             self.assertEqual(result["coordinate_system"], "EEGLAB")
             self.assertEqual(result["coordinate_units"], "mm")
 
+
     # -- the `space` entity ----------------------------------------------------
     #
     # BIDS names electrodes and coordsystem files with an optional `space` entity
@@ -1911,6 +1912,7 @@ class TestElectrodePositionsFor(unittest.TestCase):
                 result, warnings = self._run(d, self.REC, head)
                 self.assertIsNotNone(result)
                 self.assertEqual(set(result["positions"]), {expected})
+                self.assertEqual(result["positions_file"], expected)
                 self.assertEqual(warnings, [])
 
     def test_the_same_space_among_the_most_specific_files_takes_the_last_by_path(self):
@@ -1922,7 +1924,7 @@ class TestElectrodePositionsFor(unittest.TestCase):
             head = self._put(d, [by_ses, by_task])
             result, warnings = self._run(d, rec, head)
             self.assertIsNotNone(result)
-            self.assertEqual(set(result["positions"]), {max(by_ses, by_task)})
+            self.assertEqual(result["positions_file"], max(by_ses, by_task))
             self.assertEqual(warnings, [])
 
     # -- pairing the coordsystem with the electrodes file ----------------------
@@ -1940,6 +1942,7 @@ class TestElectrodePositionsFor(unittest.TestCase):
                 self.assertIsNotNone(result)
                 self.assertEqual(result["coordinate_system"], "")
                 self.assertEqual(result["coordinate_units"], "")
+                self.assertNotIn("coordsystem_file", result)
         with self.subTest("a space coordsystem, for a file with no space"), \
                 tempfile.TemporaryDirectory() as d:
             head = self._put(d, [
@@ -1948,6 +1951,7 @@ class TestElectrodePositionsFor(unittest.TestCase):
             ])
             result, _ = self._run(d, self.REC, head)
             self.assertEqual(result["coordinate_system"], "")
+            self.assertNotIn("coordsystem_file", result)
 
     def test_the_paired_coordsystem_wins_over_a_more_specific_one_for_another_space(self):
         """The restriction comes first: the coordsystem of the chosen file's space is
@@ -1959,8 +1963,52 @@ class TestElectrodePositionsFor(unittest.TestCase):
             head = self._put(d, [elec, paired, other])
             result, warnings = self._run(d, self.REC, head)
             self.assertIsNotNone(result)
+            self.assertEqual(result["coordsystem_file"], paired)
             self.assertEqual(result["coordinate_system"], paired)
             self.assertEqual(warnings, [])
+
+    # -- where the positions came from -----------------------------------------
+
+    def test_the_source_word_follows_the_file_name_not_its_directory(self):
+        """`subject` when the chosen file's NAME carries the `sub` entity, `dataset`
+        otherwise: the directory says nothing (a file in the subject directory named
+        without `sub` is shared, and a root file named for the subject is not)."""
+        cases = [
+            ("sub-01/eeg/sub-01_electrodes.tsv", "subject"),
+            ("sub-01/eeg/sub-01_task-rest_electrodes.tsv", "subject"),
+            ("sub-01/eeg/sub-01_space-CapTrak_electrodes.tsv", "subject"),
+            ("electrodes.tsv", "dataset"),
+            ("space-CapTrak_electrodes.tsv", "dataset"),
+            ("task-rest_electrodes.tsv", "dataset"),
+            ("sub-01/electrodes.tsv", "dataset"),
+            ("sub-01/eeg/space-CapTrak_electrodes.tsv", "dataset"),
+            ("sub-01_electrodes.tsv", "subject"),
+        ]
+        for rel, word in cases:
+            with self.subTest(rel), tempfile.TemporaryDirectory() as d:
+                head = self._put(d, [rel])
+                result, _ = self._run(d, self.REC, head)
+                self.assertIsNotNone(result)
+                self.assertEqual(result["positions_source"], word)
+                self.assertEqual(result["positions_file"], rel)
+
+    def test_the_coordsystem_path_is_given_only_when_one_resolved(self):
+        elec = "sub-01/eeg/sub-01_electrodes.tsv"
+        cs = "sub-01/eeg/sub-01_coordsystem.json"
+        with tempfile.TemporaryDirectory() as d:
+            result, _ = self._run(d, self.REC, self._put(d, [elec, cs]))
+            self.assertEqual(result["coordsystem_file"], cs)
+            self.assertEqual(result["positions_file"], elec)
+        with tempfile.TemporaryDirectory() as d:
+            result, _ = self._run(d, self.REC, self._put(d, [elec]))
+            self.assertNotIn("coordsystem_file", result)
+            self.assertEqual(result["coordinate_system"], "")
+
+    def test_the_provenance_never_says_measured_or_template(self):
+        with tempfile.TemporaryDirectory() as d:
+            for rel in ("sub-01/eeg/sub-01_electrodes.tsv", "electrodes.tsv"):
+                result, _ = self._run(d, self.REC, self._put(d, [rel]))
+                self.assertIn(result["positions_source"], {"subject", "dataset"})
 
     # -- an applicable file that cannot be read --------------------------------
 
@@ -12148,6 +12196,15 @@ class TestDuplicateLabelsThroughConvertOne(unittest.TestCase):
     #
     # Real EDF, real `convert_one`, the root `zarr.json` the converter wrote.
 
+    ELECTRODE_ATTRS = (
+        "electrode_positions",
+        "electrode_coordinate_system",
+        "electrode_coordinate_units",
+        "electrode_positions_source",
+        "electrode_positions_file",
+        "electrode_coordsystem_file",
+    )
+
     def declare_electrodes(self, files: dict[str, str]) -> None:
         """A three-channel EDF whose dataset tree holds `files` (path -> body)."""
         build_labeled_edf(os.path.join(self.repo, self.PRIMARY), ["Fp1", "F7", "Fz"])
@@ -12186,6 +12243,54 @@ class TestDuplicateLabelsThroughConvertOne(unittest.TestCase):
         })
         self.assertEqual(self.parse_strictly(text)["attributes"], attrs)
         self.assertEqual(attrs["electrode_positions"], {"Fz": [0.0, 0.05, 0.09]})
+
+    def test_a_subject_file_says_subject_and_names_its_files(self):
+        elec = "sub-01/eeg/sub-01_electrodes.tsv"
+        cs = "sub-01/eeg/sub-01_coordsystem.json"
+        _, attrs = self.converted_root({
+            elec: "name\tx\ty\tz\nFp1\t-0.03\t0.08\t0.0\nF7\t-0.07\t0.04\t0.0\n",
+            cs: json.dumps({"EEGCoordinateSystem": "CapTrak", "EEGCoordinateUnits": "m"}),
+        })
+        self.assertEqual(attrs["electrode_positions"], {"Fp1": [-0.03, 0.08, 0.0], "F7": [-0.07, 0.04, 0.0]})
+        self.assertEqual(attrs["electrode_coordinate_system"], "CapTrak")
+        self.assertEqual(attrs["electrode_coordinate_units"], "m")
+        self.assertEqual(attrs["electrode_positions_source"], "subject")
+        self.assertEqual(attrs["electrode_positions_file"], elec)
+        self.assertEqual(attrs["electrode_coordsystem_file"], cs)
+        # The three existing attributes keep their place; the new ones follow, in order.
+        written = [k for k in attrs if k in self.ELECTRODE_ATTRS]
+        self.assertEqual(written, list(self.ELECTRODE_ATTRS))
+
+    def test_a_dataset_file_says_dataset_and_has_no_coordsystem_attribute(self):
+        _, attrs = self.converted_root({
+            "space-CapTrak_electrodes.tsv": "name\tx\ty\tz\nFz\t0.0\t0.05\t0.09\n",
+        })
+        self.assertEqual(attrs["electrode_positions"], {"Fz": [0.0, 0.05, 0.09]})
+        self.assertEqual(attrs["electrode_positions_source"], "dataset")
+        self.assertEqual(attrs["electrode_positions_file"], "space-CapTrak_electrodes.tsv")
+        self.assertNotIn("electrode_coordsystem_file", attrs)
+        self.assertEqual(attrs["electrode_coordinate_system"], "")
+        self.assertEqual(attrs["electrode_coordinate_units"], "")
+
+    def test_a_space_file_with_a_nan_cell_reaches_the_store_as_valid_json(self):
+        elec = "sub-01/eeg/sub-01_space-CapTrak_electrodes.tsv"
+        cs = "sub-01/eeg/sub-01_space-CapTrak_coordsystem.json"
+        text, attrs = self.converted_root({
+            elec: "name\tx\ty\tz\nFp1\tNaN\t0.08\t0.0\nF7\t-0.07\tinf\t0.0\nFz\t0.0\t0.05\t0.09\n",
+            cs: json.dumps({"EEGCoordinateSystem": "CapTrak", "EEGCoordinateUnits": "m"}),
+        })
+        # The store root parses the way a browser parses it, whatever the cells said.
+        root = self.parse_strictly(text)["attributes"]
+        self.assertEqual(root, attrs)
+        self.assertEqual(attrs["electrode_positions"], {"Fz": [0.0, 0.05, 0.09]})
+        self.assertEqual(attrs["electrode_coordinate_system"], "CapTrak")
+        self.assertEqual(attrs["electrode_positions_source"], "subject")
+        self.assertEqual(attrs["electrode_positions_file"], elec)
+        self.assertEqual(attrs["electrode_coordsystem_file"], cs)
+
+    def test_no_electrodes_file_writes_no_electrode_attribute(self):
+        _, attrs = self.converted_root({})
+        self.assertEqual([k for k in attrs if k in self.ELECTRODE_ATTRS], [])
 
     def entry_is_published(self, result: dict) -> None:
         """The entry validates inside a real merged index, the way `main`
