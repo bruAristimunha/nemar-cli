@@ -19,9 +19,13 @@
 --
 -- STATES. `copying`: the row is made and its files are being copied, `copied` of `object_count` so far.
 -- `stored`: every file is copied and checked and `derivative.json` is written (`stored_at` is set).
--- `failed`: the copy could not be trusted, and `failure` says which word; the objects it had copied are
--- deleted and `copied` is set back to 0 once none is left. `expired`: the objects are gone and the row stays
--- for the record.
+-- `failed`: the copy could not be trusted, and `failure` says which word. `expired`: the retention date
+-- passed (or the dataset was deleted) and the row stays for the record. A `failed` or `expired` row is
+-- marked FIRST, in one guarded statement, and its objects are deleted afterwards in bounded batches: so a
+-- promotion, which needs a `stored` row, can never meet a row whose objects are going. While a row is
+-- `failed` or `expired`, `copied` is the number of objects that may still stand under its prefix (set to
+-- `object_count` when it is marked, an upper bound that a crash between a copy and its count cannot
+-- undercount), counted down as they are deleted and 0 when none is left.
 --
 -- RETENTION. `canary` (the start of every row) expires 30 days after `stored_at`; `catalog` is kept until a
 -- later `catalog` row of the same dataset, recipe, input and profile is promoted, then `superseded_at` is set
@@ -31,12 +35,14 @@
 -- A `published` row is deliberately NOT forbidden an `expires_at`: the code that expires rows never touches a
 -- `published` one, and the guard in it is held by a test that gives a `published` row a past date.
 --
--- THE SCAN CURSOR. A succeeded stamp that cannot be keyed (its record states no digest, or fails a check of
--- the ADR) writes no row, so a candidate query that asks for "stamps with no row" would meet it again at every
--- call, and a wall of them (every record written before the recipe computed version 2 of the input digest)
--- would use the whole subrequest budget of a call and starve the stamps behind it. `compute_derivative_scan`
--- is one row that holds the highest stamp id the scan has decided; a stamp whose records could not be read
--- (a transient fault) is not decided and is met again. Resetting the cursor is a statement an owner runs.
+-- THE SKIP LOG. A succeeded stamp that cannot be keyed (its record states no digest, or fails a check of the
+-- ADR) writes NO `compute_derivatives` row, so a candidate query that asks for "stamps with no row" would meet
+-- it again at every call, and a wall of them (every record written before the recipe computed version 2 of
+-- the input digest) would use the whole subrequest budget of a call and starve the stamps behind it.
+-- `compute_derivative_skips` holds one row per stamp the scan has decided without making a derivative: the
+-- fixed word that decided it (the `derivative_unkeyable` word, or `duplicate_key` for a second stamp that
+-- reads what a first one did). A stamp whose records could not be read (a transient fault) is not decided and
+-- is met again. A record is immutable, so a decision is final; an owner who fixes the code deletes the rows.
 --
 -- Every CHECK is named, a numeric column is checked with `typeof(...) = 'integer'`, every term is TRUE or
 -- FALSE and never NULL (as 0117 requires: a CHECK passes on NULL), and every GLOB is at most 50 characters
@@ -116,19 +122,18 @@ CREATE INDEX compute_derivatives_dataset ON compute_derivatives (dataset_id, cre
 CREATE INDEX compute_derivatives_catalog ON compute_derivatives (dataset_id, recipe, input, profile)
   WHERE retention = 'catalog';
 
--- What the sync works on: rows still copying, rows due, and failed rows with objects left to delete.
+-- What the sync works on: rows still copying, rows due, and failed or expired rows with objects left to delete.
 CREATE INDEX compute_derivatives_copying ON compute_derivatives (created_at) WHERE state = 'copying';
 CREATE INDEX compute_derivatives_due ON compute_derivatives (expires_at)
   WHERE expires_at IS NOT NULL AND state IN ('copying', 'stored');
 CREATE INDEX compute_derivatives_cleanup ON compute_derivatives (created_at)
-  WHERE state = 'failed' AND copied > 0;
+  WHERE state IN ('failed', 'expired') AND copied > 0;
 
--- The scan cursor: one row, the highest succeeded-stamp id the scan has decided (see above).
-CREATE TABLE compute_derivative_scan (
-  id INTEGER PRIMARY KEY NOT NULL CONSTRAINT compute_derivative_scan_id CHECK (id = 1),
-  stamp_id INTEGER NOT NULL CONSTRAINT compute_derivative_scan_stamp CHECK (
-    typeof(stamp_id) = 'integer' AND stamp_id >= 0),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+-- The skip log: one row per stamp decided without a derivative (see above).
+CREATE TABLE compute_derivative_skips (
+  stamp_id INTEGER PRIMARY KEY NOT NULL CONSTRAINT compute_derivative_skips_stamp CHECK (
+    typeof(stamp_id) = 'integer' AND stamp_id >= 1),
+  word TEXT NOT NULL CONSTRAINT compute_derivative_skips_word CHECK (
+    length(word) BETWEEN 1 AND 64 AND word NOT GLOB '*[^a-z0-9_]*'),
+  decided_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-
-INSERT INTO compute_derivative_scan (id, stamp_id) VALUES (1, 0);
