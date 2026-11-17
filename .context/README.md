@@ -51,6 +51,7 @@ Trust these for how things work today.
 | [epic_browser_compute_state.md](epic_browser_compute_state.md) | The live map of the in-browser compute epic across osa, eegprep, nemar-cli and website: what is decided, what blocks what, what is still open. | public |
 | [epic_email_cloudflare.md](epic_email_cloudflare.md) | The live map of the email epic (#1893): moving all NEMAR mail to the Cloudflare Email Service, what is decided (ADR 0110), the phases and what is still open. | public |
 | [eegprep_lean_contract.md](eegprep_lean_contract.md) | What `eegprep-lean` will guarantee and where it deliberately differs from eegprep. The deliverable ADR 0069 names; drafted before the package exists. | public |
+| [brainlife-indexing.md](brainlife-indexing.md) | Plan and handoff for making NEMAR an indexed source on Brainlife (#2195): decisions, verified findings, eligibility rule, next actions. Waiting on the Brainlife maintainers. | public |
 | [ideas.md](ideas.md) | Exploratory design notes. Frequently rewritten; promote settled items to an ADR. | public |
 | [research.md](research.md) | Prior art from the `nemar-tools` scripts. Describes the **pre-NEMAR** Zenodo flow; DOIs are EZID now (ADR 0007). | public |
 
