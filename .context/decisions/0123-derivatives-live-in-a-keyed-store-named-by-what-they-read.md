@@ -150,3 +150,10 @@ This ADR is still `proposed`, no derivative and no key exists outside tests, and
 The 2026-11-14 text above is kept word for word so that it stays findable, and its closing sentence points here.
 This amendment is the single exception to the Consequences sentence "A change is therefore a new format name (`v2`) and a new ADR": it keeps the new format names, `nemar.store-locations.v1` and `nemar.input-digest.v2`, and not the new ADR, on the owner's decision of 2026-11-16 (Q49, D3) cited above.
 The rule in Consequences governs every later change: a change is a new format name and a new ADR, including a change to either definition above.
+
+## Amendment 2026-11-17 (owner decisions Q68 A and Q69 A): each environment binds its own derivatives bucket, reached with that environment's compute R2 token
+
+Decision 1's bucket is bound as `COMPUTE_DERIVATIVES`, with its name in `COMPUTE_DERIVATIVES_BUCKET_NAME`: `nemar-compute-derivatives` for production and `nemar-compute-derivatives-dev` for the dev Worker, never one bucket for both.
+Each is private (no r2.dev access, no custom domain) and carries no lifecycle rule that deletes objects, because Cloudflare's default abort of incomplete multipart uploads is the only rule, retention is the store's code, and a deletion rule would delete a `published` derivative.
+The copy from the results bucket is signed with the environment's existing compute key pair (`COMPUTE_R2_ACCESS_KEY_ID` and `COMPUTE_R2_SECRET_ACCESS_KEY`), whose token the owner extends to that environment's derivatives bucket and no other, so the store has no secret of its own and no address into either bucket is ever signed.
+Binding a bucket turns on no compute: the store reads no switch and keys only a succeeded pipeline stamp, which only a job dispatched while `COMPUTE_ENABLED` is on can produce.
