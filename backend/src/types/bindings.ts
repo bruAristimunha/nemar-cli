@@ -73,8 +73,15 @@ export interface Bindings {
    *  [vars] and in [env.dev.vars] both (variables do not inherit). */
   COMPUTE_RECORDS_BUCKET_NAME?: string;
   COMPUTE_RESULTS_BUCKET_NAME?: string;
+  /** The derivative store's PRIVATE R2 bucket (portable compute, card V1b; ADR 0123 decision 1), reached
+   *  only by this binding and by a server-side copy, never by an address anyone is given. Optional, and
+   *  DARK until the owner creates `nemar-compute-derivatives`, gives the compute R2 token access to it and
+   *  adds both this binding and its name in a reviewed change: with either absent every entry point of the
+   *  store answers `derivatives_unavailable` and writes nothing. */
+  COMPUTE_DERIVATIVES?: R2Bucket;
+  COMPUTE_DERIVATIVES_BUCKET_NAME?: string;
   /** Worker SECRETS, set by the owner: one R2 API token per environment (Object Read & Write on its
-   *  two buckets) and the account endpoint, which is never written in this repository. */
+   *  buckets) and the account endpoint, which is never written in this repository. */
   COMPUTE_R2_ACCESS_KEY_ID?: string;
   COMPUTE_R2_SECRET_ACCESS_KEY?: string;
   COMPUTE_R2_S3_ENDPOINT?: string;
