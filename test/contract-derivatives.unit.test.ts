@@ -1584,12 +1584,23 @@ describe("ADR 0123 states what the module does", () => {
     expect(adr).toContain("it keeps the new format names");
   });
 
-  test("the amendment is a dated section at the end, and decision 3 keeps its 2026-11-14 text", () => {
+  test("the amendment is a dated section after the receipts, every later section is a later amendment, and decision 3 keeps its 2026-11-14 text", () => {
     const heading =
       "## Amendment 2026-11-16 (owner decision Q49, D3): the Zarr input digest names the positions a recipe was handed";
     const at = adr.indexOf(heading);
-    expect(at).toBeGreaterThan(adr.indexOf("## Receipts"));
-    expect(adr.indexOf("\n## ", at + heading.length)).toBe(-1);
+    const receipts = adr.indexOf("## Receipts");
+    expect(receipts).toBeGreaterThan(-1);
+    expect(at).toBeGreaterThan(receipts);
+    // Amendments are appended, never interleaved: every section after the receipts, this one included, is
+    // an amendment dated no earlier than the one before it, so a section of any other kind or an amendment
+    // out of order fails here.
+    const after = adr.slice(receipts + "## Receipts".length).match(/^## .*$/gm) ?? [];
+    let previous = "0000-00-00";
+    for (const section of after) {
+      const date = /^## Amendment (\d{4}-\d{2}-\d{2}) \(/.exec(section)?.[1] ?? "";
+      expect([section, date !== "" && date >= previous]).toEqual([section, true]);
+      previous = date;
+    }
     // The 2026-11-14 sentences of decision 3, word for word, in their order.
     const original = [
       "3. **The input digest names what was read, not what was indexed.**",

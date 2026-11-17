@@ -224,6 +224,20 @@ bucket_name = "nemar-compute-records"
 binding = "COMPUTE_RESULTS"
 bucket_name = "nemar-compute-results"
 
+# The derivative store's PRIVATE bucket (portable compute card V1b, ADR 0123 and its amendment of
+# 2026-11-17). It is reached only by this binding and by a server-side copy from COMPUTE_RESULTS,
+# signed with the compute R2 token named in the secrets comment below, never by an address anyone is
+# given. It carries no lifecycle rule that deletes objects and no public access, both bucket
+# configuration: retention is the store's code, and a deletion rule would delete a `published`
+# derivative. Never shared with [env.dev], which binds its own bucket below. The bucket must exist
+# before the next deploy that carries this binding, or that deploy fails (it exists). The binding
+# alone starts the store's daily production pass, which reads no switch, and turns no compute on:
+# that pass keys only a succeeded pipeline stamp, which only a job dispatched while COMPUTE_ENABLED is
+# on can produce, so it copies nothing until compute runs.
+[[r2_buckets]]
+binding = "COMPUTE_DERIVATIVES"
+bucket_name = "nemar-compute-derivatives"
+
 # Outbound mail (epic #1893, ADR 0110). The Cloudflare Email Service binding.
 # Production sends through it (EMAIL_PROVIDER="cloudflare" below), with Resend as
 # the fallback for quota and account-level refusals only (EMAIL_FALLBACK="resend").
@@ -264,6 +278,7 @@ ENVIRONMENT = "production"
 # each other.
 COMPUTE_RECORDS_BUCKET_NAME = "nemar-compute-records"
 COMPUTE_RESULTS_BUCKET_NAME = "nemar-compute-results"
+COMPUTE_DERIVATIVES_BUCKET_NAME = "nemar-compute-derivatives"
 # Dataset pull-request review (ADR 0092). On in production from 2026-10-13. It lives in this
 # file because `wrangler deploy` drops dashboard-only variables (see [env.dev.vars]).
 # Not a casual switch: once any repository carries the review ruleset (ADR 0107), an unset or 0
@@ -466,10 +481,11 @@ OPENNEURO_MAINTAINER_EMAIL_ENABLED = "false"
 #                           deploy-auth env var -- unset it from the shell before `secret put`, e.g.
 #                           env -u CLOUDFLARE_API_TOKEN npx cfman wrangler --account sccn secret put CLOUDFLARE_API_TOKEN -c backend/wrangler-sccn.toml)
 # Compute gateway storage (epic #2005 phase A3): one R2 API token per environment, Object Read & Write
-# on that environment's two compute buckets (R2 has no write-only or prefix scoping), and the account's
-# S3 endpoint. The owner keeps them in the Infisical folder /backend/compute (dev and prod) and sets
-# them as Worker secrets; names only here, never a value, and the endpoint is not written in this
-# public repository. Dev and production use different tokens.
+# on that environment's three compute buckets (records, results and derivatives; the derivative store
+# reuses this token; R2 has no write-only or prefix scoping), and the account's S3 endpoint. The owner
+# keeps them in the Infisical folder /backend/compute (dev and prod) and sets them as Worker secrets;
+# names only here, never a value, and the endpoint is not written in this public repository. Dev and
+# production use different tokens.
 # - COMPUTE_R2_ACCESS_KEY_ID
 # - COMPUTE_R2_SECRET_ACCESS_KEY
 # - COMPUTE_R2_S3_ENDPOINT
@@ -617,6 +633,13 @@ bucket_name = "nemar-compute-records-dev"
 binding = "COMPUTE_RESULTS"
 bucket_name = "nemar-compute-results-dev"
 
+# The derivative store's bucket for dev (not inherited; see the top-level COMPUTE_DERIVATIVES block). It
+# is the dev worker's own bucket, so the dev worker never reads or writes production's, and it is
+# reached with the dev R2 API token. It exists already.
+[[env.dev.r2_buckets]]
+binding = "COMPUTE_DERIVATIVES"
+bucket_name = "nemar-compute-derivatives-dev"
+
 # Outbound mail for dev (epic #1893, ADR 0110; not inherited from top-level).
 # The Cloudflare Email Service binding the dev worker sends staging mail through
 # when EMAIL_PROVIDER="cloudflare" (see [env.dev.vars]). It is restricted to the
@@ -672,6 +695,7 @@ ENVIRONMENT = "development"
 # The compute buckets' names for dev (variables do not inherit): the same as the bindings' above.
 COMPUTE_RECORDS_BUCKET_NAME = "nemar-compute-records-dev"
 COMPUTE_RESULTS_BUCKET_NAME = "nemar-compute-results-dev"
+COMPUTE_DERIVATIVES_BUCKET_NAME = "nemar-compute-derivatives-dev"
 # Support-ticket retention (ADR 0112): 30 days on staging, matching its raw-mail bucket's lifecycle.
 MAIL_RETENTION_DAYS = "30"
 # Inbound screening (ADR 0113): the same hourly cap per sender address as production.
