@@ -893,6 +893,39 @@ describe("store locations digest (version 2 vectors)", () => {
     expect(vector.labels[2]).toBe(E_PRECOMPOSED);
   });
 
+  test("only own properties are read, even when Object.prototype carries the same names", () => {
+    const withUnits =
+      '"electrode_coordinate_system": "CapTrak", "electrode_coordinate_units": "mm"';
+    // JSON.parse'd, so these objects have no own `Fz` or `electrode_positions` unless the text says so.
+    const noPositions = JSON.parse(`{${withUnits}}`);
+    const emptyPositions = JSON.parse(`{"electrode_positions": {}, ${withUnits}}`);
+    const polluted = (name: string, value: unknown) =>
+      Object.defineProperty(Object.prototype, name, {
+        value,
+        configurable: true,
+        enumerable: false,
+        writable: true,
+      });
+    let withoutOwnPositions = "";
+    let withoutOwnEntry = "";
+    try {
+      polluted("Fz", [1, 2, 3]);
+      polluted("electrode_positions", { Fz: [1, 2, 3] });
+      withoutOwnPositions = storeLocationsText({ labels: ["Fz"], attributes: noPositions });
+      withoutOwnEntry = storeLocationsText({ labels: ["Fz"], attributes: emptyPositions });
+    } finally {
+      Reflect.deleteProperty(Object.prototype, "Fz");
+      Reflect.deleteProperty(Object.prototype, "electrode_positions");
+    }
+    // The inherited positions are not the store's: system and units are bare, no channel joins.
+    expect(withoutOwnPositions).toBe(`${STORE_LOCATIONS_FORMAT}\nsystem\nunits\nposition\n`);
+    // The inherited `Fz` is not an own entry of the store's own positions.
+    expect(withoutOwnEntry).toBe(`${STORE_LOCATIONS_FORMAT}\nsystem CapTrak\nunits mm\nposition\n`);
+    // And the prototype is clean again.
+    expect(Object.hasOwn(Object.prototype, "Fz")).toBe(false);
+    expect(Object.hasOwn(Object.prototype, "electrode_positions")).toBe(false);
+  });
+
   test("system without units: the empty text, a missing one and one that is not text are all bare", () => {
     const vector = locationsVector("system without units");
     expect(vector.text.split("\n").slice(1, 3)).toEqual(["system MNI305", "units"]);
