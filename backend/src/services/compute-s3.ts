@@ -12,6 +12,12 @@
  * `generatePresignedPutUrls` and `generatePresignedGetUrl` of `s3.ts` cannot be used: they hardcode
  * the AWS host.
  *
+ * A THIRD BUCKET, the derivative store's (portable compute, card V1b; ADR 0123): `derivatives`, named by
+ * `COMPUTE_DERIVATIVES_BUCKET_NAME`, which is optional (the store is dark without it). It is addressed by
+ * the same endpoint and the same R2 token as the other two, and it is reached ONLY by `copyObject` (a
+ * server-side copy from the results bucket) and by the Worker's binding: `presignPut` and `presignGet`
+ * refuse it, so no address into it can be made.
+ *
  * THE ENDPOINT. It is `globalThis.NEMAR_COMPUTE_S3_URL` when set, else the Worker secret
  * `COMPUTE_R2_S3_ENDPOINT` (the account endpoint, which is never written in this public repository).
  * `testS3EndpointOverride` is not used, and `S3_ENDPOINT_URL` is never read here: that seam is dead in
@@ -61,13 +67,24 @@ export const COPY_OBJECT_MAX_BYTES = 5 * 1024 ** 3;
 /** The longest key R2 and S3 take, in bytes of UTF-8. */
 export const COMPUTE_KEY_MAX_BYTES = 1024;
 
-export type ComputeBucket = "records" | "results";
+/**
+ * The compute buckets the signer can address. `derivatives` (portable compute, card V1b; ADR 0123) is
+ * reached ONLY by a server-side copy and by the Worker's own binding: no address is ever presigned for it,
+ * so no person's key, no launcher and no node can read or write it (`presignPut` and `presignGet` take a
+ * {@link PresignBucket}, and refuse `derivatives` at run time as well).
+ */
+export type ComputeBucket = "records" | "results" | "derivatives";
+
+/** The buckets an address may be presigned for: never the derivatives bucket. */
+export type PresignBucket = Exclude<ComputeBucket, "derivatives">;
 
 export type ComputeS3ErrorCode =
   | "expiry_invalid"
   | "key_invalid"
   | "digest_invalid"
-  | "copy_failed";
+  | "copy_failed"
+  | "bucket_unbound"
+  | "bucket_not_presignable";
 
 /**
  * A signing or copying error with a fixed code. The message never holds a key, a bucket or a
@@ -77,13 +94,19 @@ export class ComputeS3Error extends Error {
   constructor(
     readonly code: ComputeS3ErrorCode,
     message: string,
+    /** The HTTP status the interface answered with, for a refused copy; a number, never a body. */
+    readonly status?: number,
   ) {
     super(message);
     this.name = "ComputeS3Error";
   }
 }
 
-/** What the signer reads of the environment. All five are needed. */
+/**
+ * What the signer reads of the environment. The first five are needed; the derivatives bucket's name is
+ * optional, and without it the signer still works for the records and results buckets and `derivatives`
+ * is `null` (the store is dark until the owner names its bucket).
+ */
 export type ComputeS3Env = Partial<
   Pick<
     Bindings,
@@ -92,6 +115,7 @@ export type ComputeS3Env = Partial<
     | "COMPUTE_R2_SECRET_ACCESS_KEY"
     | "COMPUTE_RECORDS_BUCKET_NAME"
     | "COMPUTE_RESULTS_BUCKET_NAME"
+    | "COMPUTE_DERIVATIVES_BUCKET_NAME"
   >
 >;
 
@@ -103,6 +127,8 @@ export interface ComputeS3 {
   readonly records: string;
   /** The results bucket's name. */
   readonly results: string;
+  /** The derivatives bucket's name, or null while the owner has not named one. */
+  readonly derivatives: string | null;
 }
 
 const present = (value: string | undefined): value is string =>
@@ -129,6 +155,7 @@ export function computeS3(env: ComputeS3Env): ComputeS3 | null {
   const secretAccessKey = env.COMPUTE_R2_SECRET_ACCESS_KEY;
   const records = env.COMPUTE_RECORDS_BUCKET_NAME;
   const results = env.COMPUTE_RESULTS_BUCKET_NAME;
+  const derivatives = env.COMPUTE_DERIVATIVES_BUCKET_NAME;
   if (
     endpoint === null ||
     !present(accessKeyId) ||
@@ -149,6 +176,15 @@ export function computeS3(env: ComputeS3Env): ComputeS3 | null {
     endpoint,
     records: records.trim(),
     results: results.trim(),
+    // The derivatives bucket is NEVER one of the other two: those are presignable and the results bucket
+    // expires its objects, so a derivative stored there would be readable through an address and lost in 30
+    // days. A name that is the records or the results bucket's own is no name: the store is dark.
+    derivatives:
+      present(derivatives) &&
+      derivatives.trim() !== records.trim() &&
+      derivatives.trim() !== results.trim()
+        ? derivatives.trim()
+        : null,
   };
 }
 
@@ -191,7 +227,12 @@ function encodeKey(key: string): string {
 }
 
 function bucketName(s3: ComputeS3, bucket: ComputeBucket): string {
-  return bucket === "records" ? s3.records : s3.results;
+  if (bucket === "records") return s3.records;
+  if (bucket === "results") return s3.results;
+  if (s3.derivatives === null) {
+    throw new ComputeS3Error("bucket_unbound", "the derivatives bucket has no name");
+  }
+  return s3.derivatives;
 }
 
 /** `<endpoint>/<bucket>/<key, encoded>`: path style, because the bucket is not a host here. */
@@ -248,12 +289,20 @@ function hexToBase64(hex: string): string {
 
 async function presign(
   s3: ComputeS3,
-  bucket: ComputeBucket,
+  bucket: PresignBucket,
   key: string,
   method: "PUT" | "GET",
   options: PresignOptions,
   headers: Record<string, string>,
 ): Promise<Presigned> {
+  // The type already refuses it; a caller that gets round the type is refused here, before anything is
+  // signed: nobody is ever given an address into the derivatives bucket (ADR 0123 decision 1).
+  if ((bucket as ComputeBucket) === "derivatives") {
+    throw new ComputeS3Error(
+      "bucket_not_presignable",
+      "no address is signed for the derivatives bucket",
+    );
+  }
   assertKey(key);
   assertExpiry(options.expiresIn);
   // The expiry is in the URL BEFORE signing, so that it is part of the signature.
@@ -274,7 +323,7 @@ async function presign(
 /** A presigned PUT of one object, valid `expiresIn` seconds, with the checksum header when a digest is given. */
 export async function presignPut(
   s3: ComputeS3,
-  bucket: ComputeBucket,
+  bucket: PresignBucket,
   key: string,
   options: PresignPutOptions,
 ): Promise<Presigned> {
@@ -291,7 +340,7 @@ export async function presignPut(
 /** A presigned GET of one object, valid `expiresIn` seconds. */
 export async function presignGet(
   s3: ComputeS3,
-  bucket: ComputeBucket,
+  bucket: PresignBucket,
   key: string,
   options: PresignOptions,
 ): Promise<Presigned> {
@@ -332,7 +381,11 @@ export async function copyObject(
   }
   const body = await response.text().catch(() => "");
   if (!response.ok) {
-    throw new ComputeS3Error("copy_failed", `the copy was refused with HTTP ${response.status}`);
+    throw new ComputeS3Error(
+      "copy_failed",
+      `the copy was refused with HTTP ${response.status}`,
+      response.status,
+    );
   }
   if (/<Error[\s>]/.test(body)) {
     throw new ComputeS3Error("copy_failed", "the copy answered with an error");

@@ -14,6 +14,7 @@
  *   nemar admin compute observer mint [--json]            mint the observer's one-hour token (admin)
  *   nemar admin compute pipeline run|status ...           run NEMAR's own recipes, or read their stamps (admin; src/commands/admin-compute-pipeline.ts)
  *   nemar admin compute runners register|list|revoke ...  the machines that run jobs for NEMAR (owner; src/commands/admin-compute-runners.ts)
+ *   nemar admin compute derivatives list|show|promote|sync ...  the derivative store of pipeline products (admin; published: owner; src/commands/admin-compute-derivatives.ts)
  *
  * Amounts are service units (SU) as plain decimals with at most three places (`12.5`), and are sent
  * as whole thousandths. Every write sends one fresh `Idempotency-Key`, so within one invocation the
@@ -62,6 +63,7 @@ import {
   putComputePolicy,
 } from "../lib/api/compute.js";
 import { plain } from "../lib/terminal-text.js";
+import { derivativesCommand } from "./admin-compute-derivatives.js";
 import { jobsCommand, observerCommand } from "./admin-compute-jobs.js";
 import { pipelineCommand } from "./admin-compute-pipeline.js";
 import { runnersCommand } from "./admin-compute-runners.js";
@@ -701,7 +703,7 @@ const statusCommand = new Command("status")
   });
 
 export const computeCommand = new Command("compute").description(
-  "The compute gateway: the owner policy, the SU allocation pools, status, jobs and their reports, legal holds, the pipeline, the observer's token (ADR 0118) and the runner registry",
+  "The compute gateway: the owner policy, the SU allocation pools, status, jobs and their reports, legal holds, the pipeline, the observer's token (ADR 0118), the runner registry and the derivative store (ADR 0123)",
 );
 
 computeCommand.addCommand(policyCommand);
@@ -711,3 +713,4 @@ computeCommand.addCommand(observerCommand);
 computeCommand.addCommand(jobsCommand);
 computeCommand.addCommand(pipelineCommand);
 computeCommand.addCommand(runnersCommand);
+computeCommand.addCommand(derivativesCommand);

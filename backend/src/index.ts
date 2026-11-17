@@ -60,6 +60,7 @@ import {
   runComputeAdvanceCron,
   sweepComputeCancellations,
 } from "./services/compute-advance";
+import { derivativesLogLine, runComputeDerivativesCron } from "./services/compute-derivatives";
 import {
   pipelineDispatchLogLine,
   runComputePipelineDispatchCron,
@@ -1512,6 +1513,28 @@ export default {
           .catch((err) =>
             console.error(
               "[compute-retention] sweep failed:",
+              err instanceof Error ? err.name : typeof err,
+            ),
+          ),
+      );
+      // Portable compute (card V1b, ADR 0123): the derivative store's one daily pass. It frees the
+      // `canary` and `catalog` derivatives that are due (the rows stay; a `published` one is never
+      // touched by code), keys the succeeded stamps that have no derivative, and copies at most 100
+      // objects server side from the results bucket into the derivatives bucket. PRODUCTION-ONLY, NOT in
+      // DEV_CRON_ALLOWLIST (it deletes from, and writes to, a private bucket), self-fenced to exact
+      // production, and DARK until the owner binds the derivatives bucket: with no binding it does
+      // nothing and writes nothing. It reads no compute switch, makes no DOI and sends no mail; staging
+      // and the local stack advance the store through the admin route. One line, only when it did something.
+      ctx.waitUntil(
+        runComputeDerivativesCron(env)
+          .then((r) => {
+            const log = r ? derivativesLogLine(r) : null;
+            if (log?.level === "error") console.error(log.line);
+            else if (log) console.log(log.line);
+          })
+          .catch((err) =>
+            console.error(
+              "[compute-derivatives] sweep failed:",
               err instanceof Error ? err.name : typeof err,
             ),
           ),

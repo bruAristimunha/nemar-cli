@@ -33,6 +33,12 @@ export interface DeletionResult {
   deleted: boolean;
   steps: DeletionSteps;
   warnings: string[];
+  /**
+   * How many `published` derivatives of this dataset the derivative store keeps (portable compute, card V1b;
+   * ADR 0123 decision 5). Deleting a dataset expires its `canary` and `catalog` derivatives and NEVER a
+   * `published` one: nothing published is deleted by code, so the owner is told what stays.
+   */
+  published_derivatives_held: number;
 }
 
 /**
@@ -169,8 +175,16 @@ export async function deleteDatasetCascade(
   }
 
   // Step 3: Delete D1 records (batched for atomicity)
+  let publishedDerivativesHeld = 0;
   try {
-    const batchResults = await db.batch([
+    // The count of kept derivatives is read from the batch by the statement that asked for it, never by a
+    // position that the next statement added to the batch would move.
+    const heldDerivatives = db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM compute_derivatives WHERE dataset_id = ? AND retention = 'published'",
+      )
+      .bind(datasetId);
+    const statements = [
       db.prepare("DELETE FROM dataset_versions WHERE dataset_id = ?").bind(datasetId),
       db.prepare("DELETE FROM publication_requests WHERE dataset_id = ?").bind(datasetId),
       db
@@ -204,12 +218,31 @@ export async function deleteDatasetCascade(
       db
         .prepare("DELETE FROM compute_pipeline_stamps WHERE dataset_id = ?")
         .bind(datasetId),
+      // The derivative store (migration 0143, ADR 0123 decision 5): a deleted dataset's `canary` and
+      // `catalog` derivatives are due now (the store's next sync marks them `expired` and deletes their
+      // objects, the rows staying), and its `published` ones are KEPT, never touched by code. The count of
+      // the kept ones is read in the same batch and reported to the owner. The rows have no foreign key.
+      db
+        .prepare(
+          `UPDATE compute_derivatives SET expires_at = datetime('now')
+            WHERE dataset_id = ? AND retention IN ('canary', 'catalog') AND state IN ('copying', 'stored')`,
+        )
+        .bind(datasetId),
+      heldDerivatives,
       db.prepare("DELETE FROM datasets WHERE dataset_id = ?").bind(datasetId),
-    ]);
+    ];
+    const batchResults = await db.batch(statements);
 
     steps.d1.versionsDeleted = batchResults[0].meta.changes ?? 0;
     steps.d1.pubRequestsDeleted = batchResults[1].meta.changes ?? 0;
     steps.d1.s3PermsDeleted = batchResults[3].meta.changes ?? 0;
+    publishedDerivativesHeld = Number(
+      (
+        batchResults[statements.indexOf(heldDerivatives)]?.results?.[0] as
+          | { n?: number }
+          | undefined
+      )?.n ?? 0,
+    );
     steps.d1.success = true;
   } catch (err) {
     steps.d1.error = err instanceof Error ? err.message : String(err);
@@ -237,5 +270,6 @@ export async function deleteDatasetCascade(
       steps.d1.success && steps.github.success && (options.skipS3 || steps.s3.failed.length === 0),
     steps,
     warnings,
+    published_derivatives_held: publishedDerivativesHeld,
   };
 }
