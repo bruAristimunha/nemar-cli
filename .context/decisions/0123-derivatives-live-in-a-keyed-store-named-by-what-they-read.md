@@ -39,6 +39,7 @@ The owner decided on 2026-11-14 that derivatives live in a keyed store with thre
    For a `bids` input it is `git:` and the 40 hexadecimal digits of the source commit the dataset version names.
    `inputDigest` has no digest for no rows, a repeated path, an empty path or group, a tab, carriage return, line feed or lone surrogate in a path or group (a tab would let two different rows give one line), or a `content_sha256` that is not 64 lowercase hexadecimal digits.
    Keying on the index would orphan derivatives at every reconversion; a content digest changes only when a value the recipe read changes.
+   Amended 2026-11-16: a `zarr` input is keyed by `nemar.input-digest.v2`, which adds each store's `nemar.store-locations.v1` digest (see the amendment).
 4. **A store's content digest is `nemar.store-content.v1`, over one channel group of the level-0 array.**
    It is the SHA-256 of a UTF-8 header and then the physical values.
    The header lines, each ending in LF, are `nemar.store-content.v1`; `shape C S`, the decimal channel and sample counts; `rate H`, the 16 lowercase hexadecimal digits of the serving rate as an Institute of Electrical and Electronics Engineers (IEEE) 754 binary64, big-endian; `unit` and the unit; one `label` line per channel in stored order; `data float64-le`.
@@ -97,3 +98,55 @@ The owner decided on 2026-11-14 that derivatives live in a keyed store with thre
 - [ADR 0007](0007-ezid-is-the-sole-doi-provider.md) (EZID is the registrar), [ADR 0027](0027-zarr-dispatch-is-raw-only-derivatives-sourcedata-code-excluded.md) (the serving copy is raw-only), ADR 0118 decision 7 (the results bucket) and ADR 0121 decisions 8 and 9 (a derivative's own home; the recipe records what it read).
 - `shared/contract/derivatives.ts` and `shared/contract/derivatives-vectors.json`: the definitions, eight vectors and a list of refusals, computed with Python `struct`, `hashlib` and NumPy and with Bun `node:crypto`, all equal; computed, not measured on any NEMAR data.
 - The owner's decision of 2026-11-14 on keyed storage and the three retention classes, and the review finding that an index digest orphans derivatives at reconversion.
+- The amendment's vectors (`store_locations`, `input_digest_v2` and their refusals) in `shared/contract/derivatives-vectors.json`, computed in Python and in Bun, equal, and held to a second implementation in Python that `test/contract-derivatives-python.unit.test.ts` runs through `uv`; computed, not measured on any NEMAR data.
+
+## Amendment 2026-11-16 (owner decision Q49, D3): the Zarr input digest names the positions a recipe was handed
+
+Decision 3 above is the 2026-11-14 text and stays as written: it defines version 1 of the input digest.
+From this amendment on, a `zarr` input is keyed by `nemar.input-digest.v2`, which adds to each store's row a digest of the electrode positions the recipe was handed from that store.
+Both texts are defined byte for byte in `shared/contract/derivatives.ts` (`inputDigestV2`, `storeLocationsText` and `storeLocationsSha256`) and held to the vectors `store_locations` and `input_digest_v2` in `shared/contract/derivatives-vectors.json`, which Python and TypeScript must both reproduce.
+
+**Why.**
+Once a recipe hands electrode positions to eegprep, its output depends on them, and the store content digest of decision 4 holds none: positions are root attributes of the store, not values of the channel group that digest describes.
+Three cases then break the promise that a key names what was read.
+
+1. A converter change alone, or a reconversion after the dataset corrected its electrodes file, changes the positions and no value, so the content digest and the key stay, and the first derivative stands over positions that are no longer the store's.
+2. A recording that failed for want of positions is a deterministic failure, which may be keyed; once positions appear, a rerun has the same key and the keyed failure stands.
+3. A recipe whose quality control branches on whether positions exist takes the other branch for the same stores under the same digest once the reader carries positions.
+
+Putting positions into the store content digest was rejected: every reader implements that digest, and every derivative would be re-keyed when only positions changed, including derivatives of recipes that read none.
+A ninth key line (`nemar.derivative-key.v2`) was the second choice and was rejected because the input digest would then no longer name everything the recipe read.
+
+**`nemar.store-locations.v1`** is the SHA-256 of a UTF-8 text, as 64 lowercase hexadecimal digits, over what a reader handed eegprep for one read group.
+The lines, each ending in LF, are `nemar.store-locations.v1`; `system`, and after a space the store's coordinate system text; `units` by the same rule; then one `position` line per channel of the group in stored order, which is `position` and after a space the 16 lowercase hexadecimal digits of each of x, y and z as an IEEE 754 binary64, big-endian (as the rate is written in decision 4), or `position` alone.
+
+- The definition reads exactly three root attributes of the store, `electrode_positions`, `electrode_coordinate_system` and `electrode_coordinate_units`, through own-property reads; a key that is absent or null is absent.
+- The system and units lines carry text only when positions are present and the text is a non-empty string; a value that is not a string counts as the empty string.
+- A channel gets coordinates only when every channel of the group has a non-empty label (the all-or-none rule of decision 4, so an unlabeled group joins nothing), positions are present, they hold an own entry under exactly that label (no case fold, no trimming, no Unicode normalization, no inherited name such as `constructor`), and that entry is an array of exactly three numbers that are finite and none a boolean.
+  Any other entry gives that channel `position` alone.
+- A zero coordinate is written as positive zero, `0000000000000000`, whatever its sign, because Python reads the JSON number `-0` as the integer 0 where `JSON.parse` reads negative zero.
+- A number that is not finite as a binary64 (a NaN, an infinity, or an integer too large for binary64) gives that channel `position` alone and is not a refusal.
+- Coordinates are hashed as the store states them, before any unit change, axis change or recentering: what a reader makes of them is fixed by the reader's and the recipe's versions.
+- Refused, with no digest: labels that are not a list of at least one entry or hold an entry that is neither text nor null; attributes that are not an object; positions that are present and not an object; and a system or units text that enters the text and holds a carriage return, a line feed or a lone surrogate.
+  Text that is dropped is never examined.
+- The converter's provenance attributes `electrode_positions_source`, `electrode_positions_file` and `electrode_coordsystem_file` are not hashed, and neither is any other root attribute or an entry under a label the group does not have.
+  They do not change what eegprep receives, so a recipe that branches on one of them must first change this definition.
+
+**`nemar.input-digest.v2`** is `sha256:` and the SHA-256 of the line `nemar.input-digest.v2` and LF, then one line per store whose group was read in full, `path`, tab, `group`, tab, `content_sha256`, tab, `locations`, LF, sorted by path in code point order exactly as in decision 3.
+`locations` is the store's `nemar.store-locations.v1` digest or exactly `none`, in lowercase.
+`none` means the recipe by design handed eegprep no positions from that store; it never means that the store had none, which is the digest of a text whose every `position` is alone.
+Every refusal of decision 3 holds with the same field, except that a row that is a list is not an object and is refused with the field `stores_content` (version 1 reads a list as an object with no path and names `path`, which no stamp reaches, because the stamp rejects lists first), and a `locations` that is missing, not text, or neither shape is refused with the field `locations`.
+The header line means a version 1 text and a version 2 text are never the same bytes.
+The derivative key keeps `nemar.derivative-key.v1` and its validator, because a version 2 digest is a valid `sha256:` input digest.
+
+**What stays.**
+Nothing of version 1 moves, and version 1 stays defined: `inputDigest`, the store content digest, the key and every earlier vector keep their bytes, and the vectors file gained lines only, because records written before a recipe computes version 2 state a version 1 digest.
+No derivative and no key exists outside tests, and the code that writes a Zarr derivative recomputes `inputDigestV2` and never `inputDigest`, so nothing is keyed under version 1.
+The stamp's coverage check reads only each row's path and the `sha256:` shape of the stated digest, so it does not move.
+
+**Why an amendment and not a new ADR.**
+The decisions index keeps an amendment for a clarification and sends a changed verdict to a new ADR, because an amended verdict is invisible to anyone who read the ADR before.
+This ADR is still `proposed`, no derivative and no key exists outside tests, and the owner decided on 2026-11-16 (Q49, D3: option B, decided before the code that writes a derivative is built) that this is an amendment of decision 3.
+The 2026-11-14 text above is kept word for word so that it stays findable, and its closing sentence points here.
+This amendment is the single exception to the Consequences sentence "A change is therefore a new format name (`v2`) and a new ADR": it keeps the new format names, `nemar.store-locations.v1` and `nemar.input-digest.v2`, and not the new ADR, on the owner's decision of 2026-11-16 (Q49, D3) cited above.
+The rule in Consequences governs every later change: a change is a new format name and a new ADR, including a change to either definition above.
