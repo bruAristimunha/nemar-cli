@@ -28,9 +28,12 @@ import {
   inputDigest,
   inputDigestV2,
 } from "../../shared/contract/derivatives";
+import { AUDIT_IF_PREVIOUS_CHANGED_SQL } from "../src/db/audit-log";
 import {
   ADVANCE_COPIED_SQL,
   PROMOTE_CATALOG_SQL,
+  SKIP_STAMP_SQL,
+  STORE_ROW_SQL,
   SUPERSEDE_CATALOG_SQL,
   UNKEYABLE_WORDS,
   derivativesLogLine,
@@ -89,7 +92,24 @@ let derivativesHost: Miniflare;
 let standin: ComputeS3Standin;
 let github: GithubCompareStandin;
 const handle = makeComputeApp();
-const lossy = { truncate: (_key: string): boolean => false };
+/**
+ * What the played derivatives bucket does to a copy, by key: store half of it (`truncate`), store the same
+ * number of bytes with one flipped (`corrupt`), or let something happen first (`beforePut`, which stands for
+ * the rest of the world moving while a copy is in flight).
+ */
+const lossy = {
+  truncate: (_key: string): boolean => false,
+  corrupt: (_key: string): boolean => false,
+  beforePut: async (_key: string): Promise<void> => {},
+};
+const resetLossy = () => {
+  lossy.truncate = () => false;
+  lossy.corrupt = () => false;
+  lossy.beforePut = async () => {};
+};
+/** A second bucket the S3 interface serves, for a binding and a bucket name that do not agree. */
+const ELSEWHERE_BUCKET = "nemar-compute-elsewhere";
+let elsewhere: R2Bucket;
 const seams = globalThis as {
   NEMAR_GITHUB_API_URL?: string;
   NEMAR_ZARR_INDEX_BASE?: string;
@@ -101,33 +121,41 @@ const previous = {
   s3: seams.NEMAR_COMPUTE_S3_URL,
 };
 
-/** A derivatives bucket that stores half of the bytes a copy sends for a key the rule names. */
+/** A derivatives bucket whose copies go wrong as `lossy` says, by key. */
 function lossyBucket(real: R2Bucket): R2Bucket {
   return {
     get: (k: string) => real.get(k),
     head: (k: string) => real.head(k),
     list: (o?: Parameters<R2Bucket["list"]>[0]) => real.list(o),
     delete: (k: string | string[]) => real.delete(k),
-    put: (k: string, v: Uint8Array | string, o?: Parameters<R2Bucket["put"]>[2]) =>
-      real.put(
-        k,
-        lossy.truncate(k) && typeof v !== "string"
-          ? v.slice(0, Math.max(1, Math.floor(v.length / 2)))
-          : v,
-        o,
-      ),
+    put: async (k: string, v: Uint8Array | string, o?: Parameters<R2Bucket["put"]>[2]) => {
+      await lossy.beforePut(k);
+      let body = v;
+      if (typeof v !== "string" && lossy.truncate(k)) {
+        body = v.slice(0, Math.max(1, Math.floor(v.length / 2)));
+      } else if (typeof v !== "string" && lossy.corrupt(k)) {
+        body = Uint8Array.from(v);
+        body[0] = (body[0] as number) ^ 1;
+      }
+      return real.put(k, body, o);
+    },
   } as unknown as R2Bucket;
 }
 
-async function emptyDerivatives(): Promise<void> {
+async function emptyBucket(bucket: R2Bucket): Promise<void> {
   let cursor: string | undefined;
   do {
-    const listed = await derivatives.list({ cursor });
+    const listed = await bucket.list({ cursor });
     const keys = listed.objects.map((o) => o.key);
-    if (keys.length > 0) await derivatives.delete(keys);
+    if (keys.length > 0) await bucket.delete(keys);
     cursor = listed.truncated ? listed.cursor : undefined;
   } while (cursor);
 }
+
+const emptyDerivatives = async (): Promise<void> => {
+  await emptyBucket(derivatives);
+  await emptyBucket(elsewhere);
+};
 
 beforeAll(async () => {
   fx = await startLifecycleFixture();
@@ -139,12 +167,14 @@ beforeAll(async () => {
       modules: true,
       script: "export default { fetch() { return new Response('ok') } }",
       compatibilityDate: "2024-12-01",
-      r2Buckets: ["COMPUTE_DERIVATIVES"],
+      r2Buckets: ["COMPUTE_DERIVATIVES", "COMPUTE_ELSEWHERE"],
     });
     try {
       const bucket = (await mf.getR2Bucket("COMPUTE_DERIVATIVES")) as unknown as R2Bucket;
+      const other = (await mf.getR2Bucket("COMPUTE_ELSEWHERE")) as unknown as R2Bucket;
       await bucket.list({ limit: 1 });
-      return { mf, bucket };
+      await other.list({ limit: 1 });
+      return { mf, bucket, other };
     } catch (err) {
       await mf.dispose().catch(() => {});
       throw err;
@@ -152,6 +182,7 @@ beforeAll(async () => {
   });
   derivativesHost = infra.mf;
   derivatives = infra.bucket;
+  elsewhere = infra.other;
   // The S3 interface over the three buckets: a server-side copy goes from the results bucket to this one.
   standin = startComputeS3Standin({
     accessKeyId: fx.harness.standin.accessKeyId,
@@ -160,6 +191,7 @@ beforeAll(async () => {
       [HARNESS_BUCKETS.records]: fx.harness.records,
       [HARNESS_BUCKETS.results]: fx.harness.results,
       [DERIVATIVES_BUCKET]: lossyBucket(derivatives),
+      [ELSEWHERE_BUCKET]: elsewhere,
     },
   });
   seams.NEMAR_COMPUTE_S3_URL = standin.url;
@@ -171,7 +203,7 @@ beforeEach(async () => {
   await emptyDerivatives();
   standin.log.length = 0;
   standin.clearFailures();
-  lossy.truncate = () => false;
+  resetLossy();
   await seedComputeUsers(fx.harness.db);
 });
 
@@ -266,6 +298,8 @@ interface ZarrJobOptions {
   extra?: number;
   /** Add `--recording <path>` to the recorded specification. */
   recording?: boolean;
+  /** More product files, by relative path (a manifest that lists `derivative.json`, say). */
+  names?: string[];
   process?: unknown;
 }
 
@@ -286,6 +320,7 @@ async function finishJob(
   recordText: string,
   table: string,
   extra: number,
+  names: string[] = [],
 ): Promise<Map<string, string>> {
   const floor = findRecipe("nemar-floor") as NonNullable<ReturnType<typeof findRecipe>>;
   const wanted = recipeRequiredOutputs(floor);
@@ -295,6 +330,7 @@ async function finishJob(
   ]);
   for (let n = 1; n <= extra; n++)
     files.set(`product/sub-0${n}_qc.json`, JSON.stringify({ n, id }));
+  for (const name of names) files.set(`product/${name}`, JSON.stringify({ name, id }));
   const manifest: Array<{ path: string; size: number; sha256: string }> = [];
   for (const [path, text] of files) {
     const bytes = enc(text);
@@ -346,7 +382,15 @@ async function zarrJob(o: ZarrJobOptions = {}): Promise<Made> {
       stores_unread: o.unread ?? [],
     },
   });
-  const files = await finishJob(env, r.jobId, id, record, tableOf(o.codes), o.extra ?? 3);
+  const files = await finishJob(
+    env,
+    r.jobId,
+    id,
+    record,
+    tableOf(o.codes),
+    o.extra ?? 3,
+    o.names ?? [],
+  );
   if (o.recording) {
     const key = recordKey(r.jobId, "spec.json");
     const spec = JSON.parse((await (await fx.harness.records.get(key))?.text()) as string);
@@ -881,9 +925,7 @@ describe("retention", () => {
     // A is now superseded and B is the catalog row. Replay A's promotion at the statement level, as a racing
     // second request would after it passed the route's read: A is already catalog, so nothing changes, and
     // B, which a later promotion made the current one, is NOT superseded by it.
-    const audit = env.DB.prepare(
-      "INSERT INTO audit_log (user_id, action) SELECT 1, 'replay' WHERE changes() > 0",
-    );
+    const audit = env.DB.prepare(AUDIT_IF_PREVIOUS_CHANGED_SQL).bind(1, "replay", null, null, null);
     await env.DB.batch([
       env.DB.prepare(PROMOTE_CATALOG_SQL).bind(a.row.key),
       audit,
@@ -1036,6 +1078,9 @@ describe("dark until bound", () => {
     ["no binding", { COMPUTE_DERIVATIVES: undefined }],
     ["no bucket name", { COMPUTE_DERIVATIVES_BUCKET_NAME: undefined }],
     ["a blank bucket name", { COMPUTE_DERIVATIVES_BUCKET_NAME: "  " }],
+    // Those two are presignable, and the results bucket expires its objects after 30 days.
+    ["the results bucket's own name", { COMPUTE_DERIVATIVES_BUCKET_NAME: HARNESS_BUCKETS.results }],
+    ["the records bucket's own name", { COMPUTE_DERIVATIVES_BUCKET_NAME: HARNESS_BUCKETS.records }],
   ];
 
   for (const [name, over] of unbound) {
@@ -1116,6 +1161,12 @@ describe("dark until bound", () => {
       COMPUTE_DERIVATIVES_BUCKET_NAME: undefined,
     }) as NonNullable<typeof s3>;
     expect(unnamed.derivatives).toBeNull();
+    // A name that is the results or the records bucket's own is no name either (MUTATION: drop the check).
+    for (const name of [HARNESS_BUCKETS.results, HARNESS_BUCKETS.records]) {
+      const same = computeS3({ ...env, COMPUTE_DERIVATIVES_BUCKET_NAME: name });
+      expect(same).not.toBeNull();
+      expect(same?.derivatives).toBeNull();
+    }
     await expect(
       copyObject(
         unnamed,
@@ -1328,6 +1379,100 @@ describe("every keying check of the ADR, each failed alone", () => {
     await expectUnkeyable(() => zarrJob({ rows: legacy, digest: v1 }), "undigestable", "locations");
   });
 
+  test("a spec.json that is gone is spec_unreadable (MUTATION: key from a spec that was not read)", () =>
+    expectUnkeyable(async () => {
+      const made = await zarrJob();
+      await fx.harness.records.delete(recordKey(made.jobId, "spec.json"));
+      return made;
+    }, "spec_unreadable"));
+
+  test("a record that is not JSON is record_unreadable", () =>
+    expectUnkeyable(async () => {
+      const made = await zarrJob();
+      await fx.harness.results.put(
+        resultsOutputKey(made.jobId, "product/desc-nemarfloor_signalJourney.json"),
+        enc("{not json"),
+      );
+      return made;
+    }, "record_unreadable"));
+
+  test("a manifest that is not a manifest is manifest_unreadable", () =>
+    expectUnkeyable(async () => {
+      const made = await zarrJob();
+      await fx.harness.results.put(
+        resultsLauncherKey(made.jobId, "manifest.json"),
+        enc(JSON.stringify({ job_id: made.jobId })),
+      );
+      return made;
+    }, "manifest_unreadable"));
+
+  test("a manifest that lists derivative.json is derivative_name_taken: the description's name is the store's", () =>
+    expectUnkeyable(() => zarrJob({ names: ["derivative.json"] }), "derivative_name_taken"));
+
+  test("a stamp of a recipe the registry no longer has is recipe_unknown", () =>
+    expectUnkeyable(async () => {
+      const made = await zarrJob();
+      await sql(
+        envOf(),
+        "UPDATE compute_pipeline_stamps SET recipe = 'nemar-floor-zarr' WHERE id = ?1",
+        made.stampId,
+      );
+      return made;
+    }, "recipe_unknown"));
+
+  test("a stamp whose dataset is gone is dataset_gone, and no derivative is made for it (MUTATION: drop the dataset condition of the insert)", () =>
+    expectUnkeyable(async () => {
+      const made = await zarrJob();
+      const env = envOf();
+      await sql(env, "DELETE FROM dataset_versions WHERE dataset_id = ?1", made.id);
+      await sql(env, "DELETE FROM datasets WHERE dataset_id = ?1", made.id);
+      return made;
+    }, "dataset_gone"));
+
+  test("a bucket that throws leaves the stamp undecided and counted later, and the next sync keys it (MUTATION: decide a stamp from a read that failed)", async () => {
+    const env = envOf();
+    await zarrJob();
+    const results = fx.harness.results;
+    const flaky = {
+      head: (k: string) => results.head(k),
+      get: (k: string) =>
+        k.endsWith("signalJourney.json")
+          ? Promise.reject(new Error("the store is down"))
+          : results.get(k),
+      list: (o?: Parameters<R2Bucket["list"]>[0]) => results.list(o),
+      put: results.put.bind(results),
+      delete: (k: string | string[]) => results.delete(k),
+    } as unknown as R2Bucket;
+    let result: Awaited<ReturnType<typeof syncAll>> | undefined;
+    const lines = await logged(async () => {
+      result = await syncAll(envOf({ COMPUTE_RESULTS: flaky }));
+    });
+    expect(result).toMatchObject({ examined: 1, created: 0, later: 1, errored: 0 });
+    expect(result?.derivative_unkeyable).toEqual({});
+    expect(lines.some((l) => l.includes("key_read_failed"))).toBe(true);
+    expect(await all(env)).toHaveLength(0);
+    expect(
+      (
+        await env.DB.prepare("SELECT COUNT(*) AS n FROM compute_derivative_skips").first<{
+          n: number;
+        }>()
+      )?.n,
+    ).toBe(0);
+    expect(await syncAll(env)).toMatchObject({ examined: 1, created: 1, stored: 1 });
+  });
+
+  test("a call examines at most 20 stamps, and the rest wait for the next (MUTATION: change DERIVATIVE_STAMPS_PER_CALL)", async () => {
+    const env = envOf();
+    for (let i = 0; i < 25; i++) await zarrJob({ stampDigest: null });
+    const first = await syncAll(env);
+    expect(first).toMatchObject({ examined: 20 });
+    expect(first.derivative_unkeyable).toEqual({ no_input_digest: 20 });
+    const second = await syncAll(env);
+    expect(second).toMatchObject({ examined: 5 });
+    expect(second.derivative_unkeyable).toEqual({ no_input_digest: 5 });
+    expect(await syncAll(env)).toMatchObject({ examined: 0 });
+  }, 120_000);
+
   test("the sync returns only its declared counts, and the words it skips under are the declared ones", async () => {
     expect(new Set(UNKEYABLE_WORDS).size).toBe(UNKEYABLE_WORDS.length);
     for (const w of UNKEYABLE_WORDS) expect(w).toMatch(/^[a-z0-9_]{1,64}$/);
@@ -1411,8 +1556,9 @@ describe("what an administrator reads", () => {
     await zarrJob();
     const bad = await call("POST", "/compute/derivatives/sync", "admin", { max_objects: 0 });
     expect(bad.status).toBe(400);
+    // A copy is four subrequests and a Worker invocation makes 1,000: 150 is the most, and 151 is refused.
     expect(
-      (await call("POST", "/compute/derivatives/sync", "admin", { max_objects: 201 })).status,
+      (await call("POST", "/compute/derivatives/sync", "admin", { max_objects: 151 })).status,
     ).toBe(400);
     expect((await call("POST", "/compute/derivatives/sync", "admin", { other: 1 })).status).toBe(
       400,
@@ -1584,5 +1730,415 @@ describe("the table and its guards", () => {
         /ezid|datacite|presign|COMPUTE_ENABLED|COMPUTE_PIPELINES_DISPATCH_ENABLED|AUTO_REPULL/i,
       );
     }
+  });
+});
+
+// --- Review round 1 --------------------------------------------------------------------------------------------------
+
+describe("a derivative that is going is never kept by a promotion", () => {
+  async function storedOne(): Promise<{ made: Made; row: Der }> {
+    const env = envOf();
+    const made = await zarrJob();
+    await syncAll(env);
+    return { made, row: await one(env, `stamp_id = ${made.stampId}`) };
+  }
+
+  test("a deleted dataset's derivative cannot be promoted to catalog or published (MUTATION: drop the dataset and date conditions of the promotions)", async () => {
+    const env = envOf();
+    const a = await storedOne();
+    const b = await storedOne();
+    // B is a catalog row, A a canary; the dataset of A is deleted, which dates A to now.
+    expect((await retention(b.row.key, "admin", "catalog")).status).toBe(200);
+    await deleteDatasetCascade(env.DB, { ...env, ENVIRONMENT: "production" }, a.made.id, {
+      skipS3: true,
+    });
+    const refused = await retention(a.row.key, "admin", "catalog");
+    expect(refused).toMatchObject({ status: 409, body: { code: "not_promotable" } });
+    expect(await one(env, `key = '${a.row.key}'`)).toMatchObject({ retention: "canary" });
+    // B's dataset is deleted too: its catalog row is dated to now, and the owner cannot publish it either.
+    await deleteDatasetCascade(env.DB, { ...env, ENVIRONMENT: "production" }, b.made.id, {
+      skipS3: true,
+    });
+    const publish = await retention(b.row.key, "owner", "published");
+    expect(publish).toMatchObject({ status: 409, body: { code: "not_promotable" } });
+    expect(await one(env, `key = '${b.row.key}'`)).toMatchObject({ retention: "catalog" });
+    // The next sync expires both and deletes their objects: nothing was kept.
+    expect(await syncAll(env)).toMatchObject({ expired: 2 });
+    expect(await keysUnder(a.row.key)).toEqual([]);
+    expect(await keysUnder(b.row.key)).toEqual([]);
+  });
+
+  test("a dataset row that is gone alone is enough to refuse a promotion", async () => {
+    const env = envOf();
+    const a = await storedOne();
+    await sql(env, "DELETE FROM dataset_versions WHERE dataset_id = ?1", a.made.id);
+    await sql(env, "DELETE FROM datasets WHERE dataset_id = ?1", a.made.id);
+    expect((await retention(a.row.key, "admin", "catalog")).status).toBe(409);
+    expect(await one(env)).toMatchObject({ retention: "canary" });
+  });
+
+  test("a canary past its 30 days that the sync has not swept cannot be promoted (MUTATION: drop the date condition of the catalog promotion)", async () => {
+    const env = envOf();
+    const a = await storedOne();
+    await sql(
+      env,
+      "UPDATE compute_derivatives SET expires_at = datetime('now', '-1 days') WHERE key = ?1",
+      a.row.key,
+    );
+    const refused = await retention(a.row.key, "admin", "catalog");
+    expect(refused).toMatchObject({ status: 409, body: { code: "not_promotable" } });
+    expect(await one(env)).toMatchObject({ retention: "canary", state: "stored" });
+    expect(await syncAll(env)).toMatchObject({ expired: 1 });
+  });
+
+  test("a catalog row past its date that is not swept yet cannot be published, one still inside it can (MUTATION: drop the date condition of the published promotion)", async () => {
+    const env = envOf();
+    const a = await storedOne();
+    await newerVersion(a.made.id, "1.1.0");
+    const b = await zarrJob({ id: a.made.id });
+    await syncAll(env);
+    const rowB = await one(env, `stamp_id = ${b.stampId}`);
+    await retention(a.row.key, "admin", "catalog");
+    await retention(rowB.key, "admin", "catalog");
+    // A is superseded by B and has 30 days left: the owner may still publish it.
+    expect((await one(env, `key = '${a.row.key}'`)).expires_at).not.toBeNull();
+    await sql(
+      env,
+      "UPDATE compute_derivatives SET expires_at = datetime('now', '-1 days') WHERE key = ?1",
+      a.row.key,
+    );
+    expect((await retention(a.row.key, "owner", "published")).status).toBe(409);
+    await sql(
+      env,
+      "UPDATE compute_derivatives SET expires_at = datetime('now', '+5 days') WHERE key = ?1",
+      a.row.key,
+    );
+    expect((await retention(a.row.key, "owner", "published")).status).toBe(200);
+    expect(await one(env, `key = '${a.row.key}'`)).toMatchObject({
+      retention: "published",
+      expires_at: null,
+    });
+  });
+});
+
+describe("a copy that cannot be trusted, and a copy that cannot be made", () => {
+  test("a copy of the same length with one byte changed ends the row failed with copy_mismatch (MUTATION: compare sizes only)", async () => {
+    const env = envOf();
+    await zarrJob();
+    lossy.corrupt = (k) => k.endsWith("sub-01_qc.json");
+    const result = await syncAll(env);
+    expect(result).toMatchObject({ created: 1, failed: 1, stored: 0, errored: 0 });
+    const row = await one(env);
+    expect(row).toMatchObject({ state: "failed", failure: "copy_mismatch" });
+    expect(await keysUnder(row.key)).toEqual([]);
+  });
+
+  test("a copy the binding cannot see is not a bad copy: the row waits and the next sync, with the right bucket, finishes it (MUTATION: end the row copy_mismatch when the target is missing)", async () => {
+    const env = envOf();
+    await zarrJob();
+    // The binding is one bucket and the name the signer copies into is another.
+    const wrong = envOf({ COMPUTE_DERIVATIVES_BUCKET_NAME: ELSEWHERE_BUCKET });
+    let result: Awaited<ReturnType<typeof syncAll>> | undefined;
+    const lines = await logged(async () => {
+      result = await syncAll(wrong);
+    });
+    expect(result).toMatchObject({ created: 1, copied: 0, later: 1, failed: 0, stored: 0 });
+    expect(lines.some((l) => l.includes("target_missing"))).toBe(true);
+    expect(await one(env)).toMatchObject({
+      state: "copying",
+      copied: 0,
+      failure: null,
+      attempts: 1,
+    });
+    // Pointed at the right bucket, the row is copied whole.
+    expect(await syncAll(env)).toMatchObject({ copied: 5, stored: 1 });
+    expect(await one(env)).toMatchObject({ state: "stored", attempts: 0 });
+  });
+
+  test("a row that makes no progress five turns in a row ends failed with copy_failed, and the refusal's status is logged (MUTATION: change the count of tries)", async () => {
+    const env = envOf();
+    await zarrJob();
+    standin.failWith({ op: "CopyObject", bucket: DERIVATIVES_BUCKET, status: 503, times: 50 });
+    const lines: string[] = [];
+    for (let turn = 1; turn <= 4; turn++) {
+      lines.push(...(await logged(async () => void (await syncAll(env)))));
+      expect(await one(env)).toMatchObject({ state: "copying", attempts: turn });
+    }
+    lines.push(...(await logged(async () => void (await syncAll(env)))));
+    expect(await one(env)).toMatchObject({ state: "failed", failure: "copy_failed" });
+    expect(lines.some((l) => l.includes("copy_failed") && l.includes("status=503"))).toBe(true);
+    expect(lines.join("\n")).not.toMatch(/d\/[0-9a-f]{64}|jobs\//);
+    // A failed row is final for its key and is cleaned like any other.
+    expect(await keysUnder((await one(env)).key)).toEqual([]);
+  });
+
+  test("a copy that goes through sets the failed turns back to 0 (MUTATION: leave attempts alone when a file is copied)", async () => {
+    const env = envOf();
+    await zarrJob();
+    standin.failWith({ op: "CopyObject", bucket: DERIVATIVES_BUCKET, status: 500, times: 2 });
+    await syncAll(env);
+    await syncAll(env);
+    expect(await one(env)).toMatchObject({ state: "copying", attempts: 2 });
+    const third = await syncAll(env, { maxObjects: 1 });
+    expect(third).toMatchObject({ copied: 1 });
+    expect(await one(env)).toMatchObject({ copied: 1, attempts: 0 });
+  });
+
+  test("rows take turns: ten that cannot be copied do not starve an eleventh (MUTATION: order the copying rows by creation)", async () => {
+    const env = envOf();
+    for (let i = 0; i < 11; i++) await zarrJob();
+    // Every copy is refused once, and a sync works on ten rows: ten fail, one is never tried.
+    standin.failWith({ op: "CopyObject", bucket: DERIVATIVES_BUCKET, status: 500, times: 10 });
+    const first = await syncAll(env);
+    expect(first).toMatchObject({ created: 11, later: 10, stored: 0 });
+    const untried = await all(env, "last_attempt_at IS NULL");
+    expect(untried).toHaveLength(1);
+    // From now on the ten others are refused for good; the one that was never tried goes first and is stored.
+    for (const row of await all(env, "last_attempt_at IS NOT NULL")) {
+      standin.failWith({
+        op: "CopyObject",
+        bucket: DERIVATIVES_BUCKET,
+        keyIncludes: row.key,
+        status: 500,
+        times: 30,
+      });
+    }
+    const second = await syncAll(env);
+    expect(second.stored).toBe(1);
+    expect((await one(env, `key = '${(untried[0] as Der).key}'`)).state).toBe("stored");
+  }, 120_000);
+});
+
+describe("what the world does while a copy is in flight", () => {
+  /** The Worker's own binding to the derivatives bucket, with something happening just before a put. */
+  const bindingWithPutHook = (hook: (key: string) => Promise<void>): R2Bucket =>
+    ({
+      get: (k: string) => derivatives.get(k),
+      head: (k: string) => derivatives.head(k),
+      list: (o?: Parameters<R2Bucket["list"]>[0]) => derivatives.list(o),
+      delete: (k: string | string[]) => derivatives.delete(k),
+      put: async (k: string, v: string, o?: Parameters<R2Bucket["put"]>[2]) => {
+        await hook(k);
+        return derivatives.put(k, v, o);
+      },
+    }) as unknown as R2Bucket;
+
+  test("a deletion that dates the row while its description is written is not overwritten by a fresh 30 days (MUTATION: drop the date guard of the store statement)", async () => {
+    const env = envOf();
+    await zarrJob();
+    // The description is written through the binding: this one lets the deletion happen as it is written.
+    const during = envOf({
+      COMPUTE_DERIVATIVES: bindingWithPutHook(async (k) => {
+        if (k.endsWith("/derivative.json")) {
+          await sql(env, "UPDATE compute_derivatives SET expires_at = datetime('now')");
+        }
+      }),
+    });
+    const result = await syncAll(during);
+    expect(result).toMatchObject({ copied: 5, stored: 0 });
+    const row = await one(env);
+    expect(row.state).toBe("copying");
+    const due = await env.DB.prepare(
+      "SELECT expires_at <= datetime('now') AS due FROM compute_derivatives WHERE key = ?1",
+    )
+      .bind(row.key)
+      .first<{ due: number }>();
+    expect(due?.due).toBe(1);
+    // The next sync expires it and deletes everything under it, the description included.
+    expect(await syncAll(env)).toMatchObject({ expired: 1, deleted: 6 });
+    expect(await keysUnder(row.key)).toEqual([]);
+  });
+
+  test("the statements that count a copy and store a row change nothing once the row is dated (MUTATION: drop the date guard of either)", async () => {
+    const env = envOf();
+    await zarrJob();
+    await syncAll(env, { maxObjects: 1 });
+    const row = await one(env);
+    expect(row).toMatchObject({ state: "copying", copied: 1 });
+    await sql(
+      env,
+      "UPDATE compute_derivatives SET expires_at = datetime('now') WHERE key = ?1",
+      row.key,
+    );
+    expect((await sql(env, ADVANCE_COPIED_SQL, row.key, 1)).meta.changes).toBe(0);
+    await sql(env, "UPDATE compute_derivatives SET copied = object_count WHERE key = ?1", row.key);
+    expect((await sql(env, STORE_ROW_SQL, row.key)).meta.changes).toBe(0);
+    expect(await one(env)).toMatchObject({ state: "copying", stored_at: null });
+    // Undated, the same statements work: the guards are what they are for.
+    await sql(env, "UPDATE compute_derivatives SET expires_at = NULL WHERE key = ?1", row.key);
+    expect((await sql(env, STORE_ROW_SQL, row.key)).meta.changes).toBe(1);
+    expect(await one(env)).toMatchObject({ state: "stored" });
+  });
+
+  /** What a second sync does to a row that has ended while this one still copies it: it ends, and cleans. */
+  const endMeanwhile = async (env: Bindings): Promise<void> => {
+    await sql(
+      env,
+      `UPDATE compute_derivatives SET state = 'expired', copied = object_count, ended_at = datetime('now'),
+         expires_at = datetime('now', '-1 days')`,
+    );
+    await emptyBucket(derivatives);
+    await sql(env, "UPDATE compute_derivatives SET copied = 0");
+  };
+
+  test("a file that lands after its row has ended and been cleaned is deleted, not forgotten (MUTATION: leave the late object)", async () => {
+    const env = envOf();
+    await zarrJob();
+    let once = true;
+    lossy.beforePut = async (k) => {
+      if (once && k.endsWith("sub-01_qc.json")) {
+        once = false;
+        await endMeanwhile(env);
+      }
+    };
+    const result = await syncAll(env);
+    expect(result).toMatchObject({ stored: 0, errored: 0 });
+    const row = await one(env);
+    expect(row.state).toBe("expired");
+    expect(await keysUnder(row.key)).toEqual([]);
+  });
+
+  test("a description that lands after its row has ended and been cleaned is deleted too (MUTATION: leave the late description)", async () => {
+    const env = envOf();
+    await zarrJob();
+    let once = true;
+    const during = envOf({
+      COMPUTE_DERIVATIVES: bindingWithPutHook(async (k) => {
+        if (once && k.endsWith("/derivative.json")) {
+          once = false;
+          await endMeanwhile(env);
+        }
+      }),
+    });
+    const result = await syncAll(during);
+    expect(result).toMatchObject({ stored: 0, errored: 0 });
+    const row = await one(env);
+    expect(row.state).toBe("expired");
+    expect(await keysUnder(row.key)).toEqual([]);
+  });
+
+  test("a stamp read decided by a second call is not remembered as a duplicate (MUTATION: drop the guard of the skip statement)", async () => {
+    const env = envOf();
+    const made = await zarrJob();
+    await syncAll(env);
+    expect((await sql(env, SKIP_STAMP_SQL, made.stampId, "duplicate_key")).meta.changes).toBe(0);
+    expect(
+      (
+        await env.DB.prepare("SELECT COUNT(*) AS n FROM compute_derivative_skips").first<{
+          n: number;
+        }>()
+      )?.n,
+    ).toBe(0);
+    // A stamp with no row of its own is remembered.
+    expect((await sql(env, SKIP_STAMP_SQL, made.stampId + 1000, "key_invalid")).meta.changes).toBe(
+      1,
+    );
+  });
+});
+
+describe("the database holds what the code cannot undo", () => {
+  test("a published row is never deleted and never changes its class, state or DOI, whatever runs (MUTATION: remove a trigger)", async () => {
+    const env = envOf();
+    await zarrJob();
+    await syncAll(env);
+    const row = await one(env);
+    await retention(row.key, "admin", "catalog");
+    await retention(row.key, "owner", "published");
+    const message = async (statement: string): Promise<string> => {
+      try {
+        await sql(env, statement, row.key);
+      } catch (err) {
+        return String(err);
+      }
+      return "";
+    };
+    expect(await message("DELETE FROM compute_derivatives WHERE key = ?1")).toContain(
+      "a published derivative is never deleted",
+    );
+    for (const set of [
+      "retention = 'catalog'",
+      "retention = 'canary'",
+      "state = 'expired'",
+      "state = 'failed', failure = 'copy_failed'",
+      "doi = '10.1234/x'",
+    ]) {
+      expect(await message(`UPDATE compute_derivatives SET ${set} WHERE key = ?1`), set).toContain(
+        "a published derivative keeps its class, its state and its doi",
+      );
+    }
+    // What does not change those three is allowed: the dates, for one.
+    expect(
+      await message(
+        "UPDATE compute_derivatives SET expires_at = datetime('now', '+1 days') WHERE key = ?1",
+      ),
+    ).toBe("");
+    expect(await one(env)).toMatchObject({ retention: "published", state: "stored", doi: null });
+    expect(await keysUnder(row.key)).toHaveLength(6);
+  });
+
+  test("a row that is not published can still be deleted by an owner's SQL (the guard is for what cannot be undone)", async () => {
+    const env = envOf();
+    await zarrJob();
+    await syncAll(env);
+    const row = await one(env);
+    await sql(env, "DELETE FROM compute_derivatives WHERE key = ?1", row.key);
+    expect(await all(env)).toHaveLength(0);
+  });
+});
+
+describe("what an administrator reads and sends", () => {
+  test("a description that cannot be read is null, and the error's name is logged (MUTATION: swallow the error)", async () => {
+    const env = envOf();
+    await zarrJob();
+    await syncAll(env);
+    const row = await one(env);
+    const broken = {
+      get: () => Promise.reject(new Error("the bucket is down")),
+      head: () => Promise.reject(new Error("the bucket is down")),
+    } as unknown as R2Bucket;
+    let reply: Reply | undefined;
+    const lines = await logged(async () => {
+      reply = await call(
+        "GET",
+        `/compute/derivatives/${row.key}`,
+        "admin",
+        undefined,
+        envOf({ COMPUTE_DERIVATIVES: broken }),
+      );
+    });
+    expect(reply).toMatchObject({ status: 200, body: { description: null } });
+    expect(
+      lines.some((l) => l.includes("description_unreadable") && l.includes("error=Error")),
+    ).toBe(true);
+    expect(lines.join("\n")).not.toContain("the bucket is down");
+  });
+
+  test("a sync body that is not JSON is refused, an empty one is a sync (MUTATION: read a bad body as an empty one)", async () => {
+    const env = envOf();
+    const send = (body: string) =>
+      handle(
+        new Request("http://api.test/admin/compute/derivatives/sync", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${COMPUTE_KEYS.admin}`,
+            "Content-Type": "application/json",
+          },
+          body,
+        }),
+        env,
+      );
+    const bad = await send("{not json");
+    expect(bad.status).toBe(400);
+    expect(await bad.json()).toMatchObject({ code: "invalid_body" });
+    const empty = await send("");
+    expect(empty.status).toBe(200);
+    expect(await empty.json()).toMatchObject({ ok: true });
+    expect(
+      (
+        await env.DB.prepare(
+          "SELECT COUNT(*) AS n FROM audit_log WHERE action = 'compute.derivatives.sync'",
+        ).first<{ n: number }>()
+      )?.n,
+    ).toBe(1);
   });
 });
