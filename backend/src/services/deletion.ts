@@ -177,7 +177,14 @@ export async function deleteDatasetCascade(
   // Step 3: Delete D1 records (batched for atomicity)
   let publishedDerivativesHeld = 0;
   try {
-    const batchResults = await db.batch([
+    // The count of kept derivatives is read from the batch by the statement that asked for it, never by a
+    // position that the next statement added to the batch would move.
+    const heldDerivatives = db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM compute_derivatives WHERE dataset_id = ? AND retention = 'published'",
+      )
+      .bind(datasetId);
+    const statements = [
       db.prepare("DELETE FROM dataset_versions WHERE dataset_id = ?").bind(datasetId),
       db.prepare("DELETE FROM publication_requests WHERE dataset_id = ?").bind(datasetId),
       db
@@ -221,19 +228,20 @@ export async function deleteDatasetCascade(
             WHERE dataset_id = ? AND retention IN ('canary', 'catalog') AND state IN ('copying', 'stored')`,
         )
         .bind(datasetId),
-      db
-        .prepare(
-          "SELECT COUNT(*) AS n FROM compute_derivatives WHERE dataset_id = ? AND retention = 'published'",
-        )
-        .bind(datasetId),
+      heldDerivatives,
       db.prepare("DELETE FROM datasets WHERE dataset_id = ?").bind(datasetId),
-    ]);
+    ];
+    const batchResults = await db.batch(statements);
 
     steps.d1.versionsDeleted = batchResults[0].meta.changes ?? 0;
     steps.d1.pubRequestsDeleted = batchResults[1].meta.changes ?? 0;
     steps.d1.s3PermsDeleted = batchResults[3].meta.changes ?? 0;
     publishedDerivativesHeld = Number(
-      (batchResults[10]?.results?.[0] as { n?: number } | undefined)?.n ?? 0,
+      (
+        batchResults[statements.indexOf(heldDerivatives)]?.results?.[0] as
+          | { n?: number }
+          | undefined
+      )?.n ?? 0,
     );
     steps.d1.success = true;
   } catch (err) {
