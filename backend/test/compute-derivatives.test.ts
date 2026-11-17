@@ -2142,3 +2142,27 @@ describe("what an administrator reads and sends", () => {
     ).toBe(1);
   });
 });
+
+describe("the version DOI is read through the repository's one rule", () => {
+  test("a dataset that is anonymous has no DOI in its derivative's description or citation (MUTATION: read the version DOI by hand)", async () => {
+    const env = envOf();
+    const made = await zarrJob();
+    // The dataset is an anonymous deposit (a published dataset cannot become one, so it is unpublished): its
+    // version identifier is reserved and does not resolve, and the rule withholds it.
+    await sql(
+      env,
+      "UPDATE datasets SET first_published_at = NULL, anonymous = 1 WHERE dataset_id = ?1",
+      made.id,
+    );
+    expect(await syncAll(env)).toMatchObject({ created: 1, stored: 1 });
+    const row = await one(env);
+    const description = JSON.parse(
+      (await (await derivatives.get(`d/${row.key}/derivative.json`))?.text()) as string,
+    );
+    expect(description.SourceDatasets).toEqual([{ id: made.id, version: "v1.0.0", doi: null }]);
+    expect(description.Citation).toBe(
+      `Derived from ${made.id} version v1.0.0 by NEMAR's nemar-floor 1.0.0.`,
+    );
+    expect(JSON.stringify(description)).not.toContain("10.82901");
+  });
+});
