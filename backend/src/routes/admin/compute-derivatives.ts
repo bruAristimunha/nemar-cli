@@ -107,9 +107,18 @@ export function registerComputeDerivativeAdminRoutes(admin: AdminRouter): void {
 
   admin.post("/compute/derivatives/sync", async (c) => {
     if (!derivativesBound(c.env)) return refuseDerivative(c, "derivatives_unavailable");
-    // An empty body is a sync with the default budget; any other body is checked.
-    const raw = await readJson(c);
-    const body = syncBody.safeParse(raw ?? {});
+    // An EMPTY body is a sync with the default budget; any other body is checked, and a body that is not
+    // JSON is refused (it is never read as an empty one).
+    const text = await c.req.text();
+    let raw: unknown = {};
+    if (text.trim() !== "") {
+      try {
+        raw = JSON.parse(text);
+      } catch {
+        return invalidBody(c, [{ path: "body", code: "invalid_json" }]);
+      }
+    }
+    const body = syncBody.safeParse(raw);
     if (!body.success) return invalidBody(c, issuesOf(body.error));
     try {
       const result = await syncDerivatives(c.env, { maxObjects: body.data.max_objects });
