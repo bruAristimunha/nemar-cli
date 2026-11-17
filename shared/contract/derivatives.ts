@@ -42,6 +42,10 @@
  * ever keyed under version 1. The key keeps `nemar.derivative-key.v1` and its validator: a version 2
  * digest is a valid `sha256:` input digest, and the header line of each version makes a version 1
  * text and a version 2 text different bytes. The refusal field `locations` is `inputDigestV2`'s own.
+ * Readers parse JSON integers as binary64: in Python, `json.loads(text, parse_int=float)`, which
+ * gives the same values as `JSON.parse`, including -0.0 and inf. A plain `json.loads` raises
+ * `ValueError` on an integer literal of more than 4300 digits, which `JSON.parse` reads as Infinity,
+ * so a store root with one has a locations digest in TypeScript and cannot be read in Python.
  */
 
 /** The first line of a store content header, and the name of the digest. */
