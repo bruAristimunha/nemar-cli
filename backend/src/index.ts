@@ -1522,7 +1522,7 @@ export default {
       // touched by code), keys the succeeded stamps that have no derivative, and copies at most 100
       // objects server side from the results bucket into the derivatives bucket. PRODUCTION-ONLY, NOT in
       // DEV_CRON_ALLOWLIST (it deletes from, and writes to, a private bucket), self-fenced to exact
-      // production, and DARK until the owner binds the derivatives bucket: with no binding it does
+      // production, and dark wherever the derivatives bucket is not bound: with no binding it does
       // nothing and writes nothing. It reads no compute switch, makes no DOI and sends no mail; staging
       // and the local stack advance the store through the admin route. One line, only when it did something.
       ctx.waitUntil(
