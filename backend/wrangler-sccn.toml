@@ -230,8 +230,10 @@ bucket_name = "nemar-compute-results"
 # given. It carries no lifecycle rule that deletes objects and no public access, both bucket
 # configuration: retention is the store's code, and a deletion rule would delete a `published`
 # derivative. Never shared with [env.dev], which binds its own bucket below. The bucket must exist
-# before the next deploy that carries this binding, or that deploy fails (it does). Binding it turns
-# no compute on, because the store reads no switch.
+# before the next deploy that carries this binding, or that deploy fails (it exists). The binding
+# alone starts the store's daily production pass, which reads no switch, and turns no compute on:
+# that pass keys only a succeeded pipeline stamp, which only a job dispatched while COMPUTE_ENABLED is
+# on can produce, so it copies nothing until compute runs.
 [[r2_buckets]]
 binding = "COMPUTE_DERIVATIVES"
 bucket_name = "nemar-compute-derivatives"
