@@ -94,6 +94,8 @@ export class ComputeS3Error extends Error {
   constructor(
     readonly code: ComputeS3ErrorCode,
     message: string,
+    /** The HTTP status the interface answered with, for a refused copy; a number, never a body. */
+    readonly status?: number,
   ) {
     super(message);
     this.name = "ComputeS3Error";
@@ -174,7 +176,15 @@ export function computeS3(env: ComputeS3Env): ComputeS3 | null {
     endpoint,
     records: records.trim(),
     results: results.trim(),
-    derivatives: present(derivatives) ? derivatives.trim() : null,
+    // The derivatives bucket is NEVER one of the other two: those are presignable and the results bucket
+    // expires its objects, so a derivative stored there would be readable through an address and lost in 30
+    // days. A name that is the records or the results bucket's own is no name: the store is dark.
+    derivatives:
+      present(derivatives) &&
+      derivatives.trim() !== records.trim() &&
+      derivatives.trim() !== results.trim()
+        ? derivatives.trim()
+        : null,
   };
 }
 
@@ -371,7 +381,11 @@ export async function copyObject(
   }
   const body = await response.text().catch(() => "");
   if (!response.ok) {
-    throw new ComputeS3Error("copy_failed", `the copy was refused with HTTP ${response.status}`);
+    throw new ComputeS3Error(
+      "copy_failed",
+      `the copy was refused with HTTP ${response.status}`,
+      response.status,
+    );
   }
   if (/<Error[\s>]/.test(body)) {
     throw new ComputeS3Error("copy_failed", "the copy answered with an error");
