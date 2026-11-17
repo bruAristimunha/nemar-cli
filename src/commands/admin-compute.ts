@@ -703,7 +703,7 @@ const statusCommand = new Command("status")
   });
 
 export const computeCommand = new Command("compute").description(
-  "The compute gateway: the owner policy, the SU allocation pools, status, jobs and their reports, legal holds, the pipeline, the observer's token (ADR 0118) and the runner registry",
+  "The compute gateway: the owner policy, the SU allocation pools, status, jobs and their reports, legal holds, the pipeline, the observer's token (ADR 0118), the runner registry and the derivative store (ADR 0123)",
 );
 
 computeCommand.addCommand(policyCommand);

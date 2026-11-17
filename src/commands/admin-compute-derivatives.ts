@@ -22,7 +22,11 @@ import { COMPUTE_DATASET_ID_RE } from "../../shared/contract/compute.js";
 import { failMessage, failWith, requireSignedIn } from "../lib/admin-command.js";
 import { request } from "../lib/api/client.js";
 import { computeRefusalCode } from "../lib/api/compute.js";
+import { YES_DESCRIPTION, YES_OPTION, confirm } from "../lib/confirm.js";
 import { plain } from "../lib/terminal-text.js";
+
+/** The most objects one sync may be asked to copy: the Worker's `DERIVATIVE_MAX_OBJECTS`, which it enforces. */
+const MAX_OBJECTS = 150;
 
 const say = (line: string): void => console.log(line);
 
@@ -150,14 +154,16 @@ Raises a derivative's retention class one step, and never lowers one:
                   of the same dataset, recipe, input and profile is promoted, and the earlier ones are then
                   superseded and expire 30 days after
   --to published  a stored catalog derivative becomes published, which never expires and is never deleted by
-                  code. ONLY AN OWNER may do this (owner_only otherwise). It makes no DOI: a DOI is a
-                  separate, owner-only action that does not exist yet
+                  code, and which NOTHING can lower (the database refuses it too). ONLY AN OWNER may do
+                  this (owner_only otherwise), and the command asks first (-y, --yes skips the question).
+                  It makes no DOI: a DOI is a separate, owner-only action that does not exist yet
 
 Admin or owner for catalog; owner for published. --json prints the Worker's answer as it is.
 
 Exit codes:
   0  the derivative was raised.
-  1  the key is wrong or unknown, the class is refused (not_promotable, owner_only), or the Worker could not be reached.`;
+  1  the key is wrong or unknown, the class is refused (not_promotable, owner_only), the question was not
+     answered yes, or the Worker could not be reached.`;
 
 const SYNC_HELP = `
 Runs one bounded pass of the store: marks what is due expired and deletes its objects (a published derivative is
@@ -166,7 +172,7 @@ ADR 0123 is skipped and counted under its word), and copies at most --max-object
 the results bucket. The production cron runs the same pass once a day with 100; a development or staging Worker
 advances only through this command.
 
-  --max-objects <n>  objects copied or deleted at most (default 100, at most 200)
+  --max-objects <n>  objects copied at most (default 100, at most 150); deleting has a bound of its own
 
 Admin or owner. --json prints the Worker's answer as it is.
 
@@ -250,9 +256,10 @@ derivativesCommand
   .command("promote <key>")
   .description("Raise a derivative's retention class one step (published is the owner's)")
   .option("--to <class>", "catalog (the default) or published")
+  .option(YES_OPTION, YES_DESCRIPTION)
   .option("--json", "Print the Worker's answer as JSON")
   .addHelpText("after", PROMOTE_HELP)
-  .action(async (key: string, o: { to?: string; json?: boolean }) => {
+  .action(async (key: string, o: { to?: string; yes?: boolean; json?: boolean }) => {
     const json = o.json === true;
     if (!requireSignedIn(json)) return;
     const klass = o.to ?? "catalog";
@@ -263,6 +270,20 @@ derivativesCommand
     if (!KEY_RE.test(key)) {
       failMessage("A derivative key is 64 lowercase hexadecimal digits.", { json, answered: true });
       return;
+    }
+    // Nothing can lower a published derivative, and no code ever deletes it: ask before raising to it.
+    if (klass === "published") {
+      const answer = await confirm(
+        `Raise ${key} to published? It will never expire, and nothing can lower it or delete it.`,
+        { yes: o.yes },
+      );
+      if (answer !== "confirmed") {
+        failMessage("Nothing was changed: the question was not answered yes (use --yes).", {
+          json,
+          answered: true,
+        });
+        return;
+      }
     }
     try {
       const res = await post(
@@ -280,7 +301,7 @@ derivativesCommand
 derivativesCommand
   .command("sync")
   .description("Run one bounded pass of the store")
-  .option("--max-objects <n>", "Objects copied or deleted at most (default 100, at most 200)")
+  .option("--max-objects <n>", "Objects copied at most (default 100, at most 150)")
   .option("--json", "Print the Worker's answer as JSON")
   .addHelpText("after", SYNC_HELP)
   .action(async (o: { maxObjects?: string; json?: boolean }) => {
@@ -288,7 +309,7 @@ derivativesCommand
     if (!requireSignedIn(json)) return;
     const body: { max_objects?: number } = {};
     if (o.maxObjects !== undefined) {
-      const n = wholeNumber(o.maxObjects, "--max-objects", 1, 200, json);
+      const n = wholeNumber(o.maxObjects, "--max-objects", 1, MAX_OBJECTS, json);
       if (n === null) return;
       body.max_objects = n;
     }
