@@ -1572,6 +1572,18 @@ describe("ADR 0123 states what the module does", () => {
     }
   });
 
+  test("the amendment says what it refuses, what it accepts and what it departs from", () => {
+    // A null label is accepted (the group is then unlabeled), so the refusal is neither text nor null.
+    expect(adr).toContain("an entry that is neither text nor null");
+    // A row that is a list is refused as stores_content in version 2, where version 1 names path.
+    expect(adr).toContain(
+      "a row that is a list is not an object and is refused with the field `stores_content`",
+    );
+    // The amendment is the one exception to the Consequences sentence, and says so.
+    expect(adr).toContain("This amendment is the single exception to the Consequences sentence");
+    expect(adr).toContain("it keeps the new format names");
+  });
+
   test("the amendment is a dated section at the end, and decision 3 keeps its 2026-11-14 text", () => {
     const heading =
       "## Amendment 2026-11-16 (owner decision Q49, D3): the Zarr input digest names the positions a recipe was handed";
