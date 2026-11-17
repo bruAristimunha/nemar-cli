@@ -127,7 +127,7 @@ The lines, each ending in LF, are `nemar.store-locations.v1`; `system`, and afte
 - A zero coordinate is written as positive zero, `0000000000000000`, whatever its sign, because Python reads the JSON number `-0` as the integer 0 where `JSON.parse` reads negative zero.
 - A number that is not finite as a binary64 (a NaN, an infinity, or an integer too large for binary64) gives that channel `position` alone and is not a refusal.
 - Coordinates are hashed as the store states them, before any unit change, axis change or recentering: what a reader makes of them is fixed by the reader's and the recipe's versions.
-- Refused, with no digest: labels that are not a list of at least one entry or hold an entry that is not text; attributes that are not an object; positions that are present and not an object; and a system or units text that enters the text and holds a carriage return, a line feed or a lone surrogate.
+- Refused, with no digest: labels that are not a list of at least one entry or hold an entry that is neither text nor null; attributes that are not an object; positions that are present and not an object; and a system or units text that enters the text and holds a carriage return, a line feed or a lone surrogate.
   Text that is dropped is never examined.
 - The converter's provenance attributes `electrode_positions_source`, `electrode_positions_file` and `electrode_coordsystem_file` are not hashed, and neither is any other root attribute or an entry under a label the group does not have.
   They do not change what eegprep receives, so a recipe that branches on one of them must first change this definition.
@@ -148,4 +148,5 @@ The stamp's coverage check reads only each row's path and the `sha256:` shape of
 The decisions index keeps an amendment for a clarification and sends a changed verdict to a new ADR, because an amended verdict is invisible to anyone who read the ADR before.
 This ADR is still `proposed`, no derivative and no key exists outside tests, and the owner decided on 2026-11-16 (Q49, D3: option B, decided before the code that writes a derivative is built) that this is an amendment of decision 3.
 The 2026-11-14 text above is kept word for word so that it stays findable, and its closing sentence points here.
+This amendment is the single exception to the Consequences sentence "A change is therefore a new format name (`v2`) and a new ADR": it keeps the new format names, `nemar.store-locations.v1` and `nemar.input-digest.v2`, and not the new ADR, on the owner's decision of 2026-11-16 (Q49, D3) cited above.
 The rule in Consequences governs every later change: a change is a new format name and a new ADR, including a change to either definition above.
