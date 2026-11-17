@@ -415,6 +415,9 @@ interface Der {
   copied: number;
   object_count: number;
   bytes: number;
+  attempts: number;
+  last_attempt_at: string | null;
+  ended_at: string | null;
   stored_at: string | null;
   superseded_at: string | null;
   expires_at: string | null;
@@ -451,11 +454,19 @@ const sql = async (env: Bindings, text: string, ...binds: unknown[]) =>
     .bind(...binds)
     .run();
 
-const syncAll = async (env: Bindings, over: { maxObjects?: number } = {}) => {
+const syncAll = async (env: Bindings, over: { maxObjects?: number; maxDeletes?: number } = {}) => {
   const r = await syncDerivatives(env, over);
   if (!r.available) throw new Error("the store is dark");
   return r;
 };
+
+/** A day passes over a row that ended: what a later sync, a day on, finds. */
+const settle = (env: Bindings, key: string) =>
+  sql(
+    env,
+    "UPDATE compute_derivatives SET ended_at = datetime('now', '-2 days') WHERE key = ?1",
+    key,
+  );
 
 const keyOfStamp = async (env: Bindings, stampId: number): Promise<string> => {
   const s = await env.DB.prepare(
@@ -682,8 +693,14 @@ describe("a finished Zarr job becomes a stored derivative", () => {
       expires_at: null,
     });
     expect(await keysUnder(row.key)).toEqual([]);
-    expect(row.copied).toBe(0);
     expect(result.deleted).toBeGreaterThanOrEqual(2);
+    // A row that has just ended keeps its count for a day (a copy in flight could still land): it is listed
+    // again, found empty, and only then set to 0.
+    expect(row.copied).toBeGreaterThan(0);
+    expect(row.ended_at).not.toBeNull();
+    await settle(env, row.key);
+    await syncAll(env);
+    expect((await one(env)).copied).toBe(0);
     // A failed row is final for its key: it is never copied again.
     lossy.truncate = () => false;
     expect(await syncAll(env)).toMatchObject({ copied: 0, created: 0, failed: 0 });
@@ -713,7 +730,7 @@ describe("a finished Zarr job becomes a stored derivative", () => {
     await fx.harness.results.delete(resultsOutputKey(made.jobId, `product/${files[2]}`));
     const result = await syncAll(env);
     expect(result).toMatchObject({ failed: 1, stored: 0 });
-    expect(await one(env)).toMatchObject({ state: "failed", failure: "source_missing", copied: 0 });
+    expect(await one(env)).toMatchObject({ state: "failed", failure: "source_missing" });
     expect(await keysUnder(row.key)).toEqual([]);
   });
 });
@@ -743,15 +760,19 @@ describe("retention", () => {
     const result = await syncAll(env);
     expect(result).toMatchObject({ expired: 1, deleted: 6 });
     const after = await one(env);
-    expect(after).toMatchObject({ key: row.key, state: "expired", retention: "canary", copied: 0 });
+    expect(after).toMatchObject({ key: row.key, state: "expired", retention: "canary" });
     expect(after.object_count).toBe(5);
     expect(await keysUnder(row.key)).toEqual([]);
-    // Expired once, never again, and the row stays.
+    // Expired once, never again, and the row stays. Its count is dropped to 0 once a day has passed.
     expect(await syncAll(env)).toMatchObject({ expired: 0, deleted: 0 });
+    expect((await one(env)).copied).toBeGreaterThan(0);
+    await settle(env, row.key);
+    await syncAll(env);
+    expect((await one(env)).copied).toBe(0);
     expect(await all(env)).toHaveLength(1);
   });
 
-  test("deleting is bounded by maxObjects, a row expiring over several syncs", async () => {
+  test("deleting is bounded by maxDeletes, a row expiring over several syncs", async () => {
     const env = envOf();
     const { row } = await stored();
     await sql(
@@ -759,15 +780,33 @@ describe("retention", () => {
       "UPDATE compute_derivatives SET expires_at = datetime('now', '-1 days') WHERE key = ?1",
       row.key,
     );
-    const first = await syncAll(env, { maxObjects: 4 });
+    const first = await syncAll(env, { maxDeletes: 4 });
     expect(first).toMatchObject({ expired: 1, deleted: 4 });
     expect(await one(env)).toMatchObject({ state: "expired" });
     expect(await keysUnder(row.key)).toHaveLength(2);
     expect((await one(env)).copied).toBeGreaterThan(0);
-    const second = await syncAll(env, { maxObjects: 4 });
+    const second = await syncAll(env, { maxDeletes: 4 });
     expect(second.deleted).toBe(2);
     expect(await keysUnder(row.key)).toEqual([]);
+    await settle(env, row.key);
+    await syncAll(env);
     expect((await one(env)).copied).toBe(0);
+  });
+
+  test("a large expiry does not take the copies' turn: deleting has a budget of its own (MUTATION: charge deletes to the copy budget)", async () => {
+    const env = envOf();
+    const a = await stored();
+    await sql(
+      env,
+      "UPDATE compute_derivatives SET expires_at = datetime('now', '-1 days') WHERE key = ?1",
+      a.row.key,
+    );
+    const b = await zarrJob();
+    // Six objects are due to go and only three deletes are allowed; the copy budget is untouched by them.
+    const result = await syncAll(env, { maxObjects: 5, maxDeletes: 3 });
+    expect(result).toMatchObject({ deleted: 3, copied: 5, stored: 1, expired: 1 });
+    expect(await keysUnder(a.row.key)).toHaveLength(3);
+    expect((await one(env, `stamp_id = ${b.stampId}`)).state).toBe("stored");
   });
 
   test("promoting B to catalog supersedes A, and a class is raised one step at a time", async () => {
@@ -972,7 +1011,7 @@ describe("retention", () => {
     });
     const result = await syncAll(env);
     expect(result).toMatchObject({ copied: 0, expired: 1 });
-    expect(await one(env)).toMatchObject({ state: "expired", copied: 0 });
+    expect(await one(env)).toMatchObject({ state: "expired" });
     expect(await keysUnder((await one(env)).key)).toEqual([]);
   });
 
@@ -1289,9 +1328,38 @@ describe("every keying check of the ADR, each failed alone", () => {
     await expectUnkeyable(() => zarrJob({ rows: legacy, digest: v1 }), "undigestable", "locations");
   });
 
-  test("a recipe's own words are the only counts the sync returns", () => {
+  test("the sync returns only its declared counts, and the words it skips under are the declared ones", async () => {
     expect(new Set(UNKEYABLE_WORDS).size).toBe(UNKEYABLE_WORDS.length);
     for (const w of UNKEYABLE_WORDS) expect(w).toMatch(/^[a-z0-9_]{1,64}$/);
+    const env = envOf();
+    await zarrJob({ recording: true });
+    await zarrJob({ unread: ["sub-09/eeg/x.edf"] });
+    await zarrJob();
+    const r = await syncAll(env);
+    expect(Object.keys(r).sort()).toEqual(
+      [
+        "available",
+        "copied",
+        "created",
+        "derivative_unkeyable",
+        "deleted",
+        "duplicate",
+        "errored",
+        "examined",
+        "expired",
+        "failed",
+        "later",
+        "stored",
+      ].sort(),
+    );
+    expect(Object.keys(r.derivative_unkeyable).sort()).toEqual([
+      "recording_subset",
+      "stores_unread",
+    ]);
+    for (const word of Object.keys(r.derivative_unkeyable)) {
+      expect(UNKEYABLE_WORDS as readonly string[]).toContain(word);
+    }
+    expect(r).toMatchObject({ examined: 3, created: 1, stored: 1 });
   });
 });
 
@@ -1451,7 +1519,51 @@ describe("the table and its guards", () => {
     expect(await one(env)).toMatchObject({ retention: "canary", doi: null, state: "stored" });
   });
 
-  test("no code writes a DOI, deletes a derivative row, signs an address for the bucket or reads a compute switch", () => {
+  /** Code with its comments removed: what it does, not what it says. */
+  const stripComments = (text: string): string =>
+    text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+
+  /**
+   * What a source file does to the derivatives table that no code may: any statement naming the table that
+   * deletes, replaces, assigns a DOI anywhere in a SET list or names `doi` among the inserted columns.
+   */
+  function derivativeTableProblems(source: string): string[] {
+    const problems: string[] = [];
+    const literals =
+      stripComments(source).match(/`[^`]*`|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'/g) ?? [];
+    for (const statement of literals) {
+      if (!/\bcompute_derivatives\b/i.test(statement)) continue;
+      if (/\bDELETE\s+FROM\s+compute_derivatives\b/i.test(statement)) problems.push("delete");
+      if (/\bREPLACE\s+INTO\s+compute_derivatives\b/i.test(statement)) problems.push("replace");
+      if (/\bSET\b[^;]*?\bdoi\s*=/i.test(statement)) problems.push("set doi");
+      if (/\bINSERT\b[^;]*?\bINTO\s+compute_derivatives\s*\([^)]*\bdoi\b/i.test(statement)) {
+        problems.push("insert doi");
+      }
+    }
+    return problems;
+  }
+
+  test("the scan knows the ways to write a DOI or delete a row, so a clean result means something (MUTATION: narrow a pattern)", () => {
+    const bad: Array<[string, string]> = [
+      ["UPDATE compute_derivatives SET doi = ?1 WHERE key = ?2", "set doi"],
+      ["UPDATE compute_derivatives SET retention = 'x', doi = '10.1/x' WHERE key = ?1", "set doi"],
+      ["UPDATE compute_derivatives SET copied = 1,\n   doi = ?2 WHERE key = ?1", "set doi"],
+      ["INSERT OR REPLACE INTO compute_derivatives (key) VALUES (?1)", "replace"],
+      ["REPLACE INTO compute_derivatives (key) VALUES (?1)", "replace"],
+      ["DELETE FROM compute_derivatives WHERE key = ?1", "delete"],
+      ["INSERT INTO compute_derivatives (key, doi) VALUES (?1, ?2)", "insert doi"],
+    ];
+    for (const [statement, problem] of bad) {
+      expect(derivativeTableProblems(`const s = \`${statement}\`;`)).toContain(problem);
+    }
+    // A comment that says what no code does is not code, and a statement about another table is not this one's.
+    expect(
+      derivativeTableProblems("// UPDATE compute_derivatives SET doi = 1\nconst a = 1;"),
+    ).toEqual([]);
+    expect(derivativeTableProblems("const s = 'UPDATE other SET doi = 1';")).toEqual([]);
+  });
+
+  test("no code writes a DOI, deletes or replaces a derivative row, signs an address for the bucket or reads a compute switch", () => {
     const root = join(import.meta.dir, "..", "src");
     const files: string[] = [];
     const walk = (dir: string) => {
@@ -1462,17 +1574,15 @@ describe("the table and its guards", () => {
       }
     };
     walk(root);
+    expect(files.length).toBeGreaterThan(100);
     for (const file of files) {
-      const text = readFileSync(file, "utf8");
-      expect(text, file).not.toMatch(/DELETE\s+FROM\s+compute_derivatives\b/i);
-      expect(text, file).not.toMatch(/UPDATE\s+compute_derivatives\s+SET\s+doi\b/i);
+      expect(derivativeTableProblems(readFileSync(file, "utf8")), file).toEqual([]);
     }
     for (const name of ["services/compute-derivatives.ts", "routes/admin/compute-derivatives.ts"]) {
-      const text = readFileSync(join(root, name), "utf8");
-      expect(text).not.toMatch(
+      const code = stripComments(readFileSync(join(root, name), "utf8"));
+      expect(code).not.toMatch(
         /ezid|datacite|presign|COMPUTE_ENABLED|COMPUTE_PIPELINES_DISPATCH_ENABLED|AUTO_REPULL/i,
       );
-      expect(text).not.toMatch(/INSERT\s+INTO\s+compute_derivatives[^;]*\bdoi\b/i);
     }
   });
 });
