@@ -388,7 +388,9 @@ function rowText(text: unknown, what: string, field: string): string {
  * source commit the dataset version names (`validateDerivativeKeyFields` checks its shape).
  *
  * Version 1: a Zarr derivative is keyed by `inputDigestV2` below, which also names the electrode
- * positions a recipe was handed.
+ * positions a recipe was handed. A row that is a list is read as an object with no path, so version 1
+ * names the field `path` for it (the stamp rejects lists first, `no_stores_content`); version 2 names
+ * `stores_content`.
  */
 export async function inputDigest(rows: readonly StoreContentRow[]): Promise<string> {
   if (!Array.isArray(rows) || rows.length === 0) {
@@ -581,16 +583,18 @@ export interface StoreRowV2 extends StoreContentRow {
  * recipe by design handed eegprep no positions from that store, never "the store had none". The
  * header line means a version 1 text and a version 2 text are never the same bytes.
  *
- * Every refusal of `inputDigest` holds, with the same `field`, and a `locations` that is missing,
- * not text, or neither shape is refused with the field `locations` (checked after the other fields
- * of its row). The rows may arrive in any order.
+ * Every refusal of `inputDigest` holds, with the same `field`, except that a row that is a list is
+ * not an object here and is refused with the field `stores_content` (version 1 reads a list as an
+ * object with no path and names `path`). A `locations` that is missing, not text, or neither shape
+ * is refused with the field `locations` (checked after the other fields of its row). The rows may
+ * arrive in any order.
  */
 export function inputDigestV2Text(rows: readonly StoreRowV2[]): string {
   if (!Array.isArray(rows) || rows.length === 0) {
     throw new DerivativeContractError("an input digest needs at least one store", "stores_content");
   }
   const lines = rows.map((row, index) => {
-    if (typeof row !== "object" || row === null) {
+    if (typeof row !== "object" || row === null || Array.isArray(row)) {
       throw new DerivativeContractError(`row ${index} is not an object`, "stores_content");
     }
     const path = rowText(row.path, `row ${index} path`, "path");

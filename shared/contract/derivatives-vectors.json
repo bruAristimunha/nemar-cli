@@ -349,6 +349,11 @@
         "name": "locations missing",
         "field": "locations",
         "rows": [{"path": "sub-01/eeg/sub-01_task-rest_eeg.edf", "group": "eeg", "content_sha256": "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd"}]
+      },
+      {
+        "name": "a row that is a list",
+        "field": "stores_content",
+        "rows": [["sub-01/eeg/sub-01_task-rest_eeg.edf", "eeg", "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd", "none"]]
       }
     ],
     "derivative_key": [

@@ -135,7 +135,7 @@ The lines, each ending in LF, are `nemar.store-locations.v1`; `system`, and afte
 **`nemar.input-digest.v2`** is `sha256:` and the SHA-256 of the line `nemar.input-digest.v2` and LF, then one line per store whose group was read in full, `path`, tab, `group`, tab, `content_sha256`, tab, `locations`, LF, sorted by path in code point order exactly as in decision 3.
 `locations` is the store's `nemar.store-locations.v1` digest or exactly `none`, in lowercase.
 `none` means the recipe by design handed eegprep no positions from that store; it never means that the store had none, which is the digest of a text whose every `position` is alone.
-Every refusal of decision 3 holds with the same field, and a `locations` that is missing, not text, or neither shape is refused with the field `locations`.
+Every refusal of decision 3 holds with the same field, except that a row that is a list is not an object and is refused with the field `stores_content` (version 1 reads a list as an object with no path and names `path`, which no stamp reaches, because the stamp rejects lists first), and a `locations` that is missing, not text, or neither shape is refused with the field `locations`.
 The header line means a version 1 text and a version 2 text are never the same bytes.
 The derivative key keeps `nemar.derivative-key.v1` and its validator, because a version 2 digest is a valid `sha256:` input digest.
 

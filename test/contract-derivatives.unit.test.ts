@@ -222,6 +222,7 @@ describe("the vector file", () => {
       "locations NONE",
       "locations of 63 hexadecimal digits",
       "locations missing",
+      "a row that is a list",
     ]);
   });
 });
@@ -616,6 +617,15 @@ describe("input digest (vectors 4 and 5)", () => {
     }
     for (const content_sha256 of ["", "A".repeat(64), "a".repeat(63), "a".repeat(65), 5]) {
       expect(await fieldOf([{ ...row, content_sha256 }])).toBe("content_sha256");
+    }
+  });
+
+  test("version 1 reads a row that is a list as an object with no path and names `path`", async () => {
+    // Pinned so that nobody copies it: version 2 names `stores_content` for the same row. The stamp
+    // rejects a list before any digest is computed, so no record reaches this answer.
+    for (const rows of [[[]], [["sub-01/eeg.edf", "eeg"]], [vectors.input_digest[0].rows[0], []]]) {
+      const error = await rejects(inputDigest(rows as unknown as StoreContentRow[]));
+      expect(error.field).toBe("path");
     }
   });
 
@@ -1213,6 +1223,21 @@ describe("input digest, version 2 (rows of four fields)", () => {
     expect(await fieldOf([rowV2({ group: "", locations: "NONE" })])).toBe("group");
   });
 
+  test("a row that is a list is not an object: refused with the field stores_content", async () => {
+    // Version 1 names `path` for the same rows (pinned in the version 1 tests): the one difference.
+    const lists: unknown[][] = [
+      [[]],
+      [["sub-01/eeg.edf", "eeg", "a".repeat(64), "none"]],
+      [rowV2(), []],
+      [[], rowV2()],
+    ];
+    for (const rows of lists) {
+      const error = await rejects(inputDigestV2(rows as StoreRowV2[]));
+      expect(error.field).toBe("stores_content");
+      expect(refused(() => inputDigestV2Text(rows as StoreRowV2[])).field).toBe("stores_content");
+    }
+  });
+
   test("a different group, path, content or locations is a different digest", async () => {
     const row = rowV2();
     const base = await inputDigestV2([row]);
@@ -1251,7 +1276,10 @@ describe("input digest, version 2 (rows of four fields)", () => {
     for (const entry of FILE.refused.input_digest_v2) {
       const error = await rejects(inputDigestV2(entry.rows as StoreRowV2[]));
       expect(error.field).toBe(entry.field);
-      expect(entry.field).toBe("locations");
+      // The locations rows name `locations`; a row that is a list is not an object.
+      expect(entry.field).toBe(
+        entry.name === "a row that is a list" ? "stores_content" : "locations",
+      );
     }
   });
 });

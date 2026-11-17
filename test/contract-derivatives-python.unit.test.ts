@@ -386,10 +386,9 @@ const EXTRA_DIGESTS: string[] = [
   digestCase("rows a string", '"rows"'),
   digestCase("a row null", `[${row('"a"', '"none"')}, null]`),
   digestCase("a row a number", "[1]"),
-  // Deliberately absent: a row that is itself a list. `inputDigest` (version 1) and so the module
-  // read it as an object with no path (field `path`), where the definition's words, a row that is
-  // not an object, say `stores_content` and Python's dict check agrees with them. The definition
-  // does not settle it, so no test pins either answer.
+  digestCase("a row a list", "[[]]"),
+  digestCase("a row a list of four", `[["a", "eeg", "${HEX_A}", "none"]]`),
+  digestCase("a row a list beside a good row", `[${row('"a"', '"none"')}, []]`),
   digestCase(
     "path missing",
     `[{"group": "eeg", "content_sha256": "${HEX_A}", "locations": "none"}]`,
