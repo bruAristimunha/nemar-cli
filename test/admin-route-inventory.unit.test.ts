@@ -91,6 +91,13 @@ const EXPECTED_ENTRIES: Record<string, number> = {
   "POST /compute/runners": 2,
   "GET /compute/runners": 2,
   "POST /compute/runners/:id/revoke": 2,
+  // Portable compute, card V1b: the derivative store. Admin-only through the router's middleware, one
+  // handler each: `published` is the owner's alone, and that check is the service's (`promoteDerivative`),
+  // so no route carries an owner middleware.
+  "GET /compute/derivatives": 1,
+  "GET /compute/derivatives/:key": 1,
+  "POST /compute/derivatives/sync": 1,
+  "POST /compute/derivatives/:key/retention": 1,
 
   // Users / accounts
   "GET /users": 1,
@@ -376,7 +383,7 @@ describe("admin route inventory", () => {
   });
 
   test("entry total is pinned", () => {
-    expect(adminRoutes.routes.length).toBe(254);
+    expect(adminRoutes.routes.length).toBe(258);
   });
 
   // The count pin above can't see a SWAP of the router-level middleware

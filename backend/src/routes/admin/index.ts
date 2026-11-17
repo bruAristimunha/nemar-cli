@@ -10,6 +10,7 @@
 import { Hono } from "hono";
 import { adminMiddleware, authMiddleware, cookieOriginGuard } from "../../middleware/auth";
 import { registerComputeAdminRoutes } from "./compute";
+import { registerComputeDerivativeAdminRoutes } from "./compute-derivatives";
 import { registerComputeJobAdminRoutes } from "./compute-jobs";
 import { registerComputePipelineAdminRoutes } from "./compute-pipeline";
 import { registerComputeReportingRoutes } from "./compute-reporting";
@@ -101,3 +102,6 @@ registerComputePipelineAdminRoutes(adminRoutes);
 registerComputeReportingRoutes(adminRoutes);
 // Runner registrations (portable compute, card DM-05): owner only, behind the same router middleware.
 registerComputeRunnerAdminRoutes(adminRoutes);
+// The derivative store (portable compute, card V1b; ADR 0123): admin, with `published` the owner's alone
+// (checked in the service). Dark until the owner binds the derivatives bucket.
+registerComputeDerivativeAdminRoutes(adminRoutes);
