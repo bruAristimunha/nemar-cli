@@ -61,6 +61,7 @@ import {
 } from "../../../shared/contract/derivatives.js";
 import { AUDIT_IF_PREVIOUS_CHANGED_SQL, auditLogParams } from "../db/audit-log.js";
 import type { Bindings } from "../types/bindings.js";
+import { VERSION_DOI_SQL } from "./anonymity.js";
 import { VERSION_TAG_SQL } from "./compute-pipeline-eligibility.js";
 import { OUTPUTS_BODY_CEILING_BYTES } from "./compute-records.js";
 import {
@@ -927,10 +928,14 @@ async function describe(
     asObject(stated) !== null && JSON.stringify(stated).length <= PROCESS_BLOCK_MAX_BYTES
       ? stated
       : null;
+  // The version DOI is read through the repository's one rule (`VERSION_DOI_SQL`, which withholds it from an
+  // anonymous dataset: its identifier is reserved and does not resolve), never by hand. The description is
+  // an administrator's, but a citation that names an unresolvable identifier would be wrong all the same.
   const versionRow = await db
     .prepare(
-      `SELECT doi FROM dataset_versions WHERE dataset_id = ?1 AND ${VERSION_TAG_SQL("version")} = ?2
-        ORDER BY id ASC LIMIT 1`,
+      `SELECT ${VERSION_DOI_SQL} FROM dataset_versions dv JOIN datasets d ON d.dataset_id = dv.dataset_id
+        WHERE dv.dataset_id = ?1 AND ${VERSION_TAG_SQL("dv.version")} = ?2
+        ORDER BY dv.id ASC LIMIT 1`,
     )
     .bind(row.dataset_id, row.version)
     .first<{ doi: string | null }>();
