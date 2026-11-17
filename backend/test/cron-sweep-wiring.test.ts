@@ -187,6 +187,10 @@ const SWEEP_WIRING: Record<
   // The retention sweep deletes from the two private compute buckets, so it is production-only, absent
   // from DEV_CRON_ALLOWLIST and self-fenced; it reads no switch (a record that is due goes).
   runComputeRetentionSweep: "prod-only",
+  // Portable compute (card V1b, ADR 0123): the derivative store's daily pass copies into and deletes from a
+  // private bucket, so it is production-only, absent from DEV_CRON_ALLOWLIST and self-fenced to exact
+  // production; with the bucket unbound it does nothing, and it reads no switch.
+  runComputeDerivativesCron: "prod-only",
   sweepBlockedBidsValidationRequests: "all-envs",
   // #1789: tombstones the live integration tests' accounts. It runs ONLY outside production,
   // from a section of scheduledCleanup (`cleanUpLiveTestAccounts`); the dedicated block at the
