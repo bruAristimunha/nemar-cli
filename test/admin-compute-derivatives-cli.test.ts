@@ -32,6 +32,7 @@ import {
   type LifecycleFixture,
   startLifecycleFixture,
 } from "../backend/test/helpers/compute-lifecycle-fixture";
+import { seedEegDataset } from "../backend/test/helpers/compute-pipeline-fixture";
 import { retryInfrastructure } from "../backend/test/helpers/neurobagel-harness";
 
 const CLI_ENTRY = join(import.meta.dir, "..", "src", "index.ts");
@@ -112,7 +113,11 @@ interface Ran {
   exitCode: number;
 }
 
-async function runCli(who: ComputeWho | null, args: string[]): Promise<Ran> {
+async function runCli(
+  who: ComputeWho | null,
+  args: string[],
+  group: string[] = ["compute", "derivatives"],
+): Promise<Ran> {
   if (who === null) {
     rmSync(join(configDir, "config.json"), { force: true });
   } else {
@@ -137,7 +142,7 @@ async function runCli(who: ComputeWho | null, args: string[]): Promise<Ran> {
     if (v !== undefined) env[k] = v;
   }
   const proc = spawn({
-    cmd: ["bun", "run", CLI_ENTRY, "admin", "compute", "derivatives", ...args],
+    cmd: ["bun", "run", CLI_ENTRY, "admin", ...group, ...args],
     cwd: REPO_ROOT,
     env,
     stdin: "ignore",
@@ -153,6 +158,8 @@ const KEY = "a1".repeat(32);
 
 /** A stored `canary` derivative of `nm000104`, written with SQL the table accepts. */
 async function seedStored(key = KEY, dataset = "nm000104"): Promise<void> {
+  // A derivative is kept only while its dataset is there: the promotions check it.
+  await seedEegDataset(fx.env(), dataset);
   await fx
     .env()
     .DB.prepare(
@@ -234,18 +241,46 @@ describe("promote", () => {
     const catalog = await runCli("admin", ["promote", KEY]);
     expect(catalog.exitCode).toBe(0);
     expect(catalog.stdout).toContain("raised to catalog");
-    const refused = await runCli("admin", ["promote", KEY, "--to", "published"]);
+    const refused = await runCli("admin", ["promote", KEY, "--to", "published", "--yes"]);
     expect(refused.exitCode).toBe(1);
     expect(refused.stdout + refused.stderr).toContain("owner_only");
-    const owner = await runCli("owner", ["promote", KEY, "--to", "published", "--json"]);
+    const owner = await runCli("owner", ["promote", KEY, "--to", "published", "--yes", "--json"]);
     expect(owner.exitCode).toBe(0);
     expect(
       (JSON.parse(owner.stdout) as { derivative: { retention: string; doi: null } }).derivative,
     ).toMatchObject({ retention: "published", doi: null });
     // No step back: the same request again is refused with its word.
-    const again = await runCli("owner", ["promote", KEY, "--to", "published"]);
+    const again = await runCli("owner", ["promote", KEY, "--to", "published", "--yes"]);
     expect(again.exitCode).toBe(1);
     expect(again.stdout + again.stderr).toContain("not_promotable");
+  });
+
+  test("raising to published asks first, and without a yes sends nothing (MUTATION: skip the question)", async () => {
+    await seedStored();
+    expect((await runCli("admin", ["promote", KEY])).exitCode).toBe(0);
+    seen = [];
+    // Standard input is not a terminal here, so the question cannot be answered: nothing is changed.
+    const asked = await runCli("owner", ["promote", KEY, "--to", "published"]);
+    expect(asked.exitCode).toBe(1);
+    expect(asked.stdout + asked.stderr).toContain("not answered yes");
+    expect(seen).toEqual([]);
+    const row = await fx
+      .env()
+      .DB.prepare("SELECT retention FROM compute_derivatives WHERE key = ?1")
+      .bind(KEY)
+      .first<{ retention: string }>();
+    expect(row?.retention).toBe("catalog");
+    // A catalog promotion needs no question.
+    expect((await runCli("admin", ["promote", "--help"])).stdout).toContain("--yes");
+  });
+
+  test("the compute help names the derivative store and the sync help says what it bounds", async () => {
+    const compute = await runCli("admin", ["--help"], ["compute"]);
+    expect(compute.exitCode).toBe(0);
+    expect(compute.stdout.replace(/\s+/g, " ")).toContain("derivative store");
+    expect(compute.stdout).toContain("derivatives");
+    const sync = await runCli("admin", ["sync", "--help"]);
+    expect(sync.stdout.replace(/\s+/g, " ")).toContain("at most 150");
   });
 
   test("an unknown key exits 1 with its word", async () => {
@@ -277,6 +312,7 @@ describe("arguments and keys", () => {
       ["promote", KEY, "--to", "forever"],
       ["promote", KEY, "--to", "canary"],
       ["sync", "--max-objects", "0"],
+      ["sync", "--max-objects", "151"],
       ["sync", "--max-objects", "201"],
     ]) {
       const r = await runCli("admin", args);
