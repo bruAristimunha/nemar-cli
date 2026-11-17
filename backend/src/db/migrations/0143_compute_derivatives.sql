@@ -35,6 +35,20 @@
 -- A `published` row is deliberately NOT forbidden an `expires_at`: the code that expires rows never touches a
 -- `published` one, and the guard in it is held by a test that gives a `published` row a past date.
 --
+-- TURNS AND TRIES. `last_attempt_at` is when the sync last worked on a copying row, so the rows take turns
+-- (oldest turn first) and ten that cannot be copied cannot starve the ones behind them. `attempts` counts the
+-- turns in a row that made no progress because a read or a copy could not be done; any copied file sets it back
+-- to 0, and a row that reaches 5 ends `failed` with `copy_failed`, so a copy that can never succeed is a
+-- visible failure and not a copying row for good. `ended_at` is when a row was marked `failed` or `expired`:
+-- its objects are deleted at once, but `copied` is set to 0 only when a listing is empty AND a day has passed,
+-- so a copy that was in flight when the row ended (a copy times out after 30 seconds) cannot land its object
+-- after the last listing and be forgotten.
+--
+-- THE DATABASE KEEPS WHAT THE CODE CANNOT UNDO. Two triggers abort a DELETE of a `published` row and an UPDATE
+-- of a `published` row that changes its retention, its state or its `doi`: nothing published is ever deleted
+-- or lowered, whatever runs against this table. A later card that mints a DOI for a published derivative
+-- replaces the second trigger in its own migration, which is the point: it is a separate, reviewed act.
+--
 -- THE SKIP LOG. A succeeded stamp that cannot be keyed (its record states no digest, or fails a check of the
 -- ADR) writes NO `compute_derivatives` row, so a candidate query that asks for "stamps with no row" would meet
 -- it again at every call, and a wall of them (every record written before the recipe computed version 2 of
@@ -91,6 +105,12 @@ CREATE TABLE compute_derivatives (
     typeof(object_count) = 'integer' AND object_count BETWEEN 1 AND 1000000),
   bytes INTEGER NOT NULL CONSTRAINT compute_derivatives_bytes CHECK (
     typeof(bytes) = 'integer' AND bytes >= 0),
+  attempts INTEGER NOT NULL DEFAULT 0 CONSTRAINT compute_derivatives_attempts CHECK (
+    typeof(attempts) = 'integer' AND attempts BETWEEN 0 AND 1000),
+  last_attempt_at TEXT CONSTRAINT compute_derivatives_last_attempt_at CHECK (
+    last_attempt_at IS NULL OR length(last_attempt_at) = 19),
+  ended_at TEXT CONSTRAINT compute_derivatives_ended_at CHECK (
+    ended_at IS NULL OR length(ended_at) = 19),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   stored_at TEXT CONSTRAINT compute_derivatives_stored_at CHECK (
     stored_at IS NULL OR length(stored_at) = 19),
@@ -123,7 +143,8 @@ CREATE INDEX compute_derivatives_catalog ON compute_derivatives (dataset_id, rec
   WHERE retention = 'catalog';
 
 -- What the sync works on: rows still copying, rows due, and failed or expired rows with objects left to delete.
-CREATE INDEX compute_derivatives_copying ON compute_derivatives (created_at) WHERE state = 'copying';
+CREATE INDEX compute_derivatives_copying ON compute_derivatives (last_attempt_at, created_at)
+  WHERE state = 'copying';
 CREATE INDEX compute_derivatives_due ON compute_derivatives (expires_at)
   WHERE expires_at IS NOT NULL AND state IN ('copying', 'stored');
 CREATE INDEX compute_derivatives_cleanup ON compute_derivatives (created_at)
@@ -137,3 +158,19 @@ CREATE TABLE compute_derivative_skips (
     length(word) BETWEEN 1 AND 64 AND word NOT GLOB '*[^a-z0-9_]*'),
   decided_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- A published derivative is never deleted, and never changes its class, its state or its DOI.
+CREATE TRIGGER compute_derivatives_keep_published_delete
+BEFORE DELETE ON compute_derivatives
+WHEN OLD.retention = 'published'
+BEGIN
+  SELECT RAISE(ABORT, 'a published derivative is never deleted');
+END;
+
+CREATE TRIGGER compute_derivatives_keep_published_update
+BEFORE UPDATE ON compute_derivatives
+WHEN OLD.retention = 'published'
+ AND (NEW.retention IS NOT OLD.retention OR NEW.state IS NOT OLD.state OR NEW.doi IS NOT OLD.doi)
+BEGIN
+  SELECT RAISE(ABORT, 'a published derivative keeps its class, its state and its doi');
+END;
