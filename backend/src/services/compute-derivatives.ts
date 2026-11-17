@@ -25,10 +25,12 @@
  *    dataset was deleted, is expired: its row is marked `expired` first (one guarded statement that never
  *    selects a `published` row), then its objects are deleted in bounded batches, and the row stays. No
  *    code lowers a class, deletes a row or writes a DOI.
- *  - BOUNDED. A call copies or deletes at most `maxObjects` objects (each key is one unit) and examines at
+ *  - BOUNDED. A call copies at most `maxObjects` objects (each copy is four subrequests: the source's head,
+ *    the copy, the target's head and the count in D1), deletes at most `maxDeletes` keys (a budget of its own,
+ *    so a large expiry cannot starve copying, and one R2 delete call takes up to 1,000 keys), and examines at
  *    most `DERIVATIVE_STAMPS_PER_CALL` stamps, because the Worker makes at most 1,000 subrequests per
  *    invocation and the daily tick shares them. The progress is in D1: `copied` is the copy cursor of a row,
- *    and a decided stamp leaves the candidate set.
+ *    a decided stamp leaves the candidate set, and the rows take turns (`last_attempt_at`).
  *  - ISOLATION. The bucket is reached by this binding and by a server-side copy only; no address is ever
  *    signed for it and no route returns an object's bytes. Only `description` (`derivative.json`) is read
  *    back, by an administrator, through the route.
@@ -73,11 +75,21 @@ import { isExactProduction } from "./repull-switches.js";
 
 // --- Words and bounds ---------------------------------------------------------------------------------------
 
-/** What a call copies or deletes at most when it is not told: each key is one unit. */
+/** What a call copies at most when it is not told: each object is one unit. */
 export const DERIVATIVE_DEFAULT_MAX_OBJECTS = 100;
 
-/** The most an administrator may ask one call for (three subrequests a copy, 1,000 a Worker invocation). */
-export const DERIVATIVE_MAX_OBJECTS = 200;
+/**
+ * The most an administrator may ask one call to copy. A copy makes four subrequests (the source's head, the
+ * copy, the target's head and the advance of its count in D1) and a Worker invocation makes at most 1,000, so
+ * 150 copies are 600 and leave room for the keying reads and the deletes.
+ */
+export const DERIVATIVE_MAX_OBJECTS = 150;
+
+/** The keys one call deletes at most (one R2 delete call takes up to 1,000), whatever `maxObjects` is. */
+export const DERIVATIVE_DELETE_KEYS_PER_CALL = 1000;
+
+/** The turns in a row a copying row may make no progress before it ends `failed` with `copy_failed`. */
+export const DERIVATIVE_MAX_ATTEMPTS = 5;
 
 /** The succeeded stamps one call examines at most (about seven reads each, at the worst). */
 export const DERIVATIVE_STAMPS_PER_CALL = 20;
@@ -139,6 +151,8 @@ export const UNKEYABLE_WORDS = [
   "key_invalid",
   "manifest_unreadable",
   "derivative_name_taken",
+  "recipe_unknown",
+  "dataset_gone",
 ] as const;
 
 export type UnkeyableWord = (typeof UNKEYABLE_WORDS)[number];
@@ -147,7 +161,7 @@ export type UnkeyableWord = (typeof UNKEYABLE_WORDS)[number];
 export type SkipWord = UnkeyableWord | "duplicate_key";
 
 /** The words a derivative row says it failed with. */
-export const DERIVATIVE_FAILURE_WORDS = ["copy_mismatch", "source_missing"] as const;
+export const DERIVATIVE_FAILURE_WORDS = ["copy_mismatch", "source_missing", "copy_failed"] as const;
 
 export type DerivativeFailure = (typeof DERIVATIVE_FAILURE_WORDS)[number];
 
@@ -172,6 +186,9 @@ export interface DerivativeRow {
   copied: number;
   object_count: number;
   bytes: number;
+  attempts: number;
+  last_attempt_at: string | null;
+  ended_at: string | null;
   created_at: string;
   stored_at: string | null;
   superseded_at: string | null;
@@ -181,16 +198,26 @@ export interface DerivativeRow {
 
 export const DERIVATIVE_COLUMNS = `key, dataset_id, version, recipe, recipe_version, engine, input, profile,
   input_digest, image_digest, job_id, stamp_id, state, retention, failure, copied, object_count, bytes,
-  created_at, stored_at, superseded_at, expires_at, doi`;
+  attempts, last_attempt_at, ended_at, created_at, stored_at, superseded_at, expires_at, doi`;
 
 // --- Availability -------------------------------------------------------------------------------------------
 
 const present = (value: string | undefined): value is string =>
   typeof value === "string" && value.trim() !== "";
 
-/** Whether the derivatives bucket is bound and named: what every read entry point needs. */
+/**
+ * Whether the derivatives bucket is bound and named: what every read entry point needs. The name must not be
+ * the records or the results bucket's own (the signer refuses it too): those are presignable, and the results
+ * bucket expires its objects.
+ */
 export function derivativesBound(env: Bindings): boolean {
-  return Boolean(env.COMPUTE_DERIVATIVES) && present(env.COMPUTE_DERIVATIVES_BUCKET_NAME);
+  const name = env.COMPUTE_DERIVATIVES_BUCKET_NAME;
+  return (
+    Boolean(env.COMPUTE_DERIVATIVES) &&
+    present(name) &&
+    name.trim() !== env.COMPUTE_RECORDS_BUCKET_NAME?.trim() &&
+    name.trim() !== env.COMPUTE_RESULTS_BUCKET_NAME?.trim()
+  );
 }
 
 /** What a sync reaches: the three buckets by binding and the signer for the server-side copy. */
@@ -356,7 +383,7 @@ function tableHasTransientCode(text: string): boolean | null {
 export async function keyStamp(stores: Stores, stamp: CandidateStamp): Promise<Keying> {
   if (stamp.input_digest === null) return unkeyable("no_input_digest");
   const recipe = findRecipe(stamp.recipe);
-  if (recipe === null) return unkeyable("record_unreadable");
+  if (recipe === null) return unkeyable("recipe_unknown");
   try {
     // 1. The spec: a subset run would take its full run's key, and the record cannot say it was one.
     const spec = await readRecordedSpec(stores.records, {
@@ -497,42 +524,72 @@ export const CANDIDATE_STAMPS_SQL = `SELECT s.id, s.dataset_id, s.version, s.rec
 /**
  * Make a derivative's row: `?1` key, `?2` dataset, `?3` version, `?4` recipe, `?5` recipe version, `?6` engine,
  * `?7` input, `?8` profile, `?9` input digest, `?10` image digest, `?11` job, `?12` stamp, `?13` file count,
- * `?14` bytes. A second job with the same key adds nothing: the first derivative stands.
+ * `?14` bytes. A second job with the same key adds nothing: the first derivative stands. And nothing is made
+ * for a dataset that is gone (a deletion between the scan and the insert): a derivative of a deleted dataset
+ * must not outlive the deletion's dating of its rows.
  */
 export const INSERT_DERIVATIVE_SQL = `INSERT INTO compute_derivatives
   (key, dataset_id, version, recipe, recipe_version, engine, input, profile, input_digest, image_digest,
    job_id, stamp_id, object_count, bytes)
-  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+  SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
+   WHERE EXISTS (SELECT 1 FROM datasets WHERE dataset_id = ?2)
   ON CONFLICT(key) DO NOTHING`;
 
-/** Remember a stamp decided without a derivative. `?1` the stamp, `?2` the word. */
-export const SKIP_STAMP_SQL =
-  "INSERT OR IGNORE INTO compute_derivative_skips (stamp_id, word) VALUES (?1, ?2)";
+/**
+ * Remember a stamp decided without a derivative. `?1` the stamp, `?2` the word. Not for a stamp that has a
+ * derivative of its own (a second call made it between the read and here): its row says what became of it.
+ */
+export const SKIP_STAMP_SQL = `INSERT OR IGNORE INTO compute_derivative_skips (stamp_id, word)
+  SELECT ?1, ?2 WHERE NOT EXISTS (SELECT 1 FROM compute_derivatives WHERE stamp_id = ?1)`;
 
 /**
  * Mark every row that is due `expired`, in one statement: not a `published` row, ever, and only a row with a
  * date that has passed. The row's objects are deleted afterwards (`CLEAN_ROWS_SQL`); `copied` becomes the
- * number of objects that may stand, an upper bound.
+ * number of objects that may stand, an upper bound, and `ended_at` says when.
  */
-export const EXPIRE_DUE_SQL = `UPDATE compute_derivatives SET state = 'expired', copied = object_count
+export const EXPIRE_DUE_SQL = `UPDATE compute_derivatives
+   SET state = 'expired', copied = object_count, ended_at = datetime('now')
  WHERE retention <> 'published' AND state IN ('copying', 'stored')
    AND expires_at IS NOT NULL AND expires_at <= datetime('now')`;
 
-/** Rows that are failed or expired and may still have objects under their prefix, oldest first. `?1` the most. */
-export const CLEAN_ROWS_SQL = `SELECT key, copied FROM compute_derivatives
+/**
+ * Rows that are failed or expired and may still have objects under their prefix, oldest first. `?1` the most.
+ * `settled` is 1 once a day has passed since the row ended: only then may an empty listing set `copied` to 0,
+ * because a copy that was in flight when the row ended (a copy times out after 30 seconds) can land an object
+ * after the first empty listing.
+ */
+export const CLEAN_ROWS_SQL = `SELECT key, copied,
+       (ended_at IS NULL OR ended_at <= datetime('now', '-1 days')) AS settled
+  FROM compute_derivatives
  WHERE state IN ('failed', 'expired') AND copied > 0 ORDER BY created_at ASC, key ASC LIMIT ?1`;
 
-/** Rows still copying, oldest first, that nothing has dated (a dated row is expiring, not copying). `?1` the most. */
+/**
+ * Rows still copying that nothing has dated (a dated row is expiring, not copying), the row that was worked
+ * on longest ago first (a row never worked on first), so rows take turns. `?1` the most.
+ */
 export const COPYING_ROWS_SQL = `SELECT ${DERIVATIVE_COLUMNS} FROM compute_derivatives
- WHERE state = 'copying' AND expires_at IS NULL ORDER BY created_at ASC, key ASC LIMIT ?1`;
+ WHERE state = 'copying' AND expires_at IS NULL
+ ORDER BY last_attempt_at IS NOT NULL, last_attempt_at ASC, created_at ASC, key ASC LIMIT ?1`;
 
-/** Count one more file copied: only the caller that holds the count, so two syncs cannot both advance it. */
-export const ADVANCE_COPIED_SQL = `UPDATE compute_derivatives SET copied = copied + 1
+/** A row's turn: when the sync last worked on it. `?1` key. */
+export const TOUCH_ROW_SQL = `UPDATE compute_derivatives SET last_attempt_at = datetime('now')
+ WHERE key = ?1 AND state = 'copying'`;
+
+/** A turn that made no progress for a reason that may pass (a read or a copy that could not be done). `?1` key. */
+export const NOTE_FAILED_TURN_SQL = `UPDATE compute_derivatives SET attempts = attempts + 1
+ WHERE key = ?1 AND state = 'copying'`;
+
+/**
+ * Count one more file copied: only the caller that holds the count, so two syncs cannot both advance it, and
+ * never on a row that has been dated (a deletion's dating, or an expiry, ends the copy). Progress sets the
+ * failed turns back to 0.
+ */
+export const ADVANCE_COPIED_SQL = `UPDATE compute_derivatives SET copied = copied + 1, attempts = 0
  WHERE key = ?1 AND state = 'copying' AND copied = ?2 AND expires_at IS NULL`;
 
 /** End a copying row `failed` with a word; its objects are cleaned afterwards. `?1` key, `?2` word. */
 export const FAIL_ROW_SQL = `UPDATE compute_derivatives
-   SET state = 'failed', failure = ?2, copied = object_count
+   SET state = 'failed', failure = ?2, copied = object_count, ended_at = datetime('now')
  WHERE key = ?1 AND state = 'copying'`;
 
 /**
@@ -544,9 +601,20 @@ export const STORE_ROW_SQL = `UPDATE compute_derivatives
        expires_at = datetime('now', '+${CANARY_DAYS} days')
  WHERE key = ?1 AND state = 'copying' AND copied = object_count AND expires_at IS NULL`;
 
-/** `canary` to `catalog`, only a stored canary row. `?1` key. */
+/**
+ * A promotion needs a derivative that is still LIVE: a row whose date has passed (a canary past its 30 days
+ * that the sync has not swept yet, or one a dataset's deletion dated to now) is already going and is never
+ * kept by a promotion, and neither is a row whose dataset is gone. A canary always has a date, so for
+ * `catalog` the date must be in the future; `published` is raised from a catalog row, which has none or a
+ * future one (a superseded row).
+ */
+const LIVE_SQL =
+  "AND EXISTS (SELECT 1 FROM datasets d WHERE d.dataset_id = compute_derivatives.dataset_id)";
+
+/** `canary` to `catalog`, only a stored canary row that is not yet due. `?1` key. */
 export const PROMOTE_CATALOG_SQL = `UPDATE compute_derivatives SET retention = 'catalog', expires_at = NULL
- WHERE key = ?1 AND retention = 'canary' AND state = 'stored'`;
+ WHERE key = ?1 AND retention = 'canary' AND state = 'stored'
+   AND expires_at > datetime('now') ${LIVE_SQL}`;
 
 /**
  * A later `catalog` row supersedes every other one of its dataset, recipe, input and profile: it is dated
@@ -559,9 +627,10 @@ export const SUPERSEDE_CATALOG_SQL = `UPDATE compute_derivatives
  WHERE dataset_id = ?1 AND recipe = ?2 AND input = ?3 AND profile = ?4
    AND retention = 'catalog' AND superseded_at IS NULL AND key <> ?5 AND changes() > 0`;
 
-/** `catalog` to `published`, only a stored catalog row; it never expires after this. `?1` key. */
+/** `catalog` to `published`, only a stored catalog row that is not due; it never expires after this. `?1` key. */
 export const PROMOTE_PUBLISHED_SQL = `UPDATE compute_derivatives SET retention = 'published', expires_at = NULL
- WHERE key = ?1 AND retention = 'catalog' AND state = 'stored'`;
+ WHERE key = ?1 AND retention = 'catalog' AND state = 'stored'
+   AND (expires_at IS NULL OR expires_at > datetime('now')) ${LIVE_SQL}`;
 
 const BY_KEY_SQL = `SELECT ${DERIVATIVE_COLUMNS} FROM compute_derivatives WHERE key = ?1`;
 
@@ -617,6 +686,12 @@ interface Budget {
   left: number;
 }
 
+/** The two budgets of a call: objects copied, and keys deleted (a budget of its own, see the header). */
+interface Budgets {
+  copies: Budget;
+  deletes: Budget;
+}
+
 const errorName = (err: unknown): string => (err instanceof Error ? err.name : typeof err);
 
 /**
@@ -638,7 +713,11 @@ async function deleteSome(
   return { deleted: keys.length, done: !listed.truncated };
 }
 
-/** Delete the objects of failed and expired rows, a bounded number a call, and count each row down. */
+/**
+ * Delete the objects of failed and expired rows, a bounded number a call, and count each row down. An empty
+ * listing sets `copied` to 0 only once a day has passed since the row ended (`settled`): before that the row
+ * is listed again by a later sync, because a copy that was in flight when it ended can land after this one.
+ */
 async function cleanRows(
   stores: Stores,
   db: D1Database,
@@ -649,21 +728,28 @@ async function cleanRows(
     await db
       .prepare(CLEAN_ROWS_SQL)
       .bind(DERIVATIVE_ROWS_PER_CLEANUP)
-      .all<{ key: string; copied: number }>()
+      .all<{ key: string; copied: number; settled: number }>()
   ).results;
   for (const row of rows) {
     if (budget.left < 1) return;
     try {
       const { deleted, done } = await deleteSome(stores.derivatives, prefixOf(row.key), budget);
       counts.deleted += deleted;
-      await db
-        .prepare(
-          done
-            ? "UPDATE compute_derivatives SET copied = 0 WHERE key = ?1 AND state IN ('failed', 'expired')"
-            : "UPDATE compute_derivatives SET copied = MAX(copied - ?2, 1) WHERE key = ?1 AND state IN ('failed', 'expired')",
-        )
-        .bind(...(done ? [row.key] : [row.key, deleted]))
-        .run();
+      if (!done) {
+        await db
+          .prepare(
+            "UPDATE compute_derivatives SET copied = MAX(copied - ?2, 1) WHERE key = ?1 AND state IN ('failed', 'expired')",
+          )
+          .bind(row.key, deleted)
+          .run();
+      } else if (row.settled === 1) {
+        await db
+          .prepare(
+            "UPDATE compute_derivatives SET copied = 0 WHERE key = ?1 AND state IN ('failed', 'expired')",
+          )
+          .bind(row.key)
+          .run();
+      }
     } catch (err) {
       console.error(
         `[compute-derivatives] clean_failed key=${row.key.slice(0, 12)} error=${errorName(err)}`,
@@ -744,8 +830,16 @@ async function keyNewStamps(
         counts.duplicate++;
         continue;
       }
-      if ((inserted.meta?.changes ?? 0) > 0) counts.created++;
-      else await skipStamp(db, stamp, "duplicate_key", counts);
+      if ((inserted.meta?.changes ?? 0) > 0) {
+        counts.created++;
+        continue;
+      }
+      // Nothing was added: the key is held by a first derivative, or the dataset is gone.
+      const held = await db
+        .prepare("SELECT 1 AS held FROM compute_derivatives WHERE key = ?1")
+        .bind(decision.key)
+        .first<{ held: number }>();
+      await skipStamp(db, stamp, held ? "duplicate_key" : "dataset_gone", counts);
     } catch (err) {
       console.error(`[compute-derivatives] stamp_failed stamp=${stamp.id} error=${errorName(err)}`);
       counts.errored++;
@@ -759,7 +853,7 @@ async function failRow(
   db: D1Database,
   row: DerivativeRow,
   word: DerivativeFailure,
-  budget: Budget,
+  budgets: Budgets,
   counts: DerivativeSyncCounts,
 ): Promise<void> {
   const ended = await db.prepare(FAIL_ROW_SQL).bind(row.key, word).run();
@@ -769,7 +863,46 @@ async function failRow(
       `[compute-derivatives] derivative_failed key=${row.key.slice(0, 12)} dataset=${row.dataset_id} word=${word}`,
     );
   }
-  await cleanRows(stores, db, budget, counts);
+  await cleanRows(stores, db, budgets.deletes, counts);
+}
+
+/**
+ * A turn that made no progress for a reason that may pass (a copy the interface refused, a target the binding
+ * does not see): counted `later`, and the row stays `copying` to be tried again, until it has failed
+ * `DERIVATIVE_MAX_ATTEMPTS` turns in a row, when it ends `failed` with `copy_failed` and is no longer a copying
+ * row for good. `attempts` is the count as it stands after this call's own progress.
+ */
+async function failedTurn(
+  stores: Stores,
+  db: D1Database,
+  row: DerivativeRow,
+  attempts: number,
+  budgets: Budgets,
+  counts: DerivativeSyncCounts,
+): Promise<void> {
+  counts.later++;
+  if (attempts + 1 >= DERIVATIVE_MAX_ATTEMPTS) {
+    await failRow(stores, db, row, "copy_failed", budgets, counts);
+    return;
+  }
+  await db.prepare(NOTE_FAILED_TURN_SQL).bind(row.key).run();
+}
+
+/**
+ * A copy that landed after its row ended must not be forgotten: when the count could not be advanced (or the
+ * row could not be stored) and the row has meanwhile ended `failed` or `expired`, the object just written is
+ * deleted, because the cleanup of that row may already have listed its prefix for the last time.
+ */
+async function dropLateObject(
+  stores: Stores,
+  db: D1Database,
+  row: DerivativeRow,
+  objectKey: string,
+): Promise<void> {
+  const now = await getDerivative(db, row.key);
+  if (now !== null && (now.state === "failed" || now.state === "expired")) {
+    await stores.derivatives.delete(objectKey);
+  }
 }
 
 /** `derivative.json`: what the derivative is, so it never stands without saying what it was made from. */
@@ -844,24 +977,29 @@ async function copyRow(
   stores: Stores,
   db: D1Database,
   row: DerivativeRow,
-  budget: Budget,
+  budgets: Budgets,
   counts: DerivativeSyncCounts,
 ): Promise<void> {
+  // The row's turn: rows are worked on by the longest wait, so ten that cannot be copied starve nothing.
+  await db.prepare(TOUCH_ROW_SQL).bind(row.key).run();
   const product = await readProductFiles(stores.results, row.job_id);
-  if (product.kind !== "ok") return failRow(stores, db, row, "source_missing", budget, counts);
+  if (product.kind !== "ok") return failRow(stores, db, row, "source_missing", budgets, counts);
   const files = product.files;
   if (files.length !== row.object_count) {
-    return failRow(stores, db, row, "copy_mismatch", budget, counts);
+    return failRow(stores, db, row, "copy_mismatch", budgets, counts);
   }
   let copied = row.copied;
-  while (copied < files.length && budget.left > 0) {
+  let attempts = row.attempts;
+  while (copied < files.length && budgets.copies.left > 0) {
     const file = files[copied] as ProductFile;
     const sourceKey = resultsOutputKey(row.job_id, file.source);
     const targetKey = objectKeyOf(row.key, file.path);
     const source = await stores.results.head(sourceKey);
-    if (!source) return failRow(stores, db, row, "source_missing", budget, counts);
+    if (!source) return failRow(stores, db, row, "source_missing", budgets, counts);
     // The platform verified the declared sizes when the job ended; a source that no longer says so is not copied.
-    if (source.size !== file.size) return failRow(stores, db, row, "copy_mismatch", budget, counts);
+    if (source.size !== file.size) {
+      return failRow(stores, db, row, "copy_mismatch", budgets, counts);
+    }
     try {
       await copyObject(
         stores.s3,
@@ -870,37 +1008,61 @@ async function copyRow(
       );
     } catch (err) {
       if (!(err instanceof ComputeS3Error)) throw err;
+      // The code and the HTTP status of the refusal: the message holds no key and no secret.
       console.error(
-        `[compute-derivatives] copy_failed key=${row.key.slice(0, 12)} code=${err.code}`,
+        `[compute-derivatives] copy_failed key=${row.key.slice(0, 12)} code=${err.code}${
+          err.status === undefined ? "" : ` status=${err.status}`
+        }`,
       );
-      counts.later++;
-      return;
+      return failedTurn(stores, db, row, attempts, budgets, counts);
     }
-    budget.left--;
+    budgets.copies.left--;
     const target = await stores.derivatives.head(targetKey);
-    if (!target || target.size !== source.size || target.etag !== source.etag) {
-      return failRow(stores, db, row, "copy_mismatch", budget, counts);
+    if (!target) {
+      // A copy the interface accepted that the binding cannot see: the binding and the bucket name do not
+      // name one bucket, or the store is slow to show it. That is not a bad copy, so the row is not failed
+      // for it (a failed row is final for its key): it waits and is tried again.
+      console.error(`[compute-derivatives] target_missing key=${row.key.slice(0, 12)}`);
+      return failedTurn(stores, db, row, attempts, budgets, counts);
+    }
+    if (target.size !== source.size || target.etag !== source.etag) {
+      return failRow(stores, db, row, "copy_mismatch", budgets, counts);
     }
     const advanced = await db.prepare(ADVANCE_COPIED_SQL).bind(row.key, copied).run();
-    // Another call, or a dataset's deletion, took the row: this call stops on it.
-    if ((advanced.meta?.changes ?? 0) === 0) return;
+    if ((advanced.meta?.changes ?? 0) === 0) {
+      // Another call, or an expiry, or a dataset's deletion, took the row: this call stops on it, and an object
+      // it just wrote under a row that has ended is not left behind.
+      await dropLateObject(stores, db, row, targetKey);
+      return;
+    }
     copied++;
+    attempts = 0;
     counts.copied++;
   }
   if (copied < files.length) return;
   const text = await describe(stores, db, row, files);
-  if (text === null) return failRow(stores, db, row, "source_missing", budget, counts);
-  await stores.derivatives.put(objectKeyOf(row.key, DERIVATIVE_DESCRIPTION_FILE), text, {
+  if (text === null) return failRow(stores, db, row, "source_missing", budgets, counts);
+  const descriptionKey = objectKeyOf(row.key, DERIVATIVE_DESCRIPTION_FILE);
+  await stores.derivatives.put(descriptionKey, text, {
     httpMetadata: { contentType: "application/json" },
   });
   const stored = await db.prepare(STORE_ROW_SQL).bind(row.key).run();
   if ((stored.meta?.changes ?? 0) > 0) counts.stored++;
+  else await dropLateObject(stores, db, row, descriptionKey);
 }
 
 export interface DerivativeSyncOptions {
-  /** Objects copied or deleted at most this call; each key is one unit. Default 100, at most 200. */
+  /** Objects copied at most this call. Default 100, at most `DERIVATIVE_MAX_OBJECTS`. */
   maxObjects?: number;
+  /** Keys deleted at most this call, a budget of its own. Default and most `DERIVATIVE_DELETE_KEYS_PER_CALL`. */
+  maxDeletes?: number;
 }
+
+/** A requested bound as a whole number from 1 to `most`, the default when none was asked for. */
+const bounded = (requested: number | undefined, fallback: number, most: number): number => {
+  const value = requested ?? fallback;
+  return Math.max(1, Math.min(most, Number.isFinite(value) ? Math.floor(value) : 1));
+};
 
 /**
  * One bounded pass over the store: mark what is due `expired` and delete the objects of failed and expired rows,
@@ -914,21 +1076,27 @@ export async function syncDerivatives(
 ): Promise<DerivativeSyncResult> {
   const stores = storesOf(env);
   if (stores === null) return { available: false };
-  const requested = options.maxObjects ?? DERIVATIVE_DEFAULT_MAX_OBJECTS;
-  const budget: Budget = {
-    left: Math.max(
-      1,
-      Math.min(DERIVATIVE_MAX_OBJECTS, Number.isFinite(requested) ? Math.floor(requested) : 1),
-    ),
+  const budgets: Budgets = {
+    copies: {
+      left: bounded(options.maxObjects, DERIVATIVE_DEFAULT_MAX_OBJECTS, DERIVATIVE_MAX_OBJECTS),
+    },
+    deletes: {
+      left: bounded(
+        options.maxDeletes,
+        DERIVATIVE_DELETE_KEYS_PER_CALL,
+        DERIVATIVE_DELETE_KEYS_PER_CALL,
+      ),
+    },
   };
   const db = env.DB;
   const counts = emptyCounts();
 
-  // 1. What is due goes: the date passes (or the dataset was deleted), the row stays.
+  // 1. What is due goes: the date passes (or the dataset was deleted), the row stays. Deleting has a budget
+  //    of its own, so a large expiry cannot take the copies' turn.
   try {
     const due = await db.prepare(EXPIRE_DUE_SQL).run();
     counts.expired = due.meta?.changes ?? 0;
-    await cleanRows(stores, db, budget, counts);
+    await cleanRows(stores, db, budgets.deletes, counts);
   } catch (err) {
     console.error(`[compute-derivatives] expire_failed error=${errorName(err)}`);
     counts.errored++;
@@ -942,20 +1110,26 @@ export async function syncDerivatives(
     counts.errored++;
   }
 
-  // 3. Rows copy, oldest first, with what is left of the budget.
+  // 3. Rows copy, the row that waited longest first, with what is left of the copy budget.
   try {
     const rows = (
       await db.prepare(COPYING_ROWS_SQL).bind(DERIVATIVE_ROWS_PER_CLEANUP).all<DerivativeRow>()
     ).results;
     for (const row of rows) {
-      if (budget.left < 1) break;
+      if (budgets.copies.left < 1) break;
       try {
-        await copyRow(stores, db, row, budget, counts);
+        await copyRow(stores, db, row, budgets, counts);
       } catch (err) {
         console.error(
           `[compute-derivatives] row_failed key=${row.key.slice(0, 12)} error=${errorName(err)}`,
         );
         counts.errored++;
+        // A turn that threw is a turn without progress: it counts toward the row's tries.
+        await db
+          .prepare(NOTE_FAILED_TURN_SQL)
+          .bind(row.key)
+          .run()
+          .catch(() => undefined);
       }
     }
   } catch (err) {
@@ -1052,7 +1226,11 @@ export async function getDerivativeView(
         objectKeyOf(row.key, DERIVATIVE_DESCRIPTION_FILE),
       );
       if (object) description = JSON.parse(await object.text());
-    } catch {
+    } catch (err) {
+      // The row is still answered; the description is null, and why is logged (the error's name, never a key).
+      console.error(
+        `[compute-derivatives] description_unreadable key=${row.key.slice(0, 12)} error=${errorName(err)}`,
+      );
       description = null;
     }
   }
