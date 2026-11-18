@@ -3,6 +3,7 @@
 **Status:** accepted
 **Date:** 2026-11-17
 **Owner:** Seyed Yahya Shirazi
+**Refines:** ADR 0086 (retires the PATCH visibility route it names; see its amendment of 2026-11-17)
 
 ## Context
 

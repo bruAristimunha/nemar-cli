@@ -221,3 +221,8 @@ None blocks the release. Each is a place where the words promise a little more t
   release and `startScreenAndNotify`) is `requested` with no screen status, and no sweep looks for that.
 - **An older installed CLI prints the bare word `ci_check_unavailable`** for the 503, because only this
   release's client leads with `message`.
+
+## Amendment 2026-11-17 (#2198): the bare visibility route is retired
+
+ADR 0125 retires `PATCH /admin/datasets/:id/visibility`, which this ADR names as a way a dataset changes visibility; it now answers 409 and points at `nemar admin repo unpublish` (and, for the other direction, publication).
+The screen and its verdicts are unchanged.
