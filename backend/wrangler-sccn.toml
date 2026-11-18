@@ -293,6 +293,12 @@ COMPUTE_DERIVATIVES_BUCKET_NAME = "nemar-compute-derivatives"
 # set as a Worker secret is deleted as one instead). (d) Repeat (a) and (b) once more, for the
 # datasets that changed in between. Only then switch the review off.
 PR_REVIEW_ENABLED = "1"
+# Vector visibility filter (ADR 0126): turned on by the owner on 2026-11-18, after the `visibility`
+# and `dataset_id` metadata indexes were created and `POST /admin/vectorize/reindex-all` relabeled
+# every public vector. With it on, a vector query is narrowed by those labels, and the embed drain
+# and reindex-all embed private datasets too: after the deploy, run reindex-all once more to embed
+# them. Production only; staging stays off until its index is relabeled the same way.
+VECTORIZE_VISIBILITY_FILTER = "1"
 # Support-ticket retention (epic #1893 phase 6a, ADR 0112): days a ticket's raw record is kept
 # before the daily purge keeps only its summary. Two years in production; staging uses 30 days,
 # matching its raw-mail bucket's lifecycle rule. A missing or invalid value deletes nothing.
