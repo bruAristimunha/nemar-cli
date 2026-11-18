@@ -133,7 +133,7 @@ function errMsg(err: unknown): string {
 }
 
 /** Strip the `ok` discriminant off a VisibilityTransitionResult failure. */
-function toFailedVisibilityStep(
+export function toFailedVisibilityStep(
   failure: Exclude<VisibilityTransitionResult, { ok: true }>,
 ): Extract<VisibilityStepResult, { status: "failed" }> {
   const { ok: _ok, ...rest } = failure;

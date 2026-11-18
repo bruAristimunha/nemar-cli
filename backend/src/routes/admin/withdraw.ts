@@ -38,7 +38,7 @@ import type { DatasetTransitionResult } from "../../services/withdraw";
 import { restoreDataset, withdrawDataset } from "../../services/withdraw";
 import type { AdminRouter } from "./shared";
 
-function statusForVisibilityStage(
+export function statusForVisibilityStage(
   stage: "not_found" | "no_repo" | "invalid_repo" | "github" | "s3" | "db",
 ): 404 | 400 | 500 {
   switch (stage) {

@@ -160,6 +160,8 @@ const EXPECTED_ENTRIES: Record<string, number> = {
   // Fleet governance / visibility / CI
   // Retired to a bare refusal (409): one handler, no validator.
   "PATCH /datasets/:id/visibility": 1,
+  // ADR 0125: the one way a published dataset goes back to private. zValidator + handler.
+  "POST /datasets/:id/unpublish": 2,
   "GET /fleet/drift": 1,
   "POST /datasets/:id/enforce": 2,
   "POST /datasets/:id/revalidate": 1,
@@ -384,7 +386,7 @@ describe("admin route inventory", () => {
   });
 
   test("entry total is pinned", () => {
-    expect(adminRoutes.routes.length).toBe(257);
+    expect(adminRoutes.routes.length).toBe(259);
   });
 
   // The count pin above can't see a SWAP of the router-level middleware

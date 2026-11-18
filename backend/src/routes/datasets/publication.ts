@@ -764,6 +764,7 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
         denied_at: string | null;
         denied_reason: string | null;
         withdrawn_at: string | null;
+        unpublished_at: string | null;
         block_reason: string | null;
         min_requirements_reasons: string | null;
         prescreen_status: string | null;
@@ -784,6 +785,18 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
         dataset_id: datasetId,
         status: "none",
         message: "No publication request found",
+      });
+    }
+
+    // An administrator pulled the dataset back to unpublished (ADR 0125): the request that
+    // published it is history, not the dataset's state, so a request can be made again.
+    if (request.status === "published" && request.unpublished_at) {
+      return c.json({
+        dataset_id: datasetId,
+        status: "none",
+        unpublished_at: request.unpublished_at,
+        message:
+          "This dataset was unpublished by an administrator and is private. Request publication again when it is ready.",
       });
     }
 
