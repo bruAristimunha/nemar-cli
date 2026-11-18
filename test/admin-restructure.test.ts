@@ -47,6 +47,9 @@ async function runCli(
   return { stdout, stderr, exitCode };
 }
 
+// biome-ignore lint/suspicious/noControlCharactersInRegex: matching the escape byte is the point
+const stripAnsi = (text: string): string => text.replace(/\u001B\[[0-9;]*m/g, "");
+
 function setTestConfig(ctx: TestContext, config: Record<string, unknown>) {
   writeFileSync(ctx.configFile, JSON.stringify(config));
 }
@@ -76,12 +79,32 @@ describe("admin command restructure - help output", () => {
     expect(stdout).toContain("S3 and IAM credential management");
   });
 
-  test("admin repo --help shows public and private", async () => {
+  test("admin repo --help lists the lifecycle commands and no `private`", async () => {
     const { stdout, exitCode } = await runCli(["admin", "repo", "--help"]);
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("public");
-    expect(stdout).toContain("private");
-    expect(stdout).toContain("Repository visibility management");
+    const commands = stripAnsi(stdout)
+      .split("\n")
+      .map((l) => l.trim().split(/\s+/)[0])
+      .filter(Boolean);
+    expect(commands).toContain("public");
+    expect(commands).toContain("withdraw");
+    expect(commands).toContain("restore");
+    expect(stdout).toContain("visibility and lifecycle");
+  });
+
+  test.each([
+    ["withdraw", "nemar admin repo withdraw"],
+    ["restore", "nemar admin repo restore"],
+  ])("the old `admin %s` fails loudly and points at its new home", async (name, replacement) => {
+    const { stderr, exitCode } = await runCli(["admin", name, "nm000104", "--execute"]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain(replacement);
+  });
+
+  test("the old `admin withdraw` and `admin restore` are not listed in admin --help", async () => {
+    const { stdout } = await runCli(["admin", "--help"]);
+    const commandLines = stdout.split("\n").filter((l) => /^\s+(withdraw|restore)\s/.test(l));
+    expect(commandLines).toEqual([]);
   });
 
   test("admin ci --help shows check, add, sync, and validate", async () => {
@@ -112,12 +135,6 @@ describe("admin commands - auth requirements", () => {
   test("admin repo public requires auth", async () => {
     const ctx = createTestContext();
     const { stdout } = await runCli(["admin", "repo", "public", "nm000104", "-y"], ctx);
-    expect(stdout).toContain("Not authenticated");
-  });
-
-  test("admin repo private requires auth", async () => {
-    const ctx = createTestContext();
-    const { stdout } = await runCli(["admin", "repo", "private", "nm000104", "-y"], ctx);
     expect(stdout).toContain("Not authenticated");
   });
 

@@ -205,7 +205,7 @@ describe("the help text", () => {
       "an administrator may file a publication request on someone else's dataset",
     );
     expect(out).toContain("nemar admin publish deny");
-    expect(out).toContain("not 'nemar admin withdraw'");
+    expect(out).toContain("not 'nemar admin repo withdraw'");
   });
 
   test("status lists denied, and says a withdrawn request is stored as denied", async () => {

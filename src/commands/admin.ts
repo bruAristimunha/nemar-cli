@@ -10,12 +10,11 @@
  * - nemar admin revoke             - Revoke user access
  * - nemar admin role               - Change a user's role (owner only)
  * - nemar admin s3 regenerate-iam  - Regenerate AWS credentials for a user
- * - nemar admin repo public/private - Change repository visibility
+ * - nemar admin repo public/unpublish/withdraw/restore - Repository visibility and lifecycle
  * - nemar admin ci check/add       - Manage CI workflows
  * - nemar admin doi create/info/update/enrich - DOI management
  * - nemar admin publish list/show/start/next/approve/deny/screen - Publication workflow and its automated review
  * - nemar admin revert             - Revert dataset to a previous version
- * - nemar admin withdraw/restore   - Withdraw/restore a published dataset (visibility + EZID DOIs)
  * - nemar admin recover [status]   - Re-copy epic #967 imports whose upstream is accessible
  * - nemar admin email-preferences show/update - Email notification opt-out
  * - nemar admin notice list/set/clear - System notice management
@@ -295,7 +294,7 @@ User Management:
   role           - Change a user's role (owner only: owner > admin > member)
 
 Dataset Management:
-  repo            - Manage repository visibility (public/private)
+  repo            - Dataset visibility and lifecycle (public, unpublish, withdraw, restore)
   ci              - Manage CI workflows (check status, deploy)
   s3              - S3/IAM credential management
   doi             - Create and manage DOIs for datasets
@@ -304,8 +303,6 @@ Dataset Management:
   make-public     - Publish a dataset (permanent, irreversible)
   delete-dataset    - Delete a dataset and all associated resources
   import-openneuro  - Import an OpenNeuro dataset into NEMAR
-  withdraw          - Withdraw a broken published dataset (private + DOI tombstone), reversible
-  restore           - Reverse a withdrawal (public + DOI restore)
 
 Examples:
   $ nemar admin users --verified           # List users awaiting approval
@@ -1889,7 +1886,9 @@ async function regenerateIamAction(_username: string, _options: ConfirmOptions) 
 // Repository Management
 // ============================================================================
 
-const repoCommand = new Command("repo").description("Repository visibility management");
+const repoCommand = new Command("repo").description(
+  "Dataset repository visibility and lifecycle: public, unpublish, withdraw, restore",
+);
 
 repoCommand
   .command("public")
@@ -2637,7 +2636,7 @@ doiCommand
   .option("--make-public", "Transition DOI from reserved to public (permanent)")
   .option(
     "--unavailable",
-    "Tombstone the concept DOI (EZID _status=unavailable); concept-only, reversible via --make-public. For a full withdrawal (visibility + every version DOI) use 'nemar admin withdraw' instead.",
+    "Tombstone the concept DOI (EZID _status=unavailable); concept-only, reversible via --make-public. For a full withdrawal (visibility + every version DOI) use 'nemar admin repo withdraw' instead.",
   )
   .option("--refresh", "Refresh metadata from dataset_description.json and .nemar/metadata.json")
   .option(YES_OPTION, YES_DESCRIPTION)
@@ -3804,10 +3803,10 @@ function printTransitionResult(
   }
 }
 
-adminCommand
+repoCommand
   .command("withdraw")
   .description(
-    "Withdraw a broken published dataset: make it private and tombstone its EZID DOIs (concept + every version). Dry-run by default.",
+    "Withdraw a BROKEN or removed published dataset: private + EZID DOIs tombstoned (concept + every version). Authors pulling a dataset back use 'unpublish' instead. Dry-run by default.",
   )
   .argument("[ids...]", "Dataset id(s) to withdraw (omit when using --all)")
   .option("--all", "Target the still-withdrawn entries on the checked-in list")
@@ -3917,10 +3916,10 @@ adminCommand
     },
   );
 
-adminCommand
+repoCommand
   .command("restore")
   .description(
-    "Reverse a withdrawal: make a dataset public again and restore its EZID DOIs (concept + every version). Dry-run by default.",
+    "Reverse a 'withdraw': public again and EZID DOIs restored (concept + every version). Not for an 'unpublish'; publish again instead. Dry-run by default.",
   )
   .argument("[ids...]", "Dataset id(s) to restore (omit when using --all)")
   .option("--all", "Target the still-withdrawn entries on the checked-in list")
@@ -4012,6 +4011,23 @@ adminCommand
       }
     },
   );
+
+// The old top-level spellings moved under `admin repo`. They stay as hidden
+// commands that do nothing and exit nonzero, so a script that still calls them
+// fails loudly instead of silently running a different command.
+for (const [name, replacement] of [
+  ["withdraw", "nemar admin repo withdraw"],
+  ["restore", "nemar admin repo restore"],
+] as const) {
+  adminCommand
+    .command(name, { hidden: true })
+    .allowUnknownOption()
+    .allowExcessArguments()
+    .action(() => {
+      console.error(chalk.red(`'nemar admin ${name}' moved to '${replacement}'. Nothing was run.`));
+      process.exit(1);
+    });
+}
 
 // ============================================================================
 // Import OpenNeuro

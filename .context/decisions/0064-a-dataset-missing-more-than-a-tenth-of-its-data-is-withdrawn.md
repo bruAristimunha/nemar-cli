@@ -42,7 +42,7 @@ reader can analyze, so it must not count toward completeness.
 available.** "Files" is the wrong word for the rule and this ADR's own argument says why:
 an entry count runs above a key count, so a file-based denominator understates the loss.
 Below that, it is withdrawn from the catalog until the content can be served: withdrawal
-is `nemar admin withdraw`, which makes the repository private and tombstones the DOIs,
+is `nemar admin repo withdraw`, which makes the repository private and tombstones the DOIs,
 reversed by `restore` the day the data is fetchable again.
 
 **The threshold applies only after recovery has been attempted and has reported what it

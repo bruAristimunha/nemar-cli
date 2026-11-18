@@ -4909,7 +4909,7 @@ Description:
   you are ready ('nemar dataset publish request <dataset-id>', with or without
   --anonymous).
 
-  This is not 'nemar admin withdraw', which takes a broken published dataset
+  This is not 'nemar admin repo withdraw', which takes a broken published dataset
   out of the catalog.
 
   Only the dataset owner can withdraw the request, even though an administrator

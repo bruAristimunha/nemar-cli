@@ -29,7 +29,7 @@
  *
  * WHAT THE REAL TAKEDOWN FLOWS LEAVE BEHIND, and which term catches each (the tests
  * drive the repository's own D1 helpers and the real cascade, not a copy):
- *   - `nemar admin withdraw` (services/withdraw.ts): `visibility = 'private'` (the first
+ *   - `nemar admin repo withdraw` (services/withdraw.ts): `visibility = 'private'` (the first
  *     write), then `withdrawn_at` and `withdrawn_reason`, then the concept DOI's and
  *     every version DOI's `ezid_status = 'unavailable'`; `status` and the version rows
  *     are untouched. `public` and `not_withdrawn` each reject it; so does
