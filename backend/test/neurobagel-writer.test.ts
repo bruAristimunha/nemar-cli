@@ -1578,7 +1578,7 @@ describe("removals are bounded per run", () => {
 // ----------------------------------------------------------------------------
 
 describe("every state the real takedown flows leave behind is ineligible, and the stored artifacts leave", () => {
-  // The flows are the repository's own: `nemar admin withdraw` (services/withdraw.ts: visibility
+  // The flows are the repository's own: `nemar admin repo withdraw` (services/withdraw.ts: visibility
   // private first, then the withdrawal columns, then the concept and every version DOI marked
   // `unavailable`), a DOI tombstoned on its own (POST /admin/datasets/:id/doi/update writes only
   // `datasets.ezid_status`), and the cascade delete (services/deletion.ts). Their D1 writes are

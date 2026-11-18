@@ -731,9 +731,9 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
     const db = c.env.DB;
 
     const dataset = await db
-      .prepare("SELECT id, owner_user_id FROM datasets WHERE dataset_id = ?")
+      .prepare("SELECT id, owner_user_id, visibility FROM datasets WHERE dataset_id = ?")
       .bind(datasetId)
-      .first<{ id: number; owner_user_id: number }>();
+      .first<{ id: number; owner_user_id: number; visibility: string | null }>();
 
     if (!dataset) {
       return c.json({ error: "Dataset not found" }, 404);
@@ -764,6 +764,7 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
         denied_at: string | null;
         denied_reason: string | null;
         withdrawn_at: string | null;
+        unpublished_at: string | null;
         block_reason: string | null;
         min_requirements_reasons: string | null;
         prescreen_status: string | null;
@@ -784,6 +785,23 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
         dataset_id: datasetId,
         status: "none",
         message: "No publication request found",
+      });
+    }
+
+    // An administrator pulled the dataset back to unpublished (ADR 0125): the request that
+    // published it is history, not the dataset's state, so a request can be made again. Not when the dataset
+    // is public again (an administrator's `make-public` after an unpublish): then the request stands.
+    if (
+      request.status === "published" &&
+      request.unpublished_at &&
+      dataset.visibility !== "public"
+    ) {
+      return c.json({
+        dataset_id: datasetId,
+        status: "none",
+        unpublished_at: request.unpublished_at,
+        message:
+          "This dataset was unpublished by an administrator and is private. Request publication again when it is ready.",
       });
     }
 
@@ -921,7 +939,7 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
       return c.json(
         {
           error:
-            "Only the dataset owner can withdraw a publication request. An administrator ends one with 'nemar admin publish deny'.",
+            "Only the dataset owner can withdraw a publication request. An administrator ends one with 'nemar admin repo publish deny'.",
         },
         403,
       );
@@ -1206,7 +1224,8 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
    * (publish/request -> admin approval -> orchestrator); as a direct flip of
    * GitHub/S3/D1 visibility it skips DOI minting, manifest generation, and the
    * submission-minimums gate, so owners must go through publish/request instead.
-   * One-way operation: Cannot unpublish
+   * An administrator can pull the dataset back to private afterwards with
+   * `POST /admin/datasets/:id/unpublish` (ADR 0125); its DOIs stay registered.
    *
    * Effects:
    * 1. Changes GitHub repo from private to public

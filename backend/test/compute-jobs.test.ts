@@ -59,12 +59,26 @@ import {
   jobSpec,
   roundTripD1,
   seedUser,
-  setPolicy,
+  setPolicy as setPolicyOf,
   sha256Hex,
   trace,
 } from "./helpers/compute-seed";
 
 let h: ComputeHarness;
+
+/**
+ * Miniflare's D1 keeps every job of every earlier case live, so the tenant ceiling (issue #2121, phase P2: its
+ * own file proves it) is lifted on that engine, or the accumulated jobs would fill the default 20 and refuse a
+ * case about something else. bun:sqlite is new for every case and keeps the default.
+ */
+const setPolicy = (d1: D1Database, ownerId: number, over: Record<string, unknown>) =>
+  setPolicyOf(d1, ownerId, {
+    ...(d1 === h.d1
+      ? { tenant: { maxLiveJobs: 1000, reserved: { people: 0, pipelines: 0, partner: 0 } } }
+      : {}),
+    ...over,
+  });
+
 /** An owner of the Miniflare D1, which is never reset: the policy is restored to the default before each case. */
 let miniflareOwner = 0;
 

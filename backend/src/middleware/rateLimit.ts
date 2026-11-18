@@ -139,7 +139,7 @@ const SITE_IP_MAX_REQUESTS = 2000;
 // of removing the floor.
 const SITE_UNATTRIBUTED_MAX_REQUESTS = 20_000;
 // Authenticated bucket. Originally sized for the heaviest single admin
-// orchestration: `nemar admin publish approve` on a 6500-object dataset
+// orchestration: `nemar admin repo publish approve` on a 6500-object dataset
 // makes ~65 sequential CLI→Worker HTTP calls (one batch per ~100-object
 // page) plus the surrounding orchestrator steps — call it ~165 total
 // requests counting orchestrator overhead. (Each Worker invocation
@@ -864,6 +864,15 @@ const OAUTH_PATHS: ReadonlySet<string> = new Set([
   "/oauth/introspect",
 ]);
 const OAUTH_MAX_REQUESTS = 2000;
+// The workstation runner's routes (portable compute, ADR 0121) other than `/token`: claim, heartbeat,
+// outputs, complete, me and the rest. Their bearer is an access token that only the handler validates, so a
+// bearer-keyed bucket would let a caller mint a fresh 1,000/min bucket per request with a made-up bearer
+// AND make each one cost a privileged-token D1 lookup (the hole the Neurobagel route documents). They are
+// IP-keyed whatever they carry. A lab's runners share one address and poll a few times a minute each, so
+// 2,000/min is far above any fleet and still bounds a runaway caller. `/token` is deliberately NOT here:
+// its bearer is the runner's long secret, which falls through to the ordinary bearer branch.
+const RUNNER_PATH_RE = /^\/compute\/runners(?!\/token(\/|$))(\/|$)/;
+const RUNNER_MAX_REQUESTS = 2000;
 // The zarr serving gateway (#901), the highest-request-volume data-plane path,
 // which bypassed the middleware stack and went unthrottled. Two reachable path
 // shapes, because Hono's `app.route("/zarrproxy", zarrDataRoutes)` PREPENDS the
@@ -930,6 +939,11 @@ const AUTH_PATHS = [
   // authenticate a request with. Its own per-row 5-second floor
   // (`DEVICE_POLL_SQL`) answers `slow_down` to anything faster than that
   // without ever 429ing the loop.
+  // A runner's secret exchange (portable compute, card DM-05): credential-less in the sense that the
+  // bearer is a secret being tried, so it is keyed by IP in the strict bucket like the identity routes
+  // above. A runner exchanges once per 15 minutes. The runner's other routes (`/me`, claim, ...) are not
+  // here: they carry an access token and have their own IP-keyed `runner-ip` bucket (RUNNER_PATH_RE).
+  "/compute/runners/token",
   "/auth/device/start",
   "/auth/device/lookup",
   "/auth/device/confirm",
@@ -1061,6 +1075,8 @@ export function __readBearerTokenFromHeader(authHeader: string | undefined): str
  *  - `oauth-ip` for the OpenID Connect token, revocation and introspection
  *    endpoints. 2,000/60s, IP-keyed, checked before the bearer branch for the
  *    reasons at OAUTH_PATHS.
+ *  - `runner-ip` for the workstation runner's routes other than `/compute/runners/token`.
+ *    2,000/60s, IP-keyed, checked before the bearer branch for the reasons at RUNNER_PATH_RE.
  *  - `ip` for everything else (the unauthenticated cap), or, for a caller
  *    without `CF-Connecting-IP`, `site-ip` (the visitor it forwarded) or
  *    `site-unattributed` (nobody named). The `ip` argument is the caller key
@@ -1080,7 +1096,8 @@ export interface __BucketSelection {
     | "token"
     | "data-ip"
     | "neurobagel-ip"
-    | "oauth-ip";
+    | "oauth-ip"
+    | "runner-ip";
   /** Pre-hash key material: the caller key (see {@link __CallerIdentity}), or the raw bearer token. */
   rawKey: string;
   maxRequests: number;
@@ -1350,6 +1367,10 @@ export function __selectBucket(
   // The OpenID Connect client endpoints: IP-keyed whatever they carry (see OAUTH_PATHS).
   if (OAUTH_PATHS.has(path)) {
     return { keyKind: "oauth-ip", rawKey: ip, maxRequests: OAUTH_MAX_REQUESTS };
+  }
+  // The runner routes: IP-keyed whatever they carry (see RUNNER_PATH_RE).
+  if (RUNNER_PATH_RE.test(path)) {
+    return { keyKind: "runner-ip", rawKey: ip, maxRequests: RUNNER_MAX_REQUESTS };
   }
   const bearer = __readBearerTokenFromHeader(authHeader);
   if (bearer) {
@@ -2053,6 +2074,7 @@ export const __limits = {
   PRIVATE_GRANT_MAX_REQUESTS,
   OIDC_AUTHORIZE_MAX_REQUESTS,
   OAUTH_MAX_REQUESTS,
+  RUNNER_MAX_REQUESTS,
   WINDOW_SIZE,
 };
 

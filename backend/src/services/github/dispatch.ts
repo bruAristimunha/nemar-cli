@@ -725,7 +725,7 @@ export class DispatchRejectedError extends Error {
  * Hand a publication approval to the central workflow via
  * `repository_dispatch[approve-publication]` (ADR 0080).
  *
- * The workflow runs `nemar admin publish approve <dataset_id>` on a runner and
+ * The workflow runs `nemar admin repo publish approve <dataset_id>` on a runner and
  * drives the same caller-side loop (S3 Object Lock batches, retries,
  * `--resume`) a terminal does, which is why the approval does not run inside
  * the Worker: that loop is long and its cost belongs on the runner. The payload

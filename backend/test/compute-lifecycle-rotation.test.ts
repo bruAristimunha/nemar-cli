@@ -30,6 +30,7 @@ import {
   reread,
   startLifecycleFixture,
 } from "./helpers/compute-lifecycle-fixture";
+import { setPolicy } from "./helpers/compute-seed";
 import { logged } from "./helpers/logs";
 
 let fx: LifecycleFixture;
@@ -103,6 +104,11 @@ describe("the repair lists rotate (open point: terminal repair lists ordered by 
 describe("the orphan list and the cancel list rotate (open points)", () => {
   test("eleven orphans whose cancel fails are all tried in two ticks (MUTATION: do not stamp the orphan row)", async () => {
     const ids: string[] = [];
+    // Eleven live jobs that each record an orphan hold 22 slots (an orphan counts, issue #2121): more than the
+    // default tenant ceiling, which is not what this case is about.
+    await setPolicy(env().DB, fx.ownerId, {
+      tenant: { maxLiveJobs: 1000, reserved: { people: 0, pipelines: 0, partner: 0 } },
+    });
     for (let i = 0; i < 11; i++) {
       const made = await makeJob(fx);
       fx.harness.db.run("UPDATE compute_jobs SET orphan_tapis_uuid = ? WHERE id = ?", [

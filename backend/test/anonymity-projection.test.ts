@@ -194,6 +194,8 @@ const DELIBERATE_VERSION_DOI_READS: Readonly<Record<string, string>> = {
     "the sweep that VERIFIES each version identifier is still `reserved` at EZID (ADR 0067); it reports to admins and stamps `sweep_stamps`, and a rule that withheld the DOI from it would blind the check to the thing it exists to check",
   "services/withdraw.ts":
     "admin withdrawal and restore, which must tombstone every version DOI including a reserved one",
+  "services/unpublish.ts":
+    "admin-only unpublish counts the version DOIs it leaves untouched; only the count reaches the response and audit row, never an identifier",
   "services/upstream-repull-verified.ts":
     "admin-only record of a re-pull's release: checks that the version was minted before recording it, and puts the identifier in no response or audit row",
   // The manifest-generation family. Each reads the version DOI to EMBED it in

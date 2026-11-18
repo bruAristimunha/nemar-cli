@@ -253,6 +253,12 @@ export interface ComputeJobsQuery {
   flag?: string;
   state?: string;
   account?: number;
+  /** `tapis` or `runner`. */
+  executor?: string;
+  /** `su` or `none`. */
+  accounting?: string;
+  /** A runner registration's id. */
+  runner?: string;
   limit?: number;
   after?: number;
 }
@@ -265,6 +271,9 @@ export async function listComputeJobs(q: ComputeJobsQuery = {}): Promise<Compute
   if (q.flag) params.set("flag", q.flag);
   if (q.state) params.set("state", q.state);
   if (q.account !== undefined) params.set("account", String(q.account));
+  if (q.executor) params.set("executor", q.executor);
+  if (q.accounting) params.set("accounting", q.accounting);
+  if (q.runner) params.set("runner", q.runner);
   if (q.limit !== undefined) params.set("limit", String(q.limit));
   if (q.after !== undefined) params.set("after", String(q.after));
   return request(
@@ -431,14 +440,14 @@ export async function mintComputeObserverRun(): Promise<ComputeObserverRunRespon
  */
 export function computeRefusalCode(
   err: unknown,
-): { code: string; blockedBy: string[] } | undefined {
+): { code: string; blockedBy: string[]; reason?: string } | undefined {
   if (!(err instanceof ApiError)) return undefined;
   const body = err.rawBody;
   if (typeof body !== "object" || body === null || Array.isArray(body)) return undefined;
-  const { code, blocked_by: blocked } = body as Record<string, unknown>;
+  const { code, blocked_by: blocked, reason } = body as Record<string, unknown>;
   if (typeof code !== "string") return undefined;
   const blockedBy = Array.isArray(blocked)
     ? blocked.filter((t): t is string => typeof t === "string")
     : [];
-  return { code, blockedBy };
+  return { code, blockedBy, ...(typeof reason === "string" ? { reason } : {}) };
 }

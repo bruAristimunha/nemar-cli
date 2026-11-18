@@ -316,7 +316,12 @@ describe("the caps", () => {
 
   test("never more than one tick's bound, whatever the owner's caps allow", async () => {
     const env = await world(ids(CRON_DISPATCH_PER_TICK + 3));
-    await policy(pipelinesPolicy(100, 100));
+    // 13 live jobs in all: more than the default tenant ceiling leaves the pipelines (12 beside the people's
+    // floor, issue #2121, which compute-tenant-ceiling.test.ts proves), so this case lifts the ceiling.
+    await policy({
+      ...pipelinesPolicy(100, 100),
+      tenant: { maxLiveJobs: 1000, reserved: { people: 0, pipelines: 0, partner: 0 } },
+    });
     const result = await runComputePipelineDispatchCron(env);
     expect(result?.dispatched).toBe(CRON_DISPATCH_PER_TICK);
     // Said, so a recipe cut by the bound is not read as having nothing eligible.

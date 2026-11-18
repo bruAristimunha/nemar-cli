@@ -1,4 +1,5 @@
 import { computeReleaseStatements } from "../services/compute-release";
+import { runnerEndStatements } from "../services/compute-runners";
 import { DOCS_GRANTS_PURGE_SQL } from "../services/docs-auth";
 import { oidcEndStatements } from "../services/oidc-cascade";
 import { PRIVATE_GRANTS_PURGE_SQL } from "../services/private-auth";
@@ -150,6 +151,11 @@ export interface TombstoneCascadeResult {
  * (`sweepComputeCancellations`) makes them. Each of those statements goes through `step` like the
  * rest, so under `onlyIfEmail` it applies only when the mask did.
  *
+ * The runners the account registered end in this batch too (`runnerEndStatements`, portable compute D5):
+ * their access tokens are deleted, an unstarted claim is released, a started job becomes `unreported` with
+ * no lease, and each registration is revoked. One of THREE callers of that set (see
+ * `services/compute-runners.ts`); like the compute statements they go through `step`.
+ *
  * What it does NOT do, because both are network calls with their own failure
  * modes and only the owner-only route wants them: remove GitHub collaborators
  * and revoke legacy IAM keys. A caller that skips those must have established
@@ -207,6 +213,10 @@ export async function tombstoneUserCascade(
     // Tapis cancels follow from the retried sweep; nothing here calls Tapis. Every statement ends in
     // a WHERE clause (see compute-release.ts), because `step` appends the mask guard to each.
     ...computeReleaseStatements(id).map((s) => step(s.sql, ...s.binds)),
+    // The runners the account registered (portable compute, D5): tokens deleted, an unstarted claim
+    // released, a started job `unreported` with no lease, the registration revoked. Through `step`, so a
+    // guarded call applies them only when the mask did (every statement ends in a WHERE clause).
+    ...runnerEndStatements(id, "account_deleted").map((s) => step(s.sql, ...s.binds)),
     // Expire any outstanding passwordless login codes for the original email so
     // a code issued just before deletion can't be submitted (it would otherwise
     // be consumed and then cleanly denied; this avoids even that round-trip).

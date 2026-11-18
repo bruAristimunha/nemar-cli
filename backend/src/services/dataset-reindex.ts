@@ -25,7 +25,7 @@ import {
   writeVersionHed,
   writeVersionSize,
 } from "./dataset-metadata-columns.js";
-import { reembedDatasetVector } from "./dataset-search.js";
+import { embedsNonPublic, reembedDatasetVector } from "./dataset-search.js";
 import { enrichDataset } from "./enrich-dataset.js";
 import { exemplarOrFragment, isExemplarReindexAllowed } from "./exemplar.js";
 import { getDatasetsToken } from "./github-auth.js";
@@ -324,7 +324,7 @@ export async function refreshDatasetMetadata(
     });
 
     // Best-effort re-embed (internally guarded, never throws).
-    await reembedDatasetVector(db, env.AI, env.VECTORIZE, datasetId);
+    await reembedDatasetVector(db, env.AI, env.VECTORIZE, datasetId, embedsNonPublic(env));
   } catch (colErr) {
     metadataColumnsError = errorMessage(colErr);
     console.error(`[reindex] Failed to write metadata columns for ${datasetId}:`, colErr);

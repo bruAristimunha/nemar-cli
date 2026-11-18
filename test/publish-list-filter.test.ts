@@ -1,5 +1,5 @@
 /**
- * The flag-to-status rule behind `nemar admin publish list` (#1774), and the
+ * The flag-to-status rule behind `nemar admin repo publish list` (#1774), and the
  * command itself through the real CLI entry point: what it asks the server for
  * and what it says when nothing matches.
  */
@@ -144,11 +144,11 @@ const ROW = {
   last_error: null,
 };
 
-describe("nemar admin publish list", () => {
+describe("nemar admin repo publish list", () => {
   test("asks for the active statuses by default", async () => {
     const server = startServer([ROW]);
     try {
-      const r = await runCli(["admin", "publish", "list"], server.url);
+      const r = await runCli(["admin", "repo", "publish", "list"], server.url);
       expect(r.exitCode).toBe(0);
       expect(server.seen).toEqual(["?status=requested%2Capproving%2Cblocked"]);
       expect(r.stdout).toContain("active requests");
@@ -161,7 +161,7 @@ describe("nemar admin publish list", () => {
   test("--all sends no status", async () => {
     const server = startServer([ROW]);
     try {
-      await runCli(["admin", "publish", "list", "--all"], server.url);
+      await runCli(["admin", "repo", "publish", "list", "--all"], server.url);
       expect(server.seen).toEqual([""]);
     } finally {
       server.stop();
@@ -172,7 +172,7 @@ describe("nemar admin publish list", () => {
     const server = startServer([ROW]);
     try {
       await runCli(
-        ["admin", "publish", "list", "--published", "--denied", "--search", "nm0001"],
+        ["admin", "repo", "publish", "list", "--published", "--denied", "--search", "nm0001"],
         server.url,
       );
       expect(server.seen).toEqual(["?status=published%2Cdenied&search=nm0001"]);
@@ -189,7 +189,7 @@ describe("nemar admin publish list", () => {
     };
     const server = startServer([hostile]);
     try {
-      const r = await runCli(["admin", "publish", "list"], server.url);
+      const r = await runCli(["admin", "repo", "publish", "list"], server.url);
       expect(r.exitCode).toBe(0);
       // biome-ignore lint/suspicious/noControlCharactersInRegex: detecting control chars is the point
       expect(r.stdout).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/);
@@ -203,7 +203,7 @@ describe("nemar admin publish list", () => {
   test("an empty default list says how to widen it", async () => {
     const server = startServer([]);
     try {
-      const r = await runCli(["admin", "publish", "list", "--search", "zzz"], server.url);
+      const r = await runCli(["admin", "repo", "publish", "list", "--search", "zzz"], server.url);
       expect(r.stdout).toContain('No active requests found matching "zzz"');
       expect(r.stdout).toContain("--all");
     } finally {
@@ -214,7 +214,10 @@ describe("nemar admin publish list", () => {
   test("a search over D1's pattern limit is refused before any request", async () => {
     const server = startServer([ROW]);
     try {
-      const r = await runCli(["admin", "publish", "list", "--search", "a".repeat(49)], server.url);
+      const r = await runCli(
+        ["admin", "repo", "publish", "list", "--search", "a".repeat(49)],
+        server.url,
+      );
       expect(r.exitCode).toBe(1);
       expect(r.stderr).toContain("at most 50 bytes");
       expect(server.seen).toEqual([]);
@@ -226,7 +229,10 @@ describe("nemar admin publish list", () => {
   test("a search of exactly the limit is sent", async () => {
     const server = startServer([ROW]);
     try {
-      const r = await runCli(["admin", "publish", "list", "--search", "a".repeat(48)], server.url);
+      const r = await runCli(
+        ["admin", "repo", "publish", "list", "--search", "a".repeat(48)],
+        server.url,
+      );
       expect(r.exitCode).toBe(0);
       expect(server.seen).toHaveLength(1);
     } finally {
@@ -238,7 +244,7 @@ describe("nemar admin publish list", () => {
     const server = startServer([ROW]);
     try {
       for (const text of ["_".repeat(25), "\u00e9".repeat(25)]) {
-        const r = await runCli(["admin", "publish", "list", "--search", text], server.url);
+        const r = await runCli(["admin", "repo", "publish", "list", "--search", text], server.url);
         expect(r.exitCode).toBe(1);
       }
       expect(server.seen).toEqual([]);
@@ -250,7 +256,10 @@ describe("nemar admin publish list", () => {
   test("--status keeps its old meaning: one exact status", async () => {
     const server = startServer([ROW]);
     try {
-      const r = await runCli(["admin", "publish", "list", "--status", "denied"], server.url);
+      const r = await runCli(
+        ["admin", "repo", "publish", "list", "--status", "denied"],
+        server.url,
+      );
       expect(r.exitCode).toBe(0);
       expect(server.seen).toEqual(["?status=denied"]);
     } finally {
@@ -261,7 +270,7 @@ describe("nemar admin publish list", () => {
   test("-s is still --status, not the search", async () => {
     const server = startServer([ROW]);
     try {
-      const r = await runCli(["admin", "publish", "list", "-s", "denied"], server.url);
+      const r = await runCli(["admin", "repo", "publish", "list", "-s", "denied"], server.url);
       expect(r.exitCode).toBe(0);
       expect(server.seen).toEqual(["?status=denied"]);
     } finally {
@@ -273,7 +282,7 @@ describe("nemar admin publish list", () => {
     const server = startServer([ROW]);
     try {
       await runCli(
-        ["admin", "publish", "list", "-s", "published", "--denied", "--search", "alice"],
+        ["admin", "repo", "publish", "list", "-s", "published", "--denied", "--search", "alice"],
         server.url,
       );
       expect(server.seen).toEqual(["?status=published%2Cdenied&search=alice"]);
@@ -285,10 +294,13 @@ describe("nemar admin publish list", () => {
   test("--search has no short form", async () => {
     const server = startServer([ROW]);
     try {
-      const r = await runCli(["admin", "publish", "list", "--search", "nm000104"], server.url);
+      const r = await runCli(
+        ["admin", "repo", "publish", "list", "--search", "nm000104"],
+        server.url,
+      );
       expect(r.exitCode).toBe(0);
       expect(server.seen).toEqual(["?status=requested%2Capproving%2Cblocked&search=nm000104"]);
-      const help = await runCli(["admin", "publish", "list", "--help"], server.url);
+      const help = await runCli(["admin", "repo", "publish", "list", "--help"], server.url);
       expect(help.stdout).toContain("-s, --status <status>");
       expect(help.stdout).toContain("--search <text>");
       expect(help.stdout).not.toContain("-s, --search");
@@ -300,7 +312,7 @@ describe("nemar admin publish list", () => {
   test("an empty --requested list does not say 'requested requests'", async () => {
     const server = startServer([]);
     try {
-      const r = await runCli(["admin", "publish", "list", "--requested"], server.url);
+      const r = await runCli(["admin", "repo", "publish", "list", "--requested"], server.url);
       expect(r.stdout).toContain("No requests with status requested found.");
       expect(r.stdout).not.toContain("requested requests");
       expect(r.stdout).not.toContain("--all");
@@ -312,7 +324,7 @@ describe("nemar admin publish list", () => {
   test("an empty --status list is not told to widen either", async () => {
     const server = startServer([]);
     try {
-      const r = await runCli(["admin", "publish", "list", "-s", "denied"], server.url);
+      const r = await runCli(["admin", "repo", "publish", "list", "-s", "denied"], server.url);
       expect(r.stdout).toContain("No requests with status denied found.");
       expect(r.stdout).not.toContain("--all");
     } finally {

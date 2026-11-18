@@ -22,8 +22,8 @@
  * pure `decideWithdrawAction` so "never attempted" (fresh), "interrupted,
  * needs finishing" (resume), "private for an unrelated reason" (skip), and
  * "already fully done" (skip) are all distinguishable. Every step re-run on
- * `resume` is independently idempotent (applyDatasetVisibility's own fast
- * path when already at the target state; EZID `makeUnavailable`/`makePublic`
+ * `resume` is independently idempotent (applyDatasetVisibility reads each
+ * surface's prior state and skips a stage already at the target; EZID `makeUnavailable`/`makePublic`
  * on an already-tombstoned/public identifier is a harmless no-op), so a
  * resumed run always converges without special-casing.
  *
@@ -133,7 +133,7 @@ function errMsg(err: unknown): string {
 }
 
 /** Strip the `ok` discriminant off a VisibilityTransitionResult failure. */
-function toFailedVisibilityStep(
+export function toFailedVisibilityStep(
   failure: Exclude<VisibilityTransitionResult, { ok: true }>,
 ): Extract<VisibilityStepResult, { status: "failed" }> {
   const { ok: _ok, ...rest } = failure;
@@ -499,7 +499,8 @@ export async function withdrawDataset(
  * flip visibility back to public, then makePublic the concept DOI and every
  * version DOI. Requires the dataset to actually be withdrawn
  * (`withdrawn_at` set); restore is not a generic "make public" -- that's
- * `PATCH /admin/datasets/:id/visibility` + `doi/update --make-public`.
+ * publishing (`POST /admin/publish/:id/approve` or `make-public`) + `doi/update --make-public`;
+ * `PATCH /admin/datasets/:id/visibility` is refused with 409 (ADR 0125).
  *
  * Unlike withdrawDataset, restore's precondition already keys on
  * `withdrawn_at` (the column the operation itself clears LAST, on success),

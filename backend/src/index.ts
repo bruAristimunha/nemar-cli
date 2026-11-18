@@ -33,6 +33,7 @@ import { authOrcidRoutes } from "./routes/auth-orcid";
 import { authPrivateRoutes } from "./routes/auth-private";
 import { authWebRoutes } from "./routes/auth-web";
 import { computeRoutes } from "./routes/compute";
+import { computeRunnerRoutes } from "./routes/compute-runners";
 import { catalogIndexResponse, dataRoutes } from "./routes/data";
 import { datasetRoutes } from "./routes/datasets";
 import { mcpRoutes } from "./routes/mcp";
@@ -59,16 +60,18 @@ import {
   runComputeAdvanceCron,
   sweepComputeCancellations,
 } from "./services/compute-advance";
+import { derivativesLogLine, runComputeDerivativesCron } from "./services/compute-derivatives";
 import {
   pipelineDispatchLogLine,
   runComputePipelineDispatchCron,
 } from "./services/compute-pipeline-dispatch";
 import { retentionLogLine, runComputeRetentionSweep } from "./services/compute-retention";
+import { runnerLeaseLogLine, sweepRunnerLeases } from "./services/compute-runner-queue";
 import { sweepTenantJobs, tenantLogLine } from "./services/compute-tenant-sweep";
 import { isNemarWebOrigin, isOscOrigin } from "./services/cors-origins";
 import { sweepLogLines } from "./services/cron-sweep-log";
 import { fetchAndSyncDataPapers } from "./services/data-papers-sync";
-import { drainEmbeddingDirty } from "./services/dataset-search";
+import { drainEmbeddingDirty, embedsNonPublic } from "./services/dataset-search";
 import { DEV_EPHEMERAL_BAND_END, DEV_EPHEMERAL_BAND_START } from "./services/datasetId";
 import { deleteDatasetCascade } from "./services/deletion";
 import { reconcileReservedVersionDois } from "./services/doi-reconcile";
@@ -288,6 +291,9 @@ api.route("/sandbox", sandboxRoutes);
 // person's own cancel and links (epic #2005 phase A5, #2010). Its routes are pinned by
 // test/compute-route-inventory.test.ts.
 api.route("/compute", computeRoutes);
+// A registered runner's own routes (portable compute, card DM-05): the secret buys an access token, and
+// the token opens `GET /compute/runners/me`. No session and no API key; pinned by the same inventory test.
+api.route("/compute/runners", computeRunnerRoutes);
 api.route("/webhooks", webhooks);
 // Public JSON Schema documents (issue #1059). Static, D1-free, cached: the
 // bytes are the repo's own shared/*.schema.json, the same files the Zarr
@@ -1242,6 +1248,28 @@ export default {
               ),
             ),
         );
+        // Portable compute (card DM-07, ADR 0121 decision 4): the runner queue's lease rules. It releases an
+        // expired unstarted claim, moves a started job whose lease expired to `unreported`, settles the
+        // `unreported` ones (verified, `runner_revoked`, `lease_expired`), fails a job past its deadline, ends
+        // every recorded cancel nobody is left to carry out and copies the records of a terminal runner job.
+        // It also runs on every runner claim, in every environment, so the local stack and staging get it
+        // whenever a runner polls; this tick is the production backstop for a queue nobody polls.
+        // PRODUCTION-ONLY here, and deliberately NOT in DEV_CRON_ALLOWLIST. It reads no switch, so turning
+        // runners off never strands a claimed job. One log line, only when it changed or failed something.
+        ctx.waitUntil(
+          sweepRunnerLeases(env, env.DB)
+            .then((r) => {
+              const log = runnerLeaseLogLine(r);
+              if (log?.level === "error") console.error(log.line);
+              else if (log) console.log(log.line);
+            })
+            .catch((err) =>
+              console.error(
+                "[compute-runner-queue] tick failed:",
+                err instanceof Error ? err.name : typeof err,
+              ),
+            ),
+        );
         // #2013 (epic #2005 phase A8, ADR 0118 decision 9): the ACCESS gateway-attributes reporter.
         // It sends each Slurm job's pseudonymous gateway user to ACCESS ONCE (the claim is one
         // conditional UPDATE made before the POST, and a report that may have been recorded is never
@@ -1279,6 +1307,7 @@ export default {
             .then((r) => {
               const log = r ? tenantLogLine(r) : null;
               if (log?.level === "error") console.error(log.line);
+              else if (log?.level === "warn") console.warn(log.line);
               else if (log) console.log(log.line);
             })
             .catch((err) =>
@@ -1357,7 +1386,7 @@ export default {
     // #646 Phase 4: drain stale vectors (embedding_dirty=1) — the backstop for
     // changes that don't go through the inline enrich/reindex re-embed.
     // Safe outside prod: writes only to the env-bound (dev) Vectorize index.
-    ctx.waitUntil(drainEmbeddingDirty(env.DB, env.AI, env.VECTORIZE));
+    ctx.waitUntil(drainEmbeddingDirty(env.DB, env.AI, env.VECTORIZE, 50, embedsNonPublic(env)));
 
     if (prodOnlyJobs) {
       // #736 Phase 3: backstop re-dispatch of still-failed archive generations
@@ -1457,6 +1486,7 @@ export default {
           .then((r) => {
             const log = r ? tenantLogLine(r) : null;
             if (log?.level === "error") console.error(log.line);
+            else if (log?.level === "warn") console.warn(log.line);
             else if (log) console.log(log.line);
           })
           .catch((err) =>
@@ -1483,6 +1513,28 @@ export default {
           .catch((err) =>
             console.error(
               "[compute-retention] sweep failed:",
+              err instanceof Error ? err.name : typeof err,
+            ),
+          ),
+      );
+      // Portable compute (card V1b, ADR 0123): the derivative store's one daily pass. It frees the
+      // `canary` and `catalog` derivatives that are due (the rows stay; a `published` one is never
+      // touched by code), keys the succeeded stamps that have no derivative, and copies at most 100
+      // objects server side from the results bucket into the derivatives bucket. PRODUCTION-ONLY, NOT in
+      // DEV_CRON_ALLOWLIST (it deletes from, and writes to, a private bucket), self-fenced to exact
+      // production, and dark wherever the derivatives bucket is not bound: with no binding it does
+      // nothing and writes nothing. It reads no compute switch, makes no DOI and sends no mail; staging
+      // and the local stack advance the store through the admin route. One line, only when it did something.
+      ctx.waitUntil(
+        runComputeDerivativesCron(env)
+          .then((r) => {
+            const log = r ? derivativesLogLine(r) : null;
+            if (log?.level === "error") console.error(log.line);
+            else if (log) console.log(log.line);
+          })
+          .catch((err) =>
+            console.error(
+              "[compute-derivatives] sweep failed:",
               err instanceof Error ? err.name : typeof err,
             ),
           ),

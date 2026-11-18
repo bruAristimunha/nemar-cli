@@ -92,7 +92,7 @@ verdict that could not be bound to the head).
 
 **A held publication is not a failed import.** The data is copied, registered and CI is deployed,
 so finalize exits 0 and the import is `complete`. The request stays open and Phase 4 mails the admins
-whatever the screen says, including when it never reports; `nemar admin publish list` is the queue.
+whatever the screen says, including when it never reports; `nemar admin repo publish list` is the queue.
 
 **A forward fix of git-tracked content is never approved automatically.** When the scrub blanked a
 JSON value or rewrote a recording git held, the history the push carries still holds the original:

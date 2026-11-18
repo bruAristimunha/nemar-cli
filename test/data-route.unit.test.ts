@@ -7,6 +7,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { Hono } from "../backend/node_modules/hono";
 import "./setup";
 
 import { escapeHtml } from "../backend/src/lib/escape";
@@ -15,6 +16,7 @@ import {
   type DatasetRowForMetadata,
   type DatasetVersionRow,
   VERSION_TAG_RE,
+  bidsPathAfterMount,
   buildBidsIndex,
   buildBytesUrl,
   buildCatalogIndexPayload,
@@ -24,8 +26,10 @@ import {
   buildPersonList,
   buildRedirectUrl,
   contentTypeForBidsPath,
+  decodeBidsPath,
   deriveSessions,
   diffRemovedSince,
+  encodeBidsPath,
   findLastSeenVersion,
   isPublicCatalogId,
   normalizeBidsPath,
@@ -162,11 +166,15 @@ describe("resolveFile", () => {
   });
 
   test("URL-encoded traversal segments do not resolve to anything", () => {
-    // Hono passes the path through without decoding; `%2E%2E` is a literal
-    // segment that misses every manifest key. This test pins the contract
-    // so a future "let's pre-decode the path" refactor fails loudly.
+    // resolveFile never decodes: `%2E%2E` is a literal segment that misses
+    // every manifest key. The decodeBidsPath assertions cover the composed
+    // route-then-resolve unit: encoded-slash forms decode to real `..`
+    // segments and are rejected. (A bare `%2E%2E` segment cannot reach it over
+    // HTTP; the URL parser collapses it first.)
     expect(resolveFile(fixture(), "%2E%2E/etc/passwd").kind).toBe("not_found");
     expect(resolveFile(fixture(), "sub-01%2F..%2Fsub-02").kind).toBe("not_found");
+    expect(resolveFile(fixture(), decodeBidsPath("%2E%2E/etc/passwd")).kind).toBe("not_found");
+    expect(resolveFile(fixture(), decodeBidsPath("sub-01%2F..%2Fsub-02")).kind).toBe("not_found");
   });
 
   test("rejects prototype-pollution-shaped segments", () => {
@@ -442,6 +450,34 @@ describe("buildBytesUrl", () => {
     expect(url).toBe(
       "https://data.nemar.org/nm099999/v1.0.0/sub-01/eeg/sub-01_task-rest%20events.tsv",
     );
+  });
+
+  test("decodeBidsPath inverts the encoding, reserved characters included", () => {
+    // FreeSurfer's aparc+aseg.mgz was linked as aparc%2Baseg.mgz and 404ed.
+    for (const bidsPath of [
+      "derivatives/freesurfer/sub-01/mri/aparc+aseg.mgz",
+      "sub-01/eeg/sub-01_task-rest events.tsv",
+      "notes/a&b=c;d,e@f$g#1.txt",
+      "notes/100%.txt",
+    ]) {
+      const { pathname } = new URL(buildBytesUrl({ ...common, bidsPath }));
+      expect(decodeBidsPath(pathname.replace("/nm099999/v1.0.0/", ""))).toBe(bidsPath);
+      expect(encodeBidsPath(bidsPath)).toBe(pathname.replace("/nm099999/v1.0.0/", ""));
+    }
+    expect(decodeBidsPath("mri/aparc+aseg.mgz")).toBe("mri/aparc+aseg.mgz");
+    expect(decodeBidsPath("bad%E0%A4%A.txt")).toBe("bad%E0%A4%A.txt");
+    // Decoding is once only: %252B is the literal text %2B.
+    expect(decodeBidsPath("a%252Bb")).toBe("a%2Bb");
+  });
+
+  test("decodeBidsPath degrades per segment on a malformed escape", () => {
+    // The good segment still decodes; only the bad one stays as typed.
+    expect(decodeBidsPath("a%2Bb/100%.txt")).toBe("a+b/100%.txt");
+    expect(decodeBidsPath("100% done.txt")).toBe("100% done.txt");
+  });
+
+  test("encodeBidsPath escapes # ? + & inside segments, keeps separators", () => {
+    expect(encodeBidsPath("dir#1/a?b+c&d.txt")).toBe("dir%231/a%3Fb%2Bc%26d.txt");
   });
 
   test("annex bytes_url is host-invariant (always canonical data.nemar.org)", () => {
@@ -2558,5 +2594,67 @@ describe("renderCatalogIndexHtml (#584) — HTML escaping and edge cases", () =>
     });
     // The published cell is the last <td> of the row.
     expect(html).toMatch(/<td>-<\/td><\/tr>/);
+  });
+});
+
+describe("bidsPathAfterMount (file and QA route wiring)", () => {
+  // A real Hono app with the production route shapes; no handler is mocked.
+  // It records what the route would hand to fileOrIndexHandler / qaHandler.
+  function makeApp() {
+    const app = new Hono();
+    app.get("/:datasetId/qa/*", (c) => {
+      const rawPath = bidsPathAfterMount(new URL(c.req.url).pathname, [
+        c.req.param("datasetId"),
+        "qa",
+      ]);
+      return c.json({ rawPath });
+    });
+    app.get("/:datasetId/:version/*", (c) => {
+      const { datasetId, version } = c.req.param();
+      const rawPath = bidsPathAfterMount(new URL(c.req.url).pathname, [datasetId, version]);
+      return c.json({ rawPath });
+    });
+    return app;
+  }
+  const get = async (path: string) =>
+    (await (await makeApp().request(`http://data.nemar.org${path}`)).json()) as {
+      rawPath: string | null;
+    };
+
+  test("decodes reserved escapes that Hono's c.req.path keeps", async () => {
+    expect((await get("/nm000454/v1.0.2/mri/aparc%2Baseg.mgz")).rawPath).toBe("mri/aparc+aseg.mgz");
+    expect((await get("/nm000454/v1.0.2/a%23b%26c.txt")).rawPath).toBe("a#b&c.txt");
+    expect((await get("/nm000454/v1.0.2/mri/aparc+aseg.mgz")).rawPath).toBe("mri/aparc+aseg.mgz");
+  });
+
+  test("keeps the query string out of the path", async () => {
+    expect((await get("/nm000454/v1.0.2/a%2Bb.txt?x=%2B")).rawPath).toBe("a+b.txt");
+  });
+
+  test("an escaped dataset id or version still finds the mount", async () => {
+    // Hono decodes params; the pathname stays escaped. indexOf on the escaped
+    // pathname missed and served the version root listing for a file request.
+    expect((await get("/nm000454/v1%2E0%2E2/a%2Bb.txt")).rawPath).toBe("a+b.txt");
+    expect((await get("/nm%30%30%30454/v1.0.2/a%2Bb.txt")).rawPath).toBe("a+b.txt");
+  });
+
+  test("the QA route decodes too", async () => {
+    expect((await get("/nm000454/qa/aparc%2Baseg.html")).rawPath).toBe("aparc+aseg.html");
+  });
+
+  test("a pathname without the mount is null, not the root", () => {
+    expect(bidsPathAfterMount("/other/v1.0.0/x", ["nm000454", "v1.0.0"])).toBeNull();
+  });
+
+  test("encoded-slash traversal decodes to a path normalizeBidsPath rejects", async () => {
+    const { rawPath } = await get("/nm000454/v1.0.2/sub-01%2F..%2Fsub-02");
+    expect(rawPath).toBe("sub-01/../sub-02");
+    expect(normalizeBidsPath(rawPath as string)).toBeNull();
+  });
+
+  test("a decoded NUL or newline just misses; it is never a traversal or a hit", async () => {
+    const { rawPath } = await get("/nm000454/v1.0.2/a%00b%0Ac.txt");
+    expect(rawPath).toBe("a\u0000b\nc.txt");
+    expect(resolveFile(fixture(), rawPath as string).kind).toBe("not_found");
   });
 });

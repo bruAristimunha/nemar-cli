@@ -414,6 +414,7 @@ The repository owner approved the fix on 2026-11-04: base64url without padding.
    The last clause of the A5 amendment's not-verified paragraph (whether Tapis passes a JSON launch specification, quotes and braces included, through an environment variable unaltered) is no longer the question: the value holds no quote or brace.
    Nothing is removed from this record; the earlier sentences stay as they were written.
 8. **Registration stays blocked.**
+   **[Read as the Tapis go-live block from 2026-11-14, so a runner-only deployment is not blocked by it: see the amendment of 2026-11-14, items 1 and 2.]**
    No application definition is registered with any tenant, and `COMPUTE_ENABLED` is not turned on anywhere, until the launcher's decoder lands in `nemar-process` (it implements the same format, with the golden vectors and the alphabet pinned on both sides) AND the owner items recorded on the launcher phase's pull request (`nemarOrg/nemar-process#9`) are settled.
    The order is: this change merges into the compute epic branch, then `nemar-process` re-pins the schema file to this merge commit and merges.
    The schema file `shared/contract/compute-launch.schema.json` changes in its descriptions and not its structure: it describes the document, says the document travels as base64url and claims nothing about the scheduler; `nemar-process` copies it byte for byte.
@@ -455,6 +456,7 @@ Not verified against a real tenant, and listed so nobody reads it as fact: how t
    `--image-digest` is the caller's claim and the recipe cannot check it.
    `verifyResults` compares the one value the recorded specification passes with the digest `provenance.json` says the launcher ran, and fails the job `result_verification_failed` with `image_digest_mismatch` (flagged for an administrator) on a difference, a missing flag, a malformed value or a second flag.
 5. **Eligibility is one predicate, decided from the D1 row on every dispatch** (ADR 0065): active, public, `anonymous = 0` (NULL is unknown, and unknown is not false), first published, not withdrawn, DOI not tombstoned, a version, `eeg` as a whole modality token, and a real `nm` or `on` id outside the reserved fixture band.
+   **[Outside production a second text of this predicate also admits the compute fixture `nm099996`: see the amendment of 2026-11-14, item 8.]**
    The request names a recipe, a dataset and optionally a version, and nothing else; a body with any other key is refused.
    A version with no data-plane tag, or one whose manifest holds more than 38,000 entries, is refused (`version_untagged`, `too_many_files`) and is never a candidate of the queue.
 6. **The daily dispatcher is dark three times over.**
@@ -691,3 +693,119 @@ The owner ruled that the administrator's run obeys the same limits.
    A dry run trims `would_dispatch` to the room, so the preview is what a live run would do; for a named dataset on a full pool it reports `blocked: over_concurrency`.
 
 The decision to queue a job NEMAR cannot yet admit (rather than refuse it) is not taken here; design and open questions are in #2121.
+
+## Amendment 2026-11-10 (#2121, phase P2): a tenant-wide ceiling on live jobs, checked when a job is accepted
+
+The class caps of P1 bound each of NEMAR's front doors separately, so together they could ask for more of the cluster account than it has.
+The owner approved a ceiling for the whole tenant, with a floor of slots for each class that no other class may use.
+The numbers are policy defaults the owner can change without a deploy once the center says how the cluster account's limit is counted.
+It adds no queue and no migration.
+
+1. **The rule is a guard in every hold.**
+   `createJob` adds `tenantGuard` (`services/compute-tenant.ts`) to the hold's own statement for EVERY source, after the class cap that already exists (a person's live-job limit, or the pipelines' live cap).
+   A job of class K is admitted when `occupied + 1 + SUM over the classes L other than K of max(0, floor[L] - occupied[L]) <= ceiling`.
+   It is counted inside the statement that writes the hold, so two requests racing for the last slot cannot both win; it is a guard, not a clamp.
+   The floors are unconditional: a floor slot is never lent to another class, and a class's floor is what it is owed, not what it is limited to.
+   A floor protects a class from the OTHER classes; it does not admit anything over the ceiling.
+   When jobs NEMAR did not admit fill the headroom, a class still below its floor is refused like any other, because the cluster's limit is real.
+2. **The classes are counted by the job's `source`.**
+   People are `cli` and `web`; pipelines are `pipeline`; the partner is `partner` with `flag_unreserved = 0`; everything else is `other`: a row the tenant sweep found that skipped the reservation (`flag_unreserved = 1`, whatever its source) and an orphan (below).
+   `other` has no floor and cannot be admitted, because NEMAR did not admit it; it is only counted.
+   On `dev` only `pipeline` and swept rows exist today.
+   The person's submit and the partner's reserve are on the held third-party branch (#2116); the class function is written by the source word so both are already counted when that branch merges.
+   Whoever merges `dev` into that branch:
+   - keeps the tenant guard, the pipeline guard and the `guardRefusal` ordering in the `guards` block of `createJob`;
+   - does not keep the tail of that branch's refusal wording that ends `return refusal("over_concurrency")`, which would word every tenant refusal `over_concurrency`: use `guardRefusal`'s result;
+   - keeps the access guard's own read before the others, because it needs two words (`suspended` or `no_compute_access`) and a guard of this file holds one fixed word;
+   - adds `platform_busy` to that branch's closed partner table and sentences (`COMPUTE_PARTNER_ERROR_STATUS`, `COMPUTE_PARTNER_SENTENCES`), to `COMPUTE_SUBMIT_SENTENCES` for people, and as a step of the reserve order after the client caps.
+3. **What occupies a slot.**
+   Every row in a live state, `created` included (the states are written literally in the statement so the existing partial indexes of the live rows serve the count), and one slot more for EVERY row that records an orphaned platform job (`orphan_tapis_uuid IS NOT NULL`), live or not: that job runs on until the sweep cancels it.
+   A live row can carry one in two ways, and then holds two slots: a duplicate of the job the row owns, found when a second submit is bound; and a row that is still live with a cancel pending (`created` or `uploading` with `cancel_requested_at` set) whose Tapis job turned up after the cancel was asked for, which `bindTapisJob` records as the row's `tapis_uuid` AND as its orphan, so that one job counts twice.
+   The second case lasts only while the cancel of that job keeps failing, until `cancelOrphan` succeeds or the row ends; it costs one slot, errs high as documented, and the row also shows in `cancel_pending_failed` after an hour.
+   The count errs toward too many for what NEMAR has recorded; it is not an upper bound on the cluster (see the limits).
+4. **The defaults and why.**
+   The policy key is `tenant { maxLiveJobs, reserved { people, pipelines, partner } }`; the schema refuses floors that add up to more than the ceiling, and `PUT /admin/compute/policy` therefore refuses them.
+   The defaults are a ceiling of 20 and floors of 8 for people, 2 for the pipelines and 0 for the partner.
+   The cluster account is limited to 24 jobs at once, so the ceiling of 20 leaves four slots of headroom on purpose: that headroom is for occupants NEMAR cannot see yet (a partner job that skipped the reservation until the sweep finds it, a job someone ran by hand, a duplicate), which is also why the sweep warns when its listing holds more live jobs than the ceiling.
+   With the defaults the pipelines can burst to 12 and people to 18.
+   NEMAR's own pipelines keep the room they had (8 CPU and 4 GPU, 12 in all) only while nothing else occupies a slot: an orphan or a swept row, and people holding more than their floor, each reduce it, and a stored policy that raises `pipelines.maxLiveJobs` to 100 for both pools and has no tenant key stops at 12 under the default ceiling.
+   The pipelines' caps are in effect bounded by the ceiling less the people and partner floors.
+   Each live orphan cuts the pipelines' 12 by one (20 less the people floor of 8), and the four slots between the ceiling and the cluster's limit do not help them, because the guard checks the ceiling of 20 and never the cluster's limit of 24: a stray orphan or two leaves the normal daily run (at most 10 a tick) unchanged unless more than about 2 pipeline jobs from earlier days are still live.
+   A stored policy that lacks the key uses `TENANT_POLICY_DEFAULT`, the very object the shipped default carries, never "no limit".
+   A ceiling of 0 admits nothing new (running jobs finish).
+5. **A refusal is `platform_busy` (409), and it is not a queue.**
+   It is worded after the refusal, last in the documented order: a pool that is suspended, a balance that is short, the platform budget and the class cap are read first, then each guard is asked again in order and the first that fails names the word.
+   A pipeline run stops with it (`stopped_by`), and the daily dispatcher ends its whole run (`platform_busy` is in `ENDS_THE_RUN`), because the ceiling does not depend on the pool or the recipe.
+   A retry that raced its own original request, and found the slot taken by it, gets the original job back: `createJob` reads the idempotency key again before it words a refusal, as a sequential replay is answered before any guard.
+   Whether to hold such a job until a slot frees (the queue, P3) is decided elsewhere (#2121); until then the caller asks again.
+   The partner is checked only when it reserves, so it cannot be queued behind the ceiling: a reservation either holds a slot now or is refused.
+6. **What an administrator sees.**
+   `GET /admin/compute/status` carries `tenant { ceiling, occupied, by_class, reserved }` and the attention count `tenant_over_ceiling`, which a job NEMAR did not admit, or a ceiling lowered below what is already live, can make positive; `nemar admin compute status` prints `Tenant: occupied/ceiling (people, pipelines, partner, other)`.
+   When the stored policy cannot be read the block is absent and the attention count `policy_unreadable` is 1: that is a compute outage (every hold, run and limit reads the policy and fails closed), and the route says so instead of dropping the block.
+   The live tenant sweep adds `tenant_live=<live jobs in its listing> occupied=<n>/<ceiling>` to its line, both read before the run indexes or cancels anything, and logs a warning when `tenant_live` exceeds the ceiling.
+   A pipeline run's `room` (and a dry run's) gains `tenant_left`, the slots the pipelines' class could take under the ceiling, and `limited_by` gains `tenant` (the order is `limit`, `per_invocation`, `daily_cap`, `live_cap`, `tenant`, the first on a tie, so a run that ends at exactly the number it was asked for was not limited).
+   A run is clamped to `tenant_left` and stops with `platform_busy` when it ended the run, so the preview is what a live run does; for a named dataset a dry run reports `blocked: platform_busy` after the class cap's `over_concurrency`.
+   The clamp is a read of the guard's own arithmetic (`tenantRoom`); the hold's guard still decides, so a run that races another is refused there and its stamp ends `refused`.
+7. **Honest limits.**
+   - The guard counts NEMAR's own rows.
+     A job it has not been told about holds a slot nobody counts until the sweep finds it, and a second orphan of one row is not recorded (the row has one orphan slot) until the first is cleared, which is what the headroom and the warning are for; the ceiling is not a guarantee about the cluster.
+   - The count is read inside every hold.
+     The live rows are served by a partial index, but the orphan term has no index (it would need a migration) and is a scan of `compute_jobs`; the table has one row per job.
+     The index (`compute_jobs_orphan ON compute_jobs (examined_at) WHERE orphan_tapis_uuid IS NOT NULL`, which the plain predicate of the statement is written to match) is filed as #2131 and goes into the queue phase's migration (`dev` is at 0130, and the held third-party branch holds 0131 to 0134).
+   - A refused job is refused by the guard at the moment of the hold; the word is read afterwards, so a slot freed in between can leave a refusal worded by the first guard, and the next request may be admitted.
+   - A guard is not a clamp.
+     The tenant guard is atomic, the daily cap of P1 stays a clamp, and an atomic daily guard (with an account-bound count) is a separate small change.
+   - The pipelines' floor protects them from people and from the partner, and the people floor protects people from the pipelines; neither bounds NEMAR against slots held by what NEMAR did not admit, and neither admits a job over the ceiling.
+   - Rolling the Worker back to a build from before this change reads a stored policy that has the `tenant` key as unreadable (the policy reader is as strict as the writer, on purpose) and fails closed.
+     That is not only the holds: every reader of the policy stops.
+     The launcher's outputs call is answered 503 (`policy_unavailable` at the route, `compute_disabled` from the service's own read), so a job that is running can lose its results if the outage outlasts the launcher's retries; the tick's created-row path returns `unavailable`; the dispatcher logs `policy_unreadable`; retention, the records and bundle limits, the observer's settlement and the tenant sweep stop or fail as well.
+     It is triggered more easily than it looks: with no stored row `policy show` now returns the default WITH the `tenant` key, so any show, edit and set round trip writes the key without the owner meaning to.
+     Recovery: `putPolicy` never reads the current row, so a version without the key can be written first (by the older Worker's own `policy set`, from a file without `tenant`).
+     While `COMPUTE_ENABLED` is absent in production there is nothing live to break.
+
+## Amendment 2026-11-13: pointer to ADR 0121 and ADR 0122
+
+[ADR 0121](0121-a-job-names-its-executor-and-its-accounting-class-and-a-workstation-runner-pulls-its-work.md) refines this ADR for jobs that are not Tapis tenant jobs: a job with `accounting = 'none'` runs on a runner, never on Tapis, makes no hold and writes no ledger entry.
+For those jobs it departs from decision 3 and the A3 amendment's item 1 (the hold), decision 4 (settles twice), decision 9 (the ACCESS report), the A2 amendment's item 7 (`settled_final_at` and the `job:<id>:final` entry) and the A5 amendment's item 6 (the terminal batch's ledger entry).
+A tenant or partner job has a Tapis job and is always `su`, so nothing changes for it.
+[ADR 0122](0122-one-oci-image-runs-under-apptainer-or-docker-from-one-digest.md) refines decision 14: `NEMAR_SIF_ROOT` is not required under Docker (Podman is unsupported), and the SIF is built and signed once in CI.
+`shared/contract/compute-runner.ts` also extends decision 10's list of modules.
+`sweepRunnerLeases` also runs on claim calls outside production; the 30-minute tick itself stays production-only, so decision 8 and the dark-switch rule of `AGENTS.md` are intact.
+The verdict of this ADR stands.
+
+## Amendment 2026-11-14: the registration block and runner-only deployments
+
+The amendment of 2026-11-04 (#2043), item 8, was written when `COMPUTE_ENABLED` could only mean a Tapis submission.
+Read literally it binds every environment and every executor, because "anywhere" has no qualifier, yet both of its conditions (the launcher's decoder, and the owner items recorded on the launcher phase's pull request) guard the Tapis go-live: registration with a tenant, and a launch specification reaching a scheduler that writes it into a file a shell sources.
+[ADR 0121](0121-a-job-names-its-executor-and-its-accounting-class-and-a-workstation-runner-pulls-its-work.md) does not mention item 8, and an agent cannot read away a sentence of an accepted ADR, so the owner amends it here.
+The owner decided on 2026-11-14 to mark Tapis as parked and to apply this text.
+"Item N" means the numbered item of THIS amendment.
+It changes no code, no switch, no wrangler file and no version.
+
+1. **Item 8 of the amendment of 2026-11-04 (#2043) is read as the Tapis go-live block.**
+   It blocks three things, in every environment: registering an application definition with a tenant, setting a Tapis credential (`TAPIS_USERNAME`, `TAPIS_PASSWORD` or `TAPIS_SERVICE_TOKEN`) in a Worker where `COMPUTE_ENABLED` is `1`, and submitting a job to a tenant.
+   Its first condition, the launcher's decoder in `nemar-process`, is met (`nemarOrg/nemar-process#10`).
+   The owner items of `nemarOrg/nemar-process#9` still block all three.
+2. **`COMPUTE_ENABLED` may be `1`, with `COMPUTE_RUNNERS_ENABLED`, in a Worker that holds no Tapis credential, for runner jobs.**
+   Every path that would reach Tapis in such a Worker answers `unconfigured`, and no job, credential or launch value is sent to a tenant.
+   A Tapis-executor pipeline run is refused with `tapis_unconfigured` (503) before any write, for every caller (step S3c of the portable compute plan, #2168), so no stamp, no job row and no ledger hold can appear that only a cancel would end.
+   A runner run and a dry run are unaffected.
+3. **Setting a Tapis credential where `COMPUTE_ENABLED` is `1` is the Tapis go-live.**
+   It needs the items of `nemarOrg/nemar-process#9` settled and every Tapis mechanic selecting `executor = 'tapis'`, the tenant sweep's tag bind included.
+   The bind (`handleUnbound` with `BIND_TAPIS_JOB_SQL`) selects no executor at the time of writing, so once Tapis is configured a Tapis job tagged `nemar_job:<a runner job's id>` could move that runner row; with no credential it is unreachable.
+4. **The item on `--no-mount hostfs` is not Tapis-only.**
+   It is the launcher's Apptainer flag set, and a runner drives the same launcher, so it applies to every Apptainer run, a runner's included.
+   The owner decided that the production runner uses Apptainer, rootless, so the first production Apptainer runner waits for that item.
+   A runner that drives Docker is not affected by it.
+5. **The Tapis go-live is parked by the owner's decision of 2026-11-14.**
+   Nothing in this amendment settles the owner items of `nemarOrg/nemar-process#9`.
+6. **The switches stay the owner's.**
+   A production switch is set in a reviewed pull request that edits the dark-switch test (`backend/test/compute-switches-flag.test.ts`), and nothing else sets one.
+   Decision 8 and the dark-switch rule of `AGENTS.md` are unchanged.
+7. **Policy keys, and the first production cap.**
+   The policy reader is as strict as the writer (the A2 amendment's item 8), so a Worker that does not know a key reads a stored policy that holds it as unreadable and fails every compute path closed (the P2 amendment's item 7).
+   No policy version holding the `tenant` or the `runners` key is stored in production until the previous production deployment reads both, so that a one-step rollback cannot land on a Worker that cannot read the policy.
+   The shipped default carries `tenant`, so a `policy show`, edit and `policy set` round trip writes it even when nobody meant to.
+   The first production runner cap stays the code default (`RUNNERS_POLICY_DEFAULT`) until a second release that carries the epic is deployed, and only then is a cap stored as `policy.runners`; the owner chose that over lowering the code default.
+8. **Eligibility has a second, non-production text.**
+   Eligibility stays one predicate written once as a list of terms (item 5 of the amendment of 2026-11-05 (#2011, phase A6)), and step S1 of the portable compute plan (#2164) added a second, non-production text of it (`PIPELINE_ELIGIBLE_SQL_NONPROD`) that admits the compute fixture `nm099996` outside production only; production's text is unchanged, and an `ENVIRONMENT` that is unset or misspelled behaves as production.

@@ -1,18 +1,18 @@
 /**
- * `nemar admin publish`: the publication workflow, from the administrator's side.
+ * `nemar admin repo publish`: the publication workflow, from the administrator's side.
  *
- *   nemar admin publish list [--all|--<state>|-s <s>] [--search <t>]
+ *   nemar admin repo publish list [--all|--<state>|-s <s>] [--search <t>]
  *                                              the publication requests, with the identifier screen
- *   nemar admin publish show <ds>              the automated review of one request (admin-publish-review.ts)
- *   nemar admin publish start <ds> | --all     start the automated review (admin-publish-review.ts)
- *   nemar admin publish next                   the requests that need you, one card each (admin-publish-next.ts)
- *   nemar admin publish approve <ds>           approve and publish (admin-publish-approve.ts)
- *   nemar admin publish deny <ds> [-r <why>]   deny one, mailing the depositor the reason
- *   nemar admin publish screen <ds>            run the identifier screen of a request again
+ *   nemar admin repo publish show <ds>              the automated review of one request (admin-publish-review.ts)
+ *   nemar admin repo publish start <ds> | --all     start the automated review (admin-publish-review.ts)
+ *   nemar admin repo publish next                   the requests that need you, one card each (admin-publish-next.ts)
+ *   nemar admin repo publish approve <ds>           approve and publish (admin-publish-approve.ts)
+ *   nemar admin repo publish deny <ds> [-r <why>]   deny one, mailing the depositor the reason
+ *   nemar admin repo publish screen <ds>            run the identifier screen of a request again
  *
  * Split out of `admin.ts` (epic #1726, phase 2) so the publication review's commands do not grow
- * a file of ten thousand lines. The group is registered on `adminCommand` at the position it
- * always had, so `nemar admin --help` is unchanged. `show` and `start` are registered from their own
+ * a file of ten thousand lines. The group is registered on `repoCommand` (`nemar admin repo`; the old
+ * top-level `nemar admin publish` is a hidden stub that points here). `show` and `start` are registered from their own
  * file right after `list`, and `approve` and `next` after `screen`; commander lists a group's
  * subcommands alphabetically, so the order of registration does not show in `--help`.
  */
@@ -36,7 +36,11 @@ import {
 import { markReportedExit } from "../lib/debug-log.js";
 import { LineReader } from "../lib/prompt-lines.js";
 import { readReview } from "../lib/publication-review-approve.js";
-import { reviewListLine, screenViewLines } from "../lib/publication-review-display.js";
+import {
+  requestStatusLabel,
+  reviewListLine,
+  screenViewLines,
+} from "../lib/publication-review-display.js";
 import { needsAdministrator } from "../lib/publication-review-queue.js";
 import {
   type ListFilterOptions,
@@ -76,7 +80,7 @@ Description:
   one status, narrow the list to those states, and --all shows every request.
   Shows dataset ID, status, requesting user, the identifier screen and the
   automated review of each (ADR 0102): its outcome, then the reasons it is not a
-  pass, as codes. 'nemar admin publish show <dataset>' says what each one means.
+  pass, as codes. 'nemar admin repo publish show <dataset>' says what each one means.
 
   A * marks a request you can act on now: one waiting for your decision (unless
   it is only waiting for the screen or the review to report), or an approval that
@@ -101,13 +105,13 @@ Search:
   on standard output; errors go to standard error.
 
 Examples:
-  $ nemar admin publish list                       # Active requests
-  $ nemar admin publish list --all                 # Every request
-  $ nemar admin publish list --denied              # Denied only
-  $ nemar admin publish list -s denied             # Same as --denied
-  $ nemar admin publish list --published --denied  # Both states
-  $ nemar admin publish list --needs-me            # What is yours to act on
-  $ nemar admin publish list --search nm099999 --all   # Look up one dataset, any state`,
+  $ nemar admin repo publish list                       # Active requests
+  $ nemar admin repo publish list --all                 # Every request
+  $ nemar admin repo publish list --denied              # Denied only
+  $ nemar admin repo publish list -s denied             # Same as --denied
+  $ nemar admin repo publish list --published --denied  # Both states
+  $ nemar admin repo publish list --needs-me            # What is yours to act on
+  $ nemar admin repo publish list --search nm099999 --all   # Look up one dataset, any state`,
   )
   .action(
     async (options: ListFilterOptions & { search?: string; needsMe?: boolean; json?: boolean }) => {
@@ -158,7 +162,7 @@ Examples:
 
         for (const req of rows) {
           const statusColor =
-            req.status === "published"
+            req.status === "published" && !req.unpublished_at
               ? chalk.green
               : req.status === "denied"
                 ? chalk.red
@@ -182,7 +186,7 @@ Examples:
               ? `  ${chalk.yellow("(approval running)")}`
               : "";
           console.log(
-            `  ${chalk.bold(plain(req.dataset_id))}  ${withdrawn ? chalk.yellow("withdrawn") : statusColor(plain(req.status))}  by ${plain(req.requested_by_username)}  ${chalk.dim(plain(req.requested_at))}${name ? `  ${chalk.dim(name)}` : ""}${mark}`,
+            `  ${chalk.bold(plain(req.dataset_id))}  ${withdrawn ? chalk.yellow("withdrawn") : (req.unpublished_at ? chalk.yellow : statusColor)(requestStatusLabel(req.status, req.unpublished_at))}  by ${plain(req.requested_by_username)}  ${chalk.dim(plain(req.requested_at))}${name ? `  ${chalk.dim(name)}` : ""}${mark}`,
           );
           // #1408: an anonymous release and a publication reach this list
           // looking identical, and approving the wrong one is not reversible in
@@ -231,7 +235,7 @@ Examples:
         const mine = rows.filter(needsAdministrator).length;
         console.log();
         console.log(
-          `${count}, ${chalk.bold(String(mine))} you can act on.  ${chalk.dim("nemar admin publish next | show <dataset> | approve <dataset>")}`,
+          `${count}, ${chalk.bold(String(mine))} you can act on.  ${chalk.dim("nemar admin repo publish next | show <dataset> | approve <dataset>")}`,
         );
         // Said once, and only when every row says it: a Worker answers for one flag, so a mix would
         // mean an older backend, whose rows carry no summary at all.
@@ -314,10 +318,10 @@ Requirements:
   request in force.
 
 Examples:
-  $ nemar admin publish deny nm099999 --reason "BIDS validation failing"
-  $ nemar admin publish deny nm099999 -r "Dataset incomplete - missing subjects"
-  $ nemar admin publish deny nm099999    # Prompts for reason interactively
-  $ nemar admin publish deny nm099999 --request-id 42 -r "..."  # Only if request 42 is the one in force`,
+  $ nemar admin repo publish deny nm099999 --reason "BIDS validation failing"
+  $ nemar admin repo publish deny nm099999 -r "Dataset incomplete - missing subjects"
+  $ nemar admin repo publish deny nm099999    # Prompts for reason interactively
+  $ nemar admin repo publish deny nm099999 --request-id 42 -r "..."  # Only if request 42 is the one in force`,
   )
   .action(
     async (
@@ -442,7 +446,7 @@ Description:
   datasets, which are not screened.
 
 Examples:
-  $ nemar admin publish screen nm099999`,
+  $ nemar admin repo publish screen nm099999`,
   )
   .action(async (datasetArg: string) => {
     if (!requireSignedIn()) return;

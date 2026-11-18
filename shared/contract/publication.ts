@@ -170,7 +170,7 @@ export const REQUEST_CHANGED_MESSAGE =
  * names is the listing of requests, which shows a request of any status.
  */
 export const APPROVAL_CLOSED_DURING_RUN_MESSAGE =
-  "The request was closed while this approval was running (it was denied, blocked again or filed again), so the run did not mark it published. Its steps had already run, so the dataset may already be public. An approval cannot finish a closed request: check the dataset and the request (nemar admin publish list shows its status), then finish or repair it by hand.";
+  "The request was closed while this approval was running (it was denied, blocked again or filed again), so the run did not mark it published. Its steps had already run, so the dataset may already be public. An approval cannot finish a closed request: check the dataset and the request (nemar admin repo publish list shows its status), then finish or repair it by hand.";
 
 /**
  * The sentence of the 409 `request_mismatch`: the approval named a request (`request_id`) that is
@@ -302,3 +302,11 @@ export const backfillNameOutcomeSchema = z.enum([
   "write_failed",
 ]);
 export type BackfillNameOutcome = z.infer<typeof backfillNameOutcomeSchema>;
+
+/**
+ * What `nemar admin repo unpublish --execute` tells the administrator after it ends: the surfaces that read
+ * the live row (search) change at once, while the anonymous dataset page and the public catalog list are
+ * cached at the edge and can keep showing the dataset for several minutes.
+ */
+export const UNPUBLISH_CACHE_NOTE =
+  "Search reflects this at once; the public dataset page and catalog list are cached at the edge and can keep showing the dataset for several minutes.";

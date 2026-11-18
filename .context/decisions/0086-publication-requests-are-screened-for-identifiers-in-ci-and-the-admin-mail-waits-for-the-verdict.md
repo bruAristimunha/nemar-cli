@@ -107,9 +107,9 @@ saying so.
   holds approval until a run succeeds (an admin can start one).
   The cost is that an extended outage holds publications; there is deliberately no break-glass
   in the approval path that approves an unscreened dataset.
-  Two administrator tools can still make a dataset public without the screen
-  (`POST /datasets/:id/publish`, `PATCH /admin/datasets/:id/visibility`); they are operations on
-  datasets that already exist, they write audit rows, and each carries a comment pointing here.
+  One administrator tool can still make a dataset public without the screen
+  (`POST /datasets/:id/publish`); it is an operation on a dataset that already exists, it writes an audit row, and it carries a comment pointing here.
+  (`PATCH /admin/datasets/:id/visibility` was the second; it now refuses both directions, because a bare flip makes half states.)
 - The check is best effort, and says what it did not read.
   It does not parse formats outside EDF and BDF, it does not read the contents of sidecars and
   tables in earlier commits, and it cannot judge free text it does not recognize as a name.
@@ -221,3 +221,8 @@ None blocks the release. Each is a place where the words promise a little more t
   release and `startScreenAndNotify`) is `requested` with no screen status, and no sweep looks for that.
 - **An older installed CLI prints the bare word `ci_check_unavailable`** for the 503, because only this
   release's client leads with `message`.
+
+## Amendment 2026-11-17 (#2198): the bare visibility route is retired
+
+ADR 0125 retires `PATCH /admin/datasets/:id/visibility`, which this ADR names as a way a dataset changes visibility; it now answers 409 and points at `nemar admin repo unpublish` (and, for the other direction, publication).
+The screen and its verdicts are unchanged.

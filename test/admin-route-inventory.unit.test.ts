@@ -75,6 +75,9 @@ const EXPECTED_ENTRIES: Record<string, number> = {
   "GET /compute/records/:ref": 1,
   "POST /compute/records/:ref/read": 2,
   "GET /compute/report": 1,
+  // Portable compute, card S6: every runner's usage in a date range. Admin-only through the router's
+  // middleware; one handler.
+  "GET /compute/reports/runners": 1,
   "GET /compute/access-report": 1,
   "GET /compute/holds": 1,
   "POST /compute/holds": 2,
@@ -84,6 +87,17 @@ const EXPECTED_ENTRIES: Record<string, number> = {
   "POST /compute/observer-runs": 1,
   "POST /compute/pipeline/run": 1,
   "GET /compute/pipeline/status": 1,
+  // Portable compute, card DM-05: the owner's runner registry. `requireOwner` then the handler, each.
+  "POST /compute/runners": 2,
+  "GET /compute/runners": 2,
+  "POST /compute/runners/:id/revoke": 2,
+  // Portable compute, card V1b: the derivative store. Admin-only through the router's middleware, one
+  // handler each: `published` is the owner's alone, and that check is the service's (`promoteDerivative`),
+  // so no route carries an owner middleware.
+  "GET /compute/derivatives": 1,
+  "GET /compute/derivatives/:key": 1,
+  "POST /compute/derivatives/sync": 1,
+  "POST /compute/derivatives/:key/retention": 1,
 
   // Users / accounts
   "GET /users": 1,
@@ -144,7 +158,10 @@ const EXPECTED_ENTRIES: Record<string, number> = {
   "DELETE /zenodo/deposition/:id": 1,
 
   // Fleet governance / visibility / CI
-  "PATCH /datasets/:id/visibility": 2,
+  // Retired to a bare refusal (409): one handler, no validator.
+  "PATCH /datasets/:id/visibility": 1,
+  // ADR 0125: the one way a published dataset goes back to private. zValidator + handler.
+  "POST /datasets/:id/unpublish": 2,
   "GET /fleet/drift": 1,
   "POST /datasets/:id/enforce": 2,
   "POST /datasets/:id/revalidate": 1,
@@ -369,7 +386,7 @@ describe("admin route inventory", () => {
   });
 
   test("entry total is pinned", () => {
-    expect(adminRoutes.routes.length).toBe(247);
+    expect(adminRoutes.routes.length).toBe(259);
   });
 
   // The count pin above can't see a SWAP of the router-level middleware

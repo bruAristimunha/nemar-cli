@@ -34,6 +34,7 @@ import {
   sendBroadcast,
 } from "../../services/broadcast";
 import { computeReleaseStatements } from "../../services/compute-release";
+import { runnerEndStatements } from "../../services/compute-runners";
 import { DOCS_GRANTS_PURGE_SQL, DOCS_REVOKE_ALL_SQL } from "../../services/docs-auth";
 import {
   parseEmailPreferences,
@@ -370,10 +371,13 @@ const REVOCABLE_USER_COLUMNS =
  *
  * The credential cascade is ONE batch: sessions, docs and private grants, the
  * support tickets (`mailReleaseStatements`) and the account's compute
- * (`computeReleaseStatements`, epic #2005 phase A8). Compute has TWO callers,
- * this function and `tombstoneUserCascade`; a role demotion and a key
- * revocation do not end it (`services/compute-release.ts` says why). The Tapis
- * cancels are not made in the batch: the retried sweep makes them.
+ * (`computeReleaseStatements`, epic #2005 phase A8) and the runners the
+ * account registered (`runnerEndStatements`, portable compute D5). Compute has
+ * TWO callers, this function and `tombstoneUserCascade`; a role demotion and a
+ * key revocation do not end it (`services/compute-release.ts` says why). The
+ * runner statements have THREE: these two and the role demotion (an owner's
+ * registrations end with their standing; `services/compute-runners.ts`). The
+ * Tapis cancels are not made in the batch: the retried sweep makes them.
  */
 async function finalizeRevocation(
   c: Context<{ Bindings: Bindings; Variables: Variables }>,
@@ -523,6 +527,50 @@ async function finalizeRevocation(
   // `iam_revocation_failures` row as the surviving signal. That is pre-existing
   // and orthogonal; what matters here is that the credential cascade is
   // reachable on the retry.)
+
+  // Update user status, IN THE SAME BATCH as the cascade (below), and last.
+  //
+  // It was a separate statement after the batch, and a request already past authentication could land a
+  // runner registration between the two: the owner was still `approved`, so the registration's standing
+  // guard passed, the row stayed live, and a later re-approval brought it back. Written in the batch, the
+  // status and the cascade commit together: a registration is either before it (and ended by it) or after
+  // it (and refused by the guard). The batch is atomic, so the retry property below is unchanged: if it
+  // throws, the account is still `approved` and the admin's retry re-enters.
+  // If IAM revocation failed, mark as revoked_iam_pending for manual cleanup
+  const finalStatus = iamRevoked || !user.aws_iam_username ? "revoked" : "revoked_iam_pending";
+
+  // service_access (migration 0062) gates real (non-sandbox) uploads and
+  // compute independently of `status` -- clearing it here closes issue
+  // #1069 (a revoked user kept the grant and could still pass
+  // realDatasetServiceGate if `status` were ever restored without an
+  // explicit re-grant). The two grant stamps go with it (ADR 0040): revoke
+  // is the eraser of what approval wrote, so a later listing cannot show a
+  // revoked account still carrying "granted by X on Y".
+  //
+  // The upload-REQUEST stamps go too (ADR 0042). An open request is
+  // `upload_access_requested_at` set with no grant, so leaving the stamp on a
+  // revoked row would put a former grantee back into the admin review queue
+  // the moment their grant was taken away -- the one account an admin has
+  // just decided about. Clearing both means a re-instated account asks
+  // again, which is the right shape: the review is of a person at a moment,
+  // and revocation ends that moment.
+  const statusWrite = db
+    .prepare(
+      `
+    UPDATE users
+    SET status = ?,
+        service_access = 0,
+        service_access_granted_at = NULL,
+        service_access_granted_by = NULL,
+        upload_access_requested_at = NULL,
+        upload_access_notified_at = NULL,
+        revoked_at = datetime('now'),
+        updated_at = datetime('now')
+    WHERE id = ?
+  `,
+    )
+    .bind(finalStatus, user.id);
+
   await db.batch([
     db
       .prepare(
@@ -542,52 +590,24 @@ async function finalizeRevocation(
     // every pool is frozen. The Tapis cancels follow from the retried sweep, never from this
     // batch. A role demotion and a key revocation do NOT end compute; compute-release.ts says why.
     ...computeReleaseStatements(user.id).map((s) => db.prepare(s.sql).bind(...s.binds)),
+    // The runners the account registered end too (portable compute, D5): their access tokens are
+    // deleted, an unstarted claim is released and a started job becomes `unreported` with no lease, then
+    // each registration is revoked. One of THREE callers of `runnerEndStatements` (this function,
+    // `tombstoneUserCascade`, the role demotion); a key revocation is deliberately not one.
+    ...runnerEndStatements(user.id, "account_revoked").map((s) =>
+      db.prepare(s.sql).bind(...s.binds),
+    ),
     // What the account holds at every OpenID Connect client: its grants, tokens and unused codes end,
     // and each client with a back-channel logout address is queued to be told (ADR 0119 rule 12).
     // In this batch for the same reason as the rest: a revoked account that is approved again must
     // come back with nothing, and a cascade outside the batch could fail alone.
     ...oidcEndStatements(user.id, "account_revoked").map((s) => db.prepare(s.sql).bind(...s.binds)),
+    // The status and the service-access stamps, last (see above).
+    statusWrite,
   ]);
   // The logouts are queued; the first attempt is made after the response, so no partner can slow or
   // fail this revocation, and a partner that fails leaves the account revoked (the tick retries).
   deferLogoutDelivery(c.env, user.id, backgroundOf(c));
-
-  // Update user status
-  // If IAM revocation failed, mark as revoked_iam_pending for manual cleanup
-  const finalStatus = iamRevoked || !user.aws_iam_username ? "revoked" : "revoked_iam_pending";
-
-  // service_access (migration 0062) gates real (non-sandbox) uploads and
-  // compute independently of `status` -- clearing it here closes issue
-  // #1069 (a revoked user kept the grant and could still pass
-  // realDatasetServiceGate if `status` were ever restored without an
-  // explicit re-grant). The two grant stamps go with it (ADR 0040): revoke
-  // is the eraser of what approval wrote, so a later listing cannot show a
-  // revoked account still carrying "granted by X on Y".
-  //
-  // The upload-REQUEST stamps go too (ADR 0042). An open request is
-  // `upload_access_requested_at` set with no grant, so leaving the stamp on a
-  // revoked row would put a former grantee back into the admin review queue
-  // the moment their grant was taken away -- the one account an admin has
-  // just decided about. Clearing both means a re-instated account asks
-  // again, which is the right shape: the review is of a person at a moment,
-  // and revocation ends that moment.
-  await db
-    .prepare(
-      `
-    UPDATE users
-    SET status = ?,
-        service_access = 0,
-        service_access_granted_at = NULL,
-        service_access_granted_by = NULL,
-        upload_access_requested_at = NULL,
-        upload_access_notified_at = NULL,
-        revoked_at = datetime('now'),
-        updated_at = datetime('now')
-    WHERE id = ?
-  `,
-    )
-    .bind(finalStatus, user.id)
-    .run();
 
   // Remove from every dataset repo they touch: collaborator grants
   // (dataset_collaborators) UNION repos they own (datasets.owner_user_id).
@@ -1202,6 +1222,11 @@ export function registerUsersRoutes(admin: AdminRouter): void {
           // kind of reason: a demoted person is still an account with a grant, pools and jobs
           // (`computeReleaseStatements` is for the two paths that end the whole account).
           //
+          // The runners this person registered DO end (`runnerEndStatements`, portable compute D5):
+          // registering one is an owner's act, so what only an owner holds goes with the standing, in
+          // this batch. The third caller of that set, after `finalizeRevocation` and
+          // `tombstoneUserCascade`; it goes LAST so the results read by position above do not shift.
+          //
           // OpenID Connect grants are not ended here (ADR 0119 rule 12): a token carries no role and
           // no OIDC scope confers admin authority, so a demotion leaves nothing of theirs to
           // downgrade. `oidc-cascade-nonmembership.test.ts` holds that the rows survive; a
@@ -1220,14 +1245,17 @@ export function registerUsersRoutes(admin: AdminRouter): void {
             ...mailReleaseStatements(target.id, newRole === "admin" ? "restricted" : "all").map(
               (s) => db.prepare(s.sql).bind(...s.binds),
             ),
+            ...runnerEndStatements(target.id, "role_demoted").map((s) =>
+              db.prepare(s.sql).bind(...s.binds),
+            ),
           ]);
           tokensRevoked = result[0]?.meta?.changes ?? 0;
           docsSessionsRevoked = result[1]?.meta?.changes ?? 0;
         } catch (error) {
           // The id as well as the handle: a username can be renamed or nulled,
           // and this line is the record of a demoted account that may still
-          // hold a live token or docs session. The batch is atomic, so a failure
-          // here means NONE of the three statements landed.
+          // hold a live token, docs session or runner registration. The batch is atomic, so a
+          // failure here means NONE of its statements landed.
           console.error(
             `SECURITY: Failed to revoke credentials for demoted user ${username} (id=${target.id}):`,
             error,
@@ -1268,7 +1296,7 @@ export function registerUsersRoutes(admin: AdminRouter): void {
       }
       if (tokenRevocationFailed) {
         response.warning =
-          "Token revocation failed. User may retain elevated session. Manually revoke tokens.";
+          "Credential revocation failed. User may retain elevated session, tokens and runner registrations. Manually revoke tokens, and revoke runners with `nemar admin compute runners list` and `revoke`.";
       }
 
       return c.json(response);

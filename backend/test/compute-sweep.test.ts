@@ -40,7 +40,7 @@ import {
   setTapisTimes,
   startLifecycleFixture,
 } from "./helpers/compute-lifecycle-fixture";
-import { fundPlatform, seedUser } from "./helpers/compute-seed";
+import { fundPlatform, seedUser, setPolicy } from "./helpers/compute-seed";
 import { hookedDb } from "./helpers/db-hooks";
 import { logged } from "./helpers/logs";
 
@@ -627,6 +627,57 @@ describe("a job that NEMAR made", () => {
     const uuid = await foreign({ tags: ["nemar_job:job_0123456789abcdef01234567"] });
     await sweepTenantJobs(env(), "live");
     expect(row(uuid)).toMatchObject({ flag_unreserved: 1 });
+  });
+});
+
+describe("the tenant ceiling in the live pass (issue #2121, phase P2)", () => {
+  test("a live pass reports the live jobs of its listing and NEMAR's own count against the ceiling", async () => {
+    await foreign({ startedMsAgo: 30 * MINUTE });
+    const result = await sweepTenantJobs(env(), "live");
+    // One live job in the listing; the sweep indexed and canceled it, but both numbers are read BEFORE it did
+    // (`readTenantSlots` runs ahead of the loop), so `occupied` is what NEMAR held when the sweep looked.
+    expect(result).toMatchObject({ mode: "live", indexed: 1, tenantLive: 1, ceiling: 20 });
+    const log = result ? tenantLogLine(result) : null;
+    expect(log?.level).toBe("info");
+    expect(log?.line).toContain("tenant_live=1");
+    expect(log?.line).toContain(`occupied=${result?.occupied}/20`);
+    // The other counts and words are as they were.
+    expect(log?.line).toContain("indexed=1");
+    expect(log?.line).toContain("errors=none");
+  });
+
+  test("more live jobs in the tenant than the ceiling is a warning, even when the sweep did nothing else", async () => {
+    // Two live jobs made through `createJob`, then the owner lowers the ceiling to 1: the tenant holds more
+    // than the ceiling, and they are bound to rows, so the sweep leaves them alone.
+    const first = await makeJob(fx);
+    const second = await makeJob(fx, { env: first.env });
+    await submitComputeJob(first.env, first.job.id);
+    await submitComputeJob(second.env, second.job.id);
+    await setPolicy(env().DB, fx.ownerId, {
+      tenant: { maxLiveJobs: 1, reserved: { people: 0, pipelines: 0, partner: 0 } },
+    });
+    const result = await sweepTenantJobs(env(), "live");
+    expect(result).toMatchObject({ indexed: 0, bound: 2, tenantLive: 2, ceiling: 1 });
+    const log = result ? tenantLogLine(result) : null;
+    expect(log?.level).toBe("warn");
+    expect(log?.line).toContain("tenant_live=2");
+    expect(log?.line).toContain("occupied=2/1");
+  });
+
+  test("within the ceiling and with nothing done, there is still no line", async () => {
+    const made = await makeJob(fx);
+    await submitComputeJob(made.env, made.job.id);
+    const result = await sweepTenantJobs(env(), "live");
+    expect(result).toMatchObject({ tenantLive: 1, ceiling: 20 });
+    expect(result && tenantLogLine(result)).toBeNull();
+  });
+
+  test("the daily pass has no tenant numbers: its listing is a week, not what is live", async () => {
+    await foreign({ startedMsAgo: 30 * MINUTE });
+    const result = await sweepTenantJobs(env(), "week");
+    expect(result).toMatchObject({ tenantLive: null, occupied: null, ceiling: null });
+    const log = result ? tenantLogLine(result) : null;
+    expect(log?.line).not.toContain("tenant_live");
   });
 });
 

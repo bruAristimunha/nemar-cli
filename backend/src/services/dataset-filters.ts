@@ -47,6 +47,35 @@ export const PUBLIC_SEARCHABLE_SQL = `d.status = 'active' AND d.visibility = 'pu
   AND (d.is_sandbox = 0 OR d.is_sandbox IS NULL OR d.is_exemplar = 1)`;
 
 /**
+ * Who is searching, for the caller-visibility rule `GET /datasets/:id`
+ * enforces: anonymous (omit the viewer) sees public rows; a signed-in user
+ * also sees datasets they own and datasets they collaborate on; an admin or
+ * owner role sees everything.
+ */
+export interface SearchViewer {
+  userId: number;
+  isAdmin: boolean;
+}
+
+/**
+ * The visibility predicate over `datasets d` for a viewer (see
+ * {@link SearchViewer}); pushes its bound values onto `params`, so it must be
+ * placed in the SQL text in the same order as the push. Evaluated against the
+ * LIVE `datasets` row at query time, never against anything stored in the
+ * vector index, so a visibility change takes effect on the next search.
+ */
+export function buildViewerVisibilitySql(
+  viewer: SearchViewer | undefined,
+  params: (string | number)[],
+): string {
+  if (!viewer) return "d.visibility = 'public'";
+  if (viewer.isAdmin) return "1 = 1";
+  params.push(viewer.userId, viewer.userId);
+  return `(d.visibility = 'public' OR d.owner_user_id = ?
+    OR EXISTS (SELECT 1 FROM dataset_collaborators dc WHERE dc.dataset_id = d.id AND dc.user_id = ?))`;
+}
+
+/**
  * `s` with accents removed ("Sébastien" -> "Sebastien"). `datasets_fts` uses
  * the default unicode61 tokenizer, which folds diacritics, so it indexes
  * "sebastien"; splitting "Sébastien" on non-ASCII letters would query "bastien"

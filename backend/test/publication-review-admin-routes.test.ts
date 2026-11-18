@@ -1222,7 +1222,7 @@ describe("GET /admin/publish/:id/review", () => {
     expect(d.description.headline).toBe("Publication review: FAIL");
     expect(d.description.tone).toBe("stop");
     expect(d.description.lines.at(-1)).toBe(NOT_ASSESSED_LINE);
-    expect(d.description.next).toBe(`nemar admin publish approve ${datasetId} --force`);
+    expect(d.description.next).toBe(`nemar admin repo publish approve ${datasetId} --force`);
 
     expect(d.review).toMatchObject({
       id: reviewId,
@@ -1363,8 +1363,8 @@ describe("GET /admin/publish/:id/review", () => {
     expect(d.reasons[0].cure).toStartWith("Start it again.");
     expect(d.reasons[0].cure).not.toContain("nemar ");
     expect(d.reasons[0].cure).not.toContain("<dataset>");
-    expect(d.reasons[0].command).toBe(`nemar admin publish start ${datasetId}`);
-    expect(d.reasons[0].line).toContain(`nemar admin publish start ${datasetId}`);
+    expect(d.reasons[0].command).toBe(`nemar admin repo publish start ${datasetId}`);
+    expect(d.reasons[0].line).toContain(`nemar admin repo publish start ${datasetId}`);
     expect(d.reasons[0].line).not.toContain("<dataset>");
     expect(d.review).toMatchObject({
       state: "unreported",
@@ -1476,7 +1476,7 @@ describe("GET /admin/publish/:id/review", () => {
     // `POST /admin/publish/:id/review/start` refuses any request that is not `requested`
     // (409 request_not_requested), so the reasons whose cure is "start it" must not send an
     // administrator there for a request that is being approved or is blocked.
-    const START = "nemar admin publish start";
+    const START = "nemar admin repo publish start";
     const NOT_STARTABLE = "A review starts only for a request that is waiting for its decision.";
     const startCures: Array<[ReasonCode, Omit<SeedReview, "requestId" | "datasetId"> | null]> = [
       ["review_not_started", null],
@@ -1518,7 +1518,9 @@ describe("GET /admin/publish/:id/review", () => {
       const d = await detail(datasetId);
       // A run that has not started publishing is gated again when it resumes, so its command is
       // the resume (the approval of an `approving` request that has not started publishing).
-      expect(d.description.next).toBe(`nemar admin publish approve ${datasetId} --resume --force`);
+      expect(d.description.next).toBe(
+        `nemar admin repo publish approve ${datasetId} --resume --force`,
+      );
       // A request waiting for its decision is still told to start it.
       const open = request();
       seedPublicationReview(db, {
@@ -1528,7 +1530,7 @@ describe("GET /admin/publish/:id/review", () => {
         detail: "model_refused",
       });
       const dOpen = await detail(open.datasetId);
-      expect(dOpen.description.next).toBe(`nemar admin publish start ${open.datasetId}`);
+      expect(dOpen.description.next).toBe(`nemar admin repo publish start ${open.datasetId}`);
       expect(dOpen.reasons[0].command).toBe(`${START} ${open.datasetId}`);
       expect(dOpen.reasons[0].cure).not.toContain(START);
       expect(dOpen.reasons[0].line).toContain(`${START} ${open.datasetId}`);
@@ -1930,7 +1932,7 @@ describe("the detail carries what approve and next show from one read", () => {
     const d = await detail(datasetId);
     expect(d.request_status).toBe("blocked");
     expect(d.started_publishing).toBe(true);
-    expect(d.description.next).toBe(`nemar admin publish approve ${datasetId} --resume`);
+    expect(d.description.next).toBe(`nemar admin repo publish approve ${datasetId} --resume`);
     expect(d.description.lines).toContain(APPROVAL_PUBLISHING_LINE);
     expect(d.description.lines.at(-1)).toBe(NOT_ASSESSED_LINE);
     // Before any step changed anything it is a blocked request that never started: no run, no
@@ -1975,7 +1977,7 @@ describe("the detail carries what approve and next show from one read", () => {
     const stopped = await detail(datasetId);
     expect(stopped.started_publishing).toBe(false);
     expect(stopped.description.next).toBe(
-      `nemar admin publish approve ${datasetId} --resume --force`,
+      `nemar admin repo publish approve ${datasetId} --resume --force`,
     );
     expect(stopped.description.lines.join("\n")).not.toContain("has started publishing");
 
@@ -1986,7 +1988,9 @@ describe("the detail carries what approve and next show from one read", () => {
     const publishing = await detail(datasetId);
     expect(publishing.started_publishing).toBe(true);
     // No gate applies to a run that has started publishing: no --force, and the line says why.
-    expect(publishing.description.next).toBe(`nemar admin publish approve ${datasetId} --resume`);
+    expect(publishing.description.next).toBe(
+      `nemar admin repo publish approve ${datasetId} --resume`,
+    );
     expect(publishing.description.lines).toContain(APPROVAL_PUBLISHING_LINE);
     expect(publishing.description.lines.at(-1)).toBe(NOT_ASSESSED_LINE);
     // A request waiting for its decision is unchanged.
@@ -1998,7 +2002,7 @@ describe("the detail carries what approve and next show from one read", () => {
       report: failingReport(),
     });
     expect((await detail(open.datasetId)).description.next).toBe(
-      `nemar admin publish approve ${open.datasetId} --force`,
+      `nemar admin repo publish approve ${open.datasetId} --force`,
     );
   });
 
@@ -2027,7 +2031,7 @@ describe("the detail carries what approve and next show from one read", () => {
     const lines = stopped.description.lines;
     const at = lines.indexOf(stoppedLine(datasetId));
     expect(at).toBeGreaterThanOrEqual(0);
-    expect(lines[at]).toContain(`(nemar admin publish deny ${datasetId})`);
+    expect(lines[at]).toContain(`(nemar admin repo publish deny ${datasetId})`);
     expect(lines.filter((l) => l === stoppedLine(datasetId))).toHaveLength(1);
     expect(lines.at(-1)).toBe(NOT_ASSESSED_LINE);
     expect(at).toBe(lines.length - 2);
@@ -2183,8 +2187,8 @@ describe("the list's start_offered", () => {
       const next = (await detail(datasetId)).description.next ?? "";
       const row = await review(datasetId);
       // A start is offered only where the detail's own command is the start.
-      if (row.start_offered) expect(next).toBe(`nemar admin publish start ${datasetId}`);
-      else expect(next).not.toBe(`nemar admin publish start ${datasetId}`);
+      if (row.start_offered) expect(next).toBe(`nemar admin repo publish start ${datasetId}`);
+      else expect(next).not.toBe(`nemar admin repo publish start ${datasetId}`);
     }
   });
 });
@@ -2264,12 +2268,12 @@ describe("a dispatched review is read by time alone while the request can still 
     seedPublicationReview(db, { requestId, datasetId, state: "dispatched", createdMinutesAgo: 10 });
     const young = await detail(datasetId);
     expect(codes(young)).toEqual(["review_running"]);
-    expect(young.description.next).toBe(`nemar admin publish show ${datasetId}`);
+    expect(young.description.next).toBe(`nemar admin repo publish show ${datasetId}`);
 
     ageReview(90);
     const old = await detail(datasetId);
     expect(codes(old)).toEqual(["review_did_not_report"]);
-    expect(old.description.next).not.toBe(`nemar admin publish start ${datasetId}`);
+    expect(old.description.next).not.toBe(`nemar admin repo publish start ${datasetId}`);
   });
 
   test("the list summary of an approving request reads the same row the same way", async () => {
@@ -2477,7 +2481,7 @@ describe("the exports the approval gate reads through", () => {
     const views = reasonViewsOf(d.reasons, datasetId, d.startable, reportOf(d.rowView));
     expect(views).toEqual((await detail(datasetId)).reasons);
     expect(views.map((v) => v.code)).toEqual(["review_could_not_run"]);
-    expect(views[0].command).toBe(`nemar admin publish start ${datasetId}`);
+    expect(views[0].command).toBe(`nemar admin repo publish start ${datasetId}`);
     expect(views[0].cure).toBe(neutralCureOf("review_could_not_run", datasetId, true));
     expect(views[0].cure).not.toContain("publish start");
     // The cure of a request no start reaches is worded without the start, and names no command.
@@ -2533,7 +2537,7 @@ describe("the detail's start_offered is the list row's, one rule behind both", (
         const row = await review(datasetId, bindings);
         expect({ label, detail: d.start_offered }).toEqual({ label, detail: row.start_offered });
         expect(typeof d.start_offered).toBe("boolean");
-        const startCommand = `nemar admin publish start ${datasetId}`;
+        const startCommand = `nemar admin repo publish start ${datasetId}`;
         // A start that is offered is always the detail's next command. The converse holds for
         // every request but a sandbox dataset: `next` is derived from the reasons alone, which
         // the route's own screen precondition (a screened commit) does not enter, and a sandbox
@@ -2725,13 +2729,13 @@ describe("the approval gate's refusal body carries the reasons a page prints", (
     expect(body.error).toBe("publication_review_not_clear");
     expect(body.refusal).toBe("hard_reason");
     expect(body.message).toBe(
-      `The publication review gives a reason that no override clears, so the approval is refused. The identifier screen has no verdict about the current commit. An administrator runs the screen again: nemar admin publish screen ${datasetId}.`,
+      `The publication review gives a reason that no override clears, so the approval is refused. The identifier screen has no verdict about the current commit. An administrator runs the screen again: nemar admin repo publish screen ${datasetId}.`,
     );
     const hard = body.reasons.find((r) => r.code === "identifier_screen_not_run");
     expect(hard).toBeDefined();
     expect(hard?.cure).toBe("An administrator runs the screen again.");
     expect(hard?.cure).not.toContain("nemar ");
-    expect(hard?.command).toBe(`nemar admin publish screen ${datasetId}`);
+    expect(hard?.command).toBe(`nemar admin repo publish screen ${datasetId}`);
     expect(hard?.statement).toBe(REASONS.identifier_screen_not_run.sentence);
   });
 });

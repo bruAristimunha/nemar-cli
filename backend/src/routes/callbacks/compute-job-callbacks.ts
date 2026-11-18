@@ -26,6 +26,12 @@
  * another record. Bodies are bounded (1 MiB for `bundle` and `complete`, which need none; the outputs
  * route derives its bound from the owner's `maxFiles`, never under 1 MiB, see `outputsBodyLimitBytes`).
  *
+ * A RUNNER JOB ALSO NEEDS THE CURRENT LEASE (portable compute, ADR 0121 decision 4: at most once acceptance).
+ * For `executor = 'runner'` only, the header `X-Compute-Lease` must be a well-formed lease id and equal to the
+ * row's `lease_id`, which must itself be present: a missing header, a malformed one, or a row whose lease was
+ * cleared (a revoke does that) is the same single refusal, never compared as equal. A Tapis job's path is
+ * untouched.
+ *
  * Nothing here logs a token, an address or a path: a line carries the job id and a fixed word.
  */
 
@@ -37,6 +43,7 @@ import {
   isTerminalComputeState,
 } from "../../../../shared/compute-state.js";
 import { COMPUTE_JOB_TOKEN_HEADER } from "../../../../shared/contract/compute-launch.js";
+import { LEASE_ID_RE, RUNNER_LEASE_HEADER } from "../../../../shared/contract/compute-runner.js";
 import { COMPUTE_JOB_ID_RE } from "../../../../shared/contract/compute.js";
 import { type ComputeJobRow, getJob } from "../../services/compute-jobs.js";
 import { handleComplete, handleOutputs, outputsBodyCap } from "../../services/compute-outputs.js";
@@ -75,7 +82,23 @@ async function authorize(c: Ctx): Promise<ComputeJobRow | null> {
     !!secret &&
     (await verifyComputeToken("job", token, { jobId: id, nonce: nonce ?? NO_NONCE }, secret));
   if (!valid || !job || nonce === null || isTerminalComputeState(job.state)) return null;
+  // FAIL CLOSED: anything that is not a Tapis job needs the lease, so a row read without its `executor`
+  // (a column list that lost it in a merge) is refused rather than let through.
+  if (job.executor !== "tapis" && !holdsCurrentLease(c, job)) return null;
   return job;
+}
+
+/**
+ * Whether the request carries the runner job's current lease: the header and the row's value must BOTH be
+ * present and well formed, and equal. A NULL on either side is a refusal (`(header ?? null) === row.lease_id`
+ * would call two NULLs equal, which is the bug this is written to avoid).
+ */
+function holdsCurrentLease(c: Ctx, job: ComputeJobRow): boolean {
+  const header = c.req.header(RUNNER_LEASE_HEADER);
+  const held = job.lease_id;
+  if (typeof header !== "string" || typeof held !== "string") return false;
+  if (!LEASE_ID_RE.test(header) || !LEASE_ID_RE.test(held)) return false;
+  return header === held;
 }
 
 /** A body that declares more than `max` bytes is refused before a byte of it is read. */

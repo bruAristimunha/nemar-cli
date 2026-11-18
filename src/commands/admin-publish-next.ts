@@ -1,8 +1,8 @@
 /**
- * `nemar admin publish next`: the publication requests that need an administrator, one card at a
+ * `nemar admin repo publish next`: the publication requests that need an administrator, one card at a
  * time (ADR 0102, section 8; the shape of `nemar admin pr-reviews next`, ADR 0093).
  *
- *   nemar admin publish next [--force] [--once] [--dataset <id>]
+ *   nemar admin repo publish next [--force] [--once] [--dataset <id>]
  *
  * For each request it shows who asked, the screen, a short read of the review and, for a large
  * dataset, what locking it will take, then waits for one answer: `y` approves from this terminal
@@ -101,10 +101,10 @@ Exit status:
   with Ctrl+C. Skipping, or leaving a request open, is not a failure.
 
 Examples:
-  $ nemar admin publish next
-  $ nemar admin publish next --force            # y may approve over a review that is not a pass
-  $ nemar admin publish next --dataset nm000480
-  $ nemar admin publish next --once`,
+  $ nemar admin repo publish next
+  $ nemar admin repo publish next --force            # y may approve over a review that is not a pass
+  $ nemar admin repo publish next --dataset nm000480
+  $ nemar admin repo publish next --once`,
     )
     .action(async (options: { dataset?: string; force?: boolean; once?: boolean }) => {
       if (!requireSignedIn()) return;
@@ -177,7 +177,7 @@ async function walk(options: WalkOptions): Promise<void> {
   const endedWords = () =>
     reader.interrupted
       ? "Interrupted; stopping."
-      : "Input ended; stopping.\nSee what needs you with: nemar admin publish list --needs-me";
+      : "Input ended; stopping.\nSee what needs you with: nemar admin repo publish list --needs-me";
 
   // Whatever the loop throws (a field this version of the CLI did not expect, from a Worker of
   // another version), the reader is closed and the tally says what was done before it.
@@ -536,10 +536,10 @@ function onInterrupt(step: Step, datasetId: string): () => void {
       "  The approval may still be running, or may have finished on the server. It is not counted below.",
     );
     console.log(
-      chalk.dim(`  nemar admin publish show ${id}                find out where it stands`),
+      chalk.dim(`  nemar admin repo publish show ${id}                find out where it stands`),
     );
     console.log(
-      chalk.dim(`  nemar admin publish approve ${id} --resume    continue it if it stopped`),
+      chalk.dim(`  nemar admin repo publish approve ${id} --resume    continue it if it stopped`),
     );
     console.log();
     console.log(tallyLine(step.tally));

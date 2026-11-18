@@ -184,7 +184,7 @@ export function blockedCandidateQuery(
  * can't abort the sweep.
  *
  * Unblocked requests move to 'requested' (they re-enter the admin publish
- * queue, visible via `nemar admin publish list`) once the submission gate also
+ * queue, visible via `nemar admin repo publish list`) once the submission gate also
  * passes (one that fails is re-blocked as `min_requirements_failed`, counted as
  * `reblocked`; a blind that could not be verified waits for the next run,
  * counted as an error) and their identifier screen is

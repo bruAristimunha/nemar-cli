@@ -183,7 +183,7 @@ export const CANDIDATE_ROWS_SQL = `SELECT s.slurm_job_id, s.partition AS sacct_p
   FROM compute_sacct_rows s JOIN compute_jobs j ON j.id = s.matched_job_id
   WHERE s.applied_at IS NULL AND s.state IN ${ENDED_SQL}
     AND j.state IN (${TERMINAL_STATES_SQL}) AND j.settled_provisional_at IS NOT NULL
-    AND j.settled_final_at IS NULL AND j.flag_unreserved = 0
+    AND j.settled_final_at IS NULL AND j.flag_unreserved = 0 AND j.accounting = 'su'
     AND EXISTS (SELECT 1 FROM compute_ledger c WHERE c.job_id = j.id AND c.kind = 'charge')
   ORDER BY s.ingested_at ASC, s.slurm_job_id ASC LIMIT ?1`;
 

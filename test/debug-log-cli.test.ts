@@ -253,7 +253,7 @@ describe("--debug never writes the approval dispatch token (ADR 0105 decision 2)
         headers: { "X-Approval-Dispatch-Token": process.env.DEBUG_PROBE_TOKEN },
         body: JSON.stringify({ resume: true }),
       }, false);
-      console.log(writeDebugLogSync(["admin", "publish", "approve", "nm000123"], 0));
+      console.log(writeDebugLogSync(["admin", "repo", "publish", "approve", "nm000123"], 0));
     `;
     const proc = spawn({
       cmd: ["bun", "-e", script],

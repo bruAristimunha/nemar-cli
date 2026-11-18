@@ -10,9 +10,11 @@
 import { Hono } from "hono";
 import { adminMiddleware, authMiddleware, cookieOriginGuard } from "../../middleware/auth";
 import { registerComputeAdminRoutes } from "./compute";
+import { registerComputeDerivativeAdminRoutes } from "./compute-derivatives";
 import { registerComputeJobAdminRoutes } from "./compute-jobs";
 import { registerComputePipelineAdminRoutes } from "./compute-pipeline";
 import { registerComputeReportingRoutes } from "./compute-reporting";
+import { registerComputeRunnerAdminRoutes } from "./compute-runners";
 import { registerDatasetLifecycleRoutes } from "./datasets-lifecycle";
 import { registerDoiRoutes } from "./doi";
 import { registerExemplarRoutes } from "./exemplar";
@@ -32,6 +34,7 @@ import { registerPublicationReviewRoutes } from "./publication-review";
 import { registerPublishRoutes } from "./publish";
 import { registerPublishCommentRoutes } from "./publish-comment";
 import type { AdminRouter } from "./shared";
+import { registerUnpublishRoutes } from "./unpublish";
 import { registerUpstreamBackfillRoutes } from "./upstream-backfill";
 import { registerUpstreamRepullRoutes } from "./upstream-repulls";
 import { registerUpstreamStatusRoutes } from "./upstream-status";
@@ -82,6 +85,7 @@ registerExemplarRoutes(adminRoutes);
 registerNoticeRoutes(adminRoutes);
 registerNewsRoutes(adminRoutes);
 registerWithdrawRoutes(adminRoutes);
+registerUnpublishRoutes(adminRoutes);
 registerZarrCatalogRoutes(adminRoutes);
 registerZarrFidelitySweepRoutes(adminRoutes);
 registerNeurobagelRoutes(adminRoutes);
@@ -98,3 +102,8 @@ registerComputeAdminRoutes(adminRoutes);
 registerComputeJobAdminRoutes(adminRoutes);
 registerComputePipelineAdminRoutes(adminRoutes);
 registerComputeReportingRoutes(adminRoutes);
+// Runner registrations (portable compute, card DM-05): owner only, behind the same router middleware.
+registerComputeRunnerAdminRoutes(adminRoutes);
+// The derivative store (portable compute, card V1b; ADR 0123): admin, with `published` the owner's alone
+// (checked in the service). Dark wherever the derivatives bucket is not bound.
+registerComputeDerivativeAdminRoutes(adminRoutes);

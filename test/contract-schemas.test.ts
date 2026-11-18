@@ -15,6 +15,7 @@ import { dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import * as computeModule from "../shared/contract/compute";
 import * as launchModule from "../shared/contract/compute-launch";
+import * as runnerModule from "../shared/contract/compute-runner";
 import {
   NEUROSCHEMA_VERSION,
   NO_SESSION_KEY,
@@ -635,8 +636,19 @@ describe("old-CLI compatibility: no schema in the contract is strict", () => {
    * The two responses the launcher reads (`BundleResponseSchema`, `OutputsResponseSchema`) are in
    * those files but are OPEN (`.passthrough()`): a launcher that runs for 48 hours must survive the
    * Worker adding a key. The next two tests keep that line where it is, by behaviour and by import.
+   *
+   * `compute-runner.ts` (the runner protocol `nemar.runner.v1`, portable compute) is exempt for the
+   * same reason: its five REQUEST schemas are strict, because the Worker validates them as they
+   * arrive, and its five responses are open. Its request names are in {@link RUNNER_REQUEST_NAMES},
+   * which joins the strict names the import guard looks for, so no other file can build a response
+   * from one.
    */
-  const STRICT_BY_DESIGN = new Set(["compute.ts", "compute-launch.ts", "compute-observation.ts"]);
+  const STRICT_BY_DESIGN = new Set([
+    "compute.ts",
+    "compute-launch.ts",
+    "compute-observation.ts",
+    "compute-runner.ts",
+  ]);
 
   const HEX = "a".repeat(64);
   const JOB = "job_0123456789abcdef01234567";
@@ -677,6 +689,10 @@ describe("old-CLI compatibility: no schema in the contract is strict", () => {
     ComputeClientCapsSchema: {
       side: "strict",
       valid: () => ({ maxOpenReservations: 1, maxReservedMilliPerDay: 1 }),
+    },
+    ComputeTenantPolicySchema: {
+      side: "strict",
+      valid: () => ({ maxLiveJobs: 20, reserved: { people: 8, pipelines: 2, partner: 0 } }),
     },
     ResultManifestSchema: { side: "strict", valid: () => ({ job_id: JOB, files: [] }) },
     LauncherResultSchema: {
@@ -1068,10 +1084,22 @@ describe("old-CLI compatibility: no schema in the contract is strict", () => {
     ).toBe(false);
   });
 
+  /** The five strict request schemas of `compute-runner.ts`, which are not in CLASSIFIED. */
+  const RUNNER_REQUEST_NAMES = [
+    "RunnerRegisterRequestSchema",
+    "RunnerTokenRequestSchema",
+    "RunnerClaimRequestSchema",
+    "RunnerHeartbeatRequestSchema",
+    "RunnerCompleteRequestSchema",
+  ];
+
   /** The names a response schema must never be built from. */
-  const STRICT_NAMES = Object.entries(CLASSIFIED)
-    .filter(([, c]) => c.side === "strict")
-    .map(([name]) => name);
+  const STRICT_NAMES = [
+    ...Object.entries(CLASSIFIED)
+      .filter(([, c]) => c.side === "strict")
+      .map(([name]) => name),
+    ...RUNNER_REQUEST_NAMES,
+  ];
 
   /**
    * What a file under shared/contract takes from the strict compute schemas, by any route. Pure:
@@ -1384,15 +1412,87 @@ describe("old-CLI compatibility: no schema in the contract is strict", () => {
     ["a dynamic import of a package", "x.ts", `await import("zod");`, false],
     ["a require of a package", "x.ts", `const z = require("zod");`, false],
     ["a method named require", "x.ts", "loader.require(name);", false],
+    [
+      "a runner request schema",
+      "x.ts",
+      `import { RunnerClaimRequestSchema } from "./compute-runner.js";`,
+      true,
+    ],
+    [
+      "a runner request schema, renamed",
+      "x.ts",
+      `import { RunnerCompleteRequestSchema as C } from "./compute-runner";`,
+      true,
+    ],
+    [
+      "a runner request schema through the index",
+      "x.ts",
+      `import { RunnerRegisterRequestSchema } from "./index.js";`,
+      true,
+    ],
+    [
+      "a runner response schema",
+      "x.ts",
+      `import { RunnerClaimResponseSchema } from "./compute-runner.js";`,
+      false,
+    ],
     ["a function whose name ends in import", "x.ts", "reimport(name);", false],
   ];
 
   test("the import guard flags every shape of taking a strict compute schema, and only those", () => {
-    expect(STRICT_NAMES).toHaveLength(9);
+    expect(STRICT_NAMES).toHaveLength(15);
     expect(IMPORT_PROBES.length).toBeGreaterThan(55);
     for (const [label, file, text, offends] of IMPORT_PROBES) {
       const found = strictComputeTakes(CONTRACT_DIR, file, text, STRICT_NAMES);
       expect(found.length > 0, `${label}: ${JSON.stringify(found)}`).toBe(offends);
+    }
+  });
+
+  test("the five runner request names are strict schemas, and no runner response is", () => {
+    const exported = runnerModule as unknown as Record<string, z.ZodTypeAny>;
+    const lease = "0".repeat(32);
+    const valid_: Record<string, Record<string, unknown>> = {
+      RunnerRegisterRequestSchema: {
+        name: "a",
+        pool: "cpu",
+        cores: 1,
+        memory_mb: 1,
+        gpus: 0,
+        scratch_gb: 1,
+        backend: "local",
+        runtimes: ["docker"],
+        arch: "amd64",
+        accounting: "none",
+        site: "a",
+        trust: "lab",
+      },
+      RunnerTokenRequestSchema: { protocol: "nemar.runner.v1", runner_version: "0.1.0" },
+      RunnerClaimRequestSchema: {
+        protocol: "nemar.runner.v1",
+        free_slots: 1,
+        runtimes: ["docker"],
+        arch: "amd64",
+        runner_version: "0.1.0",
+      },
+      RunnerHeartbeatRequestSchema: { job_id: JOB, lease_id: lease, phase: "started" },
+      RunnerCompleteRequestSchema: {
+        job_id: JOB,
+        lease_id: lease,
+        exit_number: 0,
+        launcher_failure_code: null,
+        launcher_detail: null,
+        usage: { wall_seconds: 0, cpu_seconds: 0, max_rss_mb: 0 },
+        usage_partial: false,
+        scratch_discarded: false,
+      },
+    };
+    for (const name of RUNNER_REQUEST_NAMES) {
+      const valid = valid_[name];
+      expect(exported[name]?.safeParse(valid).success, `${name}: valid`).toBe(true);
+      expect(exported[name]?.safeParse({ ...valid, extra: 1 }).success, name).toBe(false);
+    }
+    for (const name of Object.keys(exported).filter((n) => /^Runner.*Response.*Schema$/.test(n))) {
+      expect(STRICT_NAMES, name).not.toContain(name);
     }
   });
 

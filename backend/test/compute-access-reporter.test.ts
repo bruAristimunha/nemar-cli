@@ -61,7 +61,7 @@ import {
   setTapisTimes,
   startLifecycleFixture,
 } from "./helpers/compute-lifecycle-fixture";
-import { fundPlatform, roundTripD1 } from "./helpers/compute-seed";
+import { fundPlatform, roundTripD1, setPolicy } from "./helpers/compute-seed";
 import { logged } from "./helpers/logs";
 
 const KEY = "access-test-key-0123456789abcdef0123456789abcdef";
@@ -979,6 +979,11 @@ describe("the tick", () => {
     // A deploy's 502, a 500, a 301 from a wrong address, a timeout: each is an outcome the sender cannot
     // judge, and a fault that is systematic makes every later row in the tick the same. The rows not
     // claimed stay pending with no attempt spent and no lease, for the next tick.
+    // Thirty live jobs in all: more than the default tenant ceiling admits (issue #2121), which is not what
+    // this case is about.
+    await setPolicy(env().DB, fx.ownerId, {
+      tenant: { maxLiveJobs: 1000, reserved: { people: 0, pipelines: 0, partner: 0 } },
+    });
     for (const [name, arrange, status] of [
       ["a 502 on every request", () => access.answer(502, 6), 502],
       ["a 500 on every request", () => access.answer(500, 6), 500],

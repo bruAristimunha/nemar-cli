@@ -1,0 +1,375 @@
+{
+  "format": "nemar.derivative-vectors.v1",
+  "note": "Test vectors for the derivative store contract (ADR 0123), byte-exact and language-neutral: Python and TypeScript must both reproduce every one. Computed from the definition with Python struct, hashlib and NumPy, and again with Bun node:crypto, all equal; computed, not measured on any NEMAR data. Never change a vector to make code pass: the maintainer decides whether the vector or the code is wrong. The key fields are full-string matches, so a Python consumer must use re.fullmatch (its $ also matches before a trailing line feed). In `refused`, the JSON string NaN stands for a NaN number, which JSON cannot hold.",
+  "note_locations": "Vectors store_locations and input_digest_v2 (ADR 0123, amendment 2026-11-16), added to the version 1 vectors above, which are unchanged. Computed from the definition with Python json, struct, hashlib and math, and again with Bun, all equal; computed, not measured on any NEMAR data. Read this file with JSON.parse or json.loads, never through an object literal: __proto__ is an own key in the vector named inherited names, and the integer in the vector named an integer too large for binary64 has 400 digits (JSON.parse reads it as Infinity, Python as an int). In each vector the text is exactly what is hashed (the digest of an input digest vector is sha256: and the SHA-256 of its text), and a vector with also_equal_to has the digest of the vector it names. A vector with also_with lists variants that a reader applies as a shallow merge over the case (a variant's labels or attributes replace the case's) and that give the same text. In refused, the field of an input_digest_v2 entry is the DerivativeContractError field.",
+  "store_content": [
+    {
+      "name": "labeled with a unit",
+      "digital": [[1, -2, 3], [32767, -32768, 0]],
+      "scale": [0.1, 0.25],
+      "offset": [0.0, -12.5],
+      "rate": 250.0,
+      "units": ["\u00b5V", "\u00b5V"],
+      "labels": ["Fz", "Cz"],
+      "header": "nemar.store-content.v1\nshape 2 3\nrate 406f400000000000\nunit \u00b5V\nlabel Fz\nlabel Cz\ndata float64-le\n",
+      "sha256": "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd"
+    },
+    {
+      "name": "no unit and no labels",
+      "digital": [[1, -2, 3], [32767, -32768, 0]],
+      "scale": [0.1, 0.25],
+      "offset": [0.0, -12.5],
+      "rate": 250.0,
+      "units": [null, null],
+      "labels": [null, null],
+      "header": "nemar.store-content.v1\nshape 2 3\nrate 406f400000000000\nunit\nlabel\nlabel\ndata float64-le\n",
+      "sha256": "6bff43f9934204b3bf515734cc563ef72da392cc594dc2cdcbd317d9e98f58fd"
+    },
+    {
+      "name": "partly labeled",
+      "digital": [[1, -2, 3], [32767, -32768, 0]],
+      "scale": [0.1, 0.25],
+      "offset": [0.0, -12.5],
+      "rate": 250.0,
+      "units": ["\u00b5V", "\u00b5V"],
+      "labels": ["Fz", null],
+      "header": "nemar.store-content.v1\nshape 2 3\nrate 406f400000000000\nunit \u00b5V\nlabel\nlabel\ndata float64-le\n",
+      "sha256": "424c2a59e3e313b591c3b5516e8522717df6add915d6508646f323338d95adc0",
+      "also_equal_to": "no unit and no labels",
+      "also_with": [
+        { "units": ["\u00b5V", "mV"], "labels": [null, null] },
+        { "units": ["", ""], "labels": ["Fz", ""] }
+      ]
+    },
+    {
+      "name": "two roundings, never fused",
+      "note": "digital 3 times scale 0.1 plus offset -0.3: two separately rounded operations give 5.551115123125783e-17; a fused multiply-add gives 2.7755575615628914e-17 and the digest in fused_sha256. A language that can fuse (C, C++, Go on arm64, GPU code) must not.",
+      "digital": [[3]],
+      "scale": [0.1],
+      "offset": [-0.3],
+      "rate": 250.0,
+      "units": [null],
+      "labels": [null],
+      "header": "nemar.store-content.v1\nshape 1 1\nrate 406f400000000000\nunit\nlabel\ndata float64-le\n",
+      "sha256": "2aa312ed5d306f1f4e3331f7eff09a23972ae2b8bf8792732a79c6e156c3cb0b",
+      "fused_sha256": "ebb90d19f4a23ee757676711f168ad69e2564e98267005d526941eb49dffc536"
+    }
+  ],
+  "store_locations": [
+    {
+      "name": "declared",
+      "note": "Fz and Cz have positions; Pz has none (position alone); Oz is an electrode the group lacks and is nowhere in the text.",
+      "labels": ["Fz", "Cz", "Pz"],
+      "attributes": {"electrode_positions": {"Fz": [0.5, 62.1, 79.3], "Cz": [0.25, -1.5, 95.75], "Oz": [0.0, -84.0, 40.0]}, "electrode_coordinate_system": "CapTrak", "electrode_coordinate_units": "mm"},
+      "text": "nemar.store-locations.v1\nsystem CapTrak\nunits mm\nposition 3fe0000000000000 404f0ccccccccccd 4053d33333333333\nposition 3fd0000000000000 bff8000000000000 4057f00000000000\nposition\n",
+      "sha256": "cd750c5311b0bb17c8b9221f87fa26fafa40be117a684f6389671b4526fc76b5"
+    },
+    {
+      "name": "no positions attribute",
+      "note": "No electrode_positions: system and units are written bare although stated, and every position is alone.",
+      "labels": ["Fz", "Cz", "Pz"],
+      "attributes": {"electrode_coordinate_system": "CapTrak", "electrode_coordinate_units": "mm"},
+      "text": "nemar.store-locations.v1\nsystem\nunits\nposition\nposition\nposition\n",
+      "sha256": "c490e09ddef38ca2df772488dc349c74645567b21232d0679ef07dd5519603c0"
+    },
+    {
+      "name": "positions null",
+      "note": "A null attribute is an absent one.",
+      "labels": ["Fz", "Cz", "Pz"],
+      "attributes": {"electrode_positions": null, "electrode_coordinate_system": "CapTrak", "electrode_coordinate_units": "mm"},
+      "text": "nemar.store-locations.v1\nsystem\nunits\nposition\nposition\nposition\n",
+      "sha256": "c490e09ddef38ca2df772488dc349c74645567b21232d0679ef07dd5519603c0",
+      "also_equal_to": "no positions attribute"
+    },
+    {
+      "name": "unlabeled group",
+      "note": "One label is null: the group joins nothing, so every position is alone; the stated system and units still enter the text.",
+      "labels": ["Fz", null, "Pz"],
+      "attributes": {"electrode_positions": {"Fz": [0.5, 62.1, 79.3], "Cz": [0.25, -1.5, 95.75], "Pz": [0.0, -40.5, 88.0]}, "electrode_coordinate_system": "CapTrak", "electrode_coordinate_units": "mm"},
+      "text": "nemar.store-locations.v1\nsystem CapTrak\nunits mm\nposition\nposition\nposition\n",
+      "sha256": "b0e0d39be7a57e8e6b1680c8737992d8729202e05c28d04e43c4706cf51f6da6",
+      "also_with": [
+        {"labels": ["Fz", "", "Pz"]}
+      ]
+    },
+    {
+      "name": "zeros and integers",
+      "note": "The JSON numbers -0, 0, -0.0, 12 and 12.0: Python reads -0 as the integer 0 and -0.0 as negative zero, JSON.parse reads both as negative zero; every zero is hashed as positive zero (0000000000000000) and 12 and 12.0 are the same binary64.",
+      "labels": ["Fz", "Cz", "Pz"],
+      "attributes": {"electrode_positions": {"Fz": [-0, 0, -0.0], "Cz": [12, 12.0, -0], "Pz": [-0.0, 12, 0]}, "electrode_coordinate_system": "CapTrak", "electrode_coordinate_units": "mm"},
+      "text": "nemar.store-locations.v1\nsystem CapTrak\nunits mm\nposition 0000000000000000 0000000000000000 0000000000000000\nposition 4028000000000000 4028000000000000 0000000000000000\nposition 0000000000000000 4028000000000000 0000000000000000\n",
+      "sha256": "57af1069c6b3a2b78a621e63cd53f82c157a1969fff35fb0f5b7e4042a580c38"
+    },
+    {
+      "name": "zeros and integers as floats",
+      "labels": ["Fz", "Cz", "Pz"],
+      "attributes": {"electrode_positions": {"Fz": [0.0, 0.0, 0.0], "Cz": [12.0, 12.0, 0.0], "Pz": [0.0, 12.0, 0.0]}, "electrode_coordinate_system": "CapTrak", "electrode_coordinate_units": "mm"},
+      "text": "nemar.store-locations.v1\nsystem CapTrak\nunits mm\nposition 0000000000000000 0000000000000000 0000000000000000\nposition 4028000000000000 4028000000000000 0000000000000000\nposition 0000000000000000 4028000000000000 0000000000000000\n",
+      "sha256": "57af1069c6b3a2b78a621e63cd53f82c157a1969fff35fb0f5b7e4042a580c38",
+      "also_equal_to": "zeros and integers"
+    },
+    {
+      "name": "entries with no position",
+      "note": "Every entry but Cz is not an array of exactly three numbers, so each of those channels is position alone; a boolean is not a number (Python's True is an int, so a boolean coordinate is the trap).",
+      "labels": ["boolean", "text", "two numbers", "four numbers", "null", "nested list", "lists of one", "object", "empty list", "boolean coordinate", "boolean coordinate last", "string coordinate", "null coordinate", "Cz"],
+      "attributes": {"electrode_positions": {"boolean": true, "text": "n/a", "two numbers": [1, 2], "four numbers": [1, 2, 3, 4], "null": null, "nested list": [[1, 2, 3]], "lists of one": [[1], [2], [3]], "object": {"x": 1, "y": 2, "z": 3}, "empty list": [], "boolean coordinate": [true, 2, 3], "boolean coordinate last": [1, 2, false], "string coordinate": [1, "2", 3], "null coordinate": [1, null, 3], "Cz": [1.5, 2.5, 3.5]}, "electrode_coordinate_system": "CapTrak", "electrode_coordinate_units": "mm"},
+      "text": "nemar.store-locations.v1\nsystem CapTrak\nunits mm\nposition\nposition\nposition\nposition\nposition\nposition\nposition\nposition\nposition\nposition\nposition\nposition\nposition\nposition 3ff8000000000000 4004000000000000 400c000000000000\n",
+      "sha256": "b7da493b4d9cd358f726bc554c622cbaef61dee7c25a7e3088da9980b28c7c3e"
+    },
+    {
+      "name": "an integer too large for binary64",
+      "note": "Fz holds a 400-digit integer: JSON.parse reads it as Infinity, Python as an int on which float() raises OverflowError; both give position alone, never a refusal.",
+      "labels": ["Fz", "Cz"],
+      "attributes": {"electrode_positions": {"Fz": [1, 2, 1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000], "Cz": [1.5, 2.5, 3.5]}, "electrode_coordinate_system": "CapTrak", "electrode_coordinate_units": "mm"},
+      "text": "nemar.store-locations.v1\nsystem CapTrak\nunits mm\nposition\nposition 3ff8000000000000 4004000000000000 400c000000000000\n",
+      "sha256": "9ca1ae5ea1032b0b4de6d23b8d68721ef8fdd52467641bfe3deff72bd45821ad"
+    },
+    {
+      "name": "non-finite coordinates",
+      "note": "A float literal beyond binary64 is an infinity in both languages: position alone.",
+      "labels": ["Fz", "Cz", "Pz"],
+      "attributes": {"electrode_positions": {"Fz": [1e999, 0, 0], "Cz": [0, -1e999, 0], "Pz": [1, 2, 3]}, "electrode_coordinate_system": "CapTrak", "electrode_coordinate_units": "mm"},
+      "text": "nemar.store-locations.v1\nsystem CapTrak\nunits mm\nposition\nposition\nposition 3ff0000000000000 4000000000000000 4008000000000000\n",
+      "sha256": "7b21eec2ca67e2ebd2e164ed04e58f6e3200cfcd2d295fbcb73bb52644d16d2d"
+    },
+    {
+      "name": "inherited names",
+      "note": "Only own entries join: constructor is position alone; hasOwnProperty and __proto__ have own entries (read the file with JSON.parse, so __proto__ is an own key).",
+      "labels": ["constructor", "hasOwnProperty", "__proto__"],
+      "attributes": {"electrode_positions": {"hasOwnProperty": [1, 2, 3], "__proto__": [4, 5, 6]}, "electrode_coordinate_system": "CapTrak", "electrode_coordinate_units": "mm"},
+      "text": "nemar.store-locations.v1\nsystem CapTrak\nunits mm\nposition\nposition 3ff0000000000000 4000000000000000 4008000000000000\nposition 4010000000000000 4014000000000000 4018000000000000\n",
+      "sha256": "8757617ae52c257bc9eaa5955d758dfe69b384f1bae3263401324e5b67c0f020"
+    },
+    {
+      "name": "exact labels only",
+      "note": "No case fold, no trimming and no Unicode normalization in the join: fz, 'Cz ' and a decomposed e match nothing.",
+      "labels": ["Fz", "Cz", "\u00e9"],
+      "attributes": {"electrode_positions": {"fz": [1, 2, 3], "Cz ": [4, 5, 6], "e\u0301": [7, 8, 9]}, "electrode_coordinate_system": "CapTrak", "electrode_coordinate_units": "mm"},
+      "text": "nemar.store-locations.v1\nsystem CapTrak\nunits mm\nposition\nposition\nposition\n",
+      "sha256": "b0e0d39be7a57e8e6b1680c8737992d8729202e05c28d04e43c4706cf51f6da6"
+    },
+    {
+      "name": "system without units",
+      "note": "An empty or unreadable text is no text: units is bare.",
+      "labels": ["Fz", "Cz"],
+      "attributes": {"electrode_positions": {"Fz": [1, 2, 3], "Cz": [4, 5, 6]}, "electrode_coordinate_system": "MNI305", "electrode_coordinate_units": ""},
+      "text": "nemar.store-locations.v1\nsystem MNI305\nunits\nposition 3ff0000000000000 4000000000000000 4008000000000000\nposition 4010000000000000 4014000000000000 4018000000000000\n",
+      "sha256": "2d14e7addd3512edfceb3c7669db450394c82b2430b52610c5936a3783d7ba90",
+      "also_with": [
+        {"attributes": {"electrode_positions": {"Fz": [1, 2, 3], "Cz": [4, 5, 6]}, "electrode_coordinate_system": "MNI305", "electrode_coordinate_units": null}},
+        {"attributes": {"electrode_positions": {"Fz": [1, 2, 3], "Cz": [4, 5, 6]}, "electrode_coordinate_system": "MNI305", "electrode_coordinate_units": 5}},
+        {"attributes": {"electrode_positions": {"Fz": [1, 2, 3], "Cz": [4, 5, 6]}, "electrode_coordinate_system": "MNI305"}}
+      ]
+    },
+    {
+      "name": "provenance is not hashed",
+      "note": "Vector declared with the converter's three provenance attributes added: none enters the text.",
+      "labels": ["Fz", "Cz", "Pz"],
+      "attributes": {"electrode_positions": {"Fz": [0.5, 62.1, 79.3], "Cz": [0.25, -1.5, 95.75], "Oz": [0.0, -84.0, 40.0]}, "electrode_coordinate_system": "CapTrak", "electrode_coordinate_units": "mm", "electrode_positions_source": "subject", "electrode_positions_file": "sub-01/eeg/sub-01_electrodes.tsv", "electrode_coordsystem_file": "sub-01/eeg/sub-01_coordsystem.json"},
+      "text": "nemar.store-locations.v1\nsystem CapTrak\nunits mm\nposition 3fe0000000000000 404f0ccccccccccd 4053d33333333333\nposition 3fd0000000000000 bff8000000000000 4057f00000000000\nposition\n",
+      "sha256": "cd750c5311b0bb17c8b9221f87fa26fafa40be117a684f6389671b4526fc76b5",
+      "also_equal_to": "declared"
+    }
+  ],
+  "input_digest": [
+    {
+      "name": "one store",
+      "rows": [
+        {"path": "sub-01/eeg/sub-01_task-rest_eeg.edf", "group": "eeg", "content_sha256": "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd"}
+      ],
+      "digest": "sha256:bea77ea8a233ae2507f192e48548af37b8acf01c8abb0e65143ac3178e44bc0b"
+    },
+    {
+      "name": "code point order",
+      "note": "U+FF61 sorts before U+1F600 by code point (UTF-8 bytes); UTF-16 units put U+1F600 first. The rows may arrive in either order; they are stored with U+1F600 first, so one pass catches both a missing sort and a UTF-16 sort.",
+      "rows": [
+        {"path": "sub-01/\ud83d\ude00", "group": "eeg", "content_sha256": "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd"},
+        {"path": "sub-01/\uff61", "group": "eeg", "content_sha256": "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd"}
+      ],
+      "digest": "sha256:4bf7b0ab0a746ebe769759f4989df1ac1c810eaea360c891d76abd6162508c53"
+    }
+  ],
+  "input_digest_v2": [
+    {
+      "name": "one store",
+      "note": "Version 1's one store row with the declared locations digest as locations.",
+      "rows": [
+        {"path": "sub-01/eeg/sub-01_task-rest_eeg.edf", "group": "eeg", "content_sha256": "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd", "locations": "cd750c5311b0bb17c8b9221f87fa26fafa40be117a684f6389671b4526fc76b5"}
+      ],
+      "text": "nemar.input-digest.v2\nsub-01/eeg/sub-01_task-rest_eeg.edf\teeg\t0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd\tcd750c5311b0bb17c8b9221f87fa26fafa40be117a684f6389671b4526fc76b5\n",
+      "digest": "sha256:490297f82b94be30894c3588a701215182d86707adbd036afdf108e68e00d0f1"
+    },
+    {
+      "name": "none",
+      "note": "The recipe by design handed eegprep no positions from this store: none.",
+      "rows": [
+        {"path": "sub-01/eeg/sub-01_task-rest_eeg.edf", "group": "eeg", "content_sha256": "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd", "locations": "none"}
+      ],
+      "text": "nemar.input-digest.v2\nsub-01/eeg/sub-01_task-rest_eeg.edf\teeg\t0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd\tnone\n",
+      "digest": "sha256:16a3ebe1a67327e55f86c3b3fa44f419b3e1a4821d6344f722454f65acb6f9ca"
+    },
+    {
+      "name": "code point order",
+      "note": "Version 1's two paths, both none; U+FF61 sorts before U+1F600 by code point. Stored with U+1F600 first.",
+      "rows": [
+        {"path": "sub-01/\ud83d\ude00", "group": "eeg", "content_sha256": "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd", "locations": "none"},
+        {"path": "sub-01/\uff61", "group": "eeg", "content_sha256": "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd", "locations": "none"}
+      ],
+      "text": "nemar.input-digest.v2\nsub-01/\uff61\teeg\t0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd\tnone\nsub-01/\ud83d\ude00\teeg\t0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd\tnone\n",
+      "digest": "sha256:03612641f7effdb73603490e5921d7e22504706b9ab33420f7cd5766fe464615"
+    },
+    {
+      "name": "a store with positions beside one without",
+      "note": "Two stores stored out of path order: one with the declared locations digest, one none.",
+      "rows": [
+        {"path": "sub-02/eeg/sub-02_task-rest_eeg.edf", "group": "eeg", "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "locations": "none"},
+        {"path": "sub-01/eeg/sub-01_task-rest_eeg.edf", "group": "eeg", "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "locations": "cd750c5311b0bb17c8b9221f87fa26fafa40be117a684f6389671b4526fc76b5"}
+      ],
+      "text": "nemar.input-digest.v2\nsub-01/eeg/sub-01_task-rest_eeg.edf\teeg\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tcd750c5311b0bb17c8b9221f87fa26fafa40be117a684f6389671b4526fc76b5\nsub-02/eeg/sub-02_task-rest_eeg.edf\teeg\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tnone\n",
+      "digest": "sha256:154bc9af30cf8c8fc5580b37df6a1489aba210833c3fb9b5cef6fbf9dc1ee04c"
+    }
+  ],
+  "derivative_key": [
+    {
+      "name": "zarr serving",
+      "fields": {
+        "dataset": "xx099999",
+        "version": "v1.0.0",
+        "recipe": "nemar-floor",
+        "recipe_version": "1.0.0",
+        "engine": "eegprep@0.5.0",
+        "input": "zarr",
+        "profile": "serving",
+        "input_digest": "sha256:bea77ea8a233ae2507f192e48548af37b8acf01c8abb0e65143ac3178e44bc0b"
+      },
+      "text": "nemar.derivative-key.v1\ndataset xx099999\nversion v1.0.0\nrecipe nemar-floor\nrecipe_version 1.0.0\nengine eegprep@0.5.0\ninput zarr\nprofile serving\ninput_digest sha256:bea77ea8a233ae2507f192e48548af37b8acf01c8abb0e65143ac3178e44bc0b\n",
+      "key": "8e133dcebb34c1df395a4521c8cddfffa441828107a2e16df041348d51ce71db"
+    },
+    {
+      "name": "bids archive",
+      "fields": {
+        "dataset": "xx099999",
+        "version": "v1.0.0",
+        "recipe": "nemar-floor",
+        "recipe_version": "1.0.0",
+        "engine": "eegprep@0.5.0",
+        "input": "bids",
+        "profile": "archive",
+        "input_digest": "git:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "text": "nemar.derivative-key.v1\ndataset xx099999\nversion v1.0.0\nrecipe nemar-floor\nrecipe_version 1.0.0\nengine eegprep@0.5.0\ninput bids\nprofile archive\ninput_digest git:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+      "key": "da56eaa8eb746589c8bd6cb98114ceb5555db6d14a1092707869526d9aba15e1"
+    }
+  ],
+  "refused": {
+    "store_content": [
+      {
+        "name": "a NaN rate",
+        "digital": [[1, -2, 3], [32767, -32768, 0]],
+        "scale": [0.1, 0.25],
+        "offset": [0.0, -12.5],
+        "rate": "NaN",
+        "units": [null, null],
+        "labels": [null, null]
+      },
+      {
+        "name": "a label holding a line feed that enters the header",
+        "digital": [[1, -2, 3], [32767, -32768, 0]],
+        "scale": [0.1, 0.25],
+        "offset": [0.0, -12.5],
+        "rate": 250.0,
+        "units": [null, null],
+        "labels": ["Fz\nCz", "Cz"]
+      }
+    ],
+    "input_digest": [
+      {
+        "name": "a tab in a path",
+        "rows": [{"path": "sub-01/a\tb", "group": "eeg", "content_sha256": "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd"}]
+      },
+      {
+        "name": "a tab in a group",
+        "rows": [{"path": "sub-01/eeg.edf", "group": "e\teg", "content_sha256": "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd"}]
+      }
+    ],
+    "store_locations": [
+      {
+        "name": "positions an array",
+        "labels": ["Fz", "Cz"],
+        "attributes": {"electrode_positions": [[1, 2, 3], [4, 5, 6]], "electrode_coordinate_system": "CapTrak", "electrode_coordinate_units": "mm"}
+      },
+      {
+        "name": "positions a string",
+        "labels": ["Fz", "Cz"],
+        "attributes": {"electrode_positions": "Fz 1 2 3", "electrode_coordinate_system": "CapTrak", "electrode_coordinate_units": "mm"}
+      },
+      {
+        "name": "a system holding a line feed",
+        "labels": ["Fz", "Cz"],
+        "attributes": {"electrode_positions": {"Fz": [1, 2, 3]}, "electrode_coordinate_system": "Cap\nTrak", "electrode_coordinate_units": "mm"}
+      },
+      {
+        "name": "units holding a carriage return",
+        "labels": ["Fz", "Cz"],
+        "attributes": {"electrode_positions": {"Fz": [1, 2, 3]}, "electrode_coordinate_system": "CapTrak", "electrode_coordinate_units": "m\rm"}
+      },
+      {
+        "name": "a system holding a lone surrogate",
+        "labels": ["Fz", "Cz"],
+        "attributes": {"electrode_positions": {"Fz": [1, 2, 3]}, "electrode_coordinate_system": "Cap\ud800Trak", "electrode_coordinate_units": "mm"}
+      },
+      {
+        "name": "attributes an array",
+        "labels": ["Fz", "Cz"],
+        "attributes": []
+      },
+      {
+        "name": "no labels",
+        "labels": [],
+        "attributes": {"electrode_positions": {"Fz": [0.5, 62.1, 79.3], "Cz": [0.25, -1.5, 95.75], "Oz": [0.0, -84.0, 40.0]}, "electrode_coordinate_system": "CapTrak", "electrode_coordinate_units": "mm"}
+      },
+      {
+        "name": "a label that is not text",
+        "labels": ["Fz", 5],
+        "attributes": {"electrode_positions": {"Fz": [0.5, 62.1, 79.3], "Cz": [0.25, -1.5, 95.75], "Oz": [0.0, -84.0, 40.0]}, "electrode_coordinate_system": "CapTrak", "electrode_coordinate_units": "mm"}
+      }
+    ],
+    "input_digest_v2": [
+      {
+        "name": "locations NONE",
+        "field": "locations",
+        "rows": [{"path": "sub-01/eeg/sub-01_task-rest_eeg.edf", "group": "eeg", "content_sha256": "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd", "locations": "NONE"}]
+      },
+      {
+        "name": "locations of 63 hexadecimal digits",
+        "field": "locations",
+        "rows": [{"path": "sub-01/eeg/sub-01_task-rest_eeg.edf", "group": "eeg", "content_sha256": "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd", "locations": "cd750c5311b0bb17c8b9221f87fa26fafa40be117a684f6389671b4526fc76b"}]
+      },
+      {
+        "name": "locations missing",
+        "field": "locations",
+        "rows": [{"path": "sub-01/eeg/sub-01_task-rest_eeg.edf", "group": "eeg", "content_sha256": "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd"}]
+      },
+      {
+        "name": "a row that is a list",
+        "field": "stores_content",
+        "rows": [["sub-01/eeg/sub-01_task-rest_eeg.edf", "eeg", "0c268ca3444e5c884afb5475ae13b6bc3170869776b2e4b0118205f2f08f84cd", "none"]]
+      }
+    ],
+    "derivative_key": [
+      {
+        "name": "a trailing line feed in version",
+        "fields": {
+          "dataset": "xx099999",
+          "version": "v1.0.0\n",
+          "recipe": "nemar-floor",
+          "recipe_version": "1.0.0",
+          "engine": "eegprep@0.5.0",
+          "input": "zarr",
+          "profile": "serving",
+          "input_digest": "sha256:bea77ea8a233ae2507f192e48548af37b8acf01c8abb0e65143ac3178e44bc0b"
+        }
+      }
+    ]
+  }
+}

@@ -146,6 +146,7 @@ export {
   enableAutoMerge,
   ensureMainBranch,
   getRepoDefaultBranch,
+  getRepoPrivate,
   listOrgRepos,
   sanitizeRepoDescription,
   setRepoDescription,

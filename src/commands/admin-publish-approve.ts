@@ -1,5 +1,5 @@
 /**
- * `nemar admin publish approve`: approve a publication request and run the orchestrator.
+ * `nemar admin repo publish approve`: approve a publication request and run the orchestrator.
  *
  * Its own file, registered on the `publish` group at the end of `admin-publish.ts`, so the work
  * that follows (the review, the override, `next`) edits this command without editing the group.
@@ -155,8 +155,8 @@ Description:
   --acknowledge-identifier-screen "<reason>", which is recorded with your name.
   Direct identifiers cannot be acknowledged: the depositor fixes the data and
   requests again. A screen that did not run or did not report must be re-run
-  with 'nemar admin publish screen <dataset-id>', and so must one whose commit
-  is no longer the repository's main. 'nemar admin publish list' shows it.
+  with 'nemar admin repo publish screen <dataset-id>', and so must one whose commit
+  is no longer the repository's main. 'nemar admin repo publish list' shows it.
 
   The PUBLICATION REVIEW (ADR 0102) is read next and shown with the screen. A pass
   approves. A reason nothing clears (a blocked request, a failed submission
@@ -204,8 +204,8 @@ Description:
   confirmation banner reads the pending request and lists what will actually
   run, so approve one and read the banner rather than this list.
 
-  WARNING: This action is PERMANENT. Published datasets cannot be unpublished.
-  Once a DOI is assigned, it is permanent and cannot be deleted.
+  WARNING: Once a DOI is assigned, it is permanent and cannot be deleted. A published
+  dataset can be pulled back to private with 'nemar admin repo unpublish', but its DOIs stay.
 
 Orchestrator Steps (execution order; shared/publication-steps.ts):
    1. CI Check          - Verify BIDS validation passes, deploy workflows if missing
@@ -250,12 +250,12 @@ Resume Capability:
   steps are automatically skipped.
 
 Examples:
-  $ nemar admin publish approve nm099999                    # Run full orchestrator
-  $ nemar admin publish approve nm099999 --resume           # Resume from failed step
-  $ nemar admin publish approve nm099999 --skip-ci-check    # Skip the live CI check only
-  $ nemar admin publish approve nm099999 --force            # Approve over a review that is not a pass
-  $ nemar admin publish approve nm099999 --yes              # Skip confirmation (never a reason)
-  $ nemar admin publish approve nm099999 --request-id 42    # Only if request 42 is the one in force
+  $ nemar admin repo publish approve nm099999                    # Run full orchestrator
+  $ nemar admin repo publish approve nm099999 --resume           # Resume from failed step
+  $ nemar admin repo publish approve nm099999 --skip-ci-check    # Skip the live CI check only
+  $ nemar admin repo publish approve nm099999 --force            # Approve over a review that is not a pass
+  $ nemar admin repo publish approve nm099999 --yes              # Skip confirmation (never a reason)
+  $ nemar admin repo publish approve nm099999 --request-id 42    # Only if request 42 is the one in force
 
 After Approval:
   - User receives email with DOI and public dataset link
@@ -649,7 +649,7 @@ export function reviewRefusalLines(error: unknown, datasetId: string): string[] 
   if (reasons.length === 0) return [];
   return [
     ...reasons.map((line) => chalk.dim(`  ${line}`)),
-    `  Next: nemar admin publish show ${plain(datasetId)}`,
+    `  Next: nemar admin repo publish show ${plain(datasetId)}`,
   ];
 }
 
@@ -815,7 +815,7 @@ export async function runApproval(
       for (const line of resultLines(result)) console.log(line);
       console.log(
         chalk.yellow(
-          `  Not published yet: the request is ${plain(String(result.status ?? "not published"))}. Do what the warning says, then run: nemar admin publish approve ${plain(datasetId)} --resume`,
+          `  Not published yet: the request is ${plain(String(result.status ?? "not published"))}. Do what the warning says, then run: nemar admin repo publish approve ${plain(datasetId)} --resume`,
         ),
       );
       // A script that asked for an approval has to be able to tell, and this is the Worker's own

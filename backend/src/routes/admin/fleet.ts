@@ -54,7 +54,6 @@ import {
 } from "../../services/pr-review-eligibility";
 import { mirrorReconcileRemovals, resolveRepoCollaborators } from "../../services/repo-spec";
 import { HttpError } from "../../services/retry";
-import { applyDatasetVisibility } from "../../services/visibility";
 import type { Bindings } from "../../types/bindings";
 import type { AdminRouter } from "./shared";
 
@@ -266,120 +265,30 @@ export function registerFleetRoutes(admin: AdminRouter): void {
   // Repository Visibility
   // ============================================================================
 
-  const visibilitySchema = z.object({
-    visibility: z.enum(["public", "private"]),
-  });
-
   /**
-   * PATCH /admin/datasets/:id/visibility - Change repository visibility
+   * PATCH /admin/datasets/:id/visibility - REFUSED in both directions.
    *
-   * A break-glass admin tool: making a dataset public here does NOT pass the
-   * identifier screen gate that a publication approval does (ADR 0086 states
-   * the exception). It writes an audit row; use the publication flow for a
-   * dataset that has not been screened.
+   * A bare visibility flip leaves the catalog row, the publication record and
+   * the DOIs saying something different from the repository: `private` on a
+   * published dataset left it "published but unreachable" (nm000289), and
+   * `public` on an unpublished one is public without a publication. Both are
+   * made by their own operation, which moves every surface together:
+   *   - public:  the publication flow (POST /admin/publish/:id/approve)
+   *   - private: POST /admin/datasets/:id/unpublish
+   * The route stays registered so an old caller gets this answer instead of a
+   * bare 404, and the route inventory pin stays honest.
    */
-  admin.patch("/datasets/:id/visibility", zValidator("json", visibilitySchema), async (c) => {
-    const datasetId = c.req.param("id");
-    const { visibility } = c.req.valid("json");
-    const db = c.env.DB;
-    const adminUser = c.get("user");
-    const isPrivate = visibility === "private";
-
-    const result = await applyDatasetVisibility(c.env, datasetId, visibility);
-
-    if (!result.ok) {
-      switch (result.stage) {
-        case "not_found":
-          return c.json({ error: result.error }, 404);
-        case "no_repo":
-          return c.json({ error: result.error }, 400);
-        case "invalid_repo":
-        case "github":
-          return c.json({ error: result.error }, 500);
-        case "s3":
-          if (result.githubReverted) {
-            return c.json(
-              {
-                error: `Failed to update S3 bucket policy, reverted GitHub repository to ${isPrivate ? "public" : "private"}`,
-                details: result.error,
-                dataset_id: datasetId,
-              },
-              500,
-            );
-          }
-          return c.json(
-            {
-              error: "CRITICAL: S3 policy update failed AND GitHub revert failed",
-              details: result.error,
-              dataset_id: datasetId,
-              github_visibility: visibility,
-              s3_public: visibility === "private",
-              revert_error: result.revertError,
-              action_required: `Manually revert GitHub repo to ${isPrivate ? "public" : "private"} OR manually ${visibility === "public" ? "add" : "remove"} S3 public read policy for ${datasetId}`,
-            },
-            500,
-          );
-        case "db":
-          if (result.githubReverted && result.s3Reverted) {
-            return c.json(
-              {
-                error: "Database update failed, reverted GitHub and S3 to original state",
-                details: result.error,
-                dataset_id: datasetId,
-              },
-              500,
-            );
-          }
-          return c.json(
-            {
-              error: "CRITICAL: Database update failed AND rollback incomplete",
-              details: result.error,
-              dataset_id: datasetId,
-              github_visibility: visibility,
-              github_reverted: result.githubReverted,
-              s3_reverted: result.s3Reverted,
-              database_visibility: visibility === "public" ? "private" : "public",
-              revert_error: result.revertError,
-              action_required:
-                `Manually fix: ${!result.githubReverted ? `revert GitHub to ${!isPrivate ? "public" : "private"}` : ""} ${!result.s3Reverted ? `revert S3 policy for ${datasetId}` : ""} update database SET visibility = '${visibility}' WHERE dataset_id = '${datasetId}'`.trim(),
-            },
-            500,
-          );
-      }
-    }
-
-    // Audit log (non-fatal but warn user if fails)
-    let auditLogFailed = false;
-    let auditLogError: string | undefined;
-
-    try {
-      await auditLogStatement(db, {
-        userId: adminUser.id,
-        action: "repo_visibility_changed",
-        resourceType: "dataset",
-        resourceId: datasetId,
-        details: JSON.stringify({ visibility, changed_by: adminUser.username }),
-      }).run();
-    } catch (auditError) {
-      auditLogFailed = true;
-      auditLogError = auditError instanceof Error ? auditError.message : String(auditError);
-      console.error(
-        "AUDIT LOG FAILURE: Visibility change for dataset",
-        datasetId,
-        "was not logged:",
-        auditLogError,
-      );
-    }
-
-    return c.json({
-      message: `Repository visibility set to ${visibility}`,
-      dataset_id: datasetId,
-      visibility,
-      spec_enforcement: result.specEnforcement?.steps,
-      warning: auditLogFailed
-        ? `Audit log write failed: ${auditLogError}. Operation succeeded but was not logged for compliance.`
-        : undefined,
-    });
+  admin.patch("/datasets/:id/visibility", async (c) => {
+    return c.json(
+      {
+        error:
+          "Direct visibility changes are no longer supported: they leave the publication state out of step with the repository. Use POST /admin/publish/:id/approve to publish, or POST /admin/datasets/:id/unpublish to pull a dataset back to private (nemar admin repo publish approve / unpublish).",
+        code: "visibility_change_refused",
+        publish: `/admin/publish/${c.req.param("id")}/approve`,
+        unpublish: `/admin/datasets/${c.req.param("id")}/unpublish`,
+      },
+      409,
+    );
   });
 
   // ============================================================================

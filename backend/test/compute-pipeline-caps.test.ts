@@ -62,8 +62,12 @@ const ids = (n: number, from = 104) =>
   Array.from({ length: n }, (_, i) => `nm${String(from + i).padStart(6, "0")}`);
 
 /** The pipelines' policy with the caps a case names, everything else the default. */
-async function caps(over: { cpu?: number; daily?: number }) {
+async function caps(over: { cpu?: number; daily?: number; liftTenant?: boolean }) {
   await setPolicy(fx.env().DB, fx.ownerId, {
+    // The default tenant ceiling leaves the pipelines 12 (issue #2121); a case that wants more lifts it.
+    ...(over.liftTenant
+      ? { tenant: { maxLiveJobs: 1000, reserved: { people: 0, pipelines: 0, partner: 0 } } }
+      : {}),
     pipelines: {
       ...DEFAULT_COMPUTE_POLICY.pipelines,
       dailyJobCap: over.daily ?? DEFAULT_COMPUTE_POLICY.pipelines.dailyJobCap,
@@ -296,7 +300,12 @@ describe("(e) a dry run says what a live run would do", () => {
       env,
     );
     expect(few.body.would_dispatch).toHaveLength(2);
-    expect(few.body.room).toEqual({ daily_left: 50, live_left: 3, limited_by: "limit" });
+    expect(few.body.room).toEqual({
+      daily_left: 50,
+      live_left: 3,
+      tenant_left: 12,
+      limited_by: "limit",
+    });
     await run("admin", { recipe: "nemar-floor", eligible: true, limit: 3 }, env);
     const full = await run(
       "admin",
@@ -349,7 +358,7 @@ describe("the day's count is a full table scan, so it is read once per run", () 
 
 describe("(f) the per-invocation bound", () => {
   test("25 eligible datasets and room for all: one run dispatches 10", async () => {
-    await caps({ cpu: 100, daily: 100 });
+    await caps({ cpu: 100, daily: 100, liftTenant: true });
     const env = await world(ids(25));
     const res = await run("admin", { recipe: "nemar-floor", eligible: true, limit: 100 }, env);
     expect(res.status).toBe(201);

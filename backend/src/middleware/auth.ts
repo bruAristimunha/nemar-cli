@@ -13,6 +13,11 @@
  */
 
 import type { Context, Next } from "hono";
+import { RUNNER_REFUSAL_STATUS, type RunnerRefusal } from "../../../shared/compute-state.js";
+import {
+  RUNNER_ACCESS_PREFIX,
+  RUNNER_SECRET_PREFIX,
+} from "../../../shared/contract/compute-runner.js";
 import type { OriginNotAllowedBody } from "../../../shared/contract/publication-review-admin.js";
 import type { AccountKind } from "../../../shared/contract/user.js";
 import {
@@ -164,9 +169,14 @@ export type BearerAuthResult =
  * key and never resolves to a user (ADR 0119 rule 4): an OIDC access token is
  * accepted only by the routes that serve its scopes (`oidcBearer`), and every
  * caller of this lookup refuses it.
+ *
+ * `runner_credential` is the same for a runner's secret (`nmr_`) or access token (`nmra_`, portable
+ * compute): never looked up as a key, never a user, and refused by every caller. A runner's access
+ * token is accepted only by `runnerAccess` (`routes/compute-runners.ts`).
  */
 export type ApiKeyResolution<Profile = undefined> =
   | { kind: "oidc_token" }
+  | { kind: "runner_credential" }
   | { kind: "malformed" }
   | { kind: "unknown" }
   | { kind: "inactive"; status: string }
@@ -249,6 +259,11 @@ export async function resolveApiKeyUser(
   // key, whatever the `tokens` table holds (ADR 0119 rule 4). `nm_` does not match `nmo_`.
   if (typeof apiKey === "string" && apiKey.startsWith(OIDC_CREDENTIAL_PREFIX)) {
     return { kind: "oidc_token" };
+  }
+  // So is a runner credential, by BOTH of its prefixes (`nmr_` is not a prefix of `nmra_`), before any
+  // lookup: it is neither a key nor a session, whatever the `tokens` table holds.
+  if (typeof apiKey === "string" && RUNNER_CREDENTIAL_PREFIXES.some((p) => apiKey.startsWith(p))) {
+    return { kind: "runner_credential" };
   }
   if (!apiKey || apiKey.length < 32) return { kind: "malformed" };
 
@@ -342,6 +357,17 @@ export async function resolveApiKeyUser(
 /** The prefix every OpenID Connect credential carries: `nmo_at_`, `nmo_rt_` and `nmo_cs_`. */
 const OIDC_CREDENTIAL_PREFIX = "nmo_";
 
+/** The two prefixes of a runner's credentials: the secret and the access token (declared with the protocol). */
+const RUNNER_CREDENTIAL_PREFIXES = [RUNNER_SECRET_PREFIX, RUNNER_ACCESS_PREFIX] as const;
+
+/**
+ * The refusal of a runner's secret or access token on any route that is not a runner route (portable
+ * compute, decision D4): a 401 with the word of `RUNNER_REFUSALS`, the one a runner reads.
+ */
+export const RUNNER_CREDENTIAL_REFUSAL = {
+  error: "runner_credential_not_accepted",
+} as const satisfies { error: RunnerRefusal };
+
 /**
  * The refusal of an OpenID Connect token on a route that is not an OIDC route (ADR 0119 rule 4). A
  * 401 like any other credential the route cannot use, with a code a client can act on: the token is
@@ -380,6 +406,14 @@ export async function resolveBearerUser(c: AuthContext): Promise<BearerAuthResul
   switch (resolved.kind) {
     case "oidc_token":
       return { kind: "refused", response: c.json(OIDC_TOKEN_REFUSAL, 401) };
+    case "runner_credential":
+      return {
+        kind: "refused",
+        response: c.json(
+          RUNNER_CREDENTIAL_REFUSAL,
+          RUNNER_REFUSAL_STATUS.runner_credential_not_accepted,
+        ),
+      };
     case "malformed":
       return { kind: "refused", response: c.json({ error: "Invalid API key format" }, 401) };
     case "unknown":

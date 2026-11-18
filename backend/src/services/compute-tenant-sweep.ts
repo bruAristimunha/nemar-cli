@@ -80,6 +80,7 @@ import { getPolicy } from "./compute-policy.js";
 import { sha256Hex } from "./compute-records.js";
 import { listAccessReportFailures } from "./compute-reporting.js";
 import { computeEnabled } from "./compute-switches.js";
+import { tenantFacts } from "./compute-tenant.js";
 import { isExactProduction } from "./repull-switches.js";
 import {
   type TapisContext,
@@ -140,6 +141,16 @@ export interface TenantSweepResult {
   settledFinal: number;
   /** ACCESS reports in `failed`, by their fixed word (week mode). */
   accessFailed: Record<string, number>;
+  /**
+   * A `live` run only: the jobs of the listing that have not ended, which is what the tenant's slots hold
+   * as Tapis sees it (null in a `week` run, and when the run did not get as far as the listing). With
+   * `occupied` and `ceiling` (NEMAR's own count and the owner's ceiling, null if the policy could not be
+   * read) it is how a job NEMAR did not admit shows: more live jobs in the tenant than the ceiling. Both are
+   * read BEFORE the run indexes or cancels anything, so the line says what the tenant held when it looked.
+   */
+  tenantLive: number | null;
+  occupied: number | null;
+  ceiling: number | null;
   /** Fixed words; never a message. */
   errors: string[];
   errorClass: string | null;
@@ -160,6 +171,9 @@ const emptyResult = (mode: TenantSweepMode): TenantSweepResult => ({
   finished: 0,
   gaveUp: 0,
   settledFinal: 0,
+  tenantLive: null,
+  occupied: null,
+  ceiling: null,
   accessFailed: {},
   errors: [],
   errorClass: null,
@@ -212,6 +226,7 @@ const UNRESERVED_GATE_SQL = `EXISTS (SELECT 1 FROM compute_jobs
 /** Rows of this sweep's own that have not ended: the rotation by last examination. */
 export const FOLLOW_ROWS_SQL = `SELECT id FROM compute_jobs
   WHERE flag_unreserved = 1 AND state IN (${LIVE_STATES_SQL}) AND tapis_uuid IS NOT NULL
+    AND executor = 'tapis'
   ORDER BY examined_at ASC, created_at ASC LIMIT ?1`;
 
 /** The account a Tapis owner maps to, by the gateway pseudonym, if the account is active and not deleted. */
@@ -616,6 +631,23 @@ function failMissing(): never {
 // --- The sweep -------------------------------------------------------------------------------------------
 
 /**
+ * A `live` run's view of the tenant ceiling (issue #2121, phase P2): the live jobs its listing holds and,
+ * beside them, NEMAR's own count of occupied slots and the owner's ceiling. Read-only. A policy that cannot
+ * be read leaves the two numbers null and is an error word, never a guess.
+ */
+async function readTenantSlots(env: Bindings, r: TenantSweepResult, live: number): Promise<void> {
+  r.tenantLive = live;
+  try {
+    const facts = await tenantFacts(env.DB, (await getPolicy(env.DB)).policy);
+    r.occupied = facts.occupied;
+    r.ceiling = facts.ceiling;
+  } catch (err) {
+    r.errors.push("tenant_unreadable");
+    r.errorClass = errorClassName(err);
+  }
+}
+
+/**
  * One run of the tenant sweep. Null outside exact production and while compute is off, before anything
  * is read. A listing that fails is `list_failed` and nothing at all is written.
  */
@@ -648,6 +680,7 @@ export async function sweepTenantJobs(
     );
     r.bound = scope.filter((j) => bound.has(j.uuid)).length;
     const unbound = scope.filter((j) => !bound.has(j.uuid));
+    if (mode === "live") await readTenantSlots(env, r, scope.length);
     for (const job of unbound.slice(0, TENANT_NEW_PER_RUN)) {
       try {
         await handleUnbound(env, ctx, job, r);
@@ -700,7 +733,7 @@ export async function sweepTenantJobs(
  */
 export function tenantLogLine(
   r: TenantSweepResult,
-): { level: "info" | "error"; line: string } | null {
+): { level: "info" | "warn" | "error"; line: string } | null {
   const accessFailed = Object.entries(r.accessFailed).reduce((n, [, c]) => n + c, 0);
   // A cut listing needs a person in a `week` pass (a job of the week may be missing) and, in a `live` pass,
   // only when a live job could be hiding past the cut.
@@ -708,7 +741,11 @@ export function tenantLogLine(
   const needsPerson = r.errors.length > 0 || cutMatters || r.deferred > 0 || accessFailed > 0;
   const acted =
     r.indexed + r.raced + r.duplicates + r.cancelled + r.finished + r.gaveUp + r.settledFinal;
-  if (!needsPerson && acted === 0) return null;
+  // More live jobs in the tenant than the owner's ceiling: something NEMAR did not admit holds slots (a job
+  // that skipped the reservation, a duplicate, a hand-run job), or the owner lowered the ceiling below what
+  // is already live. Said at warning level, whatever else the run did.
+  const overCeiling = r.tenantLive !== null && r.ceiling !== null && r.tenantLive > r.ceiling;
+  if (!needsPerson && acted === 0 && !overCeiling) return null;
   const parts = [
     "[compute-tenant]",
     `mode=${r.mode}`,
@@ -724,12 +761,20 @@ export function tenantLogLine(
     `deferred=${r.deferred}`,
     `truncated=${r.truncated ? 1 : 0}`,
     `live_may_hide=${r.liveMayHide ? 1 : 0}`,
+    ...(r.tenantLive === null
+      ? []
+      : [
+          `tenant_live=${r.tenantLive}`,
+          ...(r.occupied === null || r.ceiling === null
+            ? []
+            : [`occupied=${r.occupied}/${r.ceiling}`]),
+        ]),
     ...(r.mode === "week" ? [`settled_final=${r.settledFinal}`] : []),
     ...Object.entries(r.accessFailed).map(([word, count]) => `access_${word}=${count}`),
     `errors=${r.errors.length > 0 ? [...new Set(r.errors)].join(",") : "none"}`,
     ...(r.errorClass === null ? [] : [`class=${r.errorClass}`]),
   ];
-  return { level: needsPerson ? "error" : "info", line: parts.join(" ") };
+  return { level: needsPerson ? "error" : overCeiling ? "warn" : "info", line: parts.join(" ") };
 }
 
 // Re-exported so a test names the constants the sweep depends on from one place.

@@ -140,6 +140,7 @@ export async function resolvePrincipal(
     switch (resolved.kind) {
       // An OpenID Connect token names no principal here (ADR 0119 rule 4).
       case "oidc_token":
+      case "runner_credential":
       case "malformed":
       case "unknown":
         return INVALID;

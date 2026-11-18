@@ -1,5 +1,5 @@
 /**
- * `nemar admin publish next` (ADR 0102, section 8): the walk through the publication requests
+ * `nemar admin repo publish next` (ADR 0102, section 8): the walk through the publication requests
  * that need an administrator, one card each, with the answers piped in as a script would.
  *
  * The real command (`bun run src/index.ts ...`) against the real backend app, over a real D1
@@ -73,7 +73,7 @@ beforeEach(async () => {
   h.setEnv({ PUBLICATION_REVIEW_ENABLED: "1" });
 });
 
-const NEXT = ["admin", "publish", "next"];
+const NEXT = ["admin", "repo", "publish", "next"];
 /** The prompt of a card that offers every answer but `y`. */
 const PROMPT = "n deny, c comment, d details, s skip, q quit >";
 const WHY_ACK = "Read the recording formats by hand, nothing to remove";
@@ -225,7 +225,9 @@ describe("y approves from the terminal", () => {
     expect(r.stdout).not.toContain(B);
     expect(h.requests.filter((c) => c.path === `/admin/publish/${B}/review`)).toEqual([]);
     expect(count(r.stdout, "Input ended; stopping.")).toBe(1);
-    expect(count(r.stdout, "See what needs you with: nemar admin publish list --needs-me")).toBe(1);
+    expect(
+      count(r.stdout, "See what needs you with: nemar admin repo publish list --needs-me"),
+    ).toBe(1);
     expect(r.stdout).toContain("Done: 1 approved.");
   });
 
@@ -296,8 +298,8 @@ describe("a review that is not a pass needs --force", () => {
     expect(r.stdout).not.toContain("y approve, ");
     expect(r.stdout).toContain("y is not offered:");
     expect(r.stdout).toContain("Not approved: this review is not a pass.");
-    expect(r.stdout).toContain("nemar admin publish next --force");
-    expect(r.stdout).toContain(`nemar admin publish approve ${A} --resume --force`);
+    expect(r.stdout).toContain("nemar admin repo publish next --force");
+    expect(r.stdout).toContain(`nemar admin repo publish approve ${A} --resume --force`);
     expect(promptsIn(r)).toBe(2);
     expect(h.posted).toEqual([]);
     expect(requestRow(requestId)?.status).toBe("requested");
@@ -865,7 +867,7 @@ describe("which requests are shown, and in what order", () => {
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("Input ended; stopping.");
     // Nothing was shown, so the way to see what is waiting is named.
-    expect(r.stdout).toContain("See what needs you with: nemar admin publish list --needs-me");
+    expect(r.stdout).toContain("See what needs you with: nemar admin repo publish list --needs-me");
     expect(h.posted).toEqual([]);
   });
 
@@ -1367,7 +1369,7 @@ describe.skipIf(process.platform === "win32")("on a terminal", () => {
         const running = await t.waitFor("Running publication workflow", { after: first });
         await Bun.sleep(600);
         t.type("\u0003");
-        await t.waitFor(`nemar admin publish approve ${A} --resume`, { after: running });
+        await t.waitFor(`nemar admin repo publish approve ${A} --resume`, { after: running });
         await t.waitFor("Nothing was changed.", { after: running });
       },
     });
@@ -1375,8 +1377,8 @@ describe.skipIf(process.platform === "win32")("on a terminal", () => {
     expect(r.exitCode).toBe(130);
     expect(r.stdout).toContain(`Interrupted while approving ${A}.`);
     expect(r.stdout).toContain("may still be running, or may have finished");
-    expect(r.stdout).toContain(`nemar admin publish show ${A}`);
-    expect(r.stdout).toContain(`nemar admin publish approve ${A} --resume`);
+    expect(r.stdout).toContain(`nemar admin repo publish show ${A}`);
+    expect(r.stdout).toContain(`nemar admin repo publish approve ${A} --resume`);
     // The tally follows the pointer, and the interrupted approval is not in it.
     expect(r.stdout.indexOf("Nothing was changed.")).toBeGreaterThan(
       r.stdout.indexOf(`approve ${A} --resume`),

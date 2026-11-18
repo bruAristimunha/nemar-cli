@@ -77,17 +77,17 @@ const counts = async (env: Bindings) => {
 describe("the candidates", () => {
   test("are the eligible datasets in order, and a dataset with a live stamp for the tuple is not one", async () => {
     const env = await world();
-    expect((await pipelineCandidates(env.DB, floor, 10)).map((c) => c.dataset_id)).toEqual([
+    expect((await pipelineCandidates(env, floor, 10)).map((c) => c.dataset_id)).toEqual([
       "nm000104",
       "nm000105",
       "nm000106",
     ]);
     await dispatchPipelineJob(env, { recipe: "nemar-floor", datasetId: "nm000105", actor: ADMIN });
-    expect((await pipelineCandidates(env.DB, floor, 10)).map((c) => c.dataset_id)).toEqual([
+    expect((await pipelineCandidates(env, floor, 10)).map((c) => c.dataset_id)).toEqual([
       "nm000104",
       "nm000106",
     ]);
-    expect(await pipelineCandidates(env.DB, floor, 1)).toEqual([
+    expect(await pipelineCandidates(env, floor, 1)).toEqual([
       { dataset_id: "nm000104", version: "1.0.0", tag: "v1.0.0" },
     ]);
   });
@@ -100,16 +100,16 @@ describe("the candidates", () => {
       actor: ADMIN,
     });
     if (!first.ok) throw new Error("not dispatched");
-    expect(await pipelineCandidates(env.DB, floor, 10)).toHaveLength(0);
+    expect(await pipelineCandidates(env, floor, 10)).toHaveLength(0);
     await finishAtTapis(fx, env, first.jobId, { outputs: floorOutputs() });
     await syncPipelineStamps(env);
     // Succeeded, with the registry's own version and engine: the dataset is current.
-    expect(await pipelineCandidates(env.DB, floor, 10)).toHaveLength(0);
+    expect(await pipelineCandidates(env, floor, 10)).toHaveLength(0);
     // A failed stamp frees the tuple.
     await env.DB.prepare(
       "UPDATE compute_pipeline_stamps SET state = 'failed', refusal_code = 'job_failed', updated_at = datetime('now', '-30 days')",
     ).run();
-    expect(await pipelineCandidates(env.DB, floor, 10)).toHaveLength(1);
+    expect(await pipelineCandidates(env, floor, 10)).toHaveLength(1);
   });
 
   test("only the newest version is considered: a stamp for an older one does not make the newest current", async () => {
@@ -126,7 +126,7 @@ describe("the candidates", () => {
     )
       .bind(floor.version, floor.engine)
       .run();
-    expect(await pipelineCandidates(env.DB, floor, 10)).toEqual([
+    expect(await pipelineCandidates(env, floor, 10)).toEqual([
       { dataset_id: "nm000104", version: "1.1.0", tag: "v1.1.0" },
     ]);
   });
@@ -145,14 +145,14 @@ describe("the candidates", () => {
         .bind(rv, engine)
         .run();
     }
-    expect(await pipelineCandidates(env.DB, floor, 10)).toHaveLength(1);
+    expect(await pipelineCandidates(env, floor, 10)).toHaveLength(1);
   });
 
   test("a version with no data-plane tag is skipped, and the next dataset is still found", async () => {
     const env = fx.env();
     await seedEegDataset(env, "nm000104", { versions: [["1.0", "2026-01-01 00:00:00"]] });
     await seedEegDataset(env, "nm000105");
-    expect((await pipelineCandidates(env.DB, floor, 1)).map((c) => c.dataset_id)).toEqual([
+    expect((await pipelineCandidates(env, floor, 1)).map((c) => c.dataset_id)).toEqual([
       "nm000105",
     ]);
   });
@@ -164,7 +164,7 @@ describe("the candidates", () => {
     await seedEegDataset(env, "nm000106", { modalities: "meg" });
     await seedEegDataset(env, "nm099950");
     await seedEegDataset(env, "nm000107");
-    expect((await pipelineCandidates(env.DB, floor, 10)).map((c) => c.dataset_id)).toEqual([
+    expect((await pipelineCandidates(env, floor, 10)).map((c) => c.dataset_id)).toEqual([
       "nm000107",
     ]);
   });
@@ -177,7 +177,7 @@ describe("the candidates", () => {
       });
     }
     await seedEegDataset(env, "nm000900");
-    expect((await pipelineCandidates(env.DB, floor, 1)).map((c) => c.dataset_id)).toEqual([
+    expect((await pipelineCandidates(env, floor, 1)).map((c) => c.dataset_id)).toEqual([
       "nm000900",
     ]);
   });
@@ -204,7 +204,7 @@ describe("a dataset that keeps failing", () => {
   test("a head of datasets that failed lately does not block a dispatchable one behind it", async () => {
     const env = await world(["nm000104", "nm000105", "nm000106", "nm000107"]);
     for (const id of ["nm000104", "nm000105", "nm000106"]) await failed(env, id, 1, "-1 hours");
-    expect((await pipelineCandidates(env.DB, floor, 1)).map((c) => c.dataset_id)).toEqual([
+    expect((await pipelineCandidates(env, floor, 1)).map((c) => c.dataset_id)).toEqual([
       "nm000107",
     ]);
   });
@@ -213,7 +213,7 @@ describe("a dataset that keeps failing", () => {
     const env = await world(["nm000104", "nm000105"]);
     await failed(env, "nm000104", 1, `-${RETRY_COOLDOWN_DAYS - 1} days`);
     await failed(env, "nm000105", 1, `-${RETRY_COOLDOWN_DAYS + 1} days`);
-    expect((await pipelineCandidates(env.DB, floor, 10)).map((c) => c.dataset_id)).toEqual([
+    expect((await pipelineCandidates(env, floor, 10)).map((c) => c.dataset_id)).toEqual([
       "nm000105",
     ]);
   });
@@ -222,7 +222,7 @@ describe("a dataset that keeps failing", () => {
     const env = await world(["nm000104", "nm000105"]);
     await failed(env, "nm000104", MAX_FAILED_ATTEMPTS);
     await failed(env, "nm000105", MAX_FAILED_ATTEMPTS - 1);
-    expect((await pipelineCandidates(env.DB, floor, 10)).map((c) => c.dataset_id)).toEqual([
+    expect((await pipelineCandidates(env, floor, 10)).map((c) => c.dataset_id)).toEqual([
       "nm000105",
     ]);
   });
@@ -244,7 +244,7 @@ describe("a dataset that keeps failing", () => {
         .run();
     }
     // Five platform-coded failures, the freshest a day old: inside the cooldown and over the cap, if counted.
-    expect(await pipelineCandidates(env.DB, floor, 10)).toHaveLength(1);
+    expect(await pipelineCandidates(env, floor, 10)).toHaveLength(1);
   });
 
   /**
@@ -279,28 +279,28 @@ describe("a dataset that keeps failing", () => {
   test("a run that failed AFTER consuming units is not dispatched again the next day", async () => {
     const env = await world(["nm000104"]);
     await failedRun(env, "result_upload_failed", 4000);
-    expect(await pipelineCandidates(env.DB, floor, 10)).toHaveLength(0);
+    expect(await pipelineCandidates(env, floor, 10)).toHaveLength(0);
     // Past the cooldown it is a candidate again (the cap is 3, one failure so far).
     await env.DB.prepare(
       "UPDATE compute_pipeline_stamps SET updated_at = datetime('now', '-8 days')",
     ).run();
-    expect(await pipelineCandidates(env.DB, floor, 10)).toHaveLength(1);
+    expect(await pipelineCandidates(env, floor, 10)).toHaveLength(1);
   });
 
   test("a verification failure and any charged failed job also count; an uncharged platform failure does not", async () => {
     const env = await world(["nm000104"]);
     await failedRun(env, "result_verification_failed", 0);
-    expect(await pipelineCandidates(env.DB, floor, 10)).toHaveLength(0);
+    expect(await pipelineCandidates(env, floor, 10)).toHaveLength(0);
     await env.DB.prepare("DELETE FROM compute_pipeline_stamps").run();
     await failedRun(env, "launch_failed", 2500);
-    expect(await pipelineCandidates(env.DB, floor, 10)).toHaveLength(0);
+    expect(await pipelineCandidates(env, floor, 10)).toHaveLength(0);
     await env.DB.prepare("DELETE FROM compute_pipeline_stamps").run();
     // Nothing charged and an early word: an immediate candidate, as before.
     await failedRun(env, "tapis_submit_failed", 0);
-    expect(await pipelineCandidates(env.DB, floor, 10)).toHaveLength(1);
+    expect(await pipelineCandidates(env, floor, 10)).toHaveLength(1);
     await env.DB.prepare("DELETE FROM compute_pipeline_stamps").run();
     await failedRun(env, "staging_failed", 0);
-    expect(await pipelineCandidates(env.DB, floor, 10)).toHaveLength(1);
+    expect(await pipelineCandidates(env, floor, 10)).toHaveLength(1);
   });
 
   test("a pipeline job whose Tapis record is lost fails its stamp `tapis_record_lost`: the tuple is not blocked, and the dataset waits the cooldown (it may have run)", async () => {
@@ -329,11 +329,11 @@ describe("a dataset that keeps failing", () => {
       await env.DB.prepare("SELECT state, refusal_code FROM compute_pipeline_stamps").first(),
     ).toEqual({ state: "failed", refusal_code: "tapis_record_lost" });
     // It may have run for real, so it waits out the cooldown rather than being sent again at once.
-    expect(await pipelineCandidates(env.DB, floor, 10)).toHaveLength(0);
+    expect(await pipelineCandidates(env, floor, 10)).toHaveLength(0);
     await env.DB.prepare(
       "UPDATE compute_pipeline_stamps SET updated_at = datetime('now', '-8 days')",
     ).run();
-    expect(await pipelineCandidates(env.DB, floor, 10)).toHaveLength(1);
+    expect(await pipelineCandidates(env, floor, 10)).toHaveLength(1);
   });
 
   test("the third consumed failure stops the dataset for good", async () => {
@@ -342,7 +342,7 @@ describe("a dataset that keeps failing", () => {
       await failedRun(env, "result_upload_failed", 4000, RETRY_COOLDOWN_DAYS + 5 + i);
     }
     // Every stamp is outside the cooldown; only the cap holds.
-    expect(await pipelineCandidates(env.DB, floor, 10)).toHaveLength(0);
+    expect(await pipelineCandidates(env, floor, 10)).toHaveLength(0);
   });
 
   test("failures a dataset causes do count: three on three days block it", async () => {
@@ -356,7 +356,7 @@ describe("a dataset that keeps failing", () => {
         .run();
     }
     // Outside the cooldown, but at the cap.
-    expect(await pipelineCandidates(env.DB, floor, 10)).toHaveLength(0);
+    expect(await pipelineCandidates(env, floor, 10)).toHaveLength(0);
   });
 
   test("a refused stamp is not a failure: the pool's refusal does not cool a dataset down", async () => {
@@ -367,7 +367,7 @@ describe("a dataset that keeps failing", () => {
     )
       .bind(floor.version, floor.engine)
       .run();
-    expect(await pipelineCandidates(env.DB, floor, 10)).toHaveLength(1);
+    expect(await pipelineCandidates(env, floor, 10)).toHaveLength(1);
   });
 
   test("a failure of another tuple (another version or engine) does not cool this one down", async () => {
@@ -379,7 +379,7 @@ describe("a dataset that keeps failing", () => {
     )
       .bind(floor.engine, floor.version)
       .run();
-    expect(await pipelineCandidates(env.DB, floor, 10)).toHaveLength(1);
+    expect(await pipelineCandidates(env, floor, 10)).toHaveLength(1);
   });
 });
 
@@ -393,10 +393,12 @@ describe("the dry run", () => {
     expect(dry.estimate_milli_total).toBe(2 * recipeEstimateMilli(floor));
     // 16 GB is 8 core-units over 6 hours: 48 SU.
     expect(dry.estimate_milli_per_job).toBe(48_000);
+    // S3c: a Tapis dry run also says whether Tapis is configured; the fixture environment configures it.
     expect(dry.config).toEqual({
       compute_enabled: true,
       runtime_image: true,
       pipelines_account: true,
+      tapis_configured: true,
     });
   });
 
@@ -420,10 +422,13 @@ describe("the dry run", () => {
     const dry = await pipelineDryRun(quiet, { recipe: "nemar-floor", limit: 1 });
     if (!dry.ok) throw new Error("not ok");
     expect(dry.would_dispatch).toHaveLength(1);
+    // The quiet environment turns off the compute switch and the image only; it keeps the fixture's Tapis
+    // configuration, so Tapis is still configured here.
     expect(dry.config).toEqual({
       compute_enabled: false,
       runtime_image: false,
       pipelines_account: true,
+      tapis_configured: true,
     });
     expect(await counts(env)).toEqual(before);
   });
@@ -486,7 +491,7 @@ describe("a run over the queue", () => {
     expect(run.dispatched).toBe(2);
     expect(run.stoppedBy).toBeNull();
     expect(run.results.map((r) => (r.ok ? r.datasetId : r.code))).toEqual(["nm000104", "nm000105"]);
-    expect((await pipelineCandidates(env.DB, floor, 10)).map((c) => c.dataset_id)).toEqual([
+    expect((await pipelineCandidates(env, floor, 10)).map((c) => c.dataset_id)).toEqual([
       "nm000106",
     ]);
     // Run it again: the third, and nothing more.
@@ -557,7 +562,7 @@ describe("a run over the queue", () => {
       versions: [["1.0.0", "2026-01-01 00:00:00", 38_001]],
     });
     await seedEegDataset(env, "nm000105");
-    expect((await pipelineCandidates(env.DB, floor, 1)).map((c) => c.dataset_id)).toEqual([
+    expect((await pipelineCandidates(env, floor, 1)).map((c) => c.dataset_id)).toEqual([
       "nm000105",
     ]);
   });

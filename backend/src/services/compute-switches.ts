@@ -1,5 +1,6 @@
 /**
- * The compute gateway's two dark switches (epic #2005 phase A4, #2009; ADR 0118 decision 8).
+ * The compute gateway's three dark switches (epic #2005 phase A4, #2009; ADR 0118 decision 8; the third is
+ * portable compute's, card DM-05).
  *
  * Nothing here acts. These readers say whether a Worker job may act, and each job that reads them
  * reads at CALL time (a binding changed in a test changes the answer; nothing is cached at module
@@ -14,8 +15,10 @@
  *    an unset binding, and a value that only converts to it (the number 1, `true`, `["1"]`) are off.
  *  - The pipelines switch acts only while the compute switch is also on, so turning compute off stops
  *    NEMAR's own dispatch whatever the second switch says.
+ *  - The runners switch (portable compute, D7) is the third, and acts the same way: a registered runner
+ *    can exchange its secret and use its access token only while compute is on AND this is exactly `"1"`.
  *
- * Both names are absent from every table of `backend/wrangler-sccn.toml`; the owner adds them in a
+ * All three names are absent from every table of `backend/wrangler-sccn.toml`; the owner adds them in a
  * reviewed change (`compute-switches-flag.test.ts` pins that).
  */
 
@@ -50,4 +53,11 @@ export function computePipelinesDispatchEnabled(
   env: Pick<Bindings, "ENVIRONMENT" | "COMPUTE_ENABLED" | "COMPUTE_PIPELINES_DISPATCH_ENABLED">,
 ): boolean {
   return computeEnabled(env) && isOne(env.COMPUTE_PIPELINES_DISPATCH_ENABLED);
+}
+
+/** Registered runners may exchange a secret and use an access token: compute is on, and this switch is exactly `"1"`. */
+export function computeRunnersEnabled(
+  env: Pick<Bindings, "ENVIRONMENT" | "COMPUTE_ENABLED" | "COMPUTE_RUNNERS_ENABLED">,
+): boolean {
+  return computeEnabled(env) && isOne(env.COMPUTE_RUNNERS_ENABLED);
 }

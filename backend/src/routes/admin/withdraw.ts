@@ -14,8 +14,8 @@
  * always returns 200 -- both are informational no-ops by design (so `--all`
  * never needs per-dataset status-code branching for the common "not a
  * withdrawal candidate" case), not failures. An outright visibility-stage
- * failure maps to the same status fleet.ts's PATCH /visibility uses for that
- * stage (404/400/500), and a completed transition with one or more failed DOI
+ * failure maps to the status the visibility transition's stage names
+ * (404/400/500; fleet.ts PATCH /visibility is refused with 409 and no longer uses them), and a completed transition with one or more failed DOI
  * steps returns 207 Multi-Status (mirrors ci/sync's convention) -- both keep
  * the full structured body (visibility detail + per-DOI status) in the
  * response, and 207 stays in the 2xx-family `response.ok` range so the CLI
@@ -38,7 +38,7 @@ import type { DatasetTransitionResult } from "../../services/withdraw";
 import { restoreDataset, withdrawDataset } from "../../services/withdraw";
 import type { AdminRouter } from "./shared";
 
-function statusForVisibilityStage(
+export function statusForVisibilityStage(
   stage: "not_found" | "no_repo" | "invalid_repo" | "github" | "s3" | "db",
 ): 404 | 400 | 500 {
   switch (stage) {

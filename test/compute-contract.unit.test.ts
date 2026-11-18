@@ -592,6 +592,7 @@ describe("the whole default policy, against literals", () => {
       maxLiveJobsPerPerson: 4,
       pipelines: { dailyJobCap: 50, maxLiveJobs: { cpu: 8, gpu: 4 } },
       clients: {},
+      tenant: { maxLiveJobs: 20, reserved: { people: 8, pipelines: 2, partner: 0 } },
       reservationWaitMinutes: 30,
       retention: { recordsYears: 7, logsDays: 365, resultsDays: 30 },
       resultLimits: {
@@ -700,12 +701,47 @@ describe("the owner policy", () => {
     expect(refused(q)).toBe(true);
   });
 
-  test("every key is required", () => {
+  test("every key is required, except the tenant ceiling, which stored policies from before it lack", () => {
     for (const key of Object.keys(DEFAULT_COMPUTE_POLICY)) {
       const p = policyClone();
       delete p[key];
-      expect(refused(p), key).toBe(true);
+      expect(refused(p), key).toBe(key !== "tenant");
     }
+  });
+
+  test("the tenant ceiling: whole numbers in range, the floors fit under it, nothing unknown", () => {
+    const withTenant = (tenant: unknown) => ({ ...policyClone(), tenant });
+    const ok = (maxLiveJobs: number, people: number, pipelines: number, partner: number) =>
+      withTenant({ maxLiveJobs, reserved: { people, pipelines, partner } });
+    expect(refused(ok(20, 8, 2, 0))).toBe(false);
+    // Floors equal to the ceiling are allowed (nothing is left for other classes); one more is not.
+    expect(refused(ok(10, 5, 3, 2))).toBe(false);
+    expect(refused(ok(9, 5, 3, 2))).toBe(true);
+    // A ceiling of 0 pauses all admissions, and then no floor fits.
+    expect(refused(ok(0, 0, 0, 0))).toBe(false);
+    expect(refused(ok(0, 1, 0, 0))).toBe(true);
+    expect(refused(ok(1001, 0, 0, 0))).toBe(true);
+    expect(refused(ok(-1, 0, 0, 0))).toBe(true);
+    expect(refused(ok(5, 1.5, 0, 0))).toBe(true);
+    expect(refused(withTenant({ maxLiveJobs: 5 }))).toBe(true);
+    expect(refused(withTenant({ maxLiveJobs: 5, reserved: { people: 1, pipelines: 1 } }))).toBe(
+      true,
+    );
+    expect(
+      refused(
+        withTenant({ maxLiveJobs: 5, reserved: { people: 0, pipelines: 0, partner: 0 }, x: 1 }),
+      ),
+    ).toBe(true);
+    expect(
+      refused(
+        withTenant({ maxLiveJobs: 5, reserved: { people: 0, pipelines: 0, partner: 0, x: 1 } }),
+      ),
+    ).toBe(true);
+    // The issue names the floors, so the route can say where.
+    const bad = ComputePolicySchema.safeParse(ok(9, 5, 3, 2));
+    expect(bad.success ? [] : bad.error.issues.map((i) => i.path.join("."))).toEqual([
+      "tenant.reserved",
+    ]);
   });
 
   test("results are kept at least 14 days", () => {

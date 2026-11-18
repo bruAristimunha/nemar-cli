@@ -18,8 +18,13 @@
  */
 
 import { z } from "zod";
-import { PIPELINE_STAMP_STATES } from "../compute-recipes.js";
-import { COMPUTE_REFUSAL_STATUS, type ComputeRefusalCode } from "../compute-state.js";
+import { PIPELINE_STAMP_STATES, type RecipeInput } from "../compute-recipes.js";
+import {
+  COMPUTE_REFUSAL_STATUS,
+  type ComputeExecutor,
+  type ComputeRefusalCode,
+  RUNNER_REFUSAL_STATUS,
+} from "../compute-state.js";
 import type { ComputePool } from "./compute.js";
 
 // --- Words -----------------------------------------------------------------------------------
@@ -326,9 +331,36 @@ export const ComputeStatusResponseSchema = z
      * like every response here) does not break a released CLI, which prints only the positive counts.
      * Today: `access_reports_failed` (ACCESS reports that ended failed), `cancel_pending_failed` (a
      * recorded cancel still not carried out an hour after it was asked for) and `copy_abandoned` (a
-     * terminal job whose launcher files were never copied and no longer will be).
+     * terminal job whose launcher files were never copied and no longer will be),
+     * `tenant_over_ceiling` (slots occupied above the tenant ceiling: a job NEMAR did not admit, or a
+     * ceiling lowered below what is already live) and `policy_unreadable` (1 when the stored owner policy
+     * cannot be read, which fails every hold, run and limit closed; then `tenant` is absent).
      */
     attention: z.record(z.unknown()).optional(),
+    /**
+     * NEMAR's tenant-wide ceiling on live jobs (issue #2121, phase P2): the owner's `ceiling`, the slots
+     * `occupied` by NEMAR's own count (live jobs and the orphans not yet canceled), the count `by_class`
+     * and the floors `reserved` per class. Optional so a CLI that reads an older Worker still parses its
+     * answer, and open like every response here. Absent when the policy cannot be read just now.
+     */
+    tenant: z
+      .object({
+        ceiling: z.number(),
+        occupied: z.number(),
+        by_class: z
+          .object({
+            people: z.number(),
+            pipelines: z.number(),
+            partner: z.number(),
+            other: z.number(),
+          })
+          .passthrough(),
+        reserved: z
+          .object({ people: z.number(), pipelines: z.number(), partner: z.number() })
+          .passthrough(),
+      })
+      .passthrough()
+      .optional(),
   })
   .passthrough();
 
@@ -371,6 +403,25 @@ export const ComputeJobViewSchema = z
     results_verified: z.boolean(),
     results_bytes: z.number().int().nullable(),
     records_copied: z.boolean(),
+    /**
+     * Portable compute (ADR 0121): who runs the job and how it is accounted, and, for a runner job, the
+     * runner's claim and the usage it measured (a runner's own figures, never SU). Optional so a CLI that
+     * reads an older Worker still parses its answer; a Tapis job shows `tapis` and `su` and nulls.
+     */
+    executor: z.string().optional(),
+    accounting: z.string().optional(),
+    runner_backend: nullableString.optional(),
+    runner_id: nullableString.optional(),
+    runner_claimed_at: nullableString.optional(),
+    runner_wall_seconds: z.number().int().nullable().optional(),
+    runner_cpu_seconds: z.number().int().nullable().optional(),
+    runner_max_rss_mb: z.number().int().nullable().optional(),
+    /**
+     * Whether the runner marked its usage partial (Docker or Podman cannot always measure all of it): true
+     * or false once it reported, null for a Tapis job or a runner job that has not completed. Carried by
+     * the report views (`jobs list`, `jobs record`); absent from an older Worker.
+     */
+    runner_usage_partial: z.boolean().nullable().optional(),
   })
   .passthrough();
 
@@ -389,6 +440,23 @@ export const ComputeJobAdminResponseSchema = z
 export type ComputeJobAdminResponse = z.infer<typeof ComputeJobAdminResponseSchema>;
 
 // --- NEMAR's own pipelines (epic #2005 phase A6, #2011) ---------------------------------------------------
+
+/**
+ * The attention words of the runner queue (portable compute, ADR 0121), counted in `GET /admin/compute/status`'s
+ * `attention` block and printed by `nemar admin compute status` as `Attention: <word> <n>` when positive:
+ * `runner_cancel_pending_failed` (a live runner job whose recorded cancel is more than 60 minutes old: its
+ * runner never took it) and `runner_copy_abandoned` (a terminal runner job whose records copy never happened
+ * and no longer will) and `runner_records_unwritten` (a waiting runner job whose records never landed and were
+ * neither replayed nor given up on well past the window: the lease sweep is not running or is starved) and
+ * `runner_waiting_stale` (a runner job that has waited unclaimed for more than a day: no runner of its pool
+ * is polling, or none fits it).
+ */
+export const COMPUTE_RUNNER_ATTENTION_WORDS = [
+  "runner_cancel_pending_failed",
+  "runner_copy_abandoned",
+  "runner_records_unwritten",
+  "runner_waiting_stale",
+] as const;
 
 /**
  * The most datasets one `--eligible` request may ASK for. It is not what a run dispatches: a run is also
@@ -412,14 +480,17 @@ export const COMPUTE_PIPELINE_RUN_PER_INVOCATION = 10;
 
 /**
  * What bounded a run over the eligible datasets, the smallest of: the number asked for (`limit`), the
- * per-invocation bound, what is left of the daily cap (`daily_cap`) and what is left of the live cap of
- * the recipe's pool (`live_cap`). On a tie the first of these in this order is named.
+ * per-invocation bound, what is left of the daily cap (`daily_cap`), what is left of the live cap of
+ * the recipe's pool (`live_cap`) and what is left of NEMAR's tenant ceiling for the pipelines' class
+ * (`tenant`, issue #2121). On a tie the first of these in this order is named, so a run that ends at exactly
+ * the number it was asked for was not "limited", and the tenant is named only when it alone is the smallest.
  */
 export const COMPUTE_PIPELINE_LIMITED_BY = [
   "limit",
   "per_invocation",
   "daily_cap",
   "live_cap",
+  "tenant",
 ] as const;
 
 export type ComputePipelineLimitedBy = (typeof COMPUTE_PIPELINE_LIMITED_BY)[number];
@@ -441,6 +512,18 @@ export const COMPUTE_PIPELINE_STATUS_PAGE_MAX = 200;
  */
 export interface ComputePipelineRunRequest {
   recipe: string;
+  /**
+   * Who runs the job: `tapis` (the default) or `runner` (ADR 0121). A recipe lists the executors it may
+   * be dispatched to, and a runner run names one dataset, not the queue.
+   */
+  executor?: ComputeExecutor;
+  /**
+   * What the run reads (plan D12): `bids` (the dataset's files, on Tapis) or `zarr` (its Zarr serving copy, on a
+   * runner). The executor's own when absent: `bids` for `tapis`, `zarr` for `runner`. An input the recipe does
+   * not list, or one the executor does not run, is refused `invalid_spec` naming `input`, before anything is
+   * written.
+   */
+  input?: RecipeInput;
   dataset?: string;
   version?: string;
   eligible?: boolean;
@@ -452,6 +535,10 @@ export interface ComputePipelineRunRequest {
  * The refusal words only a pipeline run has. Their statuses are declared here; every other word a run
  * is refused with is one of the ledger's (`COMPUTE_REFUSAL_CODES`) and keeps the status
  * `COMPUTE_REFUSAL_STATUS` gives it, so no status is declared twice.
+ *  - `runners_disabled`: a runner run while the runners switch is off (503, the runner protocol's status).
+ *  - `tapis_unconfigured`: a Tapis-executor run while the Worker has no usable Tapis configuration (503).
+ *    It is refused before anything is written, so no hold waits for a submit that cannot happen; it is
+ *    the same for every dataset, recipe and pool, so it stops a run over the queue and ends the daily one.
  *  - `create_failed`: the job could not be written (502); `run_failed`: the run stopped on an
  *    unexpected error (500), a platform fault and not a refusal of the request.
  *  - `daily_cap_reached`: NEMAR's pipelines have made as many jobs today as the owner allows (409). It
@@ -466,6 +553,29 @@ export const COMPUTE_PIPELINE_ONLY_REFUSAL_STATUS = {
   version_not_found: 404,
   version_untagged: 422,
   too_many_files: 422,
+  /** A Zarr recipe over a version older than the newest, whose copy the row does not describe (DM-06). */
+  zarr_version_not_newest: 422,
+  /** A Zarr recipe over a dataset whose copy is not `ready` with a store. */
+  zarr_copy_not_ready: 409,
+  /**
+   * A Zarr recipe over a dataset whose serving copy could not be shown to be the version's data (DM-06b): not the
+   * tag's commit and not a metadata-only step after it, or a check out of its limits; the `reason` says which.
+   */
+  zarr_source_mismatch: 409,
+  /**
+   * The serving copy's commit or the tag's commit could not be read (a timeout, a refusal, no index, no
+   * credentials in production): nothing is known, so nothing is dispatched, and the same dispatch may succeed
+   * later (DM-06b).
+   */
+  zarr_source_unverifiable: 503,
+  /** The runners switch is off (portable compute): the status is the runner protocol's, declared once. */
+  runners_disabled: RUNNER_REFUSAL_STATUS.runners_disabled,
+  /**
+   * A Tapis-executor run (`nemar-floor`, one dataset or `eligible`, from an administrator, the daily
+   * dispatcher or any other caller) while the Worker has no usable Tapis configuration: refused before any
+   * stamp, hold, ledger entry, job, record or audit row is written, and nothing reaches a tenant.
+   */
+  tapis_unconfigured: 503,
   daily_cap_reached: 409,
   create_failed: 502,
   run_failed: 500,
@@ -496,8 +606,12 @@ export const ComputePipelineResultSchema = z
     stamp_id: z.number().int().optional(),
     attempt: z.number().int().optional(),
     submit: z.string().optional(),
+    /** A runner job only: false when its records did not land (`submit` is then `records_not_written`). */
+    records_written: z.boolean().optional(),
     code: z.string().optional(),
     blocked_by: z.array(z.string()).optional(),
+    /** A Zarr source refusal's reason: a fixed word (`zarr_source_mismatch`, `zarr_source_unverifiable`). */
+    reason: z.string().optional(),
   })
   .passthrough();
 
@@ -507,16 +621,29 @@ export type ComputePipelineResult = z.infer<typeof ComputePipelineResultSchema>;
  * The room a run over the eligible datasets had: what is left of the daily cap, what is left of the live
  * cap of the recipe's pool, both read before the run, and what bounded the run (see
  * {@link COMPUTE_PIPELINE_LIMITED_BY}). A dry run reports the same, so its preview matches a live run.
+ * `tenant_left` is the slots the pipelines' class could take under the tenant ceiling (optional, so a CLI
+ * that reads an older Worker still parses its answer).
  */
 export const ComputePipelineRoomSchema = z
   .object({
     daily_left: z.number().int(),
     live_left: z.number().int(),
+    tenant_left: z.number().int().optional(),
     limited_by: z.string(),
   })
   .passthrough();
 
 export type ComputePipelineRoom = z.infer<typeof ComputePipelineRoomSchema>;
+
+/**
+ * What a runner run has room for: the live `accounting = 'none'` runner jobs of the recipe's pool against the
+ * owner's `runners.maxLiveJobs` for it. Neither the daily cap nor the tenant ceiling applies to a runner job.
+ */
+const ComputePipelineRunnerRoomSchema = z
+  .object({ live_left: z.number().int(), live_cap: z.number().int() })
+  .passthrough();
+
+export type ComputePipelineRunnerRoom = z.infer<typeof ComputePipelineRunnerRoomSchema>;
 
 /**
  * The answer of a pipeline run, live or dry. A live run has `results`, `dispatched` and `stopped_by`;
@@ -533,6 +660,12 @@ export const ComputePipelineRunResponseSchema = z
     stopped_by: z.string().nullable().optional(),
     /** For a run over the eligible datasets, live or dry: the room it had and what bounded it. */
     room: ComputePipelineRoomSchema.optional(),
+    /** Who the run was for (`tapis` or `runner`); absent from an older Worker, which has only Tapis. */
+    executor: z.string().optional(),
+    /** What the run read (`bids` or `zarr`); absent from a Worker from before inputs, whose runs all read `bids`. */
+    input: z.string().optional(),
+    /** For a runner run, live or dry: the room under the runners' live cap (there is no `room`). */
+    runner_room: ComputePipelineRunnerRoomSchema.optional(),
     /** True when the run was made and the Worker could not write its audit row: nothing is lost but the row. */
     audit_pending: z.boolean().optional(),
     estimate_milli_per_job: milli.optional(),
@@ -542,6 +675,10 @@ export const ComputePipelineRunResponseSchema = z
         compute_enabled: z.boolean(),
         runtime_image: z.boolean(),
         pipelines_account: z.boolean(),
+        /** Portable compute: `computeRunnersEnabled`; optional for an older Worker. */
+        runners_enabled: z.boolean().optional(),
+        /** Whether a Tapis job could be submitted; only in the dry run of a Tapis run, optional for an older Worker. */
+        tapis_configured: z.boolean().optional(),
       })
       .passthrough()
       .optional(),
@@ -549,7 +686,12 @@ export const ComputePipelineRunResponseSchema = z
       .array(z.object({ dataset_id: z.string(), version: z.string() }).passthrough())
       .optional(),
     blocked: z
-      .object({ code: z.string(), blocked_by: z.array(z.string()), version: z.string().optional() })
+      .object({
+        code: z.string(),
+        blocked_by: z.array(z.string()),
+        version: z.string().optional(),
+        reason: z.string().optional(),
+      })
       .passthrough()
       .optional(),
     blocked_by_term: z.record(z.unknown()).optional(),
@@ -567,10 +709,21 @@ export const ComputePipelineStampViewSchema = z
     recipe: z.string(),
     recipe_version: z.string(),
     engine: z.string(),
+    /**
+     * What the run reads, the fifth word of the tuple (`bids` or `zarr`). Optional so a CLI that reads a
+     * Worker from before inputs still parses its answer; every stamp that Worker made read `bids`.
+     */
+    input: z.string().optional(),
     attempt: z.number().int(),
     state: z.string(),
     job_id: nullableString,
     refusal_code: nullableString,
+    /** A succeeded Zarr stamp: the reader that decoded the stores (`eegprep-lean@<version>+<commit>`). */
+    reader: nullableString.optional(),
+    /** A succeeded Zarr stamp: the Zarr engine version of the serving index the run read. */
+    input_engine: nullableString.optional(),
+    /** A succeeded stamp: `sha256:` and what a Zarr run read, or `git:` and the commit a BIDS run read. */
+    input_digest: nullableString.optional(),
     created_at: z.string(),
     /** While `dispatched`: when the Worker last examined the stamp. Once ended: when it ended. */
     updated_at: z.string(),
@@ -695,12 +848,116 @@ export const ComputeAccountReportResponseSchema = z
       .passthrough(),
     // Each value is an open object (`jobs`, `charged_milli`, `unsettled`, `open_hold_milli`): a word the Worker adds is kept.
     by_pool: z.record(z.object({}).passthrough()),
+    /**
+     * Runner jobs, kept APART from the service-unit totals above (ADR 0121: a runner-reported core-hour is
+     * never added to an SU total): `totals` and `by_pool` count `accounting = 'su'` jobs only. `core_hours`
+     * is the runners' own CPU seconds over 3600, rounded down to three decimals, and `partial_jobs` counts
+     * the jobs whose usage the runner marked partial (a lower bound). Optional so a CLI that reads an
+     * older Worker still parses its answer.
+     */
+    runner_totals: z
+      .object({
+        jobs: z.number().int(),
+        wall_seconds: z.number().int(),
+        cpu_seconds: z.number().int(),
+        core_hours: z.number(),
+        partial_jobs: z.number().int(),
+        // How many of `jobs` have reported usage (below `jobs`, a zero sum is not zero usage) and how many of
+        // those reported with no partial mark (completed before it was stored). Optional: an older Worker.
+        reported_jobs: z.number().int().optional(),
+        unmarked_jobs: z.number().int().optional(),
+      })
+      .passthrough()
+      .optional(),
     jobs: z.array(z.object({}).passthrough()),
     truncated: z.boolean(),
   })
   .passthrough();
 
 export type ComputeAccountReportResponse = z.infer<typeof ComputeAccountReportResponseSchema>;
+
+/** The longest range, in days (both ends counted), `GET /admin/compute/reports/runners` answers for. */
+export const COMPUTE_RUNNER_REPORT_DAYS_MAX = 366;
+
+/**
+ * What a human view appends to every runner figure the runner marked PARTIAL: under Docker or Podman it
+ * cannot always measure all of a job's usage, so the figure is a lower bound (risk K14).
+ */
+export const COMPUTE_PARTIAL_USAGE_NOTE = " (partial: Docker or Podman)";
+
+/**
+ * What a human view appends to a runner figure that has usage but no mark: the job completed before the
+ * mark was stored, so whether the figure is whole is UNKNOWN. Never shown as complete.
+ */
+export const COMPUTE_UNKNOWN_PARTIAL_NOTE = " (partial: unknown)";
+
+/**
+ * The clauses a runner total ends with, so a sum is never read as whole when it may not be: the jobs whose
+ * usage the runner marked partial (a lower bound) and those that reported with no mark (unknown). Empty when
+ * both counts are zero or absent.
+ */
+export function runnerMarkNotes(t: { partial_jobs: number; unmarked_jobs?: number }): string {
+  const lower =
+    t.partial_jobs > 0
+      ? `; usage of ${t.partial_jobs} job(s) is a lower bound${COMPUTE_PARTIAL_USAGE_NOTE}`
+      : "";
+  const unknown =
+    (t.unmarked_jobs ?? 0) > 0
+      ? `; usage of ${t.unmarked_jobs} job(s) has no partial mark${COMPUTE_UNKNOWN_PARTIAL_NOTE}`
+      : "";
+  return lower + unknown;
+}
+
+/** The last line of the runners' usage report: whose figures these are, and that they are not service units. */
+export const COMPUTE_RUNNER_USAGE_FOOTER = "Runner-reported usage; never service units.";
+
+/**
+ * `GET /admin/compute/reports/runners?from=&to=` (administrator): every runner registration's usage over a
+ * date range, in the RUNNER'S OWN FIGURES (wall and CPU seconds, the largest resident memory) and never in
+ * service units. A registration is named by its id and its fixed words; no identity is carried. OPEN, so a
+ * field the Worker adds is kept.
+ */
+export const ComputeRunnersUsageResponseSchema = z
+  .object({
+    from: z.string(),
+    to: z.string(),
+    runners: z.array(
+      z
+        .object({
+          id: z.string(),
+          name: z.string(),
+          site: z.string(),
+          trust: z.string(),
+          revoked: z.boolean(),
+          jobs: z.number().int(),
+          // Fixed state word to count; open, so a state the Worker adds is kept as it came.
+          by_state: z.record(z.unknown()),
+          wall_seconds: z.number().int(),
+          cpu_seconds: z.number().int(),
+          core_hours: z.number(),
+          max_rss_mb: z.number().int().nullable(),
+          partial_jobs: z.number().int(),
+          // As in `runner_totals` of the account report: optional for an older Worker.
+          reported_jobs: z.number().int().optional(),
+          unmarked_jobs: z.number().int().optional(),
+        })
+        .passthrough(),
+    ),
+    totals: z
+      .object({
+        jobs: z.number().int(),
+        wall_seconds: z.number().int(),
+        cpu_seconds: z.number().int(),
+        core_hours: z.number(),
+        partial_jobs: z.number().int(),
+        reported_jobs: z.number().int().optional(),
+        unmarked_jobs: z.number().int().optional(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+export type ComputeRunnersUsageResponse = z.infer<typeof ComputeRunnersUsageResponseSchema>;
 
 /** `GET /admin/compute/access-report`: for ACCESS, distinct gateway users and jobs by partition and source. */
 export const ComputeAccessReportResponseSchema = z

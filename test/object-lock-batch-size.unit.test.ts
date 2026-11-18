@@ -1,5 +1,5 @@
 /**
- * The CLI says how many calls locking a large dataset takes (`nemar admin publish next`'s size
+ * The CLI says how many calls locking a large dataset takes (`nemar admin repo publish next`'s size
  * line, ADR 0102), and it counts them at `OBJECTS_PER_LOCK_CALL` objects a call. The Worker locks
  * that many per call: `OBJECT_LOCK_BATCH_SIZE`, the default of `applyObjectLockBatch`'s
  * `batchSize`. The CLI does not import the backend, so the number is declared on both sides, and

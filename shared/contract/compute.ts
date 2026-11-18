@@ -872,6 +872,43 @@ export const ComputeClientCapsSchema = z
   .strict();
 
 /**
+ * NEMAR's tenant-wide ceiling on live jobs and the floors it keeps for each class of occupant (issue
+ * #2121, phase P2). `maxLiveJobs` is the most jobs NEMAR holds on the cluster account at once, below the
+ * account's own slots so there is headroom for occupants NEMAR cannot see yet; 0 admits nothing. A floor
+ * is a number of slots kept for a class that no other class may use, so the three must fit under the
+ * ceiling. The classes are people (`cli` and `web`), pipelines (`pipeline`) and partner (`partner`).
+ */
+export const ComputeTenantPolicySchema = z
+  .object({
+    maxLiveJobs: safeInt(0, 1000),
+    reserved: z
+      .object({
+        people: safeInt(0, 1000),
+        pipelines: safeInt(0, 1000),
+        partner: safeInt(0, 1000),
+      })
+      .strict(),
+  })
+  .strict()
+  .refine((t) => t.reserved.people + t.reserved.pipelines + t.reserved.partner <= t.maxLiveJobs, {
+    message: "the floors reserved for the classes add up to more than the ceiling",
+    path: ["reserved"],
+  });
+
+export type ComputeTenantPolicy = z.infer<typeof ComputeTenantPolicySchema>;
+
+/**
+ * What the owner lets runners hold at once (portable compute, ADR 0121 decision 6): the most live
+ * `accounting = 'none'` runner jobs of each pool. Not exported as a schema, only through
+ * {@link ComputePolicy}: an absent key reads {@link RUNNERS_POLICY_DEFAULT}, never "unlimited".
+ */
+const ComputeRunnersPolicySchema = z
+  .object({ maxLiveJobs: z.object({ cpu: safeInt(0, 1000), gpu: safeInt(0, 1000) }).strict() })
+  .strict();
+
+export type ComputeRunnersPolicy = z.infer<typeof ComputeRunnersPolicySchema>;
+
+/**
  * Everything the owner sets without a deploy, validated strictly on every write
  * (`nemar admin compute policy set`, owner only, audited). A partition that has a ceiling here is
  * offered to people; one without is for NEMAR's pipelines only. Grants and caps are whole numbers
@@ -899,6 +936,17 @@ export const ComputePolicySchema = z
       })
       .strict(),
     clients: z.record(z.string().regex(CLIENT_ID_RE), ComputeClientCapsSchema),
+    /**
+     * The tenant-wide ceiling and floors (phase P2 of #2121). OPTIONAL so a stored policy without it
+     * still parses; a missing key is never "unlimited": see {@link tenantPolicyOf}.
+     */
+    tenant: ComputeTenantPolicySchema.optional(),
+    /**
+     * The runners' live cap per pool (ADR 0121). OPTIONAL like `tenant`, so a stored policy without it
+     * still parses; see {@link runnersPolicyOf}. A Worker from before ADR 0121 reads a stored policy that
+     * has this key as unreadable (the schema is strict), which is the rollback hazard the ADR names.
+     */
+    runners: ComputeRunnersPolicySchema.optional(),
     /** Minutes a reservation may wait for its Tapis job before NEMAR searches and releases. */
     reservationWaitMinutes: safeInt(1, 1440),
     retention: z
@@ -937,6 +985,31 @@ const GIB = 1024 ** 3;
 const MIB = 1024 ** 2;
 
 /**
+ * The tenant ceiling and floors in force when a stored policy has no `tenant` key, and the value the
+ * shipped default carries. Declared once: `DEFAULT_COMPUTE_POLICY.tenant` is this object, so the two
+ * cannot differ. The ceiling of 20 sits below the cluster account's own limit, which leaves headroom for
+ * occupants NEMAR cannot see yet; the floors keep 8 slots for people and 2 for the pipelines, and none for
+ * the partner.
+ */
+export const TENANT_POLICY_DEFAULT: ComputeTenantPolicy = deepFreeze({
+  maxLiveJobs: 20,
+  reserved: { people: 8, pipelines: 2, partner: 0 },
+});
+
+/** The policy's tenant ceiling, or the default when a stored policy predates the key: never unlimited. */
+export const tenantPolicyOf = (policy: ComputePolicy): ComputeTenantPolicy =>
+  policy.tenant ?? TENANT_POLICY_DEFAULT;
+
+/** The runners' live cap in force when a stored policy has no `runners` key: 64 on the CPU pool, 8 on the GPU pool. */
+export const RUNNERS_POLICY_DEFAULT: ComputeRunnersPolicy = deepFreeze({
+  maxLiveJobs: { cpu: 64, gpu: 8 },
+});
+
+/** The policy's runners cap, or the default when a stored policy predates the key: never unlimited. */
+export const runnersPolicyOf = (policy: ComputePolicy): ComputeRunnersPolicy =>
+  policy.runners ?? RUNNERS_POLICY_DEFAULT;
+
+/**
  * The policy in force when no version has been set. Closed by default: no grant, no registry, no
  * partner client, renewal off, and small caps. The values the design and the phase issue fix are
  * 0 grants, 30 minutes, 7 years, 365 days, 30 days and the result limits; the rest (live jobs,
@@ -954,6 +1027,7 @@ export const DEFAULT_COMPUTE_POLICY: ComputePolicy = deepFreeze({
   maxLiveJobsPerPerson: 4,
   pipelines: { dailyJobCap: 50, maxLiveJobs: { cpu: 8, gpu: 4 } },
   clients: {},
+  tenant: TENANT_POLICY_DEFAULT,
   reservationWaitMinutes: 30,
   retention: { recordsYears: 7, logsDays: 365, resultsDays: 30 },
   resultLimits: {

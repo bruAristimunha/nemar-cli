@@ -57,19 +57,32 @@
  *    it however they interleave. The daily count (`pipelines.dailyJobCap`) is the dispatchers' to read
  *    (`pipelineRoom`), not a guard: it clamps a run and does not refuse a dataset an administrator names
  *    (issue #2121, ADR 0118 amendment of 2026-11-10).
+ *  - EVERY source also meets the TENANT ceiling (`tenantGuard`, `compute-tenant.ts`, phase P2 of #2121): NEMAR's
+ *    total of live jobs and the slots kept for the other classes are counted in the same statement, so a job
+ *    that would pass the ceiling or take a floor another class is owed is refused `platform_busy`. A refusal
+ *    is worded after the batch by asking each guard again in order (`guardRefusal`): the class's own cap
+ *    first, then the tenant. Whoever merges another branch into the `guards` block keeps both.
+ *  - A RUNNER JOB HAS NO HOLD (portable compute, ADR 0121). `executor: "runner"` (a `pipeline` job only) takes the
+ *    runner branch (`createRunnerJob`): the same validation, records and idempotency, then ONE statement,
+ *    `RUNNER_JOB_INSERT_SQL`, gated on the runners' live cap (`RUNNER_LIVE_JOBS_GUARD_SQL`, the owner's
+ *    `runners.maxLiveJobs` of the pool) and writing `executor = 'runner'`, `accounting = 'none'`, no hold link and
+ *    no ledger entry. `estimateSuMilli`, the pool rows, the tenant guard and the hold statements are never reached,
+ *    so a runner job occupies no Tapis slot and no budget; `JOB_INSERT_SQL`, `GATEWAY_USER_INSERT_SQL` and the
+ *    hold are byte-for-byte what they were (a test pins their text).
  */
 
 import { z } from "zod";
 import {
+  COMPUTE_EXECUTORS,
   COMPUTE_KINDS,
   COMPUTE_SOURCES,
+  type ComputeAccounting,
+  type ComputeExecutor,
   type ComputeKind,
   type ComputeRefusalCode,
   type ComputeSource,
   type ComputeState,
-  LIVE_COMPUTE_STATES,
-  TAPIS_REPORTING_STATES,
-  TERMINAL_COMPUTE_STATES,
+  type RunnerBackend,
 } from "../../../shared/compute-state.js";
 import { launchSpecFits } from "../../../shared/contract/compute-launch.js";
 import {
@@ -84,6 +97,8 @@ import {
   computeSafeInt,
   datasetVersionWithoutTag,
   estimateSuMilli,
+  runnersPolicyOf,
+  tenantPolicyOf,
 } from "../../../shared/contract/compute.js";
 import {
   type HoldGuard,
@@ -102,6 +117,12 @@ import {
   writeIdentitySnapshot,
   writeSpec,
 } from "./compute-records.js";
+import {
+  LIVE_STATES_SQL,
+  TAPIS_REPORTING_STATES_SQL,
+  TERMINAL_STATES_SQL,
+} from "./compute-state-sql.js";
+import { tenantClassOf, tenantGuard } from "./compute-tenant.js";
 
 // --- Errors and shapes ---------------------------------------------------------------------------
 
@@ -197,6 +218,22 @@ export interface ComputeJobRow {
   submit_claimed_at: string | null;
   /** A Tapis job NEMAR made that no row owns, whose cancel is still owed. */
   orphan_tapis_uuid: string | null;
+  /** Portable compute (migration 0140, ADR 0121): who runs the job, `tapis` unless a runner pulls it. */
+  executor: ComputeExecutor;
+  /** `su` is the ledger in service units; `none` (a runner job only) writes no ledger entry. */
+  accounting: ComputeAccounting;
+  runner_backend: RunnerBackend | null;
+  /** The registration that claimed the job, NULL while it waits. */
+  runner_id: string | null;
+  runner_claimed_at: string | null;
+  lease_id: string | null;
+  lease_expires_at: string | null;
+  claim_attempts: number;
+  runner_remote_id: string | null;
+  /** The runner's own measurements, labeled "runner-reported" wherever shown, never SU. */
+  runner_wall_seconds: number | null;
+  runner_cpu_seconds: number | null;
+  runner_max_rss_mb: number | null;
 }
 
 export type ComputeJobsEnv = ComputeRecordsEnv;
@@ -228,6 +265,12 @@ export interface SpecJobInput extends JobInputBase {
   /** Checked again here with the strict schema. */
   spec: JobSpec;
   holdBody?: undefined;
+  /**
+   * Who runs the job (ADR 0121): `tapis` by default, or `runner`, which makes a job with no hold and no
+   * ledger entry (`accounting = 'none'`) that a registered runner pulls. Only a `pipeline` job can name a
+   * runner; any other source is refused as an argument error.
+   */
+  executor?: ComputeExecutor;
 }
 
 /** A partner's job: its hold body, as the exact text that was sent. */
@@ -239,6 +282,7 @@ export interface PartnerJobInput extends JobInputBase {
   kind?: undefined;
   appId?: undefined;
   appVersion?: undefined;
+  executor?: undefined;
 }
 
 export type CreateJobInput = SpecJobInput | PartnerJobInput;
@@ -295,6 +339,7 @@ export type CreateJobRefusal = Extract<
   | "suspended"
   | "platform_budget_exhausted"
   | "over_concurrency"
+  | "platform_busy"
 >;
 
 export type CreateJobResult =
@@ -348,7 +393,9 @@ const JOB_COLUMNS = `id, account_id, tapis_owner, gateway_user, idempotency_key,
   settled_provisional_at, settled_final_at, flag_unreserved, flag_unattributed, flag_mismatch,
   flag_overrun, retention_until, legal_hold, webhook_nonce, launch_spec_digest, results_verified_at,
   outputs_completed_at, results_bytes, result_records_at, platform_failure, examined_at,
-  submit_claimed_at, orphan_tapis_uuid`;
+  submit_claimed_at, orphan_tapis_uuid, executor, accounting, runner_backend, runner_id,
+  runner_claimed_at, lease_id, lease_expires_at, claim_attempts, runner_remote_id,
+  runner_wall_seconds, runner_cpu_seconds, runner_max_rss_mb`;
 
 export const JOB_BY_ID_SQL = `SELECT ${JOB_COLUMNS} FROM compute_jobs WHERE id = ?1`;
 
@@ -357,14 +404,8 @@ export const JOB_BY_KEY_SQL = `SELECT ${JOB_COLUMNS} FROM compute_jobs
   WHERE account_id = ?1 AND idempotency_key = ?2`;
 
 /** The live states as a SQL list, from the one list of them: the partial index answers only this literal. */
-/** `'a', 'b'` for a SQL `IN (...)`, from this tree's own fixed state words (never a caller's). */
-const sqlList = (states: readonly string[]) => states.map((s) => `'${s}'`).join(", ");
-
-/** The live states and the terminal states as SQL lists: declared once, imported by every compute statement. */
-export const LIVE_STATES_SQL = sqlList(LIVE_COMPUTE_STATES);
-export const TERMINAL_STATES_SQL = sqlList(TERMINAL_COMPUTE_STATES);
-/** The live states whose Tapis job exists and is reported on (what a long silence turns `unreported`). */
-export const TAPIS_REPORTING_STATES_SQL = sqlList(TAPIS_REPORTING_STATES);
+// The state lists live in compute-state-sql.ts (no cycle with the tenant guard); they stay importable here.
+export { LIVE_STATES_SQL, TAPIS_REPORTING_STATES_SQL, TERMINAL_STATES_SQL };
 
 /**
  * A person's live-job limit, as a guard on the hold (plain `?` placeholders: the account and the
@@ -380,10 +421,11 @@ export const LIVE_JOBS_GUARD_SQL = `(SELECT COUNT(*) FROM compute_jobs
  * account, or none, so the count does not name an account: the owner's cap is on NEMAR's pipelines in
  * total per pool, whatever the recipe. The dispatchers read it (`pipelineRoom`) and the hold guards on it
  * (`PIPELINE_LIVE_JOBS_GUARD_SQL`); one statement, so the room that is read and the room that is
- * enforced cannot differ.
+ * enforced cannot differ. It counts `accounting = 'su'` jobs only: a runner job holds no Tapis slot and no
+ * hold, so it is the runners' cap's (`RUNNER_LIVE_JOBS_SQL`), never this one's (ADR 0121 decision 1).
  */
 export const PIPELINE_LIVE_JOBS_SQL = `SELECT COUNT(*) AS n FROM compute_jobs
-   WHERE source = 'pipeline' AND pool = ? AND state IN (${LIVE_STATES_SQL})`;
+   WHERE source = 'pipeline' AND accounting = 'su' AND pool = ? AND state IN (${LIVE_STATES_SQL})`;
 
 /**
  * The pipelines' live cap, as a guard on the hold (plain `?` placeholders: the pool word, then the
@@ -391,6 +433,33 @@ export const PIPELINE_LIVE_JOBS_SQL = `SELECT COUNT(*) AS n FROM compute_jobs
  * racing for the last slot of a pool cannot both win; a refusal is `over_concurrency`.
  */
 export const PIPELINE_LIVE_JOBS_GUARD_SQL = `(${PIPELINE_LIVE_JOBS_SQL}) < ?`;
+
+/** A guard of the hold and the refusal word it answers with. */
+interface NamedGuard {
+  guard: HoldGuard;
+  refusal: Extract<CreateJobRefusal, "over_concurrency" | "platform_busy">;
+}
+
+/**
+ * The word for a hold that a guard refused (the balance and the pool were read first: see
+ * `holdRefusalReason`): each guard is asked again, in order, with the binds it was given, and the first
+ * that no longer passes names the refusal. A class's own cap therefore comes before the tenant ceiling.
+ * If every guard passes now (a slot was freed between the refusal and this read) the first guard's word
+ * is given: the request was refused, and it may ask again.
+ */
+async function guardRefusal(
+  db: D1Database,
+  guards: readonly NamedGuard[],
+): Promise<NamedGuard["refusal"]> {
+  for (const { guard, refusal: word } of guards) {
+    const row = await db
+      .prepare(`SELECT ${guard.sql} AS ok`)
+      .bind(...(guard.binds ?? []))
+      .first<{ ok: number | null }>();
+    if (row?.ok !== 1) return word;
+  }
+  return (guards[0] as NamedGuard).refusal;
+}
 
 /** The hold row of a job exists: the one gate both of the batch's later statements wait behind. */
 const holdExists = (jobParam: number): string =>
@@ -423,6 +492,44 @@ export const JOB_INSERT_SQL = `INSERT INTO compute_jobs
          ?20, ?21
    WHERE ${holdExists(1)}`;
 
+// --- Runner jobs (portable compute, ADR 0121) ---------------------------------------------------------
+
+/**
+ * The live `accounting = 'none'` runner jobs of a pool (`?1` the pool word), over the same live states as every
+ * count above, so the room the administrator is shown (`runnerRoom`) is the room the guard enforces. It counts
+ * the runners' own jobs and nothing else: a Tapis job is `accounting = 'su'` (a CHECK of migration 0140), so
+ * neither count can see the other's rows.
+ */
+export const RUNNER_LIVE_JOBS_SQL = `SELECT COUNT(*) AS n FROM compute_jobs
+   WHERE executor = 'runner' AND accounting = 'none' AND pool = ?1 AND state IN (${LIVE_STATES_SQL})`;
+
+/**
+ * The runners' live cap as the guard of a runner job's own INSERT: live runner jobs of the pool (`?21`) fewer
+ * than the owner's `policy.runners.maxLiveJobs` for it (`?22`). It is counted INSIDE the INSERT's statement, so
+ * two requests racing for the last slot cannot both win; a runner job has no hold to carry the guard, so this
+ * statement is its only admission. The numbered placeholders continue those of {@link RUNNER_JOB_INSERT_SQL}.
+ */
+export const RUNNER_LIVE_JOBS_GUARD_SQL = `(SELECT COUNT(*) FROM compute_jobs
+   WHERE executor = 'runner' AND accounting = 'none' AND pool = ?21 AND state IN (${LIVE_STATES_SQL})) < ?22`;
+
+/**
+ * A runner job's index row. `?1` id, `?2` account, `?3` Tapis owner, `?4` the pipelines' literal, `?5` key,
+ * `?6` source, `?7` client, `?8` kind, `?9` app, `?10` version, `?11` image digest, `?12` spec digest, `?13`
+ * partition (a sizing label), `?14` pool, `?15` nodes, `?16` cores, `?17` memory, `?18` GPUs, `?19` minutes,
+ * `?20` webhook nonce, then the guard's `?21` and `?22`. It writes only while the runners' live cap has room
+ * (`WHERE`), so a refused job leaves nothing; there is no hold (`hold_ledger_id` NULL, `held_milli` 0) and no
+ * pseudonym row: only a pipeline job can be a runner job (a CHECK of migration 0140), and a pipeline job carries
+ * the literal. `executor` and `accounting` are written as literals, never bound, so no caller can name another
+ * class through this statement.
+ */
+export const RUNNER_JOB_INSERT_SQL = `INSERT INTO compute_jobs
+  (id, account_id, tapis_owner, gateway_user, idempotency_key, source, client_id, kind, app_id,
+   app_version, image_digest, spec_digest, partition, pool, nodes, cores_per_node, memory_mb, gpus,
+   minutes, webhook_nonce, executor, accounting)
+  SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+         'runner', 'none'
+   WHERE ${RUNNER_LIVE_JOBS_GUARD_SQL}`;
+
 export async function getJob(db: D1Database, id: string): Promise<ComputeJobRow | null> {
   return db.prepare(JOB_BY_ID_SQL).bind(id).first<ComputeJobRow>();
 }
@@ -437,6 +544,7 @@ const APP_VERSION_RE = /^[A-Za-z0-9._+-]{1,64}$/;
 
 interface Args {
   source: ComputeSource;
+  executor: ComputeExecutor;
   /** Null for a partner's job until its hold body has been read. */
   kind: ComputeKind | null;
   accountId: number | null;
@@ -457,6 +565,11 @@ function checkInput(input: CreateJobInput): Args {
     }
   } else if (input.holdBody !== undefined) {
     invalid("only a partner's job is a hold body");
+  }
+  const executor = input.executor ?? "tapis";
+  if (!(COMPUTE_EXECUTORS as readonly string[]).includes(executor)) invalid("not an executor");
+  if (executor === "runner" && input.source !== "pipeline") {
+    invalid("only a pipeline job can be a runner job");
   }
   const kind = input.kind ?? (partner ? null : "batch");
   if (kind !== null && !(COMPUTE_KINDS as readonly string[]).includes(kind))
@@ -491,6 +604,7 @@ function checkInput(input: CreateJobInput): Args {
   }
   return {
     source: input.source,
+    executor,
     kind: kind as ComputeKind | null,
     accountId,
     clientId,
@@ -530,7 +644,7 @@ const refusal = (code: CreateJobRefusal, field?: string): CreateJobResult =>
  * nothing, mark them written. Never throws: a failure is one log line (the job id and the error's
  * class, nothing a person chose) and `false`, and the job is left as it is for a replay to finish.
  */
-async function writeRecords(
+export async function writeRecords(
   env: ComputeJobsEnv,
   job: ComputeJobRow,
   specText: string,
@@ -556,8 +670,10 @@ async function replay(
   specDigest: string,
   specText: string,
   uploads: boolean,
+  executor: ComputeExecutor = "tapis",
 ): Promise<CreateJobResult> {
-  if (existing.spec_digest !== specDigest) {
+  // The same key for a request of another executor is another request, whatever its specification says.
+  if (existing.spec_digest !== specDigest || existing.executor !== executor) {
     throw new ComputeJobError(
       "idempotency_conflict",
       "that idempotency key was used for a different request",
@@ -588,6 +704,104 @@ const imageDigestOf = (image: string | undefined): string | null => {
   const digest = image === undefined ? null : (/@(sha256:[0-9a-f]{64})$/.exec(image)?.[1] ?? null);
   return digest !== null && COMPUTE_IMAGE_DIGEST_RE.test(digest) ? digest : null;
 };
+
+/** What {@link createRunnerJob} needs of the validated request: everything `createJob` already decided. */
+interface RunnerJobPlan {
+  args: Args;
+  resources: HoldResources;
+  appId: string;
+  appVersion: string;
+  kind: ComputeKind;
+  spec: JobSpec;
+  specText: string;
+  specDigest: string;
+  uploads: boolean;
+  maxLive: { cpu: number; gpu: number };
+}
+
+/**
+ * The runner branch of {@link createJob}: the same validation, records and idempotency, with no hold. The
+ * partition is a sizing label (`shared`): the FIXED ceiling of `PARTITIONS` applies (a runner job is not offered
+ * to people, so the owner's per-person ceilings are not read), `estimateSuMilli` is never called, no pool row or
+ * ledger entry is touched, and the one statement of the batch is {@link RUNNER_JOB_INSERT_SQL}, which the
+ * runners' live cap gates. Nothing is written for a refusal; `over_concurrency` is the cap's word.
+ */
+async function createRunnerJob(env: ComputeJobsEnv, plan: RunnerJobPlan): Promise<CreateJobResult> {
+  const { args, resources, spec, specText, specDigest, uploads } = plan;
+  const db = env.DB;
+  const label = PARTITIONS[resources.partition];
+  const ceiling = label.ceiling;
+  if (!ceiling) return refusal("partition_not_offered");
+  if (
+    resources.nodes > ceiling.maxNodes ||
+    resources.cores > ceiling.maxCoresPerNode ||
+    resources.gpus > ceiling.maxGpusPerNode ||
+    resources.minutes > ceiling.maxMinutes
+  ) {
+    return refusal("over_job_limit");
+  }
+  const byKey = async (): Promise<CreateJobResult | null> => {
+    if (args.key === null || args.accountId === null) return null;
+    const existing = await db
+      .prepare(JOB_BY_KEY_SQL)
+      .bind(args.accountId, args.key)
+      .first<ComputeJobRow>();
+    return existing ? replay(env, existing, specDigest, specText, uploads, "runner") : null;
+  };
+
+  const jobId = newJobId();
+  let changes: number;
+  try {
+    changes =
+      (
+        await db.batch([
+          db
+            .prepare(RUNNER_JOB_INSERT_SQL)
+            .bind(
+              jobId,
+              args.accountId,
+              args.tapisOwner,
+              PIPELINES_TAPIS_OWNER,
+              args.key,
+              args.source,
+              args.clientId,
+              plan.kind,
+              plan.appId,
+              plan.appVersion,
+              imageDigestOf(spec.image),
+              specDigest,
+              resources.partition,
+              label.pool,
+              resources.nodes,
+              resources.cores,
+              resources.memory_mb ?? null,
+              resources.gpus,
+              resources.minutes,
+              crypto.randomUUID(),
+              label.pool,
+              plan.maxLive[label.pool],
+            ),
+        ])
+      )[0]?.meta?.changes ?? 0;
+  } catch (err) {
+    // Another request with this key got there first: the batch was refused as a whole.
+    if (looksUnique(err)) {
+      const found = await byKey();
+      if (found) return found;
+    }
+    throw err;
+  }
+  if (changes === 0) {
+    // A retry that raced its own original request finds the job under its key; anything else is the cap.
+    return (await byKey()) ?? refusal("over_concurrency");
+  }
+
+  const created = await getJob(db, jobId);
+  if (!created) throw new Error("a job that was just written could not be read");
+  const recordsWritten = await writeRecords(env, created, specText, uploads);
+  const job = recordsWritten ? ((await getJob(db, jobId)) ?? created) : created;
+  return { ok: true, replayed: false, job, recordsWritten };
+}
 
 /**
  * Make a job and its hold, or refuse, and leave no trace of a refusal. See the file's header for the
@@ -653,7 +867,7 @@ export async function createJob(
       .prepare(JOB_BY_KEY_SQL)
       .bind(args.accountId, args.key)
       .first<ComputeJobRow>();
-    if (existing) return replay(env, existing, specDigest, specText, uploads);
+    if (existing) return replay(env, existing, specDigest, specText, uploads, args.executor);
   }
 
   // Before any hold exists: what the owner's policy and the launch itself allow.
@@ -681,6 +895,21 @@ export async function createJob(
     ) {
       return refusal("bundle_too_large");
     }
+  }
+  // A runner job has no hold: it is admitted by its own INSERT's guard and never priced (ADR 0121).
+  if (args.executor === "runner") {
+    return createRunnerJob(env, {
+      args,
+      resources,
+      appId,
+      appVersion,
+      kind,
+      spec: spec as JobSpec,
+      specText,
+      specDigest,
+      uploads,
+      maxLive: runnersPolicyOf(policy).maxLiveJobs,
+    });
   }
   let amountMilli: number;
   try {
@@ -713,15 +942,36 @@ export async function createJob(
   }
 
   const jobId = newJobId();
-  // The person's live-job limit, or for NEMAR's own pipelines the pipelines' live cap of this pool: the
-  // guard is in the hold's statement, and its refusal is read after the batch (`over_concurrency`).
-  const guards: HoldGuard[] =
-    args.source === "pipeline"
-      ? [{ sql: PIPELINE_LIVE_JOBS_GUARD_SQL, binds: [word, policy.pipelines.maxLiveJobs[word]] }]
-      : args.accountId !== null
-        ? [{ sql: LIVE_JOBS_GUARD_SQL, binds: [args.accountId, policy.maxLiveJobsPerPerson] }]
-        : [];
-  const hold = { poolId, budgetPoolId, amountMilli, jobId, extraGuards: guards };
+  // The guards, in the order a refusal is worded: the class's own cap (a person's live-job limit, or for
+  // NEMAR's own pipelines the pipelines' live cap of this pool), then the tenant ceiling that EVERY source
+  // meets. Each is in the hold's statement, and a refusal is worded after the batch by asking each guard
+  // again (`guardRefusal`), so the word is the guard's and never a second hold's.
+  const guards: NamedGuard[] = [];
+  if (args.source === "pipeline") {
+    guards.push({
+      guard: {
+        sql: PIPELINE_LIVE_JOBS_GUARD_SQL,
+        binds: [word, policy.pipelines.maxLiveJobs[word]],
+      },
+      refusal: "over_concurrency",
+    });
+  } else if (args.accountId !== null) {
+    guards.push({
+      guard: { sql: LIVE_JOBS_GUARD_SQL, binds: [args.accountId, policy.maxLiveJobsPerPerson] },
+      refusal: "over_concurrency",
+    });
+  }
+  guards.push({
+    guard: tenantGuard(tenantClassOf(args.source), tenantPolicyOf(policy)),
+    refusal: "platform_busy",
+  });
+  const hold = {
+    poolId,
+    budgetPoolId,
+    amountMilli,
+    jobId,
+    extraGuards: guards.map((g) => g.guard),
+  };
 
   const statements = [...holdStatements(db, hold)];
   if (args.source !== "pipeline" && args.accountId !== null) {
@@ -773,8 +1023,19 @@ export async function createJob(
     throw err;
   }
   if (changes === 0) {
+    // A retry that raced its own original request: the original took the slot (or the pool's last funds)
+    // between this request's first read of the key and its hold, so the hold was refused, but the job
+    // under this key now exists and is the answer. Asked BEFORE the refusal is worded, as a sequential
+    // replay is answered before any guard.
+    if (args.key !== null && args.accountId !== null) {
+      const existing = await db
+        .prepare(JOB_BY_KEY_SQL)
+        .bind(args.accountId, args.key)
+        .first<ComputeJobRow>();
+      if (existing) return replay(env, existing, specDigest, specText, uploads);
+    }
     const why = await holdRefusalReason(db, hold);
-    return refusal(why === "guard_refused" ? "over_concurrency" : why);
+    return refusal(why === "guard_refused" ? await guardRefusal(db, guards) : why);
   }
 
   const created = await getJob(db, jobId);

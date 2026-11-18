@@ -205,6 +205,15 @@ export const TERMINAL_TRANSITION_SQL = `UPDATE compute_jobs SET
   WHERE id = ?1 AND state = ?2 AND (?16 = 0 OR tapis_uuid IS NULL)`;
 
 /**
+ * A RUNNER job's terminal transition: {@link TERMINAL_TRANSITION_SQL} plus the lease the writer READ (`?17`,
+ * compared with `IS`, so a row that had no lease must still have none). A writer that read a job under one
+ * lease must not end it after the lease was released and the job claimed again (state is still `created`
+ * across that), nor after a revoke cleared it: at most once acceptance (ADR 0121). Used by `commitTerminal`
+ * for `executor = 'runner'` rows only; the Tapis statement is unchanged.
+ */
+export const RUNNER_TERMINAL_TRANSITION_SQL = `${TERMINAL_TRANSITION_SQL} AND lease_id IS ?17`;
+
+/**
  * The gate of the settlement statement: this job row has taken the terminal state `?` and has not been
  * settled. The settlement runs after the transition in one batch, so for the writer that won the
  * transition this is true, and for any other it is false (and the ledger's own "the hold is open"
@@ -230,6 +239,21 @@ export const SETTLED_STAMP_SQL = `UPDATE compute_jobs SET
     AND EXISTS (SELECT 1 FROM compute_ledger c
                  WHERE c.job_id = ?1 AND c.kind IN ('charge', 'release'))`;
 
+/**
+ * The stamp of a terminal `accounting = 'none'` runner job (ADR 0121, decision 6): there is no ledger entry
+ * to close, so both settled timestamps are written together with `charged_milli = 0`, and the records copy
+ * and the reports treat the job as settled like any other. `?1` the job, `?2` the state. Run in the same
+ * batch as the state change, in place of the ledger statements and {@link SETTLED_STAMP_SQL}; it writes only
+ * while the row has just taken `?2` and is not settled, and only for a runner job that is `none`, so a
+ * Tapis row can never be stamped settled without its ledger entry.
+ */
+export const NONE_SETTLED_STAMP_SQL = `UPDATE compute_jobs SET
+    settled_provisional_at = datetime('now'),
+    settled_final_at = datetime('now'),
+    charged_milli = 0
+  WHERE id = ?1 AND state = ?2 AND settled_provisional_at IS NULL
+    AND executor = 'runner' AND accounting = 'none'`;
+
 /** The job's tag search and its result are bound to the job with this: `?1` the job, `?2` the uuid, `?3` the status, `?4` the submit time. */
 export const BIND_TAPIS_JOB_SQL = `UPDATE compute_jobs SET
     tapis_uuid = ?2, tapis_status = ?3, state = 'submitted', submitted_at = datetime('now'),
@@ -245,7 +269,8 @@ export const BIND_ORPHAN_UUID_SQL = `UPDATE compute_jobs SET tapis_uuid = ?2
 export const SUBMIT_LEASE_MINUTES = 5;
 
 /**
- * The submitter's lease, taken BEFORE the tag search: `?1` the job, `?2` the claim stamp (the
+ * The submitter's lease, taken BEFORE the tag search (and only for `executor = 'tapis'`: a runner job is
+ * pulled, never submitted, and this statement is the atomic refusal if a path forgets to look first): `?1` the job, `?2` the claim stamp (the
  * submitter's own time, to the millisecond, which is also how it knows the lease is its own). One
  * conditional UPDATE, so two submitters cannot both reach Tapis: only the one that changes a row goes
  * on, and an expired lease (a submitter that died or stalled) may be taken again. Released when the
@@ -253,7 +278,7 @@ export const SUBMIT_LEASE_MINUTES = 5;
  */
 export const CLAIM_SUBMIT_SQL = `UPDATE compute_jobs SET submit_claimed_at = ?2
   WHERE id = ?1 AND state IN ('created', 'uploading') AND tapis_uuid IS NULL
-    AND cancel_requested_at IS NULL
+    AND executor = 'tapis' AND cancel_requested_at IS NULL
     AND (submit_claimed_at IS NULL
          OR submit_claimed_at < datetime('now', '-${SUBMIT_LEASE_MINUTES} minutes'))`;
 
@@ -297,6 +322,30 @@ export const LAUNCH_DIGEST_SQL = `UPDATE compute_jobs SET
   WHERE id = ?1 AND state IN ('created', 'uploading') AND tapis_uuid IS NULL
     AND cancel_requested_at IS NULL`;
 
+/**
+ * A WAITING runner job ends cancelled in SQL (ADR 0121): `?1` the job, `?2` the reason, `?3` the records
+ * retention as a SQLite modifier (`+7 years`). It writes only a job nobody has claimed (`runner_claimed_at
+ * IS NULL`, state `created`), so a claim that won first is never ended from under its runner: that job keeps
+ * its recorded intent for the heartbeat. Run in one batch with {@link NONE_SETTLED_STAMP_SQL} and
+ * {@link END_CANCELLED_STAMP_SQL}.
+ */
+export const CANCEL_WAITING_RUNNER_SQL = `UPDATE compute_jobs SET
+    state = 'cancelled', cancel_reason = COALESCE(cancel_reason, ?2),
+    ended_at = datetime('now'), retention_until = datetime('now', ?3)
+  WHERE id = ?1 AND executor = 'runner' AND accounting = 'none' AND state = 'created'
+    AND runner_claimed_at IS NULL`;
+
+/**
+ * The pipeline stamp of a job that just ended cancelled, ended the way the stamp sync ends a cancelled
+ * job's stamp (`syncPipelineStamps`: state `failed`, the word `job_cancelled`), `?1` the job. In the same
+ * batch as the cancel, so the tuple is free (no `live_attempt_exists`) the moment the job is over; the sync
+ * finds nothing left to do for it. It writes only while the job is cancelled and the stamp is open.
+ */
+export const END_CANCELLED_STAMP_SQL = `UPDATE compute_pipeline_stamps
+   SET state = 'failed', refusal_code = 'job_cancelled', updated_at = datetime('now')
+ WHERE job_id = ?1 AND state = 'dispatched'
+   AND EXISTS (SELECT 1 FROM compute_jobs j WHERE j.id = ?1 AND j.state = 'cancelled')`;
+
 /** The intent to cancel, recorded in D1 before anything is asked of Tapis: `?1` the job, `?2` the reason. */
 export const CANCEL_INTENT_SQL = `UPDATE compute_jobs SET
     cancel_requested_at = COALESCE(cancel_requested_at, datetime('now')),
@@ -333,11 +382,14 @@ export const UNSETTLED_TERMINAL_SQL = `SELECT id FROM compute_jobs j
  * Terminal jobs whose launcher files and logs have not been copied into the records yet, in the same
  * rotation as {@link UNSETTLED_TERMINAL_SQL} (a copy that fails on every attempt held a slot for the
  * three days it is retried; ten of them delayed every newer copy). A job that skipped the reservation is
- * not NEMAR's to copy: it has no launcher files, and the tenant sweep owns its row.
+ * not NEMAR's to copy: it has no launcher files, and the tenant sweep owns its row. A runner job is not a
+ * Tapis row either (ADR 0121): it has no launcher directory, so this list, its abandoned-copy statements below
+ * and the repair they feed select `executor = 'tapis'`; how a runner job's records are copied is the runner
+ * protocol's.
  */
 export const UNCOPIED_TERMINAL_SQL = `SELECT id FROM compute_jobs
   WHERE state IN (${TERMINAL_STATES_SQL}) AND result_records_at IS NULL AND settled_provisional_at IS NOT NULL
-    AND flag_unreserved = 0
+    AND flag_unreserved = 0 AND executor = 'tapis'
     AND ended_at >= datetime('now', '-${RECORDS_COPY_RETRY_DAYS} days')
   ORDER BY examined_at ASC, ended_at ASC LIMIT ?1`;
 
@@ -353,7 +405,7 @@ export const CANCEL_PENDING_FAILED_MINUTES = 60;
  */
 export const CANCEL_PENDING_FAILED_SQL = `SELECT COUNT(*) AS n FROM compute_jobs
   WHERE state IN (${LIVE_STATES_SQL}) AND cancel_requested_at IS NOT NULL
-    AND flag_unreserved = 0
+    AND flag_unreserved = 0 AND executor = 'tapis'
     AND NOT (source = 'partner' AND tapis_uuid IS NULL)
     AND cancel_requested_at < datetime('now', '-${CANCEL_PENDING_FAILED_MINUTES} minutes')`;
 
@@ -372,7 +424,7 @@ export async function countCancelPendingFailed(db: D1Database): Promise<number> 
  */
 export const MARK_COPY_ABANDONED_SQL = `UPDATE compute_jobs SET flag_mismatch = 1
   WHERE state IN (${TERMINAL_STATES_SQL}) AND result_records_at IS NULL
-    AND settled_provisional_at IS NOT NULL AND flag_unreserved = 0 AND records_deleted_at IS NULL
+    AND settled_provisional_at IS NOT NULL AND flag_unreserved = 0 AND records_deleted_at IS NULL AND executor = 'tapis'
     AND flag_mismatch = 0
     AND ended_at < datetime('now', '-${RECORDS_COPY_RETRY_DAYS} days')`;
 
@@ -386,14 +438,14 @@ export const COPY_ABANDONED_REPORT_DAYS = 30;
  */
 export const COPY_ABANDONED_RECENT_SQL = `SELECT COUNT(*) AS n FROM compute_jobs
   WHERE state IN (${TERMINAL_STATES_SQL}) AND result_records_at IS NULL
-    AND settled_provisional_at IS NOT NULL AND flag_unreserved = 0 AND records_deleted_at IS NULL
+    AND settled_provisional_at IS NOT NULL AND flag_unreserved = 0 AND records_deleted_at IS NULL AND executor = 'tapis'
     AND ended_at < datetime('now', '-${RECORDS_COPY_RETRY_DAYS} days')
     AND ended_at >= datetime('now', '-${RECORDS_COPY_RETRY_DAYS + COPY_ABANDONED_REPORT_DAYS} days')`;
 
 /** The rows {@link MARK_COPY_ABANDONED_SQL} describes, flagged or not and however old: the number an administrator is shown. */
 export const COPY_ABANDONED_COUNT_SQL = `SELECT COUNT(*) AS n FROM compute_jobs
   WHERE state IN (${TERMINAL_STATES_SQL}) AND result_records_at IS NULL
-    AND settled_provisional_at IS NOT NULL AND flag_unreserved = 0 AND records_deleted_at IS NULL
+    AND settled_provisional_at IS NOT NULL AND flag_unreserved = 0 AND records_deleted_at IS NULL AND executor = 'tapis'
     AND ended_at < datetime('now', '-${RECORDS_COPY_RETRY_DAYS} days')`;
 
 /** {@link COPY_ABANDONED_COUNT_SQL} as a number. */
@@ -471,6 +523,17 @@ export function tapisAccess(
   const owner = config.username;
   if (owner === undefined || !TAPIS_OWNER_RE.test(owner)) return null;
   return { env, owner, ...mode };
+}
+
+/**
+ * Whether this Worker can submit a job to Tapis at all: the gate's and the submitter's one definition.
+ * `submitComputeJob` answers `unconfigured` at its Tapis access check exactly when it is false (it can
+ * answer `unconfigured` again later, when the launch itself is not configured), and a pipeline run's
+ * refusal `tapis_unconfigured` (the route and `dispatchPipelineJob`) is decided here, so a run is never
+ * made that the submitter would leave waiting forever. It reads configuration only and makes no request.
+ */
+export function tapisSubmitConfigured(env: Bindings): boolean {
+  return tapisAccess(env, TICK_READ) !== null;
 }
 
 // --- Settlement: what a job used -----------------------------------------------------------------
@@ -590,7 +653,7 @@ export interface TerminalPlan {
  * settled. Returns true when THIS writer won the transition: a job some other writer already moved
  * changes nothing here and answers false, and it is that writer's batch that settled it.
  */
-async function commitTerminal(
+export async function commitTerminal(
   env: Bindings,
   job: ComputeJobRow,
   plan: TerminalPlan,
@@ -598,13 +661,22 @@ async function commitTerminal(
 ): Promise<boolean> {
   const db = env.DB;
   const gate = { sql: SETTLEMENT_GATE_SQL, binds: [job.id, plan.to] };
-  const settle =
-    plan.settlement.kind === "release"
-      ? releaseStatements(db, { jobId: job.id }, gate)
-      : settleStatements(db, { jobId: job.id, chargeMilli: plan.settlement.milli }, gate);
+  // An `accounting = 'none'` job has no hold: no ledger statement is built, and its own stamp settles it
+  // (ADR 0121). Everything else is the Tapis job's batch, byte for byte.
+  const settlement =
+    job.accounting === "none"
+      ? [db.prepare(NONE_SETTLED_STAMP_SQL).bind(job.id, plan.to)]
+      : [
+          ...(plan.settlement.kind === "release"
+            ? releaseStatements(db, { jobId: job.id }, gate)
+            : settleStatements(db, { jobId: job.id, chargeMilli: plan.settlement.milli }, gate)),
+          db.prepare(SETTLED_STAMP_SQL).bind(job.id, plan.to),
+        ];
+  // Fails closed, like the launcher routes: anything that is not a Tapis row carries the lease it read.
+  const runnerRow = job.executor !== "tapis";
   const results = await db.batch([
     db
-      .prepare(TERMINAL_TRANSITION_SQL)
+      .prepare(runnerRow ? RUNNER_TERMINAL_TRANSITION_SQL : TERMINAL_TRANSITION_SQL)
       .bind(
         job.id,
         job.state,
@@ -622,9 +694,9 @@ async function commitTerminal(
         plan.slurmJobId,
         `+${recordsRetentionYears} years`,
         plan.unsubmittedOnly ? 1 : 0,
+        ...(runnerRow ? [job.lease_id ?? null] : []),
       ),
-    ...settle,
-    db.prepare(SETTLED_STAMP_SQL).bind(job.id, plan.to),
+    ...settlement,
     // The report ACCESS is owed for a job whose record first shows its Slurm id at its END (phase A8,
     // #2013): the same batch as the write that gave the row the id, `OR IGNORE`, and no network call.
     ...(plan.slurmJobId === null ? [] : [db.prepare(ACCESS_REPORT_PENDING_SQL).bind(job.id)]),
@@ -649,12 +721,12 @@ async function commitSettlementOnly(
 
 // --- Reading what ended --------------------------------------------------------------------------
 
-async function recordsRetentionYears(env: Bindings): Promise<number> {
+export async function recordsRetentionYears(env: Bindings): Promise<number> {
   return (await getPolicy(env.DB)).policy.retention.recordsYears;
 }
 
 /** The byte bound for one launcher document: the outputs body's bound for the owner's `maxFiles`. */
-async function launcherDocumentLimit(env: Bindings): Promise<number> {
+export async function launcherDocumentLimit(env: Bindings): Promise<number> {
   try {
     return outputsBodyLimitBytes((await getPolicy(env.DB)).policy.resultLimits.maxFiles);
   } catch {
@@ -932,7 +1004,11 @@ async function applyOnce(
  * into the records (a failure leaves `result_records_at` NULL for the tick to retry), and a finished
  * job's person is told. Neither may fail the transition.
  */
-async function afterTerminal(env: Bindings, job: ComputeJobRow, plan: TerminalPlan): Promise<void> {
+export async function afterTerminal(
+  env: Bindings,
+  job: ComputeJobRow,
+  plan: TerminalPlan,
+): Promise<void> {
   try {
     await copyResultRecords(env, job);
   } catch (err) {
@@ -1098,13 +1174,15 @@ const refused = (outcome: Exclude<SubmitOutcome, "submitted" | "bound" | "alread
  * `launchSpecEnv` is the `NEMAR_LAUNCH_SPEC` value (the specification's text in base64url, A1c);
  * `digest` is the SHA-256 of the TEXT the launcher decodes it to, never of the value.
  */
-interface BuiltLaunch {
+export interface BuiltLaunch {
   launchSpecEnv: LaunchSpecEnvValue;
   digest: string;
   imageDigest: string;
+  /** The image the specification names, as a runner is told it (ADR 0121): reference, digest and SIF file name. */
+  image: { uri: string; digest: string; sif: string };
 }
 
-type BuildResult =
+export type BuildResult =
   | { ok: true; launch: BuiltLaunch }
   | { ok: false; why: "unconfigured" | "unbuildable" };
 
@@ -1124,7 +1202,7 @@ type BuildResult =
  * results limit is `resultLimits.maxJobBytes` and the outputs route enforces it; the two numbers are
  * never one.
  */
-async function buildLaunch(env: Bindings, job: ComputeJobRow): Promise<BuildResult> {
+export async function buildLaunch(env: Bindings, job: ComputeJobRow): Promise<BuildResult> {
   const secret = env.PRESCREEN_CALLBACK_SECRET;
   const apiBase = (env.API_BASE_URL ?? "").trim().replace(/\/+$/, "");
   if (!secret || apiBase === "" || job.webhook_nonce === null || !env.COMPUTE_RECORDS) {
@@ -1178,6 +1256,7 @@ async function buildLaunch(env: Bindings, job: ComputeJobRow): Promise<BuildResu
         launchSpecEnv: encodeLaunchSpecEnv(text),
         digest: await sha256Hex(new TextEncoder().encode(text)),
         imageDigest: digest,
+        image: { uri: imageRef, digest, sif },
       },
     };
   } catch {
@@ -1543,6 +1622,8 @@ export async function submitComputeJob(
   if (row.source === "partner" || (row.state !== "created" && row.state !== "uploading")) {
     return refused("bad_state");
   }
+  // A runner job is pulled by its runner and never submitted to Tapis (`CLAIM_SUBMIT_SQL` says so again).
+  if (row.executor !== "tapis") return refused("bad_state");
   if (row.cancel_requested_at !== null) return refused("bad_state");
 
   let policy: Awaited<ReturnType<typeof getPolicy>>["policy"];
@@ -1724,8 +1805,11 @@ async function adopt(
 
 export interface CancelResult {
   ok: boolean;
-  /** `cancel_requested` is recorded; `already_cancelled` for a replay; `bad_state` for a job that ended otherwise. */
-  outcome: "cancel_requested" | "already_cancelled" | "bad_state" | "job_not_found";
+  /**
+   * `cancel_requested` is recorded; `cancelled` for a waiting runner job that ended in SQL in the call;
+   * `already_cancelled` for a replay; `bad_state` for a job that ended otherwise.
+   */
+  outcome: "cancel_requested" | "cancelled" | "already_cancelled" | "bad_state" | "job_not_found";
   state: ComputeState | null;
 }
 
@@ -1749,9 +1833,50 @@ export async function requestComputeCancel(
   if (isTerminalComputeState(job.state))
     return { ok: false, outcome: "bad_state", state: job.state };
   await env.DB.prepare(CANCEL_INTENT_SQL).bind(job.id, reason).run();
+  if (job.executor === "runner") {
+    // A waiting runner job ends here, in one batch; a claimed one keeps the intent for its heartbeat.
+    const endedHere = await endWaitingRunnerJob(env, job, reason);
+    const ended = await getJob(env.DB, job.id);
+    return {
+      ok: true,
+      outcome: endedHere ? "cancelled" : "cancel_requested",
+      state: ended?.state ?? job.state,
+    };
+  }
   await driveCancel(env, job.id, REQUEST_READ);
   const after = await getJob(env.DB, job.id);
   return { ok: true, outcome: "cancel_requested", state: after?.state ?? job.state };
+}
+
+/**
+ * End a runner job nobody has claimed: cancelled, settled with charge 0 and its pipeline stamp ended, in ONE
+ * batch (see {@link CANCEL_WAITING_RUNNER_SQL}). The intent is recorded first, so a claim (which needs
+ * `cancel_requested_at IS NULL`) can no longer take the row; a claim that won before the intent leaves the
+ * job claimed, the batch changes nothing, and the heartbeat carries the cancel. The records copy follows and
+ * may not fail the cancel. True when this call ended the job.
+ */
+export async function endWaitingRunnerJob(
+  env: Bindings,
+  job: ComputeJobRow,
+  reason: "user" | "admin",
+): Promise<boolean> {
+  const db = env.DB;
+  const years = await recordsRetentionYears(env);
+  const results = await db.batch([
+    db.prepare(CANCEL_WAITING_RUNNER_SQL).bind(job.id, reason, `+${years} years`),
+    db.prepare(NONE_SETTLED_STAMP_SQL).bind(job.id, "cancelled"),
+    db.prepare(END_CANCELLED_STAMP_SQL).bind(job.id),
+  ]);
+  if ((results[0]?.meta?.changes ?? 0) !== 1) return false;
+  const done = (await getJob(db, job.id)) ?? job;
+  try {
+    await copyResultRecords(env, done);
+  } catch (err) {
+    console.error(
+      `[compute-lifecycle] records_copy_failed job=${job.id} class=${errorClassName(err)}`,
+    );
+  }
+  return true;
 }
 
 /**
@@ -1777,6 +1902,9 @@ export async function driveCancel(
   // A job that skipped the reservation is the tenant sweep's, which cancels it and follows it to its end
   // (phase A7): the lifecycle's read-back would verify results a foreign job never uploaded.
   if (job.flag_unreserved === 1) return "skipped";
+  // A runner job is not at Tapis: its cancel is carried back to its runner on a heartbeat, and ending the row
+  // here would end work a runner may be running (ADR 0121). The intent stays recorded.
+  if (job.executor !== "tapis") return "skipped";
   if (job.tapis_uuid === null) {
     if (job.state !== "created" && job.state !== "uploading") return "skipped";
     // A PARTNER'S RESERVATION is the partner contract's (phase D4), never ended here. NEMAR does not take
@@ -1915,6 +2043,8 @@ export async function advanceComputeJob(
   if (!job) return { outcome: "job_not_found", job: null };
   // The tenant sweep owns a job that skipped the reservation (phase A7): nothing here reads it back.
   if (job.flag_unreserved === 1) return { outcome: "nothing_to_do", job };
+  // A runner job is the runner protocol's: nothing here submits, reads back or repairs it (ADR 0121).
+  if (job.executor !== "tapis") return { outcome: "nothing_to_do", job };
 
   // A cancel that is recorded and not yet carried out is carried out here too: the cancel sweep is
   // production-only, so on staging (where no cron runs) a cancel Tapis could not take at the time would
@@ -2087,5 +2217,13 @@ export function jobView(job: ComputeJobRow): ComputeJobView {
     results_verified: job.results_verified_at !== null,
     results_bytes: job.results_bytes,
     records_copied: job.result_records_at !== null,
+    executor: job.executor,
+    accounting: job.accounting,
+    runner_backend: job.runner_backend,
+    runner_id: job.runner_id,
+    runner_claimed_at: job.runner_claimed_at,
+    runner_wall_seconds: job.runner_wall_seconds,
+    runner_cpu_seconds: job.runner_cpu_seconds,
+    runner_max_rss_mb: job.runner_max_rss_mb,
   };
 }

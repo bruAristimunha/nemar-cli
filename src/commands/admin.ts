@@ -10,12 +10,10 @@
  * - nemar admin revoke             - Revoke user access
  * - nemar admin role               - Change a user's role (owner only)
  * - nemar admin s3 regenerate-iam  - Regenerate AWS credentials for a user
- * - nemar admin repo public/private - Change repository visibility
+ * - nemar admin repo publish/unpublish/withdraw/restore - Dataset publication lifecycle
  * - nemar admin ci check/add       - Manage CI workflows
  * - nemar admin doi create/info/update/enrich - DOI management
- * - nemar admin publish list/show/start/next/approve/deny/screen - Publication workflow and its automated review
  * - nemar admin revert             - Revert dataset to a previous version
- * - nemar admin withdraw/restore   - Withdraw/restore a published dataset (visibility + EZID DOIs)
  * - nemar admin recover [status]   - Re-copy epic #967 imports whose upstream is accessible
  * - nemar admin email-preferences show/update - Email notification opt-out
  * - nemar admin notice list/set/clear - System notice management
@@ -50,6 +48,7 @@ import {
   neurobagelVerdictExitCode,
   neurobagelVerificationState,
 } from "../../shared/contract/neurobagel-admin.js";
+import { UNPUBLISH_CACHE_NOTE } from "../../shared/contract/publication.js";
 import { weeklyAttention } from "../../shared/contract/weekly-attention.js";
 import { isOpenNeuroTag } from "../../shared/openneuro-tag.js";
 import {
@@ -108,6 +107,7 @@ import {
   type ReviewRulesetOutcome,
   type SignalDefaultsSweepBatchResponse,
   type SummaryVersionCoverage,
+  type UnpublishResponse,
   type UpstreamBackfillResponse,
   type UserListItem,
   type WeeklySummaryResponse,
@@ -124,7 +124,6 @@ import {
   backfillUsernames,
   bulkDeleteDatasets,
   changeUserRole,
-  changeVisibility,
   clearIdentityConflict,
   createConceptDoi,
   createExemplar,
@@ -180,6 +179,7 @@ import {
   signalDefaultsSweep,
   signalDefaultsSweepReset,
   syncCi,
+  unpublishDataset,
   updateDoi,
   updateEmailPreferences,
   uploadTierOf,
@@ -295,17 +295,14 @@ User Management:
   role           - Change a user's role (owner only: owner > admin > member)
 
 Dataset Management:
-  repo            - Manage repository visibility (public/private)
+  repo            - Dataset publication lifecycle (publish, unpublish, withdraw, restore)
   ci              - Manage CI workflows (check status, deploy)
   s3              - S3/IAM credential management
   doi             - Create and manage DOIs for datasets
-  publish         - Publication workflow management
   revert          - Revert dataset to previous version (via PR)
-  make-public     - Publish a dataset (permanent, irreversible)
+  make-public     - Publish a dataset (pull it back with 'repo unpublish')
   delete-dataset    - Delete a dataset and all associated resources
   import-openneuro  - Import an OpenNeuro dataset into NEMAR
-  withdraw          - Withdraw a broken published dataset (private + DOI tombstone), reversible
-  restore           - Reverse a withdrawal (public + DOI restore)
 
 Examples:
   $ nemar admin users --verified           # List users awaiting approval
@@ -313,7 +310,7 @@ Examples:
   $ nemar admin approve john_doe           # Approve a user
   $ nemar admin approve --id 123           # Approve a web/ORCID user (no username)
   $ nemar admin role john_doe admin        # Promote user to admin (owner only)
-  $ nemar admin repo public nm000104       # Make dataset repo public
+  $ nemar admin repo unpublish nm000104    # Pull a published dataset back to private
   $ nemar admin ci check nm000104          # Check CI status
   $ nemar admin s3 regenerate-iam john_doe # Regenerate AWS credentials
   $ nemar admin doi create nm000104        # Create concept DOI`,
@@ -1889,67 +1886,9 @@ async function regenerateIamAction(_username: string, _options: ConfirmOptions) 
 // Repository Management
 // ============================================================================
 
-const repoCommand = new Command("repo").description("Repository visibility management");
-
-repoCommand
-  .command("public")
-  .description("Make a dataset repository public")
-  .argument("<dataset-id>", "Dataset ID (e.g., nm000104)")
-  .option(YES_OPTION, YES_DESCRIPTION)
-  .option(NO_OPTION, NO_DESCRIPTION)
-  .action(async (datasetId, options: ConfirmOptions) => {
-    if (!requireAuth()) return;
-
-    console.log(chalk.cyan(`\nMaking repository public: ${datasetId}\n`));
-    console.log(chalk.yellow("Warning: This will make the dataset visible to everyone."));
-    console.log();
-
-    const confirmResult = await confirm(`Make ${datasetId} public?`, options);
-    if (confirmResult !== "confirmed") {
-      console.log(chalk.dim(confirmResult === "declined" ? "Skipped" : "Cancelled"));
-      return;
-    }
-
-    const spinner = ora(`Setting ${datasetId} to public...`).start();
-    try {
-      await changeVisibility(datasetId, "public");
-      spinner.succeed(`Repository ${datasetId} is now public`);
-    } catch (error) {
-      handleCommandError(error, spinner, "Failed to change visibility", {
-        404: "Dataset not found",
-      });
-    }
-  });
-
-repoCommand
-  .command("private")
-  .description("Make a dataset repository private")
-  .argument("<dataset-id>", "Dataset ID (e.g., nm000104)")
-  .option(YES_OPTION, YES_DESCRIPTION)
-  .option(NO_OPTION, NO_DESCRIPTION)
-  .action(async (datasetId, options: ConfirmOptions) => {
-    if (!requireAuth()) return;
-
-    console.log(chalk.yellow(`\nMaking repository private: ${datasetId}\n`));
-    console.log("This will restrict access to collaborators only.");
-    console.log();
-
-    const confirmResult = await confirm(`Make ${datasetId} private?`, options);
-    if (confirmResult !== "confirmed") {
-      console.log(chalk.dim(confirmResult === "declined" ? "Skipped" : "Cancelled"));
-      return;
-    }
-
-    const spinner = ora(`Setting ${datasetId} to private...`).start();
-    try {
-      await changeVisibility(datasetId, "private");
-      spinner.succeed(`Repository ${datasetId} is now private`);
-    } catch (error) {
-      handleCommandError(error, spinner, "Failed to change visibility", {
-        404: "Dataset not found",
-      });
-    }
-  });
+const repoCommand = new Command("repo").description(
+  "Dataset publication lifecycle: publish, unpublish, withdraw, restore",
+);
 
 adminCommand.addCommand(repoCommand);
 
@@ -2637,7 +2576,7 @@ doiCommand
   .option("--make-public", "Transition DOI from reserved to public (permanent)")
   .option(
     "--unavailable",
-    "Tombstone the concept DOI (EZID _status=unavailable); concept-only, reversible via --make-public. For a full withdrawal (visibility + every version DOI) use 'nemar admin withdraw' instead.",
+    "Tombstone the concept DOI (EZID _status=unavailable); concept-only, reversible via --make-public. For a full withdrawal (visibility + every version DOI) use 'nemar admin repo withdraw' instead.",
   )
   .option("--refresh", "Refresh metadata from dataset_description.json and .nemar/metadata.json")
   .option(YES_OPTION, YES_DESCRIPTION)
@@ -3160,7 +3099,7 @@ doiCommand
 
 adminCommand.addCommand(doiCommand);
 
-adminCommand.addCommand(publishCommand);
+repoCommand.addCommand(publishCommand);
 
 // ============================================================================
 // Revert (Admin Only)
@@ -3451,7 +3390,9 @@ adminCommand
 
 adminCommand
   .command("make-public")
-  .description("Publish a dataset (make repository and data public) - PERMANENT")
+  .description(
+    "Publish a dataset (make repository and data public); pull back with 'repo unpublish'",
+  )
   .argument("<dataset-id>", "Dataset ID (e.g., nm000104)")
   .addHelpText(
     "after",
@@ -3459,17 +3400,16 @@ adminCommand
 Description:
   Publish a dataset by making both the GitHub repository and S3 data publicly accessible.
 
-  ${chalk.yellow("WARNING: This operation is PERMANENT and IRREVERSIBLE")}
+  ${chalk.yellow("WARNING: Publication mints DOIs that stay registered even if the dataset is later pulled back with 'nemar admin repo unpublish'")}
 
   Once published:
   - GitHub repository will be publicly visible
   - S3 data files will be publicly downloadable
   - git-annex will use public URLs for downloads
 
-  Publishing cannot be undone because:
+  Publication leaves marks that unpublishing does not remove:
   - Data may be cached, indexed, or linked externally
-  - Unpublishing would create broken links
-  - Aligns with DOI permanence principles
+  - Minted DOIs stay registered (DOI permanence); 'repo unpublish' never calls the registrar
 
   Use this when:
   - Dataset has been reviewed and validated
@@ -3485,7 +3425,8 @@ Examples:
   $ nemar admin make-public nm000104
 
   This will prompt for confirmation by requiring you to type
-  the dataset ID to confirm the permanent action.
+  the dataset ID to confirm. Publication mints DOIs, which stay registered;
+  'nemar admin repo unpublish' pulls the dataset back to private afterwards.
 `,
   )
   .action(async (datasetIdArg: string) => {
@@ -3511,7 +3452,11 @@ Examples:
     }
 
     // Show warning and dataset info
-    console.log(chalk.yellow("\nWARNING: Publishing is PERMANENT and IRREVERSIBLE\n"));
+    console.log(
+      chalk.yellow(
+        "\nWARNING: Publishing mints DOIs that stay registered. The dataset can be pulled back to private with 'nemar admin repo unpublish', but its DOIs remain.\n",
+      ),
+    );
     console.log("This will:");
     console.log("  1. Make the GitHub repository PUBLIC");
     console.log("  2. Allow public S3 access to all dataset files");
@@ -3804,10 +3749,122 @@ function printTransitionResult(
   }
 }
 
-adminCommand
+/** Print one unpublish result (the plan on a dry run, the outcome on an execute). */
+function printUnpublishResult(tag: string, result: UnpublishResponse): void {
+  if ("skipped" in result) {
+    console.log(`  ${chalk.yellow("skipped".padEnd(8))} ${result.dataset_id}: ${result.skipped}`);
+    return;
+  }
+  const caseNote: Record<typeof result.case, string> = {
+    published: "published and public",
+    "public-never-published": "public, never published",
+    "private-with-live-publication-record":
+      "already private, but a publication record still says published (a repair)",
+  };
+  console.log(chalk.bold(`  ${tag}${result.dataset_id}: ${caseNote[result.case]}`));
+  const v = result.visibility;
+  console.log(
+    `    visibility: ${v.status === "failed" ? chalk.red(v.status) : chalk.green(v.status)}`,
+  );
+  if (v.status === "failed") {
+    console.log(chalk.red(`      stage=${v.stage}: ${v.error}`));
+    if ("githubReverted" in v) {
+      const s3Bit = "s3Reverted" in v ? ` s3Reverted=${v.s3Reverted}` : "";
+      console.log(chalk.dim(`      githubReverted=${v.githubReverted}${s3Bit}`));
+    }
+  }
+  console.log(`    publication requests reset: ${result.publication_requests_reset}`);
+  console.log(
+    `    DOIs left untouched: concept ${result.dois_untouched.concept ?? "none"}, ${result.dois_untouched.versions} version(s)`,
+  );
+  if (result.warning) console.log(chalk.yellow(`    warning: ${result.warning}`));
+  if (result.record_error) console.log(chalk.red(`    ${result.record_error}`));
+  // Only an execute changed anything: a dry run has nothing to wait for.
+  if (!tag && result.visibility.status !== "failed")
+    console.log(chalk.dim(`    ${UNPUBLISH_CACHE_NOTE}`));
+}
+
+repoCommand
+  .command("unpublish")
+  .description(
+    "Authors pull a dataset back: private everywhere, publication state reset, DOIs untouched, can be published again. A broken or removed dataset is 'withdraw' instead. Dry-run by default.",
+  )
+  .argument("<dataset-id>", "Dataset id (e.g., nm000104)")
+  .option("--reason <reason>", "Why it is being unpublished (required with --execute)")
+  .option("--execute", "Actually apply the unpublish (default is a dry run)")
+  .option(YES_OPTION, YES_DESCRIPTION)
+  .option(NO_OPTION, NO_DESCRIPTION)
+  .option("--json", "Output raw JSON")
+  .addHelpText(
+    "after",
+    `
+Unpublish versus withdraw:
+  unpublish  the authors asked to take a dataset back. It becomes a private, unpublished
+             dataset again: the owner, admins and collaborators see it, share it, edit it,
+             and can request publication later. The DOIs are NOT touched (EZID is not called).
+  withdraw   the dataset is broken or removed. It is made private AND every DOI is tombstoned.
+             Undo with 'restore'.
+
+Also repairs a dataset that was made private by a bare visibility change and still carries a
+publication record. Making a dataset public is what publishing does ('admin repo publish').
+
+Examples:
+  $ nemar admin repo unpublish nm000123                                      # dry run
+  $ nemar admin repo unpublish nm000123 --execute --reason "authors request"`,
+  )
+  .action(
+    async (
+      datasetId: string,
+      options: { reason?: string; execute?: boolean; json?: boolean } & ConfirmOptions,
+    ) => {
+      if (!requireAuth()) return;
+
+      const dryRun = !options.execute;
+      if (!dryRun && !options.reason) {
+        console.log(chalk.red("Error: --reason is required with --execute"));
+        process.exit(1);
+      }
+
+      if (!dryRun) {
+        console.log(
+          chalk.yellow(
+            `\n${datasetId} will become private everywhere and its publication state will be reset. Its DOIs are not touched.`,
+          ),
+        );
+        const confirmResult = await confirm(`Unpublish ${datasetId}?`, options);
+        if (confirmResult !== "confirmed") {
+          console.log(chalk.dim(confirmResult === "declined" ? "Skipped" : "Cancelled"));
+          return;
+        }
+      }
+
+      const spinner = ora(`${dryRun ? "Planning" : "Unpublishing"} ${datasetId}...`).start();
+      let result: UnpublishResponse;
+      try {
+        result = await unpublishDataset(datasetId, { reason: options.reason, dryRun });
+        spinner.stop();
+      } catch (error) {
+        handleCommandError(error, spinner, "Failed to unpublish", { 404: "Dataset not found" });
+        return;
+      }
+
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log();
+        printUnpublishResult(dryRun ? "[dry-run] " : "", result);
+        if (dryRun && !("skipped" in result)) {
+          console.log(chalk.dim("\nNothing was changed. Re-run with --execute --reason <why>."));
+        }
+      }
+      if (!("skipped" in result) && result.visibility.status === "failed") process.exit(1);
+    },
+  );
+
+repoCommand
   .command("withdraw")
   .description(
-    "Withdraw a broken published dataset: make it private and tombstone its EZID DOIs (concept + every version). Dry-run by default.",
+    "Withdraw a BROKEN or removed published dataset: private + EZID DOIs tombstoned (concept + every version). Authors pulling a dataset back use 'unpublish' instead. Dry-run by default.",
   )
   .argument("[ids...]", "Dataset id(s) to withdraw (omit when using --all)")
   .option("--all", "Target the still-withdrawn entries on the checked-in list")
@@ -3917,10 +3974,10 @@ adminCommand
     },
   );
 
-adminCommand
+repoCommand
   .command("restore")
   .description(
-    "Reverse a withdrawal: make a dataset public again and restore its EZID DOIs (concept + every version). Dry-run by default.",
+    "Reverse a 'withdraw': public again and EZID DOIs restored (concept + every version). Not for an 'unpublish'; publish again instead. Dry-run by default.",
   )
   .argument("[ids...]", "Dataset id(s) to restore (omit when using --all)")
   .option("--all", "Target the still-withdrawn entries on the checked-in list")
@@ -4012,6 +4069,25 @@ adminCommand
       }
     },
   );
+
+// The old top-level spellings moved under `admin repo`. They stay as hidden
+// commands that do nothing and exit nonzero, so a script that still calls them
+// fails loudly instead of silently running a different command.
+for (const [name, replacement] of [
+  ["publish", "nemar admin repo publish"],
+  ["withdraw", "nemar admin repo withdraw"],
+  ["restore", "nemar admin repo restore"],
+] as const) {
+  adminCommand
+    .command(name, { hidden: true })
+    .allowUnknownOption()
+    .allowExcessArguments()
+    .action(() => {
+      console.error(chalk.red(`'nemar admin ${name}' moved to '${replacement}'. Nothing was run.`));
+      markReportedExit();
+      process.exit(1);
+    });
+}
 
 // ============================================================================
 // Import OpenNeuro

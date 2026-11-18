@@ -294,6 +294,7 @@ nemar dataset clone <id>       # Clone metadata only (--host <origin> for an aut
 nemar dataset get [files]      # Download annexed data files
 nemar dataset drop [files]     # Free local copies of data
 nemar dataset list             # List all datasets (--mine for own)
+nemar dataset search <query>   # Search every dataset you can see: public ones, plus your own and collaborated private datasets when signed in, and all datasets for administrators
 nemar dataset status <id>      # Check dataset status
 nemar dataset release <id>     # Create version bump PR
 nemar dataset update [path]    # Push local changes via PR (needs -m title and --description)
@@ -321,35 +322,35 @@ nemar dataset publish resend <dataset-id>  # Resend admin notification
 nemar dataset publish withdraw <dataset-id> # Take back your request (a withdrawn request; no admin step)
 
 # Admin: Manage publication requests
-nemar admin publish list                   # List active publication requests
-nemar admin publish list --all             # Every request, whatever its state
-nemar admin publish list --denied          # One state (also --published, --requested, ...)
-nemar admin publish list -s denied         # Same as --denied (--status, as before)
-nemar admin publish list --search nm099999 --all
+nemar admin repo publish list                   # List active publication requests
+nemar admin repo publish list --all             # Every request, whatever its state
+nemar admin repo publish list --denied          # One state (also --published, --requested, ...)
+nemar admin repo publish list -s denied         # Same as --denied (--status, as before)
+nemar admin repo publish list --search nm099999 --all
                                            # Look up a dataset by ID, user or name
-nemar admin publish list --needs-me        # Only the requests you can act on now
-nemar admin publish show <dataset-id>      # The automated review of one request, in full
-nemar admin publish start <dataset-id>     # Start the automated review (--all: every request waiting)
-nemar admin publish next                   # One card per request that needs you: y approves, n denies, c comments
-nemar admin publish approve <dataset-id>   # Approve and publish dataset
-nemar admin publish approve <dataset-id> --force
+nemar admin repo publish list --needs-me        # Only the requests you can act on now
+nemar admin repo publish show <dataset-id>      # The automated review of one request, in full
+nemar admin repo publish start <dataset-id>     # Start the automated review (--all: every request waiting)
+nemar admin repo publish next                   # One card per request that needs you: y approves, n denies, c comments
+nemar admin repo publish approve <dataset-id>   # Approve and publish dataset
+nemar admin repo publish approve <dataset-id> --force
                                            # Approve over a review that is not a pass
-nemar admin publish approve <dataset-id> --acknowledge-identifier-screen "<reason>"
+nemar admin repo publish approve <dataset-id> --acknowledge-identifier-screen "<reason>"
                                            # Approve over a screen that needs review
-nemar admin publish approve <dataset-id> --request-id <n>
+nemar admin repo publish approve <dataset-id> --request-id <n>
                                            # Approve only if request n is the one in force
-nemar admin publish deny <dataset-id>      # Deny publication request
-nemar admin publish deny <dataset-id> --request-id <n>
+nemar admin repo publish deny <dataset-id>      # Deny publication request
+nemar admin repo publish deny <dataset-id> --request-id <n>
                                            # Deny only if request n is the one in force
-nemar admin publish screen <dataset-id>    # Re-run the identifier screen
+nemar admin repo publish screen <dataset-id>    # Re-run the identifier screen
 ```
 
 A publication request is screened for identifying information before the
-admins are mailed; the mail, `publish status` and `admin publish list` state
+admins are mailed; the mail, `publish status` and `admin repo publish list` state
 the result, and approval waits for a screen that is clear for the current
 `main`.
 Each request also gets an automated review of what the depositor submitted,
-which `admin publish list` and `admin publish show` state.
+which `admin repo publish list` and `admin repo publish show` state.
 An approval over a review that is not a pass needs `--force` and is recorded
 with your account.
 An approval is for the request it showed, and the API refuses it when that
@@ -364,7 +365,7 @@ approver, and `--force`, `--acknowledge-identifier-screen`, `--skip-ci-check`
 and `--sandbox` are refused.
 Without the variable the command is your own approval, recorded under your
 account, and `next` never reads it.
-Every failure of `admin publish` exits 1, and so does an outcome that is not
+Every failure of `admin repo publish` exits 1, and so does an outcome that is not
 what was asked: `publish screen` exits 1 when the API accepted the call but
 could not start the screen (the dispatch failed), and `publish approve` exits 1
 when the API's answer is not `published` (a tail job's warning leaves the
@@ -382,12 +383,13 @@ nemar admin revoke <username>              # Revoke user access
 nemar admin role <username> <role>         # Change user role
 
 # Dataset management
-nemar admin repo public <id>               # Make repo public
-nemar admin repo private <id>              # Make repo private
+nemar admin repo unpublish <id>            # Authors pull a published dataset back to private (DOIs untouched, can publish again)
+nemar admin repo withdraw <id>             # Broken or removed dataset: private and DOIs tombstoned
+nemar admin repo restore <id>              # Reverse a withdraw
 nemar admin ci check <id>                  # Check CI status
 nemar admin ci add <id>                    # Deploy CI workflows
 nemar admin s3 regenerate-iam <user>       # Regenerate AWS credentials
-nemar admin make-public <id>               # Publish dataset (permanent)
+nemar admin make-public <id>               # Make a dataset public (publication can be pulled back with `repo unpublish`)
 nemar admin delete-dataset <id>            # Delete dataset
 
 # DOI management

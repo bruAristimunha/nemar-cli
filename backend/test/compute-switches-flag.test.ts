@@ -2,7 +2,8 @@
  * The compute gateway's two dark switches, and where they are NOT set (epic #2005 phase A4, #2009;
  * ADR 0118 decision 8).
  *
- * `COMPUTE_ENABLED` and `COMPUTE_PIPELINES_DISPATCH_ENABLED` appear in no table of
+ * `COMPUTE_ENABLED`, `COMPUTE_PIPELINES_DISPATCH_ENABLED` and (portable compute, card DM-05)
+ * `COMPUTE_RUNNERS_ENABLED` appear in no table of
  * `backend/wrangler-sccn.toml`, so the file turns compute on nowhere. The owner adds them in a
  * reviewed change after the first real job has run by hand; a line added by any other change would
  * turn compute on somewhere nobody decided it should be, and that is what this test refuses. It is
@@ -25,7 +26,11 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { computeEnabled, computePipelinesDispatchEnabled } from "../src/services/compute-switches";
+import {
+  computeEnabled,
+  computePipelinesDispatchEnabled,
+  computeRunnersEnabled,
+} from "../src/services/compute-switches";
 import type { Bindings } from "../src/types/bindings";
 
 type VarsBlock = Record<string, unknown>;
@@ -34,7 +39,12 @@ const config = Bun.TOML.parse(
   readFileSync(join(import.meta.dir, "../wrangler-sccn.toml"), "utf-8"),
 ) as { vars?: VarsBlock; env?: Record<string, { vars?: VarsBlock }> };
 
-const SWITCH_NAMES = ["COMPUTE_ENABLED", "COMPUTE_PIPELINES_DISPATCH_ENABLED"] as const;
+const SWITCH_NAMES = [
+  "COMPUTE_ENABLED",
+  "COMPUTE_PIPELINES_DISPATCH_ENABLED",
+  // Portable compute (card DM-05, D7): registered runners may exchange a secret and use a token.
+  "COMPUTE_RUNNERS_ENABLED",
+] as const;
 
 /** The credentials and addresses of the Tapis tenant (and the ACCESS key): secrets, never file text. */
 const SECRET_NAMES = [
@@ -79,12 +89,17 @@ describe("backend/wrangler-sccn.toml and the compute switches", () => {
       pathsOfNames(SWITCH_NAMES, {
         a: { b: [{ COMPUTE_ENABLED: "1" }] },
         COMPUTE_PIPELINES_DISPATCH_ENABLED: "1",
+        c: { COMPUTE_RUNNERS_ENABLED: "1" },
         COMPUTE_RECORDS_BUCKET_NAME: "not a switch",
       }),
-    ).toEqual(["a.b[0].COMPUTE_ENABLED", "COMPUTE_PIPELINES_DISPATCH_ENABLED"]);
+    ).toEqual([
+      "a.b[0].COMPUTE_ENABLED",
+      "COMPUTE_PIPELINES_DISPATCH_ENABLED",
+      "c.COMPUTE_RUNNERS_ENABLED",
+    ]);
   });
 
-  test("neither switch is set in any table of the file", () => {
+  test("no switch is set in any table of the file", () => {
     expect(pathsOfNames(SWITCH_NAMES, config)).toEqual([]);
   });
 
@@ -253,5 +268,55 @@ describe("computePipelinesDispatchEnabled", () => {
         ),
       ).toBe(false);
     }
+  });
+});
+
+describe("computeRunnersEnabled", () => {
+  const compute = { ENVIRONMENT: "production", COMPUTE_ENABLED: "1" };
+
+  test("needs the compute switch AND its own, each exactly '1', in production or development", () => {
+    expect(computeRunnersEnabled(env({ ...compute, COMPUTE_RUNNERS_ENABLED: "1" }))).toBe(true);
+    expect(
+      computeRunnersEnabled(
+        env({ ENVIRONMENT: "development", COMPUTE_ENABLED: "1", COMPUTE_RUNNERS_ENABLED: "1" }),
+      ),
+    ).toBe(true);
+    // Its own switch alone does nothing: turning compute off stops the runners whatever it says.
+    expect(
+      computeRunnersEnabled(env({ ENVIRONMENT: "production", COMPUTE_RUNNERS_ENABLED: "1" })),
+    ).toBe(false);
+    expect(computeRunnersEnabled(env({ ...compute }))).toBe(false);
+    expect(computeRunnersEnabled(env({ ...compute, COMPUTE_RUNNERS_ENABLED: undefined }))).toBe(
+      false,
+    );
+  });
+
+  test.each([["true"], [" 1"], ["1 "], ["01"], ["yes"], ["0"], [""], [1], [true], [["1"]]])(
+    "is false for the switch %p",
+    (value) => {
+      expect(computeRunnersEnabled(env({ ...compute, COMPUTE_RUNNERS_ENABLED: value }))).toBe(
+        false,
+      );
+    },
+  );
+
+  test.each([["staging"], ["test"], ["Production"], [undefined]])(
+    "is false for the environment %p even with both switches on",
+    (environment) => {
+      expect(
+        computeRunnersEnabled(
+          env({ ENVIRONMENT: environment, COMPUTE_ENABLED: "1", COMPUTE_RUNNERS_ENABLED: "1" }),
+        ),
+      ).toBe(false);
+    },
+  );
+
+  test("is read at call time, so a changed binding changes the answer", () => {
+    const bindings = env({ ...compute });
+    expect(computeRunnersEnabled(bindings)).toBe(false);
+    (bindings as unknown as Record<string, string>).COMPUTE_RUNNERS_ENABLED = "1";
+    expect(computeRunnersEnabled(bindings)).toBe(true);
+    (bindings as unknown as Record<string, string>).COMPUTE_ENABLED = "0";
+    expect(computeRunnersEnabled(bindings)).toBe(false);
   });
 });

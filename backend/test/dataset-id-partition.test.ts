@@ -428,9 +428,11 @@ describe("the soak fixture is declared before it exists (ADR 0102)", () => {
   });
 
   test("is assigned downward from nm099999 and nm099998, the order ADR 0068 sets", () => {
+    // nm099996 is the standing compute fixture, declared ahead of its creation like nm099997.
+    expect(isDevOwnedDatasetId("nm099996")).toBe(true);
     // The next undeclared fixture id is the one after it, and stays refused until declared.
-    expect(isDevOwnedDatasetId("nm099996")).toBe(false);
-    expect(isReservedFixtureId("nm099996")).toBe(true);
+    expect(isDevOwnedDatasetId("nm099995")).toBe(false);
+    expect(isReservedFixtureId("nm099995")).toBe(true);
   });
 });
 

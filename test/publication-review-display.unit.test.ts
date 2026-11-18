@@ -1,5 +1,5 @@
 /**
- * What `nemar admin publish` decides from a list row and prints for a review, as the pure
+ * What `nemar admin repo publish` decides from a list row and prints for a review, as the pure
  * functions it is made of (ADR 0102, section 8).
  *
  * The queue predicates (`needsAdministrator`, `startAllCandidates`) are the two places the CLI
@@ -33,6 +33,7 @@ import {
   approveEvidenceLines,
   evidenceLine,
   historyLines,
+  requestStatusLabel,
   reviewDetailLines,
   reviewListLine,
   screenViewLines,
@@ -375,7 +376,7 @@ describe("shownLine and withheldLine", () => {
 describe("approveEvidenceLines", () => {
   const review = (evidence: unknown) => ({ id: 1, evidence }) as unknown as PublicationReviewRecord;
   const POINTER =
-    "The whole review, with the model's questions and findings: nemar admin publish show nm000480";
+    "The whole review, with the model's questions and findings: nemar admin repo publish show nm000480";
   const full = () =>
     evidenceOf({
       documents: {
@@ -454,7 +455,7 @@ describe("approveEvidenceLines", () => {
   test("the dataset id in the pointer is reduced to plain text", () => {
     const pointer = approveEvidenceLines(review(evidenceOf()), `nm000480${HOSTILE}`).at(-1) ?? "";
     expect(pointer).not.toMatch(DANGEROUS);
-    expect(pointer).toContain("nemar admin publish show nm000480");
+    expect(pointer).toContain("nemar admin repo publish show nm000480");
   });
 });
 
@@ -729,5 +730,25 @@ describe("reviewDetailLines", () => {
     expect(lines.join("\n")).not.toContain("Questions:");
     expect(lines.join("\n")).not.toContain("Evidence:");
     expect(lines.at(-1)).toContain("Next:");
+  });
+});
+
+describe("requestStatusLabel (ADR 0125)", () => {
+  test("a published request an administrator pulled back says so, with the day", () => {
+    expect(requestStatusLabel("published", "2026-11-17 19:30:00")).toBe(
+      "published (unpublished 2026-11-17)",
+    );
+  });
+
+  test("a live published request and every other status are printed as they are", () => {
+    expect(requestStatusLabel("published", null)).toBe("published");
+    expect(requestStatusLabel("published")).toBe("published");
+    expect(requestStatusLabel("denied", "2026-11-17 19:30:00")).toBe("denied");
+    expect(requestStatusLabel("requested")).toBe("requested");
+  });
+
+  test("terminal escapes in the stamp or the status are removed", () => {
+    expect(requestStatusLabel("published", "2026-11-17\u001b[31m")).not.toContain("\u001b");
+    expect(requestStatusLabel("pub\u001b[2Jlished")).not.toContain("\u001b");
   });
 });

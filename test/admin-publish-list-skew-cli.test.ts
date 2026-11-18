@@ -1,5 +1,5 @@
 /**
- * `nemar admin publish list`, and the commands this release added, across a Worker of another
+ * `nemar admin repo publish list`, and the commands this release added, across a Worker of another
  * version: the package is published and the Worker deployed by separate workflows within minutes
  * of each other, in either order, so the CLI has to be correct against BOTH.
  *
@@ -78,7 +78,7 @@ function listCalls(): string[] {
 }
 
 function listOn(worker: OldWorker | null, args: string[]): Promise<CliResult> {
-  return h.cli(["admin", "publish", "list", ...args], worker ? { apiUrl: worker.url } : {});
+  return h.cli(["admin", "repo", "publish", "list", ...args], worker ? { apiUrl: worker.url } : {});
 }
 
 describe("a Worker of this release: what the list shows is unchanged", () => {

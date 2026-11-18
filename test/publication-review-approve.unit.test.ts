@@ -1,5 +1,5 @@
 /**
- * What `nemar admin publish approve` decides before it asks (ADR 0102, sections 8 and 9).
+ * What `nemar admin repo publish approve` decides before it asks (ADR 0102, sections 8 and 9).
  *
  * `decideApproval` is a pure function of the review the administrator was SHOWN (the detail the
  * command read), the three flags that are theirs (`--force`, `--acknowledge-identifier-screen`,
@@ -135,7 +135,7 @@ describe("2. a run that has started publishing is continued, not gated", () => {
   test("without --resume the CLI names the cure and nothing is sent", () => {
     const d = refusal(decide(spec));
     expect(d.why).toBe("needs_resume");
-    expect(d.lines.join(" ")).toContain(`nemar admin publish approve ${ID} --resume`);
+    expect(d.lines.join(" ")).toContain(`nemar admin repo publish approve ${ID} --resume`);
     expect(refusal(decide(spec, FORCE)).why).toBe("needs_resume");
   });
 
@@ -169,7 +169,7 @@ describe("2. a run that has started publishing is continued, not gated", () => {
     };
     const needs = refusal(decide(blockedMidRun));
     expect(needs.why).toBe("needs_resume");
-    expect(needs.lines.join(" ")).toContain(`nemar admin publish approve ${ID} --resume`);
+    expect(needs.lines.join(" ")).toContain(`nemar admin repo publish approve ${ID} --resume`);
     expect(refusal(decide(blockedMidRun, FORCE)).why).toBe("needs_resume");
     for (const gate of ["enforced", "off", "n/a"] as const) {
       const d = proceeds(decide({ ...blockedMidRun, gate }, { ...NO_FLAGS, resume: true }));
@@ -516,7 +516,7 @@ describe("10. otherwise the CLI asks for --force", () => {
     const text = d.lines.join("\n");
     // The gate's own sentence for this refusal, then the exact command.
     expect(d.lines[0]).toBe(reviewGateRefusalText("needs_override", ID));
-    expect(text).toContain(`nemar admin publish approve ${ID} --force`);
+    expect(text).toContain(`nemar admin repo publish approve ${ID} --force`);
   });
 
   test("it repeats the acknowledgment and the resume the administrator gave or needs", () => {
@@ -527,7 +527,7 @@ describe("10. otherwise the CLI asks for --force", () => {
       ),
     );
     expect(d.lines.join("\n")).toContain(
-      `nemar admin publish approve ${ID} --resume --acknowledge-identifier-screen "<reason>" --force`,
+      `nemar admin repo publish approve ${ID} --resume --acknowledge-identifier-screen "<reason>" --force`,
     );
     // An approving run that stopped before it published is gated again, so the cure carries --resume.
     expect(refusal(decide({ ...spec, status: "approving" })).lines.join("\n")).toContain(

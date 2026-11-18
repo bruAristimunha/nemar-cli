@@ -1,5 +1,5 @@
 /**
- * The rules of `nemar admin publish next` (ADR 0102, section 8) that need no terminal and no
+ * The rules of `nemar admin repo publish next` (ADR 0102, section 8) that need no terminal and no
  * server: what each typed answer means, whether `y` is offered for a card and what it will ask,
  * which requests the walk shows and in what order, the size line and the card.
  *
@@ -103,13 +103,13 @@ describe("yAnswer: a review that is not a pass needs --force", () => {
 
   test("without --force y is not offered, and the words name both ways forward", () => {
     const a = refused(answerOf(spec));
-    expect(a.why).toContain("nemar admin publish next --force");
-    expect(a.why).toContain(`nemar admin publish approve ${ID} --force`);
+    expect(a.why).toContain("nemar admin repo publish next --force");
+    expect(a.why).toContain(`nemar admin repo publish approve ${ID} --force`);
   });
 
   test("a stopped run's cure carries --resume, as approve's does", () => {
     const a = refused(answerOf({ ...spec, status: "approving" }, false, true));
-    expect(a.why).toContain(`nemar admin publish approve ${ID} --resume --force`);
+    expect(a.why).toContain(`nemar admin repo publish approve ${ID} --resume --force`);
   });
 
   test("with --force it is offered, naming exactly the override-class reasons shown", () => {

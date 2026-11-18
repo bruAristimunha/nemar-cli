@@ -8091,60 +8091,143 @@ def fetch_dataset_row(api_base: str, dataset_id: str) -> tuple[dict | None, bool
     return None, True
 
 
+def _sidecar_candidates(
+    primary_path: str, head_files: set[str], needle: str
+) -> list[tuple[int, int, str | None, str]]:
+    """The electrodes or coordsystem files that apply to a recording, as
+    `(directory depth, entity count, space, path)`.
+
+    `needle` is an entity-prefixed suffix such as ``_electrodes.tsv``. A file
+    matches when its basename ends with `needle` (``sub-01_task-rest_electrodes.tsv``)
+    or is exactly the bare form (``electrodes.tsv``). It applies when it sits in the
+    recording's directory or an ancestor and every entity in its name equals the
+    recording's, EXCEPT `space`: BIDS names the coordinate system with it and it
+    selects no recording, so the recording (which has none) never rejects a file for
+    carrying one. `space` is returned as its own field (None when the name has none)
+    and is not counted in the entity count, so a file's specificity is the same with
+    or without it.
+    """
+    rec_dir = os.path.dirname(primary_path)
+    rec_ents = _bids_entities(filename_stem(primary_path))
+    bare = needle.lstrip("_")  # "electrodes.tsv" from "_electrodes.tsv"
+    candidates: list[tuple[int, int, str | None, str]] = []
+    for f in head_files:
+        if not (f.endswith(needle) or os.path.basename(f) == bare):
+            continue
+        cdir = os.path.dirname(f)
+        if cdir and rec_dir != cdir and not rec_dir.startswith(cdir + "/"):
+            continue
+        cents = _bids_entities(filename_stem(f))
+        space = cents.pop("space", None)
+        if any(rec_ents.get(k) != v for k, v in cents.items()):
+            continue
+        depth = cdir.count("/") + (1 if cdir else 0)
+        candidates.append((depth, len(cents), space, f))
+    return candidates
+
+
+def _most_specific_sidecars(
+    candidates: list[tuple[int, int, str | None, str]],
+) -> list[tuple[int, int, str | None, str]]:
+    """The candidates tied for the most specific, by directory depth and then entity
+    count, sorted by path: the last is the base's choice among them."""
+    if not candidates:
+        return []
+    best = max((depth, count) for depth, count, _, _ in candidates)
+    return sorted((c for c in candidates if c[:2] == best), key=lambda c: c[3])
+
+
+# File sets `electrode_positions_for` has already warned about in this process. One
+# inherited file reaches every recording of a dataset, and a line per recording would
+# bury the log (GitHub also caps annotations). Keyed by the sorted file paths, so the
+# first warning names the first recording.
+_ELECTRODE_WARNED: set[tuple[str, ...]] = set()
+
+
+def _warn_electrode_once(paths: list[str], message: str) -> None:
+    """Print `::warning::<message>` once per process for this set of files. `message`
+    names files and recordings with `repr`, so no name can start a log line."""
+    key = tuple(sorted(paths))
+    if key in _ELECTRODE_WARNED:
+        return
+    _ELECTRODE_WARNED.add(key)
+    print(f"::warning::{message}", flush=True)
+
+
 def electrode_positions_for(
     repo_dir: str, primary_path: str, head_files: set[str], head: str
 ) -> dict | None:
-    """BIDS electrode positions for a recording, resolved via the inheritance
-    principle: among the `_electrodes.tsv` sidecars in the recording's directory
-    or an ancestor whose entities are a subset of the recording's, the most
-    specific one wins. A sibling `_coordsystem.json` is resolved the same way.
+    """BIDS electrode positions for a recording, and where they came from.
 
-    The TSV is parsed by its header row to find the `name`/`x`/`y`/`z` columns
-    (robust to extra columns like type/impedance and to column-order variation).
-    Rows where any of x/y/z is missing, non-numeric, or "n/a" are skipped.
+    Which file (BIDS inheritance, `_sidecar_candidates`): among the `_electrodes.tsv`
+    files in the recording's directory or an ancestor whose entities equal the
+    recording's, the most specific wins (deepest directory, then most entities, then
+    the last by path). `space`, the entity that names the coordinate system, is the one
+    entity not compared with the recording's and not counted. If the most specific files
+    hold more than one distinct `space` value (a file with none counts as a value), the
+    recording has two coordinate systems and the converter does not choose: it prints a
+    `::warning::` naming those files and returns None.
+
+    The coordsystem: `_coordsystem.json` is resolved the same way, among only the files
+    whose `space` equals the chosen electrodes file's (both absent counts as equal); none
+    left gives an empty system and units. The system and units are the file's own
+    words, verbatim. A resolved coordsystem file that cannot be read, is not valid JSON
+    (an empty file included) or is not a JSON object also gives an empty system and
+    units, with a `::warning::` naming it and the recording; `coordsystem_file` still
+    names it, so it may name a file that supplied no system or units.
+
+    The TSV is parsed by its header row to find the `name`/`x`/`y`/`z` columns (robust to
+    extra columns like type/impedance and to column-order variation). A row whose x, y or z
+    is missing, `n/a`, not a number, or a number that is not finite (`NaN`, `inf`, any
+    case or sign) gives no position: a non-finite number would reach the store's root
+    `zarr.json` as a bare token that `JSON.parse` refuses.
+
+    An applicable electrodes file that cannot be read prints a `::warning::` naming it
+    and the recording, and gives no positions: that is a failure, not a dataset that
+    declares none. An empty file, or one with no valid row, gives none quietly.
+
+    Each warning is given once per process for its set of files (`_warn_electrode_once`),
+    naming the first recording it was met for: one inherited file reaches every
+    recording of a dataset, and a line per recording would bury the log. File and
+    recording names are printed with `repr`, so a newline in a name cannot start a line
+    of its own (GitHub reads a line that starts with `::` as a workflow command).
 
     Returns ``{"positions": {label: [x, y, z]}, "coordinate_system": str,
-    "coordinate_units": str}`` or None when no `_electrodes.tsv` resolves or it
-    contains no valid rows.
+    "coordinate_units": str, "positions_source": "subject" | "dataset",
+    "positions_file": str, "coordsystem_file": str}`` or None. `positions_source` is
+    `subject` when the electrodes file's NAME carries the `sub` entity and `dataset`
+    when it does not (one file applied to every subject it reaches): where the dataset
+    declares the positions, never whether they were measured (a per-subject file may
+    hold template coordinates), and never a template of the converter's own.
+    `positions_file` is the electrodes file's path in `head_files`; `coordsystem_file`
+    the coordsystem file's, present only when one resolved.
     """
-    stem = filename_stem(primary_path)
-    rec_dir = os.path.dirname(primary_path)
-    rec_ents = _bids_entities(stem)
-
-    def _resolve_sidecar(needle: str) -> str | None:
-        """Return the most-specific applicable sidecar path, or None.
-
-        `needle` is an entity-prefixed suffix like ``_electrodes.tsv``.
-        A file matches when its basename ends with `needle` (e.g.
-        ``sub-01_task-rest_electrodes.tsv``) or its basename is exactly
-        the bare form without the leading underscore (e.g. ``electrodes.tsv``
-        at the dataset root). Both forms carry empty entities, so the entity
-        subset check still applies correctly.
-        """
-        bare = needle.lstrip("_")  # "electrodes.tsv" from "_electrodes.tsv"
-        candidates: list[tuple[int, int, str]] = []
-        for f in head_files:
-            bname = os.path.basename(f)
-            if not (f.endswith(needle) or bname == bare):
-                continue
-            cdir = os.path.dirname(f)
-            if cdir and rec_dir != cdir and not rec_dir.startswith(cdir + "/"):
-                continue
-            cents = _bids_entities(filename_stem(f))
-            if any(rec_ents.get(k) != v for k, v in cents.items()):
-                continue
-            depth = cdir.count("/") + (1 if cdir else 0)
-            candidates.append((depth, len(cents), f))
-        if not candidates:
-            return None
-        candidates.sort()
-        # most specific = last after ascending sort
-        return candidates[-1][2]
-
-    elec_path = _resolve_sidecar("_electrodes.tsv")
-    if elec_path is None:
+    most_specific = _most_specific_sidecars(
+        _sidecar_candidates(primary_path, head_files, "_electrodes.tsv")
+    )
+    if not most_specific:
         return None
+    if len({space for _, _, space, _ in most_specific}) > 1:
+        paths = [path for _, _, _, path in most_specific]
+        _warn_electrode_once(
+            paths,
+            f"{', '.join(repr(path) for path in paths)} all apply to {primary_path!r} "
+            f"with different coordinate systems (space entities); no electrode "
+            f"positions are embedded",
+        )
+        return None
+    _, _, elec_space, elec_path = most_specific[-1]
     elec_text = _read_repo_text(repo_dir, head, elec_path)
+    if elec_text is None:
+        # NOT the same as "this dataset declares no positions": an electrodes file
+        # that applies is present at HEAD and we failed to read it. Same wording as
+        # the channels file's warning in `convert_one`.
+        _warn_electrode_once(
+            [elec_path],
+            f"could not read {elec_path!r}; electrode positions are NOT embedded for "
+            f"{primary_path!r}",
+        )
+        return None
     if not elec_text:
         return None
 
@@ -8177,39 +8260,69 @@ def electrode_positions_for(
             zv = cols[z_i].strip()
             if xv.lower() == "n/a" or yv.lower() == "n/a" or zv.lower() == "n/a":
                 continue
-            positions[label] = [float(xv), float(yv), float(zv)]
+            xyz = [float(xv), float(yv), float(zv)]
         except (ValueError, IndexError):
             continue
+        if not all(math.isfinite(v) for v in xyz):
+            continue  # `float` parses NaN and inf; a store's root JSON must not hold them
+        positions[label] = xyz
 
     if not positions:
         return None
 
-    # Resolve the sibling coordsystem.json for coordinate metadata.
+    # Resolve the coordsystem.json of the same coordinate system for the metadata.
     coord_system = ""
     coord_units = ""
-    cs_path = _resolve_sidecar("_coordsystem.json")
+    paired = [
+        c
+        for c in _sidecar_candidates(primary_path, head_files, "_coordsystem.json")
+        if c[2] == elec_space
+    ]
+    cs_path = _most_specific_sidecars(paired)[-1][3] if paired else None
     if cs_path is not None:
         cs_text = _read_repo_text(repo_dir, head, cs_path)
-        if cs_text:
+        cs_data: object = None
+        if cs_text is None:
+            cs_problem = f"could not read {cs_path!r}"
+        else:
             try:
                 cs_data = json.loads(cs_text)
-                if isinstance(cs_data, dict):
-                    sys_val = cs_data.get("EEGCoordinateSystem") or cs_data.get(
-                        "iEEGCoordinateSystem"
-                    ) or cs_data.get("MEGCoordinateSystem") or ""
-                    units_val = cs_data.get("EEGCoordinateUnits") or cs_data.get(
-                        "iEEGCoordinateUnits"
-                    ) or cs_data.get("MEGCoordinateUnits") or ""
-                    coord_system = str(sys_val) if sys_val else ""
-                    coord_units = str(units_val) if units_val else ""
             except ValueError:
-                pass
+                cs_problem = f"{cs_path!r} is not valid JSON"
+            else:
+                cs_problem = (
+                    None if isinstance(cs_data, dict) else f"{cs_path!r} is not a JSON object"
+                )
+        if cs_problem is not None:
+            # The positions stand, with no system or units; `coordsystem_file` still
+            # names the file, which is a fact about the dataset.
+            _warn_electrode_once(
+                [cs_path],
+                f"{cs_problem}; the electrode coordinate system and units are left "
+                f"empty for {primary_path!r}",
+            )
+        elif isinstance(cs_data, dict):
+            sys_val = cs_data.get("EEGCoordinateSystem") or cs_data.get(
+                "iEEGCoordinateSystem"
+            ) or cs_data.get("MEGCoordinateSystem") or ""
+            units_val = cs_data.get("EEGCoordinateUnits") or cs_data.get(
+                "iEEGCoordinateUnits"
+            ) or cs_data.get("MEGCoordinateUnits") or ""
+            coord_system = str(sys_val) if sys_val else ""
+            coord_units = str(units_val) if units_val else ""
 
-    return {
+    found: dict = {
         "positions": positions,
         "coordinate_system": coord_system,
         "coordinate_units": coord_units,
+        "positions_source": (
+            "subject" if "sub" in _bids_entities(filename_stem(elec_path)) else "dataset"
+        ),
+        "positions_file": elec_path,
     }
+    if cs_path is not None:
+        found["coordsystem_file"] = cs_path
+    return found
 
 
 def event_descriptions_for(
@@ -8893,6 +9006,12 @@ def convert_recording(
         )
         embed_root_attr(store_path, "electrode_coordinate_system", electrode_positions["coordinate_system"])
         embed_root_attr(store_path, "electrode_coordinate_units", electrode_positions["coordinate_units"])
+        # Where the dataset declares the positions (never "measured", never a template:
+        # `electrode_positions_for` says why), and the files they came from.
+        embed_root_attr(store_path, "electrode_positions_source", electrode_positions["positions_source"])
+        embed_root_attr(store_path, "electrode_positions_file", electrode_positions["positions_file"])
+        if "coordsystem_file" in electrode_positions:
+            embed_root_attr(store_path, "electrode_coordsystem_file", electrode_positions["coordsystem_file"])
 
 
 # --- Parallel conversion ------------------------------------------------------

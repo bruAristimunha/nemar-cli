@@ -35,8 +35,16 @@ import {
   pickVersion,
 } from "../src/services/compute-pipeline-eligibility";
 import { RESERVED_FIXTURE_FLOOR, formatDatasetId } from "../src/services/datasetId";
+import type { Bindings } from "../src/types/bindings";
 import { freshDb, realD1 } from "./helpers/d1";
 import { seedDatasetRow } from "./helpers/neurobagel-harness";
+
+/**
+ * This file is about the PRODUCTION predicate, `PIPELINE_ELIGIBLE_SQL`: every function that decides takes the
+ * environment (plan S1), and production's is the one whose text and terms this file pins. What a
+ * non-production environment lets through in addition is `compute-fixture-eligibility.test.ts`'s.
+ */
+const PRODUCTION = { ENVIRONMENT: "production" } as Pick<Bindings, "ENVIRONMENT">;
 
 let db: Database;
 beforeEach(() => {
@@ -71,7 +79,7 @@ const predicateWithout = (term: PipelineTermId) =>
 describe("the predicate's shape", () => {
   test("binds no parameter: every literal a term names is inline", () => {
     expect(PIPELINE_ELIGIBLE_SQL.match(/\?/g)).toBeNull();
-    expect(isPipelineEligible.length).toBe(1);
+    expect(isPipelineEligible.length).toBe(2);
     for (const t of PIPELINE_TERMS) expect(t.holds.length).toBe(1);
   });
 
@@ -176,8 +184,8 @@ describe("each term is necessary (mutation-style)", () => {
         .prepare(`SELECT ${PIPELINE_ROW_COLUMNS} FROM datasets d WHERE d.dataset_id = ?`)
         .bind(id)
         .first<PipelineRow>();
-      expect(isPipelineEligible(row)).toBe(false);
-      expect(failedPipelineTerms(row)).toEqual([term.id]);
+      expect(isPipelineEligible(row, PRODUCTION)).toBe(false);
+      expect(failedPipelineTerms(row, PRODUCTION)).toEqual([term.id]);
       expect(
         PIPELINE_TERMS.filter((t) => t.id !== term.id).every((t) => t.holds(row as PipelineRow)),
       ).toBe(true);
@@ -188,8 +196,8 @@ describe("each term is necessary (mutation-style)", () => {
     // `anonymous` is NOT NULL in the schema, so the row that would separate the two forms cannot be
     // stored; the TypeScript form is the one that sees it, and the SQL term is pinned to `= 0` above.
     const unknown: PipelineRow = { ...BASE, anonymous: null };
-    expect(isPipelineEligible(unknown)).toBe(false);
-    expect(failedPipelineTerms(unknown)).toEqual(["not_anonymous"]);
+    expect(isPipelineEligible(unknown, PRODUCTION)).toBe(false);
+    expect(failedPipelineTerms(unknown, PRODUCTION)).toEqual(["not_anonymous"]);
     // The mutant `IS NOT 1` would hold for NULL; this is the row it would wrongly let through.
     expect(unknown.anonymous !== 1).toBe(true);
     seed("nm000502");
@@ -200,8 +208,8 @@ describe("each term is necessary (mutation-style)", () => {
 
   test("with the schema's triggers in place an anonymous row fails two terms, which back each other up", async () => {
     seed("nm000503", { anonymous: 1, firstPublishedAt: null });
-    const row = (await loadPipelineRow(realD1(db), "nm000503")).row as PipelineRow;
-    expect(failedPipelineTerms(row)).toEqual(["not_anonymous", "first_published"]);
+    const row = (await loadPipelineRow(realD1(db), "nm000503", PRODUCTION)).row as PipelineRow;
+    expect(failedPipelineTerms(row, PRODUCTION)).toEqual(["not_anonymous", "first_published"]);
   });
 });
 
@@ -227,14 +235,14 @@ describe("the rows the issue names, each failing exactly its term", () => {
       nm099901: ["real_dataset"],
     };
     for (const [id, terms] of Object.entries(expected)) {
-      const { eligible, blockedBy } = await loadPipelineRow(d1, id);
+      const { eligible, blockedBy } = await loadPipelineRow(d1, id, PRODUCTION);
       expect([id, blockedBy, eligible]).toEqual([id, terms, terms.length === 0]);
     }
     expect(await selected()).toEqual(["nm000600"]);
   });
 
   test("a dataset that is not there is blocked by every term, and is not eligible", async () => {
-    const loaded = await loadPipelineRow(realD1(db), "nm000777");
+    const loaded = await loadPipelineRow(realD1(db), "nm000777", PRODUCTION);
     expect(loaded.row).toBeNull();
     expect(loaded.eligible).toBe(false);
     expect(loaded.blockedBy).toEqual(PIPELINE_TERMS.map((t) => t.id));
@@ -269,7 +277,7 @@ describe("the rows the issue names, each failing exactly its term", () => {
       const id = `nm000${n++}`;
       seed(id, {}, modalities);
       const sql = (await selected()).includes(id);
-      const row = await loadPipelineRow(realD1(db), id);
+      const row = await loadPipelineRow(realD1(db), id, PRODUCTION);
       expect([modalities, sql, row.eligible]).toEqual([modalities, wanted, wanted]);
     }
   });
@@ -321,7 +329,7 @@ describe("SQL and TypeScript agree on every combination", () => {
     expect(rows.results).toHaveLength(seeded);
     let accepted = 0;
     for (const row of rows.results) {
-      const byTs = isPipelineEligible(row);
+      const byTs = isPipelineEligible(row, PRODUCTION);
       if (byTs) accepted++;
       expect(`${row.dataset_id}:${byTs}`).toBe(`${row.dataset_id}:${bySql.has(row.dataset_id)}`);
     }

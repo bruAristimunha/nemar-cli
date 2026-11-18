@@ -1,5 +1,5 @@
 /**
- * What `nemar admin publish deny --help-all` says about the denials the API refuses (ADR 0105,
+ * What `nemar admin repo publish deny --help-all` says about the denials the API refuses (ADR 0105,
  * decision 11, #1730).
  *
  * `deny` is refused for a request whose approval is running, and for one whose approval has already
@@ -30,7 +30,7 @@ beforeEach(async () => {
 });
 
 test("--help-all says that a running approval, and one that has published a step, block a denial", async () => {
-  const r = await h.cli(["admin", "publish", "deny", "--help-all"]);
+  const r = await h.cli(["admin", "repo", "publish", "deny", "--help-all"]);
 
   expect(r.exitCode).toBe(0);
   const text = r.stdout.replace(/\s+/g, " ");
@@ -49,7 +49,7 @@ test("--help-all says that a running approval, and one that has published a step
   expect(h.requests).toEqual([]);
 });
 
-test("no help text of `admin publish` names a live dataset in an example (nm000103 to nm000107)", async () => {
+test("no help text of `admin repo publish` names a live dataset in an example (nm000103 to nm000107)", async () => {
   // The examples of approve, deny, list and screen are the lines an administrator copies; a live
   // dataset's id there is one paste from an approval or a denial of a published dataset. They name
   // the end-to-end dataset instead, which exists to be approved and denied.
@@ -64,7 +64,7 @@ test("no help text of `admin publish` names a live dataset in an example (nm0001
     [] as string[],
   ];
   for (const sub of commands) {
-    const r = await h.cli(["admin", "publish", ...sub, "--help-all"]);
+    const r = await h.cli(["admin", "repo", "publish", ...sub, "--help-all"]);
     expect(r.exitCode).toBe(0);
     expect(r.stdout, `admin publish ${sub.join(" ")}`).not.toMatch(/nm00010[3-7]/);
   }

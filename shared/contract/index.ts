@@ -34,3 +34,7 @@ export * from "./compute.js";
 // The routes of the compute allocation ledger and owner policy: error words, request shapes and
 // the OPEN response schemas the CLI parses (epic #2005 phase A2).
 export * from "./compute-admin.js";
+// The runner protocol `nemar.runner.v1` (portable compute): its words, prefixes, header, numbers and
+// the request and response shapes a runner and the Worker exchange. Its JSON Schema is shared byte for
+// byte with nemarOrg/nemar-process; the words shared with the job model are in `../compute-state.ts`.
+export * from "./compute-runner.js";

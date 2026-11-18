@@ -1,5 +1,5 @@
 /**
- * What `nemar admin publish approve` prints from the network, and the rule that none of it can act
+ * What `nemar admin repo publish approve` prints from the network, and the rule that none of it can act
  * on a terminal (ADR 0102, section 8; P2-1 of the Phase 2 review).
  *
  * Text that came from the network passes `plain()` where `approve` prints it: the screen and the
@@ -447,7 +447,7 @@ describe("runApproval against a Worker that answers with hostile text", () => {
     // The message reaches the spinner's failure line, and the reason its own line, cleaned.
     expect(text).toContain(`Not clear ${CLEANED}`);
     expect(text).toContain(`Whole ${CLEANED}`);
-    expect(text).toContain(`Next: nemar admin publish show ${ID}`);
+    expect(text).toContain(`Next: nemar admin repo publish show ${ID}`);
   });
 
   test("the command itself stops on a refused read and prints the Worker's sentence, cleaned", async () => {

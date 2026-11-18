@@ -286,6 +286,7 @@ describe("a live run", () => {
     });
     expect(JSON.parse(rows[0]?.details as string)).toEqual({
       mode: "dataset",
+      executor: "tapis",
       dispatched: 1,
       refused: 0,
       stopped_by: null,
@@ -344,7 +345,13 @@ describe("a live run", () => {
     expect(res.body.results.map((r: any) => r.dataset_id)).toEqual(["nm000104", "nm000105"]);
     expect(res.body.stopped_by).toBeNull();
     const details = JSON.parse((await audits(env))[0]?.details as string);
-    expect(details).toEqual({ mode: "eligible", dispatched: 2, refused: 0, stopped_by: null });
+    expect(details).toEqual({
+      mode: "eligible",
+      executor: "tapis",
+      dispatched: 2,
+      refused: 0,
+      stopped_by: null,
+    });
     expect(await n(env, "compute_pipeline_stamps")).toBe(2);
   });
 

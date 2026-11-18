@@ -126,7 +126,6 @@ const MODULE_EXPORTS: Record<string, string[]> = {
     "backfillUsernames",
     "bulkDeleteDatasets",
     "changeUserRole",
-    "changeVisibility",
     "clearIdentityConflict",
     "clearPrReviewAuthor",
     "createConceptDoi",
@@ -206,6 +205,7 @@ const MODULE_EXPORTS: Record<string, string[]> = {
     "signalDefaultsSweepReset",
     "startPrReview",
     "syncCi",
+    "unpublishDataset",
     "updateDoi",
     "updateEmailPreferences",
     "uploadTierOf",
@@ -277,6 +277,17 @@ const MODULE_EXPORTS: Record<string, string[]> = {
     "releaseComputeHold",
     "requeueComputeAccessReport",
     "runComputePipeline",
+  ],
+  // Portable compute, card DM-05: the owner's runner registry (`nemar admin compute runners`), and card S6's
+  // usage report (`nemar admin compute runners usage`).
+  "compute-runners": [
+    "RunnerListResponseSchema",
+    "RunnerRevokeResponseSchema",
+    "RunnerViewSchema",
+    "getComputeRunnersUsage",
+    "listComputeRunners",
+    "registerComputeRunner",
+    "revokeComputeRunner",
   ],
 };
 
@@ -407,6 +418,13 @@ const POST_SPLIT_ADDITIONS = [
   "runComputePipeline", // epic #2005 phase A6: POST /admin/compute/pipeline/run
   "getComputePipelineStatus", // epic #2005 phase A6: GET /admin/compute/pipeline/status
   "computeRefusalCode", // epic #2005 phase A6: reads a compute refusal's word (no request)
+  "registerComputeRunner", // portable compute, DM-05: POST /admin/compute/runners
+  "listComputeRunners", // portable compute, DM-05: GET /admin/compute/runners
+  "revokeComputeRunner", // portable compute, DM-05: POST /admin/compute/runners/:id/revoke
+  "getComputeRunnersUsage", // portable compute, S6: GET /admin/compute/reports/runners
+  "RunnerViewSchema", // portable compute, DM-05: the open schema of one registration (the listing's row)
+  "RunnerListResponseSchema", // portable compute, DM-05: the open schema of the listing
+  "RunnerRevokeResponseSchema", // portable compute, DM-05: the open schema of a revoke's answer
   "listComputePools", // epic #2005 phase A2: GET /admin/compute/pools
   "getAccountComputePools", // epic #2005 phase A2: GET /admin/compute/pools/by-id/:accountId
   "grantAccountComputePool", // epic #2005 phase A2: POST /admin/compute/pools/by-id/:accountId/grant
@@ -458,7 +476,6 @@ const MONOLITH_EXPORTS = [
   "availabilityReportSweepReset",
   "bulkDeleteDatasets",
   "changeUserRole",
-  "changeVisibility",
   "checkGitHubUsername",
   "checkHealth",
   "checkSSHKeyStatus",
@@ -536,6 +553,7 @@ const MONOLITH_EXPORTS = [
   "stepIndexFor",
   "submitEnrichment",
   "syncCi",
+  "unpublishDataset",
   "updateDoi",
   "updateEmailPreferences",
   "validateCi",

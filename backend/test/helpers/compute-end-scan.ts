@@ -43,6 +43,18 @@ import { SRC, type Tree, foldString, parse, rel, resolveImport } from "./ts-scan
 
 export const COMPUTE_SET_FUNCTION = "computeReleaseStatements";
 
+/**
+ * The statement set a scan looks for: the base name of the module that exports it (no extension) and the
+ * exported function. The default is the compute set; `compute-runner-end-callers.test.ts` scans for
+ * `runnerEndStatements` of `compute-runners` the same way, so the two sets are held by ONE scan.
+ */
+export interface ScanTarget {
+  module: string;
+  fn: string;
+}
+
+export const COMPUTE_TARGET: ScanTarget = { module: "compute-release", fn: COMPUTE_SET_FUNCTION };
+
 const TABLE = (name: string) => `(?:["\`\\[]?\\w+["\`\\]]?\\.)?["\`\\[]?${name}["\`\\]]?`;
 const UPDATE_TOKENS_RE = new RegExp(
   `\\bUPDATE(?:\\s+OR\\s+\\w+)?\\s+${TABLE("tokens")}\\s+SET\\s+revoked_at\\b([\\s\\S]*)$`,
@@ -166,7 +178,7 @@ function labelOf(node: FnNode, sf: ts.SourceFile): string {
   return `<anonymous@${sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1}>`;
 }
 
-function collectFacts(tree: Tree, file: string, sf: ts.SourceFile): FileFacts {
+function collectFacts(tree: Tree, file: string, sf: ts.SourceFile, target: ScanTarget): FileFacts {
   const imports = new Map<string, { original: string; file: string | null }>();
   const namespaces = new Map<string, string>();
   const nsFiles = new Map<string, string | null>();
@@ -195,7 +207,7 @@ function collectFacts(tree: Tree, file: string, sf: ts.SourceFile): FileFacts {
             original,
             file: resolveImport(tree, file, (stmt.moduleSpecifier as ts.StringLiteral).text),
           });
-          if (base === "compute-release" && original === COMPUTE_SET_FUNCTION) {
+          if (base === target.module && original === target.fn) {
             computeLocals.add(el.name.text);
           }
         }
@@ -211,22 +223,22 @@ function collectFacts(tree: Tree, file: string, sf: ts.SourceFile): FileFacts {
       ts.isExportDeclaration(stmt) &&
       stmt.moduleSpecifier &&
       ts.isStringLiteral(stmt.moduleSpecifier) &&
-      moduleBase(stmt.moduleSpecifier.text) === "compute-release"
+      moduleBase(stmt.moduleSpecifier.text) === target.module
     ) {
-      unfollowable.push(`${rel(file)}: re-exports compute-release`);
+      unfollowable.push(`${rel(file)}: re-exports ${target.module}`);
     }
   }
 
-  // Dynamic imports of compute-release, anywhere.
+  // Dynamic imports of the target module, anywhere.
   const dynamic = (n: ts.Node): void => {
     if (
       ts.isCallExpression(n) &&
       n.expression.kind === ts.SyntaxKind.ImportKeyword &&
       n.arguments[0] &&
       ts.isStringLiteralLike(n.arguments[0]) &&
-      moduleBase(n.arguments[0].text) === "compute-release"
+      moduleBase(n.arguments[0].text) === target.module
     ) {
-      unfollowable.push(`${rel(file)}: dynamically imports compute-release`);
+      unfollowable.push(`${rel(file)}: dynamically imports ${target.module}`);
     }
     ts.forEachChild(n, dynamic);
   };
@@ -236,16 +248,16 @@ function collectFacts(tree: Tree, file: string, sf: ts.SourceFile): FileFacts {
     if (ts.isPropertyAccessExpression(n)) {
       return (
         ts.isIdentifier(n.expression) &&
-        namespaces.get(n.expression.text) === "compute-release" &&
-        n.name.text === COMPUTE_SET_FUNCTION
+        namespaces.get(n.expression.text) === target.module &&
+        n.name.text === target.fn
       );
     }
     if (ts.isElementAccessExpression(n)) {
       return (
         ts.isIdentifier(n.expression) &&
-        namespaces.get(n.expression.text) === "compute-release" &&
+        namespaces.get(n.expression.text) === target.module &&
         ts.isStringLiteralLike(n.argumentExpression) &&
-        n.argumentExpression.text === COMPUTE_SET_FUNCTION
+        n.argumentExpression.text === target.fn
       );
     }
     return false;
@@ -267,12 +279,12 @@ function collectFacts(tree: Tree, file: string, sf: ts.SourceFile): FileFacts {
         if (
           ts.isObjectBindingPattern(n.name) &&
           ts.isIdentifier(init) &&
-          namespaces.get(init.text) === "compute-release"
+          namespaces.get(init.text) === target.module
         ) {
           for (const el of n.name.elements) {
             const prop = (el.propertyName ?? el.name).getText(sf);
             if (
-              prop === COMPUTE_SET_FUNCTION &&
+              prop === target.fn &&
               ts.isIdentifier(el.name) &&
               !computeLocals.has(el.name.text)
             ) {
@@ -354,11 +366,11 @@ export interface Analysis {
   unfollowable: string[];
 }
 
-export function analyse(tree: Tree): Analysis {
+export function analyse(tree: Tree, target: ScanTarget = COMPUTE_TARGET): Analysis {
   const facts = tree
     .walk(SRC)
-    .filter((f) => !f.endsWith("services/compute-release.ts"))
-    .map((f) => collectFacts(tree, f, parse(tree, f)));
+    .filter((f) => !f.endsWith(`services/${target.module}.ts`))
+    .map((f) => collectFacts(tree, f, parse(tree, f), target));
   const unfollowable = facts.flatMap((f) => f.unfollowable);
 
   // The compute set's users.
@@ -368,8 +380,7 @@ export function analyse(tree: Tree): Analysis {
       const direct =
         [...u.names].some((n) => f.computeLocals.has(n)) ||
         [...u.nsProps].some(
-          ([ns, props]) =>
-            f.namespaces.get(ns) === "compute-release" && props.has(COMPUTE_SET_FUNCTION),
+          ([ns, props]) => f.namespaces.get(ns) === target.module && props.has(target.fn),
         );
       if (!direct) continue;
       if (u.label === "<module>") {

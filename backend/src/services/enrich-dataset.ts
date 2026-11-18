@@ -32,7 +32,7 @@ import {
   writeDatasetCatalogFields,
   writeDatasetMetadataColumns,
 } from "./dataset-metadata-columns.js";
-import { reembedDatasetVector } from "./dataset-search.js";
+import { embedsNonPublic, reembedDatasetVector } from "./dataset-search.js";
 import {
   type DoiResolution,
   type DoiResolutionSummary,
@@ -1195,7 +1195,7 @@ export async function enrichDataset(
       });
 
       // Best-effort re-embed (internally guarded, never throws).
-      await reembedDatasetVector(env.DB, env.AI, env.VECTORIZE, datasetId);
+      await reembedDatasetVector(env.DB, env.AI, env.VECTORIZE, datasetId, embedsNonPublic(env));
     } catch (err) {
       metadataColumnsError = errorMessage(err);
       console.error(`[llm-enrich] Failed to write metadata columns for ${datasetId}:`, err);

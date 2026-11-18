@@ -8,7 +8,7 @@
 // (extracting those to this helper is deliberately out of scope for #904).
 
 import { Database } from "bun:sqlite";
-import { readFileSync, readdirSync } from "node:fs";
+import { chmodSync, closeSync, openSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 const MIGRATIONS_DIR = join(import.meta.dir, "../../src/db/migrations");
@@ -52,6 +52,74 @@ export function freshDbWithForeignKeys(): Database {
   const db = Database.deserialize(templateWithForeignKeys);
   db.exec("PRAGMA foreign_keys = ON");
   return db;
+}
+
+/** The table a persistent database records its applied migrations in (the stack's, not production's). */
+export const APPLIED_MIGRATIONS_TABLE = "_applied_migrations";
+
+/**
+ * A database FILE carrying every production migration, for a process that outlives a test: the long-running
+ * local control-plane stack of `backend/scripts/compute-local-stack.ts`. The file is created mode 0600.
+ * Each migration file is applied once and recorded in {@link APPLIED_MIGRATIONS_TABLE}; opening a database
+ * that is already there applies only the files it has not recorded, in order, and NEVER resets it. A file
+ * that holds tables but no record (not one this function made) is refused rather than guessed at.
+ * `files` restricts the set (default: every file), which a test uses to leave one migration unapplied.
+ * Returns the connection and the names applied by this call.
+ */
+export function openMigratedDb(
+  path: string,
+  files: string[] = readdirSync(MIGRATIONS_DIR)
+    .filter((f) => f.endsWith(".sql"))
+    .sort(),
+): { db: Database; applied: string[] } {
+  closeSync(openSync(path, "a", 0o600));
+  chmodSync(path, 0o600);
+  const db = new Database(path);
+  const hasTables = () =>
+    db
+      .query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+      .get() !== null;
+  if (!tableExists(db, APPLIED_MIGRATIONS_TABLE)) {
+    if (hasTables()) {
+      db.close();
+      throw new Error(
+        `${path} holds tables but no migration record; it was not made by this stack`,
+      );
+    }
+    db.exec(
+      `CREATE TABLE ${APPLIED_MIGRATIONS_TABLE} (file TEXT PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+    );
+  }
+  const recorded = new Set(
+    (db.query(`SELECT file FROM ${APPLIED_MIGRATIONS_TABLE}`).all() as { file: string }[]).map(
+      (r) => r.file,
+    ),
+  );
+  const applied: string[] = [];
+  for (const file of files) {
+    if (recorded.has(file)) continue;
+    const text = readFileSync(join(MIGRATIONS_DIR, file), "utf-8");
+    // One transaction per file, as D1 runs a file, unless the file sets a pragma (they cannot run inside one).
+    const atomic = !/\bPRAGMA\b/i.test(text);
+    try {
+      if (atomic) db.exec("BEGIN");
+      db.exec(text);
+      db.query(`INSERT INTO ${APPLIED_MIGRATIONS_TABLE} (file) VALUES (?)`).run(file);
+      if (atomic) db.exec("COMMIT");
+    } catch (err) {
+      if (atomic && db.inTransaction) db.exec("ROLLBACK");
+      db.close();
+      throw new Error(`migration ${file} failed: ${err}`);
+    }
+    applied.push(file);
+  }
+  return { db, applied };
+}
+
+function tableExists(db: Database, name: string): boolean {
+  return (
+    db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== null
+  );
 }
 
 export function realD1(db: Database): D1Database {

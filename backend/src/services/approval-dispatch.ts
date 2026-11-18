@@ -93,6 +93,9 @@ export function approvalInFlightSql(columnPrefix = ""): string {
   return `(${approvalLeaseLiveSql(p)} AND (${p}last_error IS NULL OR ${p}updated_at >= ${failedBefore}))`;
 }
 
+/** The statuses of a request that is still open (not yet published or denied). */
+export const OPEN_REQUEST_STATUSES_SQL = "('requested', 'approving', 'blocked')";
+
 /**
  * The newest request an approval could act on, for one dataset. The orchestrator
  * (`runPublicationApproval`) and the dispatch route both read it, and it must be
@@ -103,7 +106,7 @@ export function approvalInFlightSql(columnPrefix = ""): string {
  * caller's: this is only the WHERE / ORDER tail, bound with the dataset id.
  */
 export const ACTIVE_REQUEST_TAIL_SQL = `FROM publication_requests
-   WHERE dataset_id = ? AND status IN ('requested', 'approving', 'blocked')
+   WHERE dataset_id = ? AND status IN ${OPEN_REQUEST_STATUSES_SQL}
    ORDER BY requested_at DESC LIMIT 1`;
 
 /**

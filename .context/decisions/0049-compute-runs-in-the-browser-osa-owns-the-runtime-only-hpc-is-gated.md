@@ -15,6 +15,9 @@ The verdict stands; the cost it accepted is smaller than it said.
 **Amendment 2026-11-03:** Stage 3, HPC submission, is specified by [ADR 0118](0118-the-compute-gateway-records-every-tenant-job-and-keeps-the-ledger-in-expanse-service-units.md): who runs a job, who holds its record and how time is counted.
 The verdict stands.
 
+**Amendment 2026-11-13:** Stage 3 also runs on a workstation runner that polls NEMAR and writes no ledger entry, as [ADR 0121](0121-a-job-names-its-executor-and-its-accounting-class-and-a-workstation-runner-pulls-its-work.md) decides.
+The verdict stands.
+
 Supersedes ADR 0025.
 The parts of 0025 that still hold are restated here so this document is the single current statement;
 0025 is kept for its history.

@@ -29,9 +29,12 @@ import type { ComputeStatusResponse } from "../../../shared/contract/compute-adm
 import type { Bindings } from "../types/bindings";
 import { CANCEL_PENDING_FAILED_SQL, COPY_ABANDONED_COUNT_SQL } from "./compute-lifecycle";
 import { pipelinesAccountId } from "./compute-pipeline";
+import { ComputePolicyUnreadable, getPolicy } from "./compute-policy";
+import { RUNNER_ATTENTION_COUNTS } from "./compute-runner-queue";
 import { readRuntimeImage } from "./compute-runtime-image";
 import { computeS3 } from "./compute-s3";
 import { computeEnabled, computePipelinesDispatchEnabled } from "./compute-switches";
+import { type TenantFacts, tenantFacts, tenantOverCeiling } from "./compute-tenant";
 import { mintTapisToken } from "./tapis/auth";
 import { tapisHealth } from "./tapis/client";
 import { tapisConfig } from "./tapis/config";
@@ -82,7 +85,8 @@ function runtimeImageStatus(env: Bindings): ComputeStatusResponse["runtime_image
 /**
  * Counts that need a person to look. ONE ROW A COUNT: `[key, statement]`, the statement a single
  * `SELECT COUNT(*) AS n`; add a line and the Worker, the contract (a record of counts) and the CLI
- * (which prints every key) carry it. Fixed words as keys, never a value.
+ * (which prints every key) carry it. Fixed words as keys, never a value. Two more are derived from the owner's
+ * policy and are added by `attentionCounts`: `tenant_over_ceiling` and `policy_unreadable`.
  */
 const ATTENTION_COUNTS: ReadonlyArray<readonly [key: string, sql: string]> = [
   [
@@ -93,16 +97,47 @@ const ATTENTION_COUNTS: ReadonlyArray<readonly [key: string, sql: string]> = [
   ["cancel_pending_failed", CANCEL_PENDING_FAILED_SQL],
   // A terminal row whose copy of the launcher files was never made and no longer will be (flagged `mismatch`).
   ["copy_abandoned", COPY_ABANDONED_COUNT_SQL],
+  // The same two for runner jobs (portable compute, ADR 0121): the Tapis counts above select Tapis rows only.
+  ...RUNNER_ATTENTION_COUNTS,
 ];
 
-async function attentionCounts(db: D1Database): Promise<Record<string, number>> {
+async function attentionCounts(
+  db: D1Database,
+  tenant: TenantRead,
+): Promise<Record<string, number>> {
   const counts = await Promise.all(
     ATTENTION_COUNTS.map(async ([key, sql]) => {
       const row = await db.prepare(sql).first<{ n: number }>();
       return [key, row?.n ?? 0] as const;
     }),
   );
+  // The ceiling is the owner's policy and not a column, so this one is read from the tenant facts. A positive
+  // count is a job NEMAR did not admit (one that skipped the reservation, an orphan) or a ceiling the owner
+  // lowered below what is already live. Absent while the policy cannot be read.
+  if (tenant.facts !== null) {
+    counts.push(["tenant_over_ceiling", tenantOverCeiling(tenant.facts)] as const);
+  }
+  // A stored policy the strict reader cannot parse is a compute outage: every hold, run and limit reads it and
+  // fails closed. Said here, because the tenant block is absent for the same reason.
+  counts.push(["policy_unreadable", tenant.unreadable ? 1 : 0] as const);
   return Object.fromEntries(counts);
+}
+
+/** The tenant ceiling and its counts, and whether the owner's policy could not be read (then no facts). */
+interface TenantRead {
+  facts: TenantFacts | null;
+  unreadable: boolean;
+}
+
+async function readTenant(db: D1Database): Promise<TenantRead> {
+  try {
+    return { facts: await tenantFacts(db, (await getPolicy(db)).policy), unreadable: false };
+  } catch (err) {
+    // Only an unreadable policy is a finding; a database fault is the route's own failure.
+    if (!(err instanceof ComputePolicyUnreadable)) throw err;
+    console.error("[compute-status] policy unreadable: version", err.version);
+    return { facts: null, unreadable: true };
+  }
 }
 
 /** Whether any pool of the platform's budget `key` has a grant: a hold on a person's job needs `people`. */
@@ -154,13 +189,14 @@ export async function computeStatus(
     outcome(() => tapisHealth(env, { timeoutMs, maxAttempts: 1 })),
   ]);
 
-  const [pipelinesAccount, policy, peopleGranted, pipelinesGranted, attention] = await Promise.all([
+  const [pipelinesAccount, policy, peopleGranted, pipelinesGranted, tenant] = await Promise.all([
     pipelinesAccountId(env.DB),
     env.DB.prepare("SELECT 1 AS present FROM compute_policy LIMIT 1").first(),
     platformGranted(env.DB, "people"),
     platformGranted(env.DB, "pipelines"),
-    attentionCounts(env.DB),
+    readTenant(env.DB),
   ]);
+  const attention = await attentionCounts(env.DB, tenant);
 
   return {
     switches: {
@@ -200,5 +236,6 @@ export async function computeStatus(
     // The tenant sweep returns null while compute is off, which pauses what only it does.
     reconciliation: { paused: !computeOn },
     attention,
+    ...(tenant.facts === null ? {} : { tenant: tenant.facts }),
   };
 }

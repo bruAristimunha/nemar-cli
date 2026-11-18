@@ -43,7 +43,8 @@ In use today (the code is the source of truth for the declared set: `DEV_OWNED_F
   It exists in both production and dev D1 and is deliberately NOT dev-owned.
 - `nm099998`: the standing anonymous deposit, dev-owned (see below).
 - `nm099997`: the standing fixture the publication review (ADR 0102) is exercised against on the dev worker, declared dev-owned in `DEV_OWNED_FIXTURE_IDS` ahead of its creation.
-  The next fixture, assigned downward, is `nm099996`.
+- `nm099996`: the standing compute fixture (portable compute, plan step S1), a staging copy of a small public EEG dataset that runner jobs run on outside production only, declared dev-owned in `DEV_OWNED_FIXTURE_IDS` ahead of its creation.
+  The next fixture, assigned downward, is `nm099995`.
 - The `xx099900+` exemplar fleet.
 
 The FLOOR of the `nm` band is spoken for in the opposite direction: `nm099900` is `ABSENT_DATASET_ID`, the id live tests rely on never resolving.

@@ -338,6 +338,43 @@ export async function enableAutoMerge(repo: string, pat: string): Promise<boolea
 }
 
 /**
+ * Read whether a repository is private right now. `ok: false` when GitHub did not answer or the
+ * answer carried no boolean `private`: a caller that must know the prior state (so it can put it
+ * back) treats that as "unknown" and stops, instead of guessing the opposite of its target.
+ */
+export async function getRepoPrivate(
+  repo: string,
+  pat: string,
+): Promise<{ ok: true; isPrivate: boolean } | { ok: false; status: number; error: string }> {
+  let response: Response;
+  try {
+    response = await fetch(`${GITHUB_API()}/repos/${ORG_NAME}/${repo}`, {
+      headers: {
+        Authorization: `Bearer ${pat}`,
+        Accept: "application/vnd.github.v3+json",
+        "User-Agent": "NEMAR-API",
+      },
+    });
+  } catch (fetchError) {
+    const msg = fetchError instanceof Error ? fetchError.message : String(fetchError);
+    return { ok: false, status: 0, error: `Network error: ${msg}` };
+  }
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    return { ok: false, status: response.status, error: body || `HTTP ${response.status}` };
+  }
+  const info = (await response.json().catch(() => null)) as { private?: unknown } | null;
+  if (typeof info?.private !== "boolean") {
+    return {
+      ok: false,
+      status: response.status,
+      error: "GitHub's answer carried no `private` flag",
+    };
+  }
+  return { ok: true, isPrivate: info.private };
+}
+
+/**
  * Set repository visibility (public or private)
  */
 export async function setRepoVisibility(

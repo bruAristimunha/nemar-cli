@@ -659,6 +659,37 @@ describe("the API is mounted twice, and both spellings must bucket alike", () =>
   });
 });
 
+describe("the runner routes are IP-keyed, except the secret exchange", () => {
+  const IP = "203.0.113.88";
+  const MADE_UP = "Bearer made-up-0123456789abcdef0123456789abcdef";
+
+  test("claim, heartbeat, outputs, complete and me never mint a bucket per bearer", () => {
+    for (const route of [
+      "/compute/runners/claim",
+      "/compute/runners/heartbeat",
+      "/compute/runners/outputs",
+      "/compute/runners/complete",
+      "/compute/runners/me",
+      "/nemar/compute/runners/claim",
+    ]) {
+      for (const auth of [undefined, `Bearer ${VALID_TOKEN}`, MADE_UP]) {
+        const sel = __selectBucket(route, auth, IP);
+        expect(sel.keyKind, route).toBe("runner-ip");
+        expect(sel.rawKey).toBe(IP);
+        expect(sel.maxRequests).toBe(__limits.RUNNER_MAX_REQUESTS);
+      }
+    }
+  });
+
+  test("the token exchange keeps its own (already IP-keyed) auth bucket, and a lookalike path is not the route", () => {
+    expect(__selectBucket("/compute/runners/token", MADE_UP, IP).keyKind).toBe("auth-ip");
+    expect(__selectBucket("/nemar/compute/runners/token", MADE_UP, IP).keyKind).toBe("auth-ip");
+    for (const route of ["/compute/runnersx/claim", "/compute/jobs", "/xcompute/runners/claim"]) {
+      expect(__selectBucket(route, undefined, IP).keyKind).toBe("ip");
+    }
+  });
+});
+
 describe("the Neurobagel read route has its own IP-keyed bucket (epic #1586 phase 4)", () => {
   const IP = "203.0.113.77";
   const ROUTES = [

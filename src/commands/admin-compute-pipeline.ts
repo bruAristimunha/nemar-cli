@@ -2,7 +2,7 @@
  * `nemar admin compute pipeline`: an administrator runs NEMAR's own processing recipes through the compute
  * gateway and reads the stamps they leave (epic #2005 phase A6, #2011; ADR 0118; design section 10).
  *
- *   nemar admin compute pipeline run <recipe> --dataset <id>[@version] [--dry-run]
+ *   nemar admin compute pipeline run <recipe> --dataset <id>[@version] [--executor tapis|runner] [--input bids|zarr] [--dry-run]
  *   nemar admin compute pipeline run <recipe> --eligible [--limit <n>] [--dry-run]
  *   nemar admin compute pipeline status [--recipe <name>] [--dataset <id>] [--state <state>] [--limit <n>]
  *
@@ -17,6 +17,7 @@
  */
 
 import { Command } from "commander";
+import { RECIPE_INPUTS } from "../../shared/compute-recipes.js";
 import {
   COMPUTE_PIPELINE_RUN_LIMIT_DEFAULT,
   COMPUTE_PIPELINE_RUN_LIMIT_MAX,
@@ -52,10 +53,12 @@ const word = (value: string): string => plain(value);
 /** One dataset's outcome on a line. */
 function resultLine(r: ComputePipelineResult): string {
   if (r.ok) {
-    return (
+    const line =
       `  ${word(r.dataset_id)} ${word(r.version ?? "")}: dispatched` +
-      ` (attempt ${r.attempt ?? "?"}, job ${word(r.job_id ?? "?")}, submit ${word(r.submit ?? "?")})`
-    );
+      ` (attempt ${r.attempt ?? "?"}, job ${word(r.job_id ?? "?")}, submit ${word(r.submit ?? "?")})`;
+    return r.records_written === false
+      ? `${line}; its records were NOT written: the job waits until they are (records_not_written)`
+      : line;
   }
   const blocked =
     r.blocked_by && r.blocked_by.length > 0 ? ` [${r.blocked_by.map(word).join(", ")}]` : "";
@@ -68,17 +71,28 @@ const LIMITED_BY_TEXT: Record<string, string> = {
   per_invocation: `the bound of ${COMPUTE_PIPELINE_RUN_PER_INVOCATION} per invocation, run it again for more`,
   daily_cap: "the daily cap",
   live_cap: "the live cap of the pool",
+  tenant: "the tenant ceiling (NEMAR's share of the cluster)",
 };
 
 function roomLine(room: ComputePipelineRoom, when: string): string {
   const by = LIMITED_BY_TEXT[room.limited_by] ?? word(room.limited_by);
-  return `  room ${when}: ${room.daily_left} left of the daily cap, ${room.live_left} left of the live cap; bounded by ${by}`;
+  return `  room ${when}: ${room.daily_left} left of the daily cap, ${room.live_left} left of the live cap${
+    room.tenant_left === undefined ? "" : `, ${room.tenant_left} left under the tenant ceiling`
+  }; bounded by ${by}`;
+}
+
+/** The runners' room: a runner job has no daily cap and no tenant slot, only the runners' live cap. */
+function runnerRoomLine(room: { live_left: number; live_cap: number }, when: string): string {
+  return `  runner room ${when}: ${room.live_left} left of the runners' live cap of ${room.live_cap}`;
 }
 
 function printRun(res: ComputePipelineRunResponse): void {
+  const runner = res.executor === "runner";
   if (res.dry_run) {
-    say(`dry run of ${word(res.recipe)}: nothing was written`);
-    if (res.estimate_milli_per_job !== undefined) {
+    say(`dry run of ${word(res.recipe)}${runner ? " on a runner" : ""}: nothing was written`);
+    if (runner) {
+      say("  executor: runner (no hold, no service units; a runner pulls the job)");
+    } else if (res.estimate_milli_per_job !== undefined) {
       say(
         `  estimated hold per job: ${formatSu(res.estimate_milli_per_job)} SU, ` +
           `in total ${formatSu(res.estimate_milli_total ?? 0)} SU`,
@@ -86,13 +100,19 @@ function printRun(res: ComputePipelineRunResponse): void {
     }
     if (res.config) {
       const c = res.config;
-      say(
-        `  a real run needs: compute ${c.compute_enabled ? "on" : "OFF"}, ` +
-          `runtime image ${c.runtime_image ? "set" : "NOT SET"}, ` +
-          `pipelines account ${c.pipelines_account ? "present" : "MISSING"}`,
-      );
+      const needs = [
+        `compute ${c.compute_enabled ? "on" : "OFF"}`,
+        `runtime image ${c.runtime_image ? "set" : "NOT SET"}`,
+        `pipelines account ${c.pipelines_account ? "present" : "MISSING"}`,
+      ];
+      if (runner) needs.push(`runners ${c.runners_enabled ? "on" : "OFF"}`);
+      else if (c.tapis_configured !== undefined) {
+        needs.push(c.tapis_configured ? "Tapis configured" : "Tapis NOT CONFIGURED");
+      }
+      say(`  a real run needs: ${needs.join(", ")}`);
     }
     if (res.room) say(roomLine(res.room, "now"));
+    if (res.runner_room) say(runnerRoomLine(res.runner_room, "now"));
     const would = res.would_dispatch ?? [];
     say(`  would dispatch ${would.length}:`);
     for (const d of would) say(`    ${word(d.dataset_id)} ${word(d.version)}`);
@@ -101,7 +121,8 @@ function printRun(res: ComputePipelineRunResponse): void {
         res.blocked.blocked_by.length > 0
           ? ` [${res.blocked.blocked_by.map(word).join(", ")}]`
           : "";
-      say(`  blocked: ${word(res.blocked.code)}${terms}`);
+      const reason = res.blocked.reason ? `, reason ${word(res.blocked.reason)}` : "";
+      say(`  blocked: ${word(res.blocked.code)}${terms}${reason}`);
     }
     if (res.blocked_by_term) {
       const rows = Object.entries(res.blocked_by_term).filter(([, n]) => Number(n) > 0);
@@ -112,7 +133,9 @@ function printRun(res: ComputePipelineRunResponse): void {
     return;
   }
   const results = res.results ?? [];
-  say(`${word(res.recipe)}: dispatched ${res.dispatched ?? 0} of ${results.length} tried`);
+  say(
+    `${word(res.recipe)}${runner ? " (runner)" : ""}: dispatched ${res.dispatched ?? 0} of ${results.length} tried`,
+  );
   for (const r of results) say(resultLine(r));
   if (res.stopped_by) say(`  stopped by ${word(res.stopped_by)}`);
   if (res.room) say(roomLine(res.room, "before the run"));
@@ -123,8 +146,8 @@ function stampLine(s: ComputePipelineStampView): string {
   const job = s.job_id ? ` job ${word(s.job_id)}` : "";
   return (
     `${String(s.id).padStart(5)}  ${word(s.dataset_id)} ${word(s.version).padEnd(8)} ` +
-    `${word(s.recipe)} ${word(s.recipe_version)} ${word(s.engine)} attempt ${s.attempt}  ` +
-    `${word(s.state)}${tail}${job}`
+    `${word(s.recipe)} ${word(s.recipe_version)} ${word(s.engine)} ${word(s.input ?? "bids")} ` +
+    `attempt ${s.attempt}  ${word(s.state)}${tail}${job}`
   );
 }
 
@@ -171,12 +194,31 @@ Runs a processing recipe on NEMAR's own datasets through the compute gateway, or
                             ${COMPUTE_PIPELINE_RUN_LIMIT_DEFAULT}, at most ${COMPUTE_PIPELINE_RUN_LIMIT_MAX}); a run is also
                             bounded by the live cap of the pool, the daily cap and at most
                             ${COMPUTE_PIPELINE_RUN_PER_INVOCATION} per invocation, and says which one bounded it
-  --dry-run                 read only: the datasets it would run, the estimated SU, what a real run
-                            lacks, and what blocks the rest; works against every Worker
+  --executor <who>          tapis (the default) or runner. A recipe lists the executors it may be run
+                            on (nemar-floor on both) and the Worker refuses another with invalid_body
+                            naming executor. A runner run names one dataset
+                            (not --eligible), needs the runners switch (runners_disabled when it is off),
+                            makes a job with no hold and no service units that a registered runner pulls,
+                            and is bounded only by the owner's live cap for runners (over_concurrency),
+                            never by the daily cap or the tenant ceiling
+  --input <kind>            what the run reads: bids (the dataset's files, on tapis) or zarr (its Zarr
+                            serving copy, on a runner). When none is given it is the executor's own, so
+                            the run on a runner reads zarr. A recipe lists the inputs it reads, and an
+                            input it does not list, or one the executor does not run (bids on a runner,
+                            zarr on tapis), is refused as invalid_spec naming input, before anything is
+                            written. A dataset's bids run and its zarr run are separate runs of the same
+                            version and do not block each other
+  --dry-run                 read only: the datasets it would run, the estimated SU (none for a runner),
+                            the room (for a runner, the runners' live cap), what a real run lacks, and what
+                            blocks the rest; works against every Worker
 
 The caps are the owner's, for every path: a run that finds the pool full or the day's cap used stops
 with over_concurrency or daily_cap_reached and dispatches nothing. One named dataset is refused as
 over_concurrency when the pool is full; it counts toward the daily cap and is not refused by it.
+NEMAR's share of the cluster has a ceiling too: a job that would pass it, or take slots kept for
+people or partners, is refused as platform_busy, which stops a run (try again shortly). A run is
+clamped to the room under it (the room line says how many are left and, when it is the smallest,
+that the tenant ceiling bounded the run), and a dry run of one named dataset reports it as blocked.
 
 Only a public, non-anonymous, first-published, non-withdrawn dataset with EEG data and at least one
 version is eligible; the Worker decides that from its own record, never from this command. A dataset
@@ -208,6 +250,8 @@ pipelineCommand
   .command("run <recipe>")
   .description("Run a recipe over one dataset or the eligible ones, or dry-run it")
   .option("--dataset <id>", "One dataset, nm000104 or nm000104@1.0.2")
+  .option("--executor <who>", "Who runs the job: tapis (default) or runner")
+  .option("--input <kind>", "What the run reads: bids (on tapis) or zarr (on a runner)")
   .option("--eligible", "The next eligible datasets the recipe has not been run over")
   .option("--limit <n>", "With --eligible: how many datasets at most")
   .option("--dry-run", "Say what would happen; write nothing")
@@ -216,7 +260,15 @@ pipelineCommand
   .action(
     async (
       recipe: string,
-      o: { dataset?: string; eligible?: boolean; limit?: string; dryRun?: boolean; json?: boolean },
+      o: {
+        dataset?: string;
+        executor?: string;
+        input?: string;
+        eligible?: boolean;
+        limit?: string;
+        dryRun?: boolean;
+        json?: boolean;
+      },
     ) => {
       const json = o.json === true;
       if (!requireSignedIn(json)) return;
@@ -235,6 +287,27 @@ pipelineCommand
         return;
       }
       const request: ComputePipelineRunRequest = { recipe };
+      if (o.executor !== undefined) {
+        if (o.executor !== "tapis" && o.executor !== "runner") {
+          failMessage("--executor is tapis or runner.", { json, answered: true });
+          return;
+        }
+        if (o.executor === "runner" && o.dataset === undefined) {
+          failMessage("A runner run names one dataset with --dataset, not --eligible.", {
+            json,
+            answered: true,
+          });
+          return;
+        }
+        request.executor = o.executor;
+      }
+      if (o.input !== undefined) {
+        if (o.input !== "bids" && o.input !== "zarr") {
+          failMessage(`--input is ${RECIPE_INPUTS.join(" or ")}.`, { json, answered: true });
+          return;
+        }
+        request.input = o.input;
+      }
       if (o.dataset !== undefined) {
         if (o.limit !== undefined) {
           failMessage("--limit goes with --eligible.", { json, answered: true });
@@ -264,7 +337,11 @@ pipelineCommand
             refusal.blockedBy.length > 0
               ? `, blocked by ${refusal.blockedBy.map(word).join(", ")}`
               : "";
-          failMessage(`${err.message} (${word(refusal.code)}${terms})`, { json, answered: true });
+          const reason = refusal.reason ? `, reason ${word(refusal.reason)}` : "";
+          failMessage(`${err.message} (${word(refusal.code)}${terms}${reason})`, {
+            json,
+            answered: true,
+          });
           return;
         }
         failWith(err, null, "Could not run the pipeline.", undefined, { json });

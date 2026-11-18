@@ -526,9 +526,11 @@ describe("report and access-report", () => {
       "2026-10-31",
     ]);
     expect(text.exitCode).toBe(0);
+    // The header counts SU jobs, and says so (the pool line below repeats the figure, so it is anchored here).
+    expect(text.stdout).toContain("2026-10-31: 1 SU job(s), 1.5 SU charged");
     // The job is held and unsettled: the total says so, so a running account does not look cheaper.
     expect(text.stdout).toMatch(
-      /1 job\(s\), 1\.5 SU charged, 1 not settled \([0-9.]+ SU still held\)/,
+      /1 SU job\(s\), 1\.5 SU charged, 1 not settled \([0-9.]+ SU still held\)/,
     );
     expect(text.stdout).toContain("(not settled,");
     clean(text);
@@ -544,7 +546,9 @@ describe("report and access-report", () => {
     ]);
     const lines = csv.stdout.trim().split("\n");
     expect(lines[0]).toBe(
-      "id,created_at,ended_at,state,partition,pool,source,su_charged,settled,su_held,flags",
+      "id,created_at,ended_at,state,partition,pool,source,su_charged,settled,su_held,flags," +
+        "executor,accounting,runner_id,runner_wall_seconds,runner_cpu_seconds,runner_max_rss_mb," +
+        "runner_usage_partial",
     );
     const held = sql.one<{ h: number }>(
       "SELECT held_milli AS h FROM compute_jobs WHERE id = ?",
@@ -552,7 +556,7 @@ describe("report and access-report", () => {
     ).h;
     expect(held).toBeGreaterThan(0);
     expect(lines[1]).toBe(
-      `${a.job.id},2026-10-05 10:00:00,,created,shared,cpu,cli,1.5,no,${formatSu(held)},`,
+      `${a.job.id},2026-10-05 10:00:00,,created,shared,cpu,cli,1.5,no,${formatSu(held)},,tapis,su,,,,,`,
     );
     expect(lines).toHaveLength(2);
     expect(csv.stderr.trim()).toBe("");
@@ -757,5 +761,416 @@ describe("observer mint", () => {
     const json = await runCli("admin", ["mint", "--json"], ["observer"]);
     expect(JSON.parse(json.stdout)).toMatchObject({ expires_in_minutes: 60 });
     expect((await runCli("member", ["mint"], ["observer"])).exitCode).toBe(1);
+  });
+});
+
+describe("a runner job", () => {
+  async function runnerRow(): Promise<string> {
+    const env = fx.env();
+    const id = `job_${"1".repeat(24)}`;
+    await env.DB.prepare(
+      `INSERT INTO compute_jobs
+         (id, source, kind, app_id, app_version, spec_digest, partition, pool, nodes, cores_per_node, gpus,
+          minutes, executor, accounting, runner_backend, runner_id, runner_claimed_at, runner_wall_seconds,
+          runner_cpu_seconds, runner_max_rss_mb)
+       VALUES (?1, 'pipeline', 'batch', 'nemar-launch', '1.0.0', ?2, 'shared', 'cpu', 1, 4, 0, 60,
+               'runner', 'none', 'local', ?3, datetime('now'), 61, 240, 4096)`,
+    )
+      .bind(id, "a".repeat(64), `rnr_${"c".repeat(24)}`)
+      .run();
+    return id;
+  }
+
+  test("is shown with its executor, accounting and runner-reported usage, not as held SU (MUTATION: drop the runner branch)", async () => {
+    const id = await runnerRow();
+    const r = await runCli("owner", ["cancel", id]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("executor: runner, accounting: none (no hold, no service units)");
+    expect(r.stdout).toContain(`runner: rnr_${"c".repeat(24)} (local), claimed `);
+    expect(r.stdout).toContain("runner-reported: wall 61 s, cpu 240 s, max resident 4096 MB");
+    expect(r.stdout).not.toContain("held 0 SU");
+    expect(r.stdout).not.toContain("not settled");
+  });
+
+  test("is listed with its runner and its runner-reported usage, and no SU figure", async () => {
+    const id = await runnerRow();
+    const r = await runCli("admin", ["list"]);
+    expect(r.exitCode).toBe(0);
+    const line = r.stdout.split("\n").find((l) => l.includes(id)) ?? "";
+    expect(line).toContain(`runner rnr_${"c".repeat(24)}, runner-reported wall 61 s, cpu 240 s`);
+    expect(line).not.toContain("SU");
+    expect(line).not.toContain("not settled");
+    // The row has usage and no mark (it was seeded as a completion from before the mark was stored): its
+    // figures are never shown as whole, and never as partial either: unknown.
+    expect(line).toContain("cpu 240 s (partial: unknown)");
+  });
+});
+
+/** Runner jobs for the S6 reporting views, written by SQL the table accepts (the pattern above). */
+describe("runner reporting (card S6)", () => {
+  const RUNNER_A = `rnr_${"a".repeat(24)}`;
+  const RUNNER_B = `rnr_${"b".repeat(24)}`;
+  let made = 0;
+
+  function runnerJob(over: {
+    account?: number | null;
+    runnerId?: string | null;
+    state?: string;
+    usage?: { wall: number; cpu: number; rss: number; partial: 0 | 1 | null } | null;
+    createdAt?: string;
+    /** `su` writes a runner job accounted in service units (a later phase's; the table accepts it). */
+    accounting?: "su" | "none";
+    chargedMilli?: number;
+  }): string {
+    const id = `job_${(++made).toString(16).padStart(24, "0")}`;
+    const u = over.usage ?? null;
+    sql.run(
+      `INSERT INTO compute_jobs
+         (id, account_id, source, kind, state, app_id, app_version, spec_digest, partition, pool, nodes,
+          cores_per_node, gpus, minutes, executor, accounting, charged_milli, runner_backend, runner_id,
+          runner_claimed_at, runner_wall_seconds, runner_cpu_seconds, runner_max_rss_mb,
+          runner_usage_partial, created_at, ended_at, settled_provisional_at, failure_code,
+          cancel_reason, cancel_requested_at)
+       VALUES (?1, ?2, 'pipeline', 'batch', ?3, 'nemar-launch', '1.0.0', ?4, 'shared', 'cpu', 1, 4, 0, 60,
+               'runner', ?12, ?13, 'local', ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+               CASE WHEN ?3 IN ('finished', 'failed', 'cancelled') THEN ?11 END,
+               CASE WHEN ?3 IN ('finished', 'failed', 'cancelled') THEN ?11 END,
+               CASE WHEN ?3 = 'failed' THEN 'launch_failed' END,
+               CASE WHEN ?3 = 'cancelled' THEN 'admin' END,
+               CASE WHEN ?3 = 'cancelled' THEN ?11 END)`,
+      id,
+      over.account ?? null,
+      over.state ?? "created",
+      "a".repeat(64),
+      over.runnerId ?? null,
+      over.runnerId ? "2026-10-05 10:00:00" : null,
+      u?.wall ?? null,
+      u?.cpu ?? null,
+      u?.rss ?? null,
+      u?.partial ?? null,
+      over.createdAt ?? "2026-10-05 10:00:00",
+      over.accounting ?? "none",
+      over.chargedMilli ?? 0,
+    );
+    return id;
+  }
+
+  /** One account: a Tapis job, a whole runner job, a partial one, and a claimed one that has not reported. */
+  async function world() {
+    const tapis = await makeJob(fx);
+    sql.run(
+      "UPDATE compute_jobs SET charged_milli = 1500, created_at = '2026-10-05 10:00:00' WHERE id = ?",
+      tapis.job.id,
+    );
+    const account = tapis.accountId;
+    const whole = runnerJob({
+      account,
+      runnerId: RUNNER_A,
+      state: "finished",
+      usage: { wall: 120, cpu: 400, rss: 2048, partial: 0 },
+    });
+    const partial = runnerJob({
+      account,
+      runnerId: RUNNER_A,
+      state: "failed",
+      usage: { wall: 300, cpu: 7200, rss: 4096, partial: 1 },
+    });
+    const waiting = runnerJob({ account, runnerId: RUNNER_B });
+    return { tapis: tapis.job.id, account, whole, partial, waiting };
+  }
+
+  const lineOf = (out: string, id: string) => out.split("\n").find((l) => l.includes(id)) ?? "";
+
+  test("list --executor, --accounting and --runner each narrow the page to what the Worker filtered", async () => {
+    const w = await world();
+    const ids = (out: string) =>
+      [w.tapis, w.whole, w.partial, w.waiting].filter((id) => out.includes(id)).sort();
+
+    const byExecutor = await runCli("admin", ["list", "--executor", "runner"]);
+    expect(byExecutor.exitCode).toBe(0);
+    expect(ids(byExecutor.stdout)).toEqual([w.whole, w.partial, w.waiting].sort());
+    expect(ids((await runCli("admin", ["list", "--executor", "tapis"])).stdout)).toEqual([w.tapis]);
+    expect(ids((await runCli("admin", ["list", "--accounting", "su"])).stdout)).toEqual([w.tapis]);
+    expect(ids((await runCli("admin", ["list", "--accounting", "none"])).stdout)).toEqual(
+      [w.whole, w.partial, w.waiting].sort(),
+    );
+    expect(ids((await runCli("admin", ["list", "--runner", RUNNER_A])).stdout)).toEqual(
+      [w.whole, w.partial].sort(),
+    );
+    expect(ids((await runCli("admin", ["list", "--runner", RUNNER_B])).stdout)).toEqual([
+      w.waiting,
+    ]);
+    expect(seen.every((p) => p === "GET /admin/compute/jobs")).toBe(true);
+  });
+
+  test("list marks a partial row and no other, and shows a job that has not reported as such (MUTATION: drop the partial note from the list row)", async () => {
+    const w = await world();
+    const r = await runCli("admin", ["list", "--executor", "runner"]);
+    expect(lineOf(r.stdout, w.partial)).toContain(
+      `runner ${RUNNER_A}, runner-reported wall 300 s, cpu 7200 s (partial: Docker or Podman)`,
+    );
+    expect(lineOf(r.stdout, w.whole)).toContain("runner-reported wall 120 s, cpu 400 s");
+    expect(lineOf(r.stdout, w.whole)).not.toContain("partial");
+    expect(lineOf(r.stdout, w.waiting)).toContain(`runner ${RUNNER_B}, no usage reported yet`);
+    // No SU is printed next to a runner job, in any of its rows.
+    for (const id of [w.whole, w.partial, w.waiting])
+      expect(lineOf(r.stdout, id)).not.toContain("SU");
+    clean(r);
+  });
+
+  test("list refuses an executor, an accounting class or a runner id that is not one, before anything is sent", async () => {
+    await world();
+    for (const args of [
+      ["--executor", "gpu"],
+      ["--accounting", "free"],
+      ["--runner", "rnr_short"],
+      ["--runner", `rnr_${"A".repeat(24)}`],
+    ]) {
+      const r = await runCli("admin", ["list", ...args]);
+      expect([args, r.exitCode]).toEqual([args, 1]);
+    }
+    expect(seen).toEqual([]);
+  });
+
+  test("list --json prints the Worker's rows, the partial mark included, and nothing else", async () => {
+    const w = await world();
+    const r = await runCli("admin", ["list", "--executor", "runner", "--json"]);
+    expect(r.exitCode).toBe(0);
+    const rows = new Map<string, Record<string, unknown>>(
+      (JSON.parse(r.stdout).jobs as Array<Record<string, unknown>>).map((j) => [String(j.id), j]),
+    );
+    expect(rows.get(w.partial)).toMatchObject({ runner_usage_partial: true });
+    expect(rows.get(w.whole)).toMatchObject({ runner_usage_partial: false });
+    expect(rows.get(w.waiting)).toMatchObject({ runner_usage_partial: null });
+    expect(r.stderr.trim()).toBe("");
+  });
+
+  test("record marks partial usage on the runner-reported line (MUTATION: drop the partial note from the record view)", async () => {
+    const w = await world();
+    const partial = await runCli("admin", ["record", w.partial]);
+    expect(partial.exitCode).toBe(0);
+    expect(partial.stdout).toContain(
+      "runner-reported: wall 300 s, cpu 7200 s, max resident 4096 MB (partial: Docker or Podman)",
+    );
+    const whole = await runCli("admin", ["record", w.whole]);
+    expect(whole.stdout).toContain("runner-reported: wall 120 s, cpu 400 s, max resident 2048 MB");
+    expect(whole.stdout).not.toContain("partial");
+  });
+
+  test("report keeps the SU totals to the Tapis job and gives the runner jobs a line of their own, in runner-reported core-hours (MUTATION: drop the runner branch of the report's job lines, the runner totals line, or the SU word in the report header or pool line)", async () => {
+    const w = await world();
+    const r = await runCli("admin", [
+      "report",
+      "--account",
+      String(w.account),
+      "--from",
+      "2026-10-01",
+      "--to",
+      "2026-10-31",
+    ]);
+    expect(r.exitCode).toBe(0);
+    // The SU line is the Tapis job's alone.
+    expect(r.stdout).toContain("2026-10-31: 1 SU job(s), 1.5 SU charged, 1 not settled");
+    expect(r.stdout).toContain("  cpu: 1 SU job(s), 1.5 SU charged");
+    // The runner jobs, apart: 7600 CPU seconds is 2.111 runner-reported core-hours, one job partial.
+    expect(r.stdout).toContain(
+      "runner jobs (runner-reported, never service units): 3 job(s), 2 with usage reported, wall 420 s, cpu 7600 s, " +
+        "2.111 runner-reported core-hours; usage of 1 job(s) is a lower bound (partial: Docker or Podman)",
+    );
+    // Each runner job's line carries its usage and no SU; only the Tapis job's line has SU.
+    expect(lineOf(r.stdout, w.partial)).toContain(
+      `runner ${RUNNER_A}, runner-reported wall 300 s, cpu 7200 s (partial: Docker or Podman)`,
+    );
+    expect(lineOf(r.stdout, w.whole)).toContain("runner-reported wall 120 s, cpu 400 s");
+    expect(lineOf(r.stdout, w.whole)).not.toContain("partial");
+    expect(lineOf(r.stdout, w.waiting)).toContain("no usage reported yet");
+    for (const id of [w.whole, w.partial, w.waiting])
+      expect(lineOf(r.stdout, id)).not.toContain("SU");
+    expect(lineOf(r.stdout, w.tapis)).toContain("1.5 SU");
+    clean(r);
+  });
+
+  test("report --csv leaves a runner job's SU cells empty and adds its runner columns", async () => {
+    const w = await world();
+    const r = await runCli("admin", [
+      "report",
+      "--account",
+      String(w.account),
+      "--from",
+      "2026-10-01",
+      "--to",
+      "2026-10-31",
+      "--csv",
+    ]);
+    expect(r.exitCode).toBe(0);
+    const cell = (id: string) => lineOf(r.stdout, id).split(",");
+    // su_charged, settled and su_held (indexes 7, 8, 9) are empty for a runner job.
+    expect(cell(w.partial).slice(0, 4)).toEqual([
+      w.partial,
+      "2026-10-05 10:00:00",
+      "2026-10-05 10:00:00",
+      "failed",
+    ]);
+    expect(cell(w.partial).slice(7, 10)).toEqual(["", "", ""]);
+    expect(cell(w.partial).slice(11)).toEqual([
+      "runner",
+      "none",
+      RUNNER_A,
+      "300",
+      "7200",
+      "4096",
+      "yes",
+    ]);
+    expect(cell(w.whole).slice(11)).toEqual([
+      "runner",
+      "none",
+      RUNNER_A,
+      "120",
+      "400",
+      "2048",
+      "no",
+    ]);
+    expect(cell(w.waiting).slice(11)).toEqual(["runner", "none", RUNNER_B, "", "", "", ""]);
+    // The Tapis job keeps its SU cells.
+    expect(cell(w.tapis)[7]).toBe("1.5");
+    expect(cell(w.tapis).slice(11)).toEqual(["tapis", "su", "", "", "", "", ""]);
+    expect(r.stderr.trim()).toBe("");
+  });
+
+  test("report --json carries runner_totals and each row's runner usage as the Worker answered", async () => {
+    const w = await world();
+    const r = await runCli("admin", [
+      "report",
+      "--account",
+      String(w.account),
+      "--from",
+      "2026-10-01",
+      "--to",
+      "2026-10-31",
+      "--json",
+    ]);
+    const body = JSON.parse(r.stdout);
+    expect(body.totals).toMatchObject({ jobs: 1, charged_milli: 1500 });
+    expect(body.runner_totals).toEqual({
+      jobs: 3,
+      wall_seconds: 420,
+      cpu_seconds: 7600,
+      core_hours: 2.111,
+      reported_jobs: 2,
+      partial_jobs: 1,
+      unmarked_jobs: 0,
+    });
+    expect(r.stderr.trim()).toBe("");
+  });
+
+  const REPORT_ARGS = (account: number) => [
+    "report",
+    "--account",
+    String(account),
+    "--from",
+    "2026-10-01",
+    "--to",
+    "2026-10-31",
+  ];
+
+  test("cancel on a runner job that ended canceled after its runner reported prints the mark, in text and in JSON (MUTATION: drop the partial note from the record line, or the mark from the cancel answer)", async () => {
+    const partial = runnerJob({
+      runnerId: RUNNER_A,
+      state: "cancelled",
+      usage: { wall: 300, cpu: 7200, rss: 4096, partial: 1 },
+    });
+    const whole = runnerJob({
+      runnerId: RUNNER_A,
+      state: "cancelled",
+      usage: { wall: 120, cpu: 400, rss: 2048, partial: 0 },
+    });
+    const text = await runCli("admin", ["cancel", partial]);
+    expect(text.exitCode).toBe(0);
+    expect(text.stdout).toContain("outcome: already_cancelled");
+    expect(text.stdout).toContain(
+      "runner-reported: wall 300 s, cpu 7200 s, max resident 4096 MB (partial: Docker or Podman)",
+    );
+    const json = await runCli("admin", ["cancel", partial, "--json"]);
+    expect(JSON.parse(json.stdout).job).toMatchObject({ runner_usage_partial: true });
+    const complete = await runCli("admin", ["cancel", whole]);
+    expect(complete.stdout).toContain(
+      "runner-reported: wall 120 s, cpu 400 s, max resident 2048 MB",
+    );
+    expect(complete.stdout).not.toContain("partial");
+    expect(
+      JSON.parse((await runCli("admin", ["cancel", whole, "--json"])).stdout).job,
+    ).toMatchObject({ runner_usage_partial: false });
+  });
+
+  test("usage with no mark is shown as (partial: unknown) in every view, and in the CSV, never as whole (MUTATION: drop the unknown note from partialNote, or the unknown word from the CSV)", async () => {
+    const w = await world();
+    const unmarked = runnerJob({
+      account: w.account,
+      runnerId: RUNNER_A,
+      state: "finished",
+      usage: { wall: 61, cpu: 240, rss: 100, partial: null },
+    });
+    const list = await runCli("admin", ["list", "--runner", RUNNER_A]);
+    expect(lineOf(list.stdout, unmarked)).toContain("cpu 240 s (partial: unknown)");
+    expect(lineOf(list.stdout, w.whole)).not.toContain("partial");
+    const record = await runCli("admin", ["record", unmarked]);
+    expect(record.stdout).toContain("max resident 100 MB (partial: unknown)");
+    const report = await runCli("admin", REPORT_ARGS(w.account));
+    expect(lineOf(report.stdout, unmarked)).toContain("cpu 240 s (partial: unknown)");
+    expect(report.stdout).toContain(
+      "; usage of 1 job(s) is a lower bound (partial: Docker or Podman)" +
+        "; usage of 1 job(s) has no partial mark (partial: unknown)",
+    );
+    const csv = await runCli("admin", [...REPORT_ARGS(w.account), "--csv"]);
+    const cells = lineOf(csv.stdout, unmarked).split(",");
+    expect(cells.slice(11)).toEqual(["runner", "none", RUNNER_A, "61", "240", "100", "unknown"]);
+    // The job that has not reported has no usage and no note, and the whole one has a plain "no".
+    expect(lineOf(csv.stdout, w.waiting).split(",").slice(17)).toEqual([""]);
+    expect(lineOf(csv.stdout, w.whole).split(",").slice(17)).toEqual(["no"]);
+  });
+
+  test("a runner total over jobs that have not reported says so instead of printing zeros (MUTATION: drop the reported count and the no-usage phrase from the runner totals line)", async () => {
+    const tapis = await makeJob(fx);
+    sql.run(
+      "UPDATE compute_jobs SET created_at = '2026-10-05 10:00:00' WHERE id = ?",
+      tapis.job.id,
+    );
+    runnerJob({ account: tapis.accountId, runnerId: RUNNER_B });
+    const r = await runCli("admin", REPORT_ARGS(tapis.accountId));
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain(
+      "runner jobs (runner-reported, never service units): 1 job(s), 0 with usage reported, no usage reported yet",
+    );
+    expect(r.stdout).not.toContain("wall 0 s");
+    expect(r.stdout).not.toContain("0.000");
+  });
+
+  test("a job is shown in service units by its accounting, not its executor, in the CSV, the list and the report lines (MUTATION: key the CSV's SU cells on the executor)", async () => {
+    const tapis = await makeJob(fx);
+    sql.run(
+      "UPDATE compute_jobs SET created_at = '2026-10-05 10:00:00' WHERE id = ?",
+      tapis.job.id,
+    );
+    // A runner job accounted in service units has an SU figure; its runner figures come with it.
+    const accounted = runnerJob({
+      account: tapis.accountId,
+      runnerId: RUNNER_A,
+      state: "finished",
+      usage: { wall: 120, cpu: 400, rss: 2048, partial: 0 },
+      accounting: "su",
+      chargedMilli: 2000,
+    });
+    const csv = await runCli("admin", [...REPORT_ARGS(tapis.accountId), "--csv"]);
+    const cells = lineOf(csv.stdout, accounted).split(",");
+    expect(cells.slice(7, 10)).toEqual(["2", "yes", "0"]);
+    expect(cells.slice(11)).toEqual(["runner", "su", RUNNER_A, "120", "400", "2048", "no"]);
+    const report = await runCli("admin", REPORT_ARGS(tapis.accountId));
+    expect(lineOf(report.stdout, accounted)).toContain(
+      `2 SU, runner ${RUNNER_A}, runner-reported wall 120 s, cpu 400 s`,
+    );
+    const list = await runCli("admin", ["list", "--runner", RUNNER_A]);
+    expect(lineOf(list.stdout, accounted)).toContain(
+      `2 SU, runner ${RUNNER_A}, runner-reported wall 120 s, cpu 400 s`,
+    );
   });
 });

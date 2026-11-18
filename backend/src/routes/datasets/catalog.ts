@@ -1301,6 +1301,7 @@ export function registerCatalogRoutes(datasetRoutes: DatasetsRouter): void {
     }
 
     const minScore = parseMinScore(c);
+    const user = c.get("user");
 
     try {
       const envelope = await executeDatasetSearch(c.env.DB, c.env.AI, c.env.VECTORIZE, {
@@ -1309,6 +1310,11 @@ export function registerCatalogRoutes(datasetRoutes: DatasetsRouter): void {
         limit,
         offset,
         minScore,
+        // The caller's own visibility (GET /datasets/:id's rule). The default
+        // `no-store` above stays on EVERY response, because any of them may now
+        // carry a private row.
+        viewer: user ? { userId: user.id, isAdmin: hasRole(user.role, "admin") } : undefined,
+        vectorMetadataFilter: c.env.VECTORIZE_VISIBILITY_FILTER === "1",
       });
       return c.json(envelope);
     } catch (err) {

@@ -5,11 +5,12 @@
  *   nemar admin compute jobs cancel <id>    cancel a job: at Tapis, or here for a job that never started
  *   nemar admin compute jobs advance <id>   one step: submit a `created` job, or read a submitted one
  *                                           back from Tapis, or give a finished one what it is owed
- *   nemar admin compute jobs list           jobs by flag, state and account; `--unmatched` lists
- *                                           Expanse's rows that no job claims
+ *   nemar admin compute jobs list           jobs by flag, state, account, executor, accounting and
+ *                                           runner; `--unmatched` lists Expanse's rows that no job claims
  *   nemar admin compute jobs record <ref>   one job by NEMAR id, Tapis uuid or Slurm id; with
  *                                           `--identity` or `--spec` and `--reason`, the owner's read
- *   nemar admin compute jobs report         one account's jobs and charge in a date range (`--csv`)
+ *   nemar admin compute jobs report         one account's jobs and charge in a date range (`--csv`);
+ *                                           runner jobs are shown apart, never in service units
  *   nemar admin compute jobs access-report  a quarter's distinct gateway users and jobs (`--csv`)
  *   nemar admin compute jobs hold|release-hold|holds   legal holds on `job:<id>` or `account:<id>`
  *   nemar admin compute jobs access-reports  ACCESS report rows, `failed` ones by their fixed word
@@ -28,17 +29,23 @@
 import { Command } from "commander";
 import {
   COMPUTE_ACCESS_REPORT_STATES,
+  COMPUTE_ACCOUNTING,
+  COMPUTE_EXECUTORS,
   COMPUTE_HOLD_SCOPES,
   COMPUTE_JOB_FLAGS,
   COMPUTE_STATES,
   COMPUTE_WORD_RE,
 } from "../../shared/compute-state.js";
 import {
+  COMPUTE_PARTIAL_USAGE_NOTE,
   COMPUTE_RECORD_REASON_MAX,
   COMPUTE_RECORD_REASON_MIN,
+  COMPUTE_UNKNOWN_PARTIAL_NOTE,
   type ComputeJobAdminResponse,
   type ComputeJobView,
+  runnerMarkNotes,
 } from "../../shared/contract/compute-admin.js";
+import { RUNNER_ID_RE } from "../../shared/contract/compute-runner.js";
 import { COMPUTE_JOB_ID_RE } from "../../shared/contract/compute.js";
 import { formatSu } from "../../shared/contract/compute.js";
 import { failMessage, failWith, requireSignedIn } from "../lib/admin-command.js";
@@ -62,6 +69,40 @@ import { plain } from "../lib/terminal-text.js";
 
 const say = (line: string): void => console.log(line);
 
+/**
+ * The note a runner figure carries. Partial when the runner said so; nothing when it said the usage is whole;
+ * and UNKNOWN when there is usage but no mark (the job completed before the mark was stored, or the Worker
+ * predates it), because a figure with no mark is never shown as complete. No usage, no note.
+ */
+function partialNote(partial: unknown, usagePresent: boolean): string {
+  if (partial === true) return COMPUTE_PARTIAL_USAGE_NOTE;
+  if (partial === false) return "";
+  return usagePresent ? COMPUTE_UNKNOWN_PARTIAL_NOTE : "";
+}
+
+/** How a job is accounted: a service-unit figure is shown for every job except one accounted `none`. */
+const inServiceUnits = (accounting: unknown): boolean => accounting !== "none";
+
+/** A whole number a Worker sent for a runner figure, or `?` when it has not been reported. */
+function figure(value: unknown): string {
+  return typeof value === "number" ? String(value) : "?";
+}
+
+/**
+ * A runner job's own figures as one phrase: the runner-reported usage and its partial mark, never service
+ * units. `usage` is the account report's `runner_usage`; the list view has the same figures on the job.
+ */
+function runnerPhrase(
+  runnerId: unknown,
+  usage: { wall: unknown; cpu: unknown; partial: unknown },
+): string {
+  const who = typeof runnerId === "string" ? `runner ${plain(runnerId)}` : "runner (unclaimed)";
+  if (typeof usage.wall !== "number" && typeof usage.cpu !== "number") {
+    return `${who}, no usage reported yet`;
+  }
+  return `${who}, runner-reported wall ${figure(usage.wall)} s, cpu ${figure(usage.cpu)} s${partialNote(usage.partial, true)}`;
+}
+
 /** The job as lines for a terminal; everything the Worker sent is made plain first. */
 function printJob(res: ComputeJobAdminResponse): void {
   const job: ComputeJobView | null = res.job;
@@ -81,9 +122,25 @@ function printJob(res: ComputeJobAdminResponse): void {
     );
   }
   say(`  partition: ${plain(job.partition)} (${plain(job.pool)})`);
-  say(
-    `  held ${formatSu(job.held_milli)} SU, charged ${formatSu(job.charged_milli)} SU, ${job.settled ? "settled" : "not settled"}`,
-  );
+  if (job.executor === "runner") {
+    // A runner job has no hold and no ledger entry: its usage is the runner's own figure, never SU.
+    say(
+      `  executor: runner, accounting: ${plain(job.accounting ?? "none")} (no hold, no service units)`,
+    );
+    say(
+      `  runner: ${job.runner_id ? plain(job.runner_id) : "none yet"}` +
+        `${job.runner_backend ? ` (${plain(job.runner_backend)})` : ""}` +
+        `${job.runner_claimed_at ? `, claimed ${plain(job.runner_claimed_at)}` : ""}`,
+    );
+    say(
+      `  runner-reported: wall ${job.runner_wall_seconds ?? "?"} s, cpu ${job.runner_cpu_seconds ?? "?"} s, ` +
+        `max resident ${job.runner_max_rss_mb ?? "?"} MB${partialNote(job.runner_usage_partial, typeof job.runner_wall_seconds === "number")}`,
+    );
+  } else {
+    say(
+      `  held ${formatSu(job.held_milli)} SU, charged ${formatSu(job.charged_milli)} SU, ${job.settled ? "settled" : "not settled"}`,
+    );
+  }
   say(`  flags: ${job.flags.length > 0 ? job.flags.map(plain).join(", ") : "none"}`);
   say(
     `  results: upload ${job.outputs_completed ? "complete" : "not complete"}, ` +
@@ -217,9 +274,12 @@ function formatChoice(o: { csv?: boolean; json?: boolean }): boolean {
 
 const LIST_HELP = `
 Lists compute jobs, newest first, with their state, source, partition, pool, charge and flags. Filters
-combine: --flag unreserved|unattributed|mismatch|overrun, --state <state>, --account <id>. A page is at
-most 200 jobs; the last line names the --after value that continues it. --unmatched lists instead the
-rows of Expanse's own accounting (posted by the observer) that no job claims. No identity is shown.
+combine: --flag unreserved|unattributed|mismatch|overrun, --state <state>, --account <id>,
+--executor tapis|runner, --accounting su|none, --runner <runner id>. A runner job shows the runner and
+its runner-reported usage instead of a charge, marked "(partial: Docker or Podman)" when the runner said
+it could not measure all of it. A page is at most 200 jobs; the last line names the --after value that
+continues it. --unmatched lists instead the rows of Expanse's own accounting (posted by the observer)
+that no job claims. No identity is shown.
 
 Admin or owner. --json prints the Worker's answer as it is.
 
@@ -229,10 +289,13 @@ Exit codes:
 
 jobsCommand
   .command("list")
-  .description("List compute jobs by flag, state and account, or Expanse's unmatched rows")
+  .description("List compute jobs by flag, state, account, executor, accounting and runner")
   .option("--flag <name>", `One of ${COMPUTE_JOB_FLAGS.join(", ")}`)
   .option("--state <state>", `One of ${COMPUTE_STATES.join(", ")}`)
   .option("--account <id>", "Only this account's jobs")
+  .option("--executor <word>", `Who runs the job: ${COMPUTE_EXECUTORS.join(" or ")}`)
+  .option("--accounting <word>", `How it is accounted for: ${COMPUTE_ACCOUNTING.join(" or ")}`)
+  .option("--runner <id>", "Only the jobs this runner claimed (rnr_ and 24 hexadecimal digits)")
   .option("--limit <n>", "Jobs per page, 1 to 200", "50")
   .option("--after <n>", "Continue after this page's last row")
   .option("--unmatched", "List Expanse's rows that no job claims")
@@ -243,6 +306,9 @@ jobsCommand
       flag?: string;
       state?: string;
       account?: string;
+      executor?: string;
+      accounting?: string;
+      runner?: string;
       limit: string;
       after?: string;
       unmatched?: boolean;
@@ -256,6 +322,33 @@ jobsCommand
       }
       if (o.state !== undefined && !(COMPUTE_STATES as readonly string[]).includes(o.state)) {
         failMessage(`--state is one of ${COMPUTE_STATES.join(", ")}.`, { json, answered: true });
+        return;
+      }
+      if (
+        o.executor !== undefined &&
+        !(COMPUTE_EXECUTORS as readonly string[]).includes(o.executor)
+      ) {
+        failMessage(`--executor is one of ${COMPUTE_EXECUTORS.join(", ")}.`, {
+          json,
+          answered: true,
+        });
+        return;
+      }
+      if (
+        o.accounting !== undefined &&
+        !(COMPUTE_ACCOUNTING as readonly string[]).includes(o.accounting)
+      ) {
+        failMessage(`--accounting is one of ${COMPUTE_ACCOUNTING.join(", ")}.`, {
+          json,
+          answered: true,
+        });
+        return;
+      }
+      if (o.runner !== undefined && !RUNNER_ID_RE.test(o.runner)) {
+        failMessage("--runner is a runner id: rnr_ and 24 lowercase hexadecimal digits.", {
+          json,
+          answered: true,
+        });
         return;
       }
       const limit = wholeOption(o.limit, "--limit", json, 200);
@@ -283,6 +376,9 @@ jobsCommand
           flag: o.flag,
           state: o.state,
           account,
+          executor: o.executor,
+          accounting: o.accounting,
+          runner: o.runner,
           limit,
           after,
         });
@@ -294,7 +390,20 @@ jobsCommand
         for (const j of res.jobs) {
           say(
             `${plain(j.id)}  ${plain(j.state).padEnd(10)} ${plain(j.source).padEnd(8)} ${plain(j.partition)}/${plain(j.pool)}  ` +
-              `${formatSu(j.charged_milli)} SU${j.settled ? "" : " (not settled)"}  ` +
+              `${[
+                inServiceUnits(j.accounting)
+                  ? `${formatSu(j.charged_milli)} SU${j.settled ? "" : " (not settled)"}`
+                  : "",
+                j.executor === "runner"
+                  ? runnerPhrase(j.runner_id, {
+                      wall: j.runner_wall_seconds,
+                      cpu: j.runner_cpu_seconds,
+                      partial: j.runner_usage_partial,
+                    })
+                  : "",
+              ]
+                .filter((part) => part !== "")
+                .join(", ")}  ` +
               `${j.flags.length > 0 ? `[${j.flags.map(plain).join(",")}]  ` : ""}${plain(j.created_at)}`,
           );
         }
@@ -430,9 +539,17 @@ function recordAbsence(status: string | undefined): string {
 const REPORT_HELP = `
 One account's jobs created from --from to the end of --to (dates, YYYY-MM-DD), the SU they were charged
 by pool, and one line for each job. --csv prints the lines as comma-separated values (id, created, ended,
-state, partition, pool, source, SU charged, settled, SU still held, flags) and nothing else. A job that is
-not settled yet has charged nothing so far and still holds SU: the totals count those jobs and the SU they
-hold, so a running account does not look cheaper than it is. No identity is shown.
+state, partition, pool, source, SU charged, settled, SU still held, flags, then executor, accounting, runner
+and the runner-reported wall seconds, CPU seconds, largest resident memory and partial mark) and nothing
+else. A job that is not settled yet has charged nothing so far and still holds SU: the totals count those
+jobs and the SU they hold, so a running account does not look cheaper than it is.
+
+A job a runner ran is accounted by the runner's own measurements, never in SU: the SU totals count the jobs
+accounted in SU only, a line of its own gives the runner jobs, their wall and CPU seconds and their
+runner-reported core-hours (CPU seconds over 3600, rounded down to three decimals), and a runner job's line
+shows its usage and no SU (its SU cells in the CSV are empty). Usage the runner marked partial (Docker or
+Podman could not measure all of it) is marked "(partial: Docker or Podman)", and the runner totals say how
+many jobs are partial, so the sums are a lower bound. No identity is shown.
 
 Exit codes:
   0  reported.
@@ -485,39 +602,97 @@ jobsCommand
               "settled",
               "su_held",
               "flags",
+              "executor",
+              "accounting",
+              "runner_id",
+              "runner_wall_seconds",
+              "runner_cpu_seconds",
+              "runner_max_rss_mb",
+              "runner_usage_partial",
             ],
-            ...jobs.map((j) => [
-              String(j.id),
-              String(j.created_at),
-              j.ended_at === null ? "" : String(j.ended_at),
-              String(j.state),
-              String(j.partition),
-              String(j.pool),
-              String(j.source),
-              formatSu(Number(j.charged_milli)),
-              j.settled === false ? "no" : "yes",
-              formatSu(Number(j.open_hold_milli ?? 0)),
-              Array.isArray(j.flags) ? j.flags.join(" ") : "",
-            ]),
+            ...jobs.map((j) => {
+              // A job accounted `none` has no SU, as the Worker's totals count it: its three SU cells are
+              // empty, never a zero. The runner columns follow the executor.
+              const noSu = !inServiceUnits(j.accounting);
+              const usage = (j.executor === "runner" ? j.runner_usage : null) as Record<
+                string,
+                unknown
+              > | null;
+              return [
+                String(j.id),
+                String(j.created_at),
+                j.ended_at === null ? "" : String(j.ended_at),
+                String(j.state),
+                String(j.partition),
+                String(j.pool),
+                String(j.source),
+                noSu ? "" : formatSu(Number(j.charged_milli)),
+                noSu ? "" : j.settled === false ? "no" : "yes",
+                noSu ? "" : formatSu(Number(j.open_hold_milli ?? 0)),
+                Array.isArray(j.flags) ? j.flags.join(" ") : "",
+                typeof j.executor === "string" ? j.executor : "",
+                typeof j.accounting === "string" ? j.accounting : "",
+                typeof j.runner_id === "string" ? j.runner_id : "",
+                typeof usage?.wall_seconds === "number" ? usage.wall_seconds : "",
+                typeof usage?.cpu_seconds === "number" ? usage.cpu_seconds : "",
+                typeof usage?.max_rss_mb === "number" ? usage.max_rss_mb : "",
+                usage?.partial === true
+                  ? "yes"
+                  : usage?.partial === false
+                    ? "no"
+                    : typeof usage?.wall_seconds === "number"
+                      ? "unknown"
+                      : "",
+              ];
+            }),
           ]);
           return;
         }
         say(
-          `account ${res.account_id}, ${plain(res.from)} to ${plain(res.to)}: ${res.totals.jobs} job(s), ${formatSu(res.totals.charged_milli)} SU charged${unsettledNote(res.totals)}`,
+          `account ${res.account_id}, ${plain(res.from)} to ${plain(res.to)}: ${res.totals.jobs} SU job(s), ${formatSu(res.totals.charged_milli)} SU charged${unsettledNote(res.totals)}`,
         );
         for (const [pool, t] of Object.entries(res.by_pool)) {
           const row = t as Record<string, unknown>;
           say(
-            `  ${plain(pool)}: ${Number(row.jobs)} job(s), ${formatSu(Number(row.charged_milli))} SU charged${unsettledNote(row)}`,
+            `  ${plain(pool)}: ${Number(row.jobs)} SU job(s), ${formatSu(Number(row.charged_milli))} SU charged${unsettledNote(row)}`,
+          );
+        }
+        const runnerTotals = res.runner_totals;
+        if (runnerTotals !== undefined && runnerTotals.jobs > 0) {
+          // Apart from the SU above, and never added to it.
+          // A zero sum over jobs that have not reported is not zero usage, so the count that reported is said.
+          const reported = runnerTotals.reported_jobs;
+          say(
+            `  runner jobs (runner-reported, never service units): ${runnerTotals.jobs} job(s), ` +
+              `${reported === undefined ? "" : `${reported} with usage reported, `}` +
+              `${
+                reported === 0
+                  ? "no usage reported yet"
+                  : `wall ${runnerTotals.wall_seconds} s, cpu ${runnerTotals.cpu_seconds} s, ` +
+                    `${runnerTotals.core_hours.toFixed(3)} runner-reported core-hours`
+              }${runnerMarkNotes(runnerTotals)}`,
           );
         }
         for (const j of jobs) {
+          // The SU figure is for a job accounted in SU; the runner's figures for a job a runner ran. A job
+          // accounted `none` never has an SU figure next to it.
           const note =
             j.settled === false
               ? `  (not settled, ${formatSu(Number(j.open_hold_milli ?? 0))} SU held)`
               : "";
+          const usage = (j.runner_usage ?? {}) as Record<string, unknown>;
+          const parts = [
+            inServiceUnits(j.accounting) ? `${formatSu(Number(j.charged_milli))} SU${note}` : "",
+            j.executor === "runner"
+              ? runnerPhrase(j.runner_id, {
+                  wall: usage.wall_seconds,
+                  cpu: usage.cpu_seconds,
+                  partial: usage.partial,
+                })
+              : "",
+          ].filter((part) => part !== "");
           say(
-            `  ${plain(String(j.id))}  ${plain(String(j.state))}  ${plain(String(j.partition))}  ${formatSu(Number(j.charged_milli))} SU${note}  ${plain(String(j.created_at))}`,
+            `  ${plain(String(j.id))}  ${plain(String(j.state))}  ${plain(String(j.partition))}  ${parts.join(", ")}  ${plain(String(j.created_at))}`,
           );
         }
         if (res.truncated) say("  (the list is cut at 5,000 jobs; narrow the range)");

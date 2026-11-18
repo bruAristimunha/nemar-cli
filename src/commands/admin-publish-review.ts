@@ -1,10 +1,10 @@
 /**
- * `nemar admin publish show | start`: the automated review of a publication request, from the
+ * `nemar admin repo publish show | start`: the automated review of a publication request, from the
  * administrator's side (ADR 0102, section 8).
  *
- *   nemar admin publish show <ds>            the review of the active request, in the Worker's words
- *   nemar admin publish start <ds>           start the review of the current screened commit
- *   nemar admin publish start --all          start every review that can be started
+ *   nemar admin repo publish show <ds>            the review of the active request, in the Worker's words
+ *   nemar admin repo publish start <ds>           start the review of the current screened commit
+ *   nemar admin repo publish start --all          start every review that can be started
  *
  * Registered on the `publish` group by `admin-publish.ts`. Every sentence about a review comes
  * from the Worker (`describePublicationReview`), and `publication-review-display.ts` prints it;
@@ -65,8 +65,8 @@ Description:
   never make it. Whether a README names the depositors is not assessed.
 
 Examples:
-  $ nemar admin publish show nm000480
-  $ nemar admin publish show nm000480 --json`,
+  $ nemar admin repo publish show nm000480
+  $ nemar admin repo publish show nm000480 --json`,
     )
     .action(async (datasetArg: string, options: { json?: boolean }) => {
       const json = options.json === true;
@@ -105,7 +105,7 @@ Description:
   Start the review of the request's current screened commit, or start again one
   that was declined, ended in an error, never reported or is past its deadline.
   A review that is running or has reported is not started again. The review runs
-  in the background; read it with 'nemar admin publish show <dataset-id>'.
+  in the background; read it with 'nemar admin repo publish show <dataset-id>'.
 
   The review needs a screen result to read, so a request whose identifier screen
   has not reported is not startable until it has. The Worker also refuses a
@@ -126,9 +126,9 @@ Exit status:
   not started, failed or was not tried.
 
 Examples:
-  $ nemar admin publish start nm000480
-  $ nemar admin publish start --all --dry-run
-  $ nemar admin publish start --all --yes`,
+  $ nemar admin repo publish start nm000480
+  $ nemar admin repo publish start --all --dry-run
+  $ nemar admin repo publish start --all --yes`,
     )
     .action(
       async (
@@ -149,7 +149,7 @@ Examples:
           failMessage("Give a dataset id, or --all.", {
             json,
             answered: true,
-            hint: "nemar admin publish start nm000480",
+            hint: "nemar admin repo publish start nm000480",
           });
           return;
         }
@@ -228,7 +228,9 @@ async function startOne(datasetId: string, json: boolean): Promise<void> {
         return;
       }
       console.log(chalk.green(startedSentence(answer.body.reason, datasetId)));
-      console.log(chalk.dim(`  nemar admin publish show ${datasetId}   read it when it reports`));
+      console.log(
+        chalk.dim(`  nemar admin repo publish show ${datasetId}   read it when it reports`),
+      );
       if (answer.body.environment !== "production") {
         console.log(chalk.yellow(`  ${NON_PRODUCTION_NOTE}`));
       }

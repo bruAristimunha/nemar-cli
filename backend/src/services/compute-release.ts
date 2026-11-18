@@ -92,9 +92,11 @@ const RELEASED: ComputeLedgerReason = "released";
 
 /**
  * The job rows step 2 may end, as a WHERE term over `compute_jobs` (no alias): the account's, not yet at
- * Tapis, with no launch specification written and no live submit lease. `?` the account.
+ * Tapis, with no launch specification written and no live submit lease. `?` the account. A runner job is
+ * not at Tapis and not this step's (it has no hold to release): its cancel intent is recorded by step 1 and
+ * carried to its runner, and ending it here would end work a runner may be doing (ADR 0121).
  */
-const NEVER_REACHED_TAPIS = `account_id = ? AND source <> 'partner'
+const NEVER_REACHED_TAPIS = `account_id = ? AND source <> 'partner' AND executor = 'tapis'
     AND state IN ('created', 'uploading') AND tapis_uuid IS NULL AND launch_spec_digest IS NULL
     AND (submit_claimed_at IS NULL
          OR submit_claimed_at < datetime('now', '-${SUBMIT_LEASE_MINUTES} minutes'))`;

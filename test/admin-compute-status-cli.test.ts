@@ -22,6 +22,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "bun";
+import { putPolicy } from "../backend/src/services/compute-policy";
 import { __resetTapisTokenCacheForTests } from "../backend/src/services/tapis/auth";
 import {
   COMPUTE_KEYS,
@@ -30,8 +31,9 @@ import {
   makeComputeApp,
   seedComputeUsers,
 } from "../backend/test/helpers/compute-app";
-import { freshDb } from "../backend/test/helpers/d1";
+import { freshDb, realD1 } from "../backend/test/helpers/d1";
 import { type TapisStandin, startTapisStandin } from "../backend/test/helpers/tapis-standin";
+import { DEFAULT_COMPUTE_POLICY } from "../shared/contract/compute";
 import { ComputeStatusResponseSchema } from "../shared/contract/compute-admin";
 
 const CLI_ENTRY = join(import.meta.dir, "..", "src", "index.ts");
@@ -76,6 +78,7 @@ const server = Bun.serve({
       body.prerequisites = undefined;
       body.reconciliation = undefined;
       body.attention = undefined;
+      body.tenant = undefined;
       return Response.json(body, { status: res.status });
     }
     return res;
@@ -182,6 +185,85 @@ function expectNoSecrets(r: Ran) {
 }
 
 describe("status", () => {
+  /** A live job of `source` straight into the Worker's database (the columns a row needs). */
+  const liveJob = (n: number, source: string, extra = "") => {
+    const owner = (
+      db.query("SELECT id FROM users WHERE username = 'cmp-owner'").get() as { id: number }
+    ).id;
+    db.run(
+      `INSERT INTO compute_jobs (id, account_id, source, kind, app_id, app_version, spec_digest,
+                                 partition, pool, nodes, cores_per_node, minutes, state ${extra.split("=>")[0]})
+       VALUES (?, ?, ?, 'batch', 'a', '1', ?, 'shared', 'cpu', 1, 1, 1, 'running' ${extra.split("=>")[1] ?? ""})`,
+      [`job_${String(n).padStart(24, "0")}`, owner, source, "a".repeat(64)],
+    );
+  };
+
+  test("prints the tenant ceiling: occupied of the ceiling, by class", async () => {
+    liveJob(1, "pipeline");
+    liveJob(2, "pipeline");
+    liveJob(3, "cli");
+    liveJob(4, "web");
+    liveJob(5, "partner", ", flag_unreserved=>, 1");
+    const r = await runCli("admin", ["status"]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("Tenant: 5/20 (people 2, pipelines 2, partner 0, other 1)");
+    expect(r.stdout).not.toContain("tenant_over_ceiling");
+    const j = await runCli("admin", ["status", "--json"]);
+    expect(JSON.parse(j.stdout).tenant).toEqual({
+      ceiling: 20,
+      occupied: 5,
+      by_class: { people: 2, pipelines: 2, partner: 0, other: 1 },
+      reserved: { people: 8, pipelines: 2, partner: 0 },
+    });
+  });
+
+  test("a count above the owner's ceiling is an attention line", async () => {
+    const owner = (
+      db.query("SELECT id FROM users WHERE username = 'cmp-owner'").get() as { id: number }
+    ).id;
+    const put = await putPolicy(
+      realD1(db),
+      owner,
+      {
+        ...DEFAULT_COMPUTE_POLICY,
+        tenant: { maxLiveJobs: 1, reserved: { people: 0, pipelines: 0, partner: 0 } },
+      },
+      null,
+    );
+    expect(put.ok).toBe(true);
+    liveJob(1, "pipeline");
+    liveJob(2, "partner", ", flag_unreserved=>, 1");
+    const r = await runCli("admin", ["status"]);
+    expect(r.stdout).toContain("Tenant: 2/1 (people 0, pipelines 1, partner 0, other 1)");
+    expect(r.stdout).toContain("Attention: tenant_over_ceiling 1");
+  });
+
+  test("an unreadable owner policy is said, with what it means, and the Tenant line is absent", async () => {
+    const owner = (
+      db.query("SELECT id FROM users WHERE username = 'cmp-owner'").get() as { id: number }
+    ).id;
+    db.run("INSERT INTO compute_policy (policy_json, set_by) VALUES (?, ?)", [
+      JSON.stringify({
+        ...DEFAULT_COMPUTE_POLICY,
+        tenant: { maxLiveJobs: 1, reserved: { people: 1, pipelines: 1, partner: 1 } },
+      }),
+      owner,
+    ]);
+    const r = await runCli("admin", ["status"]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain(
+      "Attention: policy_unreadable 1 (the stored owner policy cannot be read",
+    );
+    expect(r.stdout).not.toContain("Tenant:");
+  });
+
+  test("a Worker from before the tenant block prints no Tenant line", async () => {
+    olderWorker = true;
+    const r = await runCli("admin", ["status"]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).not.toContain("Tenant:");
+  });
+
   test("an unconfigured Worker prints `unconfigured` and exits 0", async () => {
     const r = await runCli("admin", ["status"]);
     expect(r.exitCode).toBe(0);
@@ -326,6 +408,48 @@ describe("status", () => {
     expect(r.stdout).toContain("Attention: cancel_pending_failed 1");
     expect(r.stdout).toContain("Attention: copy_abandoned 1");
     expect(r.stdout).not.toContain("Attention: access_reports_failed");
+  });
+
+  test("the two runner attention words are printed with what they mean when positive, and not otherwise (MUTATION: drop either hint, or the executor term of the Worker's count)", async () => {
+    configuredWorker({});
+    const quiet = await runCli("owner", ["status"]);
+    expect(quiet.stdout).not.toContain("runner_cancel_pending_failed");
+    expect(quiet.stdout).not.toContain("runner_copy_abandoned");
+    const insert = (id: string, cols: string, vals: string) =>
+      db.run(
+        `INSERT INTO compute_jobs (id, source, kind, app_id, app_version, spec_digest, partition, pool, nodes, cores_per_node, minutes, executor, accounting, ${cols})
+         VALUES (?, 'pipeline', 'batch', 'a', '1', ?, 'shared', 'cpu', 1, 1, 1, 'runner', 'none', ${vals})`,
+        [id, "a".repeat(64)],
+      );
+    insert(
+      "job_0000000000000000000000e1",
+      "state, cancel_requested_at",
+      "'running', datetime('now', '-61 minutes')",
+    );
+    insert(
+      "job_0000000000000000000000e2",
+      "state, ended_at, settled_provisional_at",
+      "'finished', datetime('now', '-5 days'), datetime('now', '-5 days')",
+    );
+    insert(
+      "job_0000000000000000000000e3",
+      "state, created_at",
+      "'created', datetime('now', '-130 minutes')",
+    );
+    const r = await runCli("owner", ["status"]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain(
+      "Attention: runner_records_unwritten 1 (a waiting runner job's records never landed",
+    );
+    expect(r.stdout).toContain(
+      "Attention: runner_cancel_pending_failed 1 (a runner job's recorded cancel",
+    );
+    expect(r.stdout).toContain(
+      "Attention: runner_copy_abandoned 1 (a terminal runner job's launcher files",
+    );
+    // The Tapis words are about Tapis rows only.
+    expect(r.stdout).not.toContain("Attention: cancel_pending_failed");
+    expect(r.stdout).not.toContain("Attention: copy_abandoned");
   });
 
   test("the runtime image: its digest when valid, a plain word when set to something that is not a pinned reference, and never the reference", async () => {

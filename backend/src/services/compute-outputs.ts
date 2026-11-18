@@ -73,10 +73,15 @@ import { declaredKey, declaredText, firstIncomplete, readDeclared } from "./comp
  * (round 1 of #2041): a follow-up claim is bytes in the bucket like any other, and a launcher that could
  * declare any size there would not be held to the platform's limit at all. Each launcher file is also
  * capped on its own (`launcherFileCap`).
+ *
+ * `?7` and `?8` are the LEASE a runner job's caller proved (ADR 0121, at most once acceptance): `?7` is 1 for
+ * a job that is not a Tapis job and `?8` the lease id the route checked against the header; the row must
+ * STILL hold that lease (`IS`, so a cleared one is no match), so a request that passed the route's check
+ * before the lease was released or revoked changes nothing. A Tapis job binds 0 and NULL.
  */
 export const CLAIM_RESULTS_BYTES_SQL = `UPDATE compute_jobs SET results_bytes = ?2
   WHERE id = ?1 AND results_bytes IS NULL AND outputs_completed_at IS NULL
-    AND state NOT IN (${TERMINAL_STATES_SQL})
+    AND state NOT IN (${TERMINAL_STATES_SQL}) AND (?7 = 0 OR lease_id IS ?8)
     AND (?3 = 1 OR account_id IS NULL OR (SELECT COALESCE(SUM(o.results_bytes), 0) FROM compute_jobs o
          WHERE o.account_id = compute_jobs.account_id AND o.id <> compute_jobs.id
            AND o.results_bytes IS NOT NULL
@@ -85,13 +90,27 @@ export const CLAIM_RESULTS_BYTES_SQL = `UPDATE compute_jobs SET results_bytes = 
           WHERE o.id <> compute_jobs.id AND o.results_bytes IS NOT NULL
             AND (o.ended_at IS NULL OR o.ended_at > datetime('now', ?4))) + ?2 <= ?6`;
 
-/** A refusal records itself as the job's `failure_detail`, once: `?1` the job, `?2` the word. */
+/**
+ * A refusal records itself as the job's `failure_detail`, once: `?1` the job, `?2` the word, `?3` and `?4` the
+ * lease of a runner job as in {@link CLAIM_RESULTS_BYTES_SQL} (`?3` 1 for a non-Tapis job, `?4` the lease).
+ */
 export const RECORD_REFUSAL_SQL = `UPDATE compute_jobs SET failure_detail = ?2
-  WHERE id = ?1 AND failure_detail IS NULL AND state NOT IN (${TERMINAL_STATES_SQL})`;
+  WHERE id = ?1 AND failure_detail IS NULL AND state NOT IN (${TERMINAL_STATES_SQL})
+    AND (?3 = 0 OR lease_id IS ?4)`;
 
-/** The launcher completed: once, and only while the job is live. `?1` the job. */
+/**
+ * The launcher completed: once, and only while the job is live. `?1` the job, `?2` and `?3` the lease of a
+ * runner job as in {@link CLAIM_RESULTS_BYTES_SQL} (`?2` 1 for a non-Tapis job, `?3` the lease).
+ */
 export const COMPLETE_OUTPUTS_SQL = `UPDATE compute_jobs SET outputs_completed_at = datetime('now')
-  WHERE id = ?1 AND outputs_completed_at IS NULL AND state NOT IN (${TERMINAL_STATES_SQL})`;
+  WHERE id = ?1 AND outputs_completed_at IS NULL AND state NOT IN (${TERMINAL_STATES_SQL})
+    AND (?2 = 0 OR lease_id IS ?3)`;
+
+/** The lease a runner job's caller proved, as the two binds of the statements above: `[flag, lease]`. */
+const leaseBinds = (job: Pick<ComputeJobRow, "executor" | "lease_id">): [number, string | null] => [
+  job.executor === "tapis" ? 0 : 1,
+  job.lease_id ?? null,
+];
 
 /**
  * The most bytes the launcher's log may declare: 16 MiB. The records keep the first 5 MiB of it
@@ -164,7 +183,9 @@ async function refuseAndRecord(
   job: ComputeJobRow,
   code: "too_many_outputs" | "results_too_large" | "results_quota_exceeded",
 ): Promise<OutputsResult> {
-  await env.DB.prepare(RECORD_REFUSAL_SQL).bind(job.id, code).run();
+  await env.DB.prepare(RECORD_REFUSAL_SQL)
+    .bind(job.id, code, ...leaseBinds(job))
+    .run();
   console.warn(`[compute-outputs] refused job=${job.id} code=${code}`);
   const launcher = await presignLauncher(env, job.id);
   return launcher === null
@@ -244,12 +265,17 @@ export async function handleOutputs(
       `-${policy.retention.resultsDays} days`,
       policy.resultLimits.maxStoredBytesPerPerson,
       policy.resultLimits.maxStoredBytesTotal,
+      ...leaseBinds(job),
     )
     .run();
   const text = declaredText(job.id, outputs, launcher);
   if ((claimed.meta?.changes ?? 0) !== 1) {
     const now = await getJob(env.DB, job.id);
     if (!now || TERMINAL_COMPUTE_STATES.includes(now.state as never)) return refuse("bad_state");
+    // A runner job whose lease is no longer the one this request proved belongs to another holder: this
+    // request is stale. It records nothing (a refusal written here would land under the NEW lease and count
+    // against the new holder's job) and presigns nothing.
+    if (job.executor !== "tapis" && now.lease_id !== job.lease_id) return refuse("bad_state");
     if (now.results_bytes === null) return refuseAndRecord(env, now, "results_quota_exceeded");
     // Claimed already: a replay is the same declaration, and only that.
     const same = now.results_bytes === total && (await declaredMatches(bucket, job.id, text));
@@ -320,7 +346,9 @@ export async function handleComplete(env: Bindings, job: ComputeJobRow): Promise
       code: "results_incomplete",
     };
   }
-  const wrote = await env.DB.prepare(COMPLETE_OUTPUTS_SQL).bind(job.id).run();
+  const wrote = await env.DB.prepare(COMPLETE_OUTPUTS_SQL)
+    .bind(job.id, ...leaseBinds(job))
+    .run();
   if ((wrote.meta?.changes ?? 0) === 1) return { ok: true, status: 200, replayed: false };
   const now = await getJob(env.DB, job.id);
   if (now?.outputs_completed_at != null) return { ok: true, status: 200, replayed: true };

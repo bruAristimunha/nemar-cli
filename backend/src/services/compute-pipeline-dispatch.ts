@@ -75,10 +75,14 @@ import { isExactProduction } from "./repull-switches.js";
 export const CRON_DISPATCH_PER_TICK = COMPUTE_PIPELINE_RUN_PER_INVOCATION;
 
 /** The refusals that would repeat for every recipe and every pool: they end the run. */
-const ENDS_THE_RUN: ReadonlySet<PipelineRefusal> = new Set<PipelineRefusal>([
+export const ENDS_THE_RUN: ReadonlySet<PipelineRefusal> = new Set<PipelineRefusal>([
   "compute_disabled",
   "runtime_unavailable",
   "pipelines_account_missing",
+  // No Tapis job can be submitted from this Worker, whatever the recipe or the pool.
+  "tapis_unconfigured",
+  // The tenant ceiling does not depend on the pool or the recipe: no other recipe would be admitted.
+  "platform_busy",
 ]);
 
 export type RecipeSkip =

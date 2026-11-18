@@ -13,6 +13,8 @@
  *                                                         reporting, legal holds and ACCESS reports (phase A7, #2012; the same file)
  *   nemar admin compute observer mint [--json]            mint the observer's one-hour token (admin)
  *   nemar admin compute pipeline run|status ...           run NEMAR's own recipes, or read their stamps (admin; src/commands/admin-compute-pipeline.ts)
+ *   nemar admin compute runners register|list|revoke ...  the machines that run jobs for NEMAR (owner; src/commands/admin-compute-runners.ts)
+ *   nemar admin compute derivatives list|show|promote|sync ...  the derivative store of pipeline products (admin; published: owner; src/commands/admin-compute-derivatives.ts)
  *
  * Amounts are service units (SU) as plain decimals with at most three places (`12.5`), and are sent
  * as whole thousandths. Every write sends one fresh `Idempotency-Key`, so within one invocation the
@@ -61,8 +63,10 @@ import {
   putComputePolicy,
 } from "../lib/api/compute.js";
 import { plain } from "../lib/terminal-text.js";
+import { derivativesCommand } from "./admin-compute-derivatives.js";
 import { jobsCommand, observerCommand } from "./admin-compute-jobs.js";
 import { pipelineCommand } from "./admin-compute-pipeline.js";
+import { runnersCommand } from "./admin-compute-runners.js";
 
 const ACCOUNT_RE = /^[1-9][0-9]{0,14}$/;
 const POLICY_FILE_MAX_BYTES = 256 * 1024;
@@ -73,6 +77,20 @@ const NOTE_MAX = 500;
 // ---------------------------------------------------------------------------------------------
 
 const su = (milli: number) => formatSu(milli);
+
+/** What an attention count means, for the words that need a sentence (fixed text: the Worker's value is never echoed). */
+const ATTENTION_HINTS: Readonly<Record<string, string>> = {
+  policy_unreadable:
+    " (the stored owner policy cannot be read: every hold, run and limit fails closed until a valid version is written)",
+  runner_cancel_pending_failed:
+    " (a runner job's recorded cancel is over an hour old and its runner has not taken it: revoke the runner, or the lease sweep ends it once the lease is not current)",
+  runner_copy_abandoned:
+    " (a terminal runner job's launcher files were never copied into the records and no longer will be)",
+  runner_records_unwritten:
+    " (a waiting runner job's records never landed and the lease sweep has neither replayed nor ended it: the sweep is not running or is starved)",
+  runner_waiting_stale:
+    " (a runner job has waited unclaimed for over a day: no runner of its pool is polling, or none has room for it)",
+};
 
 /** One pool on one line, in SU. Everything the Worker sent is made plain first. */
 function poolLine(p: ComputePoolView): string {
@@ -182,6 +200,14 @@ itself. While no version has been set it shows the default and says so. It chang
 answer is read with an open schema, so keys the Worker has added since this CLI was released are
 shown too.
 
+The "tenant" key is NEMAR's ceiling on live jobs: { maxLiveJobs, reserved: { people, pipelines,
+partner } }. maxLiveJobs is the most jobs NEMAR holds at once (0 admits nothing new: a paused
+platform, and running jobs finish); each reserved number is a floor kept for that class that no
+other class may use, and the three floors must not add up to more than maxLiveJobs. A policy
+without the key uses the default (20, with floors 8, 2 and 0), never "no limit". The pipelines'
+own caps (pipelines.maxLiveJobs) are in effect bounded by the ceiling less the people and partner
+floors, and by what else occupies slots.
+
 Owner only. --json prints the Worker's answer as it is.
 
 Exit codes:
@@ -193,6 +219,11 @@ Writes the next version of the compute policy from a JSON file (the whole policy
 --json\` prints it under "policy"). The file is checked here with the strict policy schema first and
 the Worker checks it again: a mistyped or unknown key is refused, never dropped, and a file that is
 not a policy sends nothing. Every version is kept; the highest is in force. The write is audited.
+
+The "tenant" key ({ maxLiveJobs, reserved: { people, pipelines, partner } }) is NEMAR's ceiling on
+live jobs. The floors under "reserved" must not add up to more than maxLiveJobs, or the file is
+refused; maxLiveJobs of 0 admits no new job (running jobs finish). A file without the key keeps the
+default ceiling of 20, never "no limit".
 
 Owner only. --note records why (1 to 500 characters).
 
@@ -566,7 +597,13 @@ a tenant name or a username.
              pipelines service account is approved, whether an owner policy exists, and whether the
              people and pipelines platform pools have a grant; each is yes or no, never a value
   reconciliation whether the tenant sweep is paused, which it is while compute is off
-  attention  counts of things that need a person to look (for example ACCESS reports that failed)
+  tenant     the ceiling on live jobs and how many slots are occupied, by class (people, pipelines,
+             partner, other); other is jobs NEMAR did not admit, and a count above the ceiling (a job
+             NEMAR did not admit, or a ceiling lowered below what is live) appears as the
+             attention count tenant_over_ceiling
+  attention  counts of things that need a person to look (for example ACCESS reports that failed,
+             or policy_unreadable when the stored owner policy cannot be read, which stops every
+             hold, run and limit until a valid version is written)
   runtime image whether the runtime image variable is set, whether it is a digest-pinned reference,
              and its digest (never the reference); a python job is not submitted until it is valid
 
@@ -624,8 +661,17 @@ function printStatus(res: ComputeStatusResponse): void {
       "Reconciliation paused: compute is off, so the tenant sweep does not run (no final settlement against Expanse, no failed ACCESS report listing, and no following of jobs nobody reserved)",
     );
   }
+  const tenant = res.tenant;
+  if (tenant !== undefined) {
+    const c = tenant.by_class;
+    say(
+      `Tenant: ${tenant.occupied}/${tenant.ceiling} (people ${c.people}, pipelines ${c.pipelines}, partner ${c.partner}, other ${c.other})`,
+    );
+  }
   for (const [word, n] of Object.entries(res.attention ?? {})) {
-    if (typeof n === "number" && n > 0) say(`Attention: ${plain(word)} ${n}`);
+    if (typeof n === "number" && n > 0) {
+      say(`Attention: ${plain(word)} ${n}${ATTENTION_HINTS[word] ?? ""}`);
+    }
   }
   say("Runtime image");
   const image = res.runtime_image;
@@ -659,7 +705,7 @@ const statusCommand = new Command("status")
   });
 
 export const computeCommand = new Command("compute").description(
-  "The compute gateway: the owner policy, the SU allocation pools, status, jobs and their reports, legal holds, the pipeline and the observer's token (ADR 0118)",
+  "The compute gateway: the owner policy, the SU allocation pools, status, jobs and their reports, legal holds, the pipeline, the observer's token (ADR 0118), the runner registry and the derivative store (ADR 0123)",
 );
 
 computeCommand.addCommand(policyCommand);
@@ -668,3 +714,5 @@ computeCommand.addCommand(statusCommand);
 computeCommand.addCommand(observerCommand);
 computeCommand.addCommand(jobsCommand);
 computeCommand.addCommand(pipelineCommand);
+computeCommand.addCommand(runnersCommand);
+computeCommand.addCommand(derivativesCommand);

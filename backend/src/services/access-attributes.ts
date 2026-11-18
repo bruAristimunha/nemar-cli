@@ -139,10 +139,11 @@ export function accessRetryDelayMinutes(attempts: number): number {
  * that has an id NOW, and `OR IGNORE` is what makes a replayed read (the same record again, the next
  * live state, a repair of a terminal row) add nothing and leave a row that has moved on (`attempting`,
  * `sent`, `failed`) exactly as it is. A plain `INSERT` here would throw on the primary key at the
- * second read and roll the transition back with it.
+ * second read and roll the transition back with it. Only an `accounting = 'su'` job owes a report: a runner job
+ * is not on the allocation, so a Slurm id it may carry never makes one (ADR 0121 decision 1).
  */
 export const ACCESS_REPORT_PENDING_SQL = `INSERT OR IGNORE INTO compute_access_reports (job_id)
-  SELECT id FROM compute_jobs WHERE id = ?1 AND slurm_job_id IS NOT NULL`;
+  SELECT id FROM compute_jobs WHERE id = ?1 AND slurm_job_id IS NOT NULL AND accounting = 'su'`;
 
 /** The pending rows that are due, soonest first (the partial index `compute_access_reports_due` serves it). `?1` the limit. */
 export const ACCESS_REPORT_DUE_SQL = `SELECT job_id FROM compute_access_reports

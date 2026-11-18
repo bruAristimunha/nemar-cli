@@ -21,7 +21,11 @@ import { z } from "zod";
  * `POST /compute/jobs/:id/cancel`, 200: the intent is recorded, or the job was already cancelled. The
  * refusals (`bad_state`, `job_not_found`) are the `{ error, code }` answers of the other statuses.
  */
-export const COMPUTE_CANCEL_OUTCOMES = ["cancel_requested", "already_cancelled"] as const;
+export const COMPUTE_CANCEL_OUTCOMES = [
+  "cancel_requested",
+  "cancelled",
+  "already_cancelled",
+] as const;
 
 export const ComputeCancelResponseSchema = z
   .object({

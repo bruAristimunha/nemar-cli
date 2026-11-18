@@ -20,6 +20,16 @@
  *   - a real dataset: an `nm` id below the reserved fixture band (ADR 0068) or an `on` OpenNeuro
  *     mirror, and neither a sandbox nor an exemplar row.
  *
+ * OUTSIDE PRODUCTION ONE FIXTURE IS LET THROUGH (portable compute, plan step S1; {@link COMPUTE_FIXTURE_IDS}):
+ * the `real_dataset` term of the predicate that non-production environments use also accepts a named id of
+ * the reserved band that is not an exemplar (its `is_sandbox` flag is not tested: a staging publication mints
+ * a sandbox DOI, and the DOI step rewrites it). Every other term still applies to it. The production
+ * predicate is not edited: {@link PIPELINE_ELIGIBLE_SQL} keeps its text, and the widened one is a SECOND,
+ * precomputed text ({@link PIPELINE_ELIGIBLE_SQL_NONPROD}). Which one a caller gets is decided by the
+ * `ENVIRONMENT` binding it passes, through `isNonProductionEnv` (only `development`, `staging` and `test`;
+ * anything else, unset included, is production), and every function that decides takes that binding with no
+ * default, so a caller that forgets it does not compile.
+ *
  * "Deleted" is not a separate term: deleting a dataset removes its row, and a row with
  * `status = 'deleted'` fails the `active` term.
  *
@@ -28,8 +38,10 @@
  */
 
 import { dataTagForVersion } from "../../../shared/contract/compute.js";
+import type { Bindings } from "../types/bindings.js";
 import { MODALITY_TOKENS_SQL, parseTokenList } from "./dataset-filters.js";
 import { RESERVED_FIXTURE_FLOOR, formatDatasetId } from "./datasetId.js";
+import { isNonProductionEnv } from "./environment.js";
 
 /** The first reserved `nm` id: real datasets are strictly below it (ADR 0068). */
 export const PIPELINE_REAL_NM_CEILING = formatDatasetId("nm", RESERVED_FIXTURE_FLOOR);
@@ -135,6 +147,73 @@ export const PIPELINE_TERMS: readonly PipelineTerm[] = [
 /** The predicate as one SQL fragment over `datasets d`: every term, ANDed. It binds no parameter. */
 export const PIPELINE_ELIGIBLE_SQL = PIPELINE_TERMS.map((t) => t.sql).join("\n    AND ");
 
+// --- The compute fixture, outside production ----------------------------------------------------------------
+
+/**
+ * The standing fixtures a NON-PRODUCTION environment may run a pipeline over (portable compute, plan step S1;
+ * ADR 0068): named ids of the reserved band, each a public, first-published EEG deposit that a staging
+ * publication made. A named list, not a rule, as ADR 0068 settled for fixtures. Never `nm099900` (the id a
+ * test relies on being absent) and never `nm099999` (production's own end-to-end dataset); the declaration
+ * of the id as dev-owned is `datasetId.ts`'s and is not made here.
+ */
+export const COMPUTE_FIXTURE_IDS: ReadonlySet<string> = Object.freeze(
+  new Set(["nm099996"]),
+) as ReadonlySet<string>;
+
+/** A fixture id is `nm0999NN`: inside the reserved band, which is the only place a fixture lives. */
+const FIXTURE_ID = /^nm0999\d{2}$/;
+
+/**
+ * The list both forms of the widened term read, snapshotted once at module load: the SQL below is rendered
+ * from it and the TypeScript form tests membership of it, so the two cannot drift even if the exported set
+ * were edited later. Each id is validated here, so nothing but `nm0999NN` can reach the SQL text.
+ */
+const FIXTURE_ID_LIST: readonly string[] = Object.freeze(
+  [...COMPUTE_FIXTURE_IDS].map((id) => {
+    if (!FIXTURE_ID.test(id))
+      throw new Error("a compute fixture id is nm0999NN, in the reserved band");
+    return id;
+  }),
+);
+
+/**
+ * The `real_dataset` term of the non-production predicate: the production term, OR a fixture id that is
+ * not an exemplar. An exemplar is refused whatever its id.
+ */
+const REAL_OR_FIXTURE: PipelineTerm = (() => {
+  const real = PIPELINE_TERMS.find((t) => t.id === "real_dataset") as PipelineTerm;
+  const named = FIXTURE_ID_LIST.map((id) => `'${id}'`).join(", ");
+  return {
+    id: "real_dataset",
+    sql: `(${real.sql} OR (d.dataset_id IN (${named}) AND COALESCE(d.is_exemplar, 0) = 0))`,
+    holds: (row) =>
+      real.holds(row) || (FIXTURE_ID_LIST.includes(row.dataset_id) && (row.is_exemplar ?? 0) === 0),
+  };
+})();
+
+/** The terms non-production environments use: the production terms, with `real_dataset` widened. */
+export const PIPELINE_TERMS_NONPROD: readonly PipelineTerm[] = PIPELINE_TERMS.map((t) =>
+  t.id === "real_dataset" ? REAL_OR_FIXTURE : t,
+);
+
+/** The widened predicate as one SQL fragment over `datasets d`. It binds no parameter. */
+export const PIPELINE_ELIGIBLE_SQL_NONPROD = PIPELINE_TERMS_NONPROD.map((t) => t.sql).join(
+  "\n    AND ",
+);
+
+/** What the environment is read from: only the `ENVIRONMENT` binding. */
+export type PipelineEnv = Pick<Bindings, "ENVIRONMENT">;
+
+/** The terms an environment judges by: the widened ones outside production, the production ones otherwise. */
+export function pipelineTermsFor(env: PipelineEnv): readonly PipelineTerm[] {
+  return isNonProductionEnv(env) ? PIPELINE_TERMS_NONPROD : PIPELINE_TERMS;
+}
+
+/** The predicate an environment embeds in a statement, as SQL: production's text unless the environment is recognized as not production. */
+export function pipelineEligibleSql(env: PipelineEnv): string {
+  return isNonProductionEnv(env) ? PIPELINE_ELIGIBLE_SQL_NONPROD : PIPELINE_ELIGIBLE_SQL;
+}
+
 /**
  * The columns {@link isPipelineEligible} reads, with `has_version` computed. `FROM datasets d` is the
  * caller's. Projects no identity column and no DOI: eligibility is a decision, not a document.
@@ -146,28 +225,34 @@ export const PIPELINE_ROW_COLUMNS = `d.dataset_id, d.status, d.visibility, d.ano
 /** One dataset's row regardless of eligibility, for the re-check. */
 export const PIPELINE_ROW_BY_ID_SQL = `SELECT ${PIPELINE_ROW_COLUMNS} FROM datasets d WHERE d.dataset_id = ?`;
 
-/** The pure re-check over a row. True only when every term holds. */
-export function isPipelineEligible(row: PipelineRow | null | undefined): boolean {
-  return !!row && PIPELINE_TERMS.every((t) => t.holds(row));
+/** The pure re-check over a row, for the environment's predicate. True only when every term holds. */
+export function isPipelineEligible(row: PipelineRow | null | undefined, env: PipelineEnv): boolean {
+  return !!row && pipelineTermsFor(env).every((t) => t.holds(row));
 }
 
 /**
- * The ids of the terms a row fails. Empty means eligible. A row that is not there fails every term:
- * a dataset that does not exist is blocked by all of them, and `active` is the first the answer names.
+ * The ids of the terms a row fails under the environment's predicate. Empty means eligible. A row that is
+ * not there fails every term: a dataset that does not exist is blocked by all of them, and `active` is the
+ * first the answer names.
  */
-export function failedPipelineTerms(row: PipelineRow | null | undefined): PipelineTermId[] {
-  if (!row) return PIPELINE_TERMS.map((t) => t.id);
-  return PIPELINE_TERMS.filter((t) => !t.holds(row)).map((t) => t.id);
+export function failedPipelineTerms(
+  row: PipelineRow | null | undefined,
+  env: PipelineEnv,
+): PipelineTermId[] {
+  const terms = pipelineTermsFor(env);
+  if (!row) return terms.map((t) => t.id);
+  return terms.filter((t) => !t.holds(row)).map((t) => t.id);
 }
 
-/** Load one row and re-check it: the SQL selects, the TypeScript confirms. */
+/** Load one row and re-check it under the environment's predicate: the SQL selects, the TypeScript confirms. */
 export async function loadPipelineRow(
   db: D1Database,
   datasetId: string,
+  env: PipelineEnv,
 ): Promise<{ row: PipelineRow | null; eligible: boolean; blockedBy: PipelineTermId[] }> {
   const row =
     (await db.prepare(PIPELINE_ROW_BY_ID_SQL).bind(datasetId).first<PipelineRow>()) ?? null;
-  return { row, eligible: isPipelineEligible(row), blockedBy: failedPipelineTerms(row) };
+  return { row, eligible: isPipelineEligible(row, env), blockedBy: failedPipelineTerms(row, env) };
 }
 
 // --- The version a run reads ----------------------------------------------------------------------------

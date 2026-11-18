@@ -2296,7 +2296,7 @@ export async function finalizeImport(
     ciSpinner.fail(`CI deployment failed: ${msg}`);
     console.log(
       chalk.dim(
-        `  After fixing the deploy failure, run 'nemar admin ci add ${nemarId}' and 'nemar admin publish request/approve ${nemarId}' to resume.`,
+        `  After fixing the deploy failure, run 'nemar admin ci add ${nemarId}' and 'nemar admin repo publish request/approve ${nemarId}' to resume.`,
       ),
     );
   }
@@ -2419,7 +2419,7 @@ export async function finalizeImport(
       }
       if (attempt === PUBLICATION_REQUEST_MAX_ATTEMPTS) {
         pubSpinner.fail(
-          `BIDS validation still in progress after ${PUBLICATION_REQUEST_MAX_ATTEMPTS} attempts (~${Math.round((PUBLICATION_REQUEST_MAX_ATTEMPTS * PUBLICATION_REQUEST_WAIT_MS) / 60000)}min). Re-run 'nemar admin publish request/approve ${nemarId}' once validation completes.`,
+          `BIDS validation still in progress after ${PUBLICATION_REQUEST_MAX_ATTEMPTS} attempts (~${Math.round((PUBLICATION_REQUEST_MAX_ATTEMPTS * PUBLICATION_REQUEST_WAIT_MS) / 60000)}min). Re-run 'nemar admin repo publish request/approve ${nemarId}' once validation completes.`,
         );
         process.exit(1);
       }

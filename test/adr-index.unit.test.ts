@@ -31,11 +31,11 @@ function indexedFiles(readme: string): string[] {
 
 /**
  * ADR numbers another epic has reserved and not landed yet, so the numbering has a gap this
- * directory is not responsible for. Empty now: ADR 0118 (the compute gateway) has landed beside
- * ADR 0119 (the OpenID Connect provider). Add a number here only while a reserved ADR is on
- * another branch, and delete it in the first change that brings the file.
+ * directory is not responsible for. Add a number here only while a reserved ADR is on another
+ * branch, and delete it in the first change that brings the file.
  */
-const TOLERATED_GAPS: ReadonlySet<number> = new Set([]);
+// 0120: reserved for the collaborator's reader epic; delete this entry when that ADR lands
+const TOLERATED_GAPS: ReadonlySet<number> = new Set([120]);
 
 /** The numbers missing between 1 and the highest one present, ascending. */
 function findGaps(nums: number[]): number[] {

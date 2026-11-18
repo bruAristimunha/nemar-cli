@@ -1,0 +1,273 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://api.nemar.org/schemas/compute-runner-v1.json",
+  "title": "nemar.runner.v1",
+  "description": "The protocol between a NEMAR runner (nemar-runner, on a workstation or a cluster) and NEMAR's Worker: register, exchange, claim, heartbeat and complete. Shared byte for byte between nemarOrg/nemar-cli (shared/contract/compute-runner.schema.json) and nemarOrg/nemar-process: whichever merges first writes it, the other copies it. The root has no constraint; each shape is a member of $defs. Requests (RunnerRegisterRequest, RunnerTokenRequest, RunnerClaimRequest, RunnerHeartbeatRequest, RunnerCompleteRequest) are closed: no unknown keys. Responses (RunnerRegisterResponse, RunnerTokenResponse, RunnerClaimResponse, RunnerHeartbeatResponse, RunnerCompleteResponse) are open, and a reader ignores keys it does not know. A secret is nmr_ and 64 lowercase hex, an access token nmra_ and 64 lowercase hex. The lease of a job travels in the header X-Compute-Lease, and a runner sends the User-Agent nemar-runner/<version>.",
+  "$defs": {
+    "Word": {
+      "description": "A fixed word: lowercase letters, digits and underscore.",
+      "type": "string",
+      "pattern": "^[a-z0-9_]{1,64}(?![\\s\\S])"
+    },
+    "JobId": {
+      "type": "string",
+      "pattern": "^job_[0-9a-f]{24}(?![\\s\\S])"
+    },
+    "LeaseId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}(?![\\s\\S])"
+    },
+    "RunnerId": {
+      "type": "string",
+      "pattern": "^rnr_[0-9a-f]{24}(?![\\s\\S])"
+    },
+    "RunnerSecret": {
+      "type": "string",
+      "pattern": "^nmr_[0-9a-f]{64}(?![\\s\\S])"
+    },
+    "RunnerAccessToken": {
+      "type": "string",
+      "pattern": "^nmra_[0-9a-f]{64}(?![\\s\\S])"
+    },
+    "Timestamp": {
+      "description": "UTC, with a Z.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z(?![\\s\\S])"
+    },
+    "Version": {
+      "description": "A Semantic Versioning 2.0.0 version of at most 32 characters.",
+      "type": "string",
+      "maxLength": 32,
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?![\\s\\S])"
+    },
+    "Runtimes": {
+      "description": "The container runtimes, each at most once.",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": { "enum": ["apptainer", "docker", "podman"] }
+    },
+    "Arch": {
+      "enum": ["amd64", "arm64"]
+    },
+    "RunnerRegisterRequest": {
+      "description": "POST /compute/runners: an owner registers a runner and states its capacity and accounting class.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "pool",
+        "cores",
+        "memory_mb",
+        "gpus",
+        "scratch_gb",
+        "backend",
+        "runtimes",
+        "arch",
+        "accounting",
+        "site",
+        "trust"
+      ],
+      "properties": {
+        "name": { "$ref": "#/$defs/Word" },
+        "pool": { "enum": ["cpu", "gpu"] },
+        "cores": { "type": "integer", "minimum": 1, "maximum": 256 },
+        "memory_mb": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+        "gpus": { "type": "integer", "minimum": 0, "maximum": 8 },
+        "scratch_gb": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "backend": { "enum": ["local", "slurm"] },
+        "runtimes": { "$ref": "#/$defs/Runtimes" },
+        "arch": { "$ref": "#/$defs/Arch" },
+        "accounting": { "enum": ["su", "none"] },
+        "site": {
+          "type": "string",
+          "pattern": "^[a-z0-9_]{1,32}(?![\\s\\S])"
+        },
+        "trust": { "enum": ["lab", "hpc"] }
+      }
+    },
+    "RunnerTokenRequest": {
+      "description": "Exchange: the secret, sent as the credential, buys an access token for this protocol and runner version.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "runner_version"],
+      "properties": {
+        "protocol": { "const": "nemar.runner.v1" },
+        "runner_version": { "$ref": "#/$defs/Version" }
+      }
+    },
+    "RunnerClaimRequest": {
+      "description": "Claim: how many jobs the runner has room for, and what it can run them with.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "free_slots", "runtimes", "arch", "runner_version"],
+      "properties": {
+        "protocol": { "const": "nemar.runner.v1" },
+        "free_slots": { "type": "integer", "minimum": 1, "maximum": 32 },
+        "runtimes": { "$ref": "#/$defs/Runtimes" },
+        "arch": { "$ref": "#/$defs/Arch" },
+        "runner_version": { "$ref": "#/$defs/Version" }
+      }
+    },
+    "RunnerHeartbeatRequest": {
+      "description": "Heartbeat: renews the lease of one job and reports its phase.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["job_id", "lease_id", "phase"],
+      "properties": {
+        "job_id": { "$ref": "#/$defs/JobId" },
+        "lease_id": { "$ref": "#/$defs/LeaseId" },
+        "phase": { "enum": ["started", "uploading"] }
+      }
+    },
+    "RunnerCompleteRequest": {
+      "description": "Complete: the end of one job on the runner, idempotent for the job and lease. exit_number is the launcher's exit number (0, or 10 to 16 for its seven failure codes) or the runner's own; launcher_failure_code is the launcher's word from result.json, or null.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "job_id",
+        "lease_id",
+        "exit_number",
+        "launcher_failure_code",
+        "launcher_detail",
+        "usage",
+        "usage_partial",
+        "scratch_discarded"
+      ],
+      "properties": {
+        "job_id": { "$ref": "#/$defs/JobId" },
+        "lease_id": { "$ref": "#/$defs/LeaseId" },
+        "exit_number": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "launcher_failure_code": {
+          "enum": [
+            "code_fetch_failed",
+            "dataset_fetch_failed",
+            "entry_not_found",
+            "runtime_error",
+            "out_of_memory",
+            "time_limit",
+            "result_upload_failed",
+            null
+          ]
+        },
+        "launcher_detail": {
+          "anyOf": [{ "$ref": "#/$defs/Word" }, { "type": "null" }]
+        },
+        "usage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["wall_seconds", "cpu_seconds", "max_rss_mb"],
+          "properties": {
+            "wall_seconds": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+            "cpu_seconds": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+            "max_rss_mb": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+          }
+        },
+        "usage_partial": { "type": "boolean" },
+        "scratch_discarded": { "type": "boolean" }
+      }
+    },
+    "RunnerRegisterResponse": {
+      "description": "The registration's id and its secret, shown once. Open.",
+      "type": "object",
+      "required": ["runner_id", "secret"],
+      "properties": {
+        "runner_id": { "$ref": "#/$defs/RunnerId" },
+        "secret": { "$ref": "#/$defs/RunnerSecret" }
+      }
+    },
+    "RunnerTokenResponse": {
+      "description": "An access token and when it stops being accepted (900 seconds after it is issued). Open.",
+      "type": "object",
+      "required": ["access_token", "expires_at"],
+      "properties": {
+        "access_token": { "$ref": "#/$defs/RunnerAccessToken" },
+        "expires_at": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "RunnerClaimResponse": {
+      "description": "Up to free_slots jobs (never more than 32), each with its own 600-second lease, and the oldest runner version the Worker still serves. Open, and so is each job and its image.",
+      "type": "object",
+      "required": ["jobs", "min_runner_version"],
+      "properties": {
+        "jobs": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "lease_id",
+              "lease_expires_at",
+              "launch_spec_env",
+              "image",
+              "cores",
+              "memory_mb",
+              "gpus",
+              "minutes"
+            ],
+            "properties": {
+              "id": { "$ref": "#/$defs/JobId" },
+              "lease_id": { "$ref": "#/$defs/LeaseId" },
+              "lease_expires_at": { "$ref": "#/$defs/Timestamp" },
+              "launch_spec_env": {
+                "description": "The value of the environment variable NEMAR_LAUNCH_SPEC for this job: the base64url text of the launch specification, as in compute-launch.schema.json, at most 87382 characters.",
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 87382,
+                "pattern": "^[A-Za-z0-9_-]+(?![\\s\\S])"
+              },
+              "image": {
+                "type": "object",
+                "required": ["uri", "digest", "sif"],
+                "properties": {
+                  "uri": {
+                    "type": "string",
+                    "maxLength": 512,
+                    "pattern": "^(?:docker://)?[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]{1,5})?(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)+@sha256:[0-9a-f]{64}(?![\\s\\S])"
+                  },
+                  "digest": {
+                    "type": "string",
+                    "pattern": "^sha256:[0-9a-f]{64}(?![\\s\\S])"
+                  },
+                  "sif": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}\\.sif(?![\\s\\S])"
+                  }
+                }
+              },
+              "cores": { "type": "integer", "minimum": 1, "maximum": 256 },
+              "memory_mb": {
+                "anyOf": [
+                  { "type": "integer", "minimum": 1, "maximum": 16777216 },
+                  { "type": "null" }
+                ]
+              },
+              "gpus": { "type": "integer", "minimum": 0, "maximum": 8 },
+              "minutes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+            }
+          }
+        },
+        "min_runner_version": { "$ref": "#/$defs/Version" }
+      }
+    },
+    "RunnerHeartbeatResponse": {
+      "description": "The new end of the lease, and whether the runner is to stop the job. Open.",
+      "type": "object",
+      "required": ["lease_expires_at", "cancel"],
+      "properties": {
+        "lease_expires_at": { "$ref": "#/$defs/Timestamp" },
+        "cancel": { "type": "boolean" }
+      }
+    },
+    "RunnerCompleteResponse": {
+      "description": "The state the job is in. Open.",
+      "type": "object",
+      "required": ["state"],
+      "properties": {
+        "state": { "$ref": "#/$defs/Word" }
+      }
+    }
+  }
+}

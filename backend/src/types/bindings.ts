@@ -1,3 +1,4 @@
+import type { RunnerPrincipal } from "../services/compute-runners";
 import type { CloudflareSendEmail } from "../services/email";
 import type { ClaimAccount } from "../services/oidc-claims";
 import type { WebSessionUser } from "../services/web-session";
@@ -14,6 +15,15 @@ export interface Bindings {
   // Optional: deploy succeeds without index; runtime checks before use
   AI?: Ai;
   VECTORIZE?: VectorizeIndex;
+  // "1" narrows vector queries by their `visibility`/`dataset_id` metadata AND
+  // makes the embed drain / reindex-all embed non-public datasets. Turn it on
+  // ONLY after (1) the `visibility` and `dataset_id` Vectorize metadata indexes
+  // exist and (2) reindex-all has relabeled the public vectors: a filter on an
+  // unindexed property matches nothing (search then retries unfiltered, with a
+  // warning), and unlabeled vectors would drop out of every filtered query.
+  // Unset: queries are unfiltered, only public datasets are embedded, and the
+  // live D1 check alone decides.
+  VECTORIZE_VISIBILITY_FILTER?: string;
 
   // Analytics Engine: write-only data-plane access counters (epic #695).
   // One data point per served archive download / zarr read; read by the
@@ -72,8 +82,15 @@ export interface Bindings {
    *  [vars] and in [env.dev.vars] both (variables do not inherit). */
   COMPUTE_RECORDS_BUCKET_NAME?: string;
   COMPUTE_RESULTS_BUCKET_NAME?: string;
+  /** The derivative store's PRIVATE R2 bucket (portable compute, card V1b; ADR 0123 decision 1), reached
+   *  only by this binding and by a server-side copy, never by an address anyone is given. Bound in both
+   *  tables of `wrangler-sccn.toml` (`nemar-compute-derivatives` in production,
+   *  `nemar-compute-derivatives-dev` in `[env.dev]`) and still optional: with either this binding or its
+   *  name absent every entry point of the store answers `derivatives_unavailable` and writes nothing. */
+  COMPUTE_DERIVATIVES?: R2Bucket;
+  COMPUTE_DERIVATIVES_BUCKET_NAME?: string;
   /** Worker SECRETS, set by the owner: one R2 API token per environment (Object Read & Write on its
-   *  two buckets) and the account endpoint, which is never written in this repository. */
+   *  buckets) and the account endpoint, which is never written in this repository. */
   COMPUTE_R2_ACCESS_KEY_ID?: string;
   COMPUTE_R2_SECRET_ACCESS_KEY?: string;
   COMPUTE_R2_S3_ENDPOINT?: string;
@@ -87,6 +104,10 @@ export interface Bindings {
   // so `GET /admin/compute/status` is what says what the Worker reads.
   COMPUTE_ENABLED?: string; // "1" lets compute run (production or development only)
   COMPUTE_PIPELINES_DISPATCH_ENABLED?: string; // "1" lets NEMAR's own pipelines dispatch (needs COMPUTE_ENABLED)
+  // The portable-compute switch (card DM-05, D7): "1" lets a registered runner exchange its secret and
+  // use its access token. Needs COMPUTE_ENABLED too, is absent from wrangler-sccn.toml like the other
+  // two, and is pinned by the same test.
+  COMPUTE_RUNNERS_ENABLED?: string;
 
   // The Tapis tenant the compute gateway submits to (epic #2005 phase A4, services/tapis/config.ts).
   // Worker secrets or owner-set variables, NEVER in wrangler-sccn.toml: a tenant name is not public.
@@ -529,6 +550,8 @@ export interface AuthUser {
  */
 export interface Variables {
   user: AuthUser;
+  /** Set by `runnerAccess` (routes/compute-runners.ts): the runner whose access token the request carried. */
+  runner?: RunnerPrincipal;
   // Set by optionalAuthMiddleware when an Authorization: Bearer header was
   // provided but did not resolve to a valid, approved user. Lets routes that
   // require auth on a flag (e.g., /datasets?mine=true) emit a token-specific

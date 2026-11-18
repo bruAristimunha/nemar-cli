@@ -92,6 +92,7 @@ export const BOUND_ROWS_SQL = `SELECT id FROM compute_jobs
  */
 export const CREATED_ROWS_SQL = `SELECT id FROM compute_jobs
   WHERE state IN ('created', 'uploading') AND tapis_uuid IS NULL AND source <> 'partner'
+    AND executor = 'tapis'
   ORDER BY examined_at ASC, created_at ASC LIMIT ?1`;
 
 /**
@@ -115,7 +116,7 @@ export const ORPHAN_ROWS_SQL = `SELECT id FROM compute_jobs
  */
 export const CANCEL_ROWS_SQL = `SELECT id FROM compute_jobs
   WHERE state IN (${LIVE_STATES_SQL}) AND cancel_requested_at IS NOT NULL
-    AND flag_unreserved = 0
+    AND flag_unreserved = 0 AND executor = 'tapis'
     AND NOT (source = 'partner' AND tapis_uuid IS NULL)
   ORDER BY cancel_attempted_at ASC, cancel_requested_at ASC LIMIT ?1`;
 

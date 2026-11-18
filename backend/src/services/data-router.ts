@@ -139,10 +139,12 @@ export async function versionExists(
 }
 
 // Reject literal `..` segments, empty segments, and absolute paths.
-// URL-encoded variants like `%2E%2E` reach the manifest lookup unchanged
-// and miss every key (the manifest is keyed by raw paths), so they fall
-// through to not_found by construction -- the URL-encoded traversal test
-// in test/data-route.unit.test.ts pins that contract.
+// The file and QA routes decode the path first (`bidsPathAfterMount`), so
+// encoded-slash forms such as `%2E%2E%2F` or `a%2F..%2Fb` arrive here as real
+// `..` segments and are rejected. A bare `%2E%2E` segment never gets this far
+// over HTTP: the URL parser collapses it before routing. An undecoded
+// `%2E%2E` misses every key (the manifest is keyed by raw paths). The
+// traversal tests in test/data-route.unit.test.ts pin these contracts.
 const FORBIDDEN_SEGMENTS = new Set(["", ".", "..", "__proto__", "constructor", "prototype"]);
 
 // Exported so the QA route can use the same traversal-rejection contract.
@@ -155,6 +157,57 @@ export function normalizeBidsPath(rawPath: string): string | null {
     if (part.startsWith("/")) return null;
   }
   return parts.join("/");
+}
+
+function decodeSegment(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    // Malformed escape (a bare `%`): keep this segment as typed, like Hono's
+    // lenient decodeURI, so a literal key such as `100%.txt` still resolves.
+    return segment;
+  }
+}
+
+/**
+ * Decode a still-escaped bids-path, once per segment.
+ *
+ * The input must come from the raw `URL.pathname`, never from Hono's
+ * `c.req.path`: that applies `decodeURI`, which keeps reserved escapes such as
+ * `%2B`, `%23`, `%26` and `%2F`, so a manifest link like `.../aparc%2Baseg.mgz`
+ * missed its key and 404ed. `buildBytesUrl` and the directory-table links
+ * encode each segment with `encodeURIComponent`; this inverts that.
+ *
+ * A decoded `%2F` becomes a path separator, which `normalizeBidsPath` splits
+ * again, so encoded-slash traversal is still rejected. A malformed escape
+ * leaves only its own segment undecoded.
+ */
+export function decodeBidsPath(encodedPath: string): string {
+  return encodedPath.split("/").map(decodeSegment).join("/");
+}
+
+/** Inverse of `decodeBidsPath`: encode each segment, keep the separators. */
+export function encodeBidsPath(bidsPath: string): string {
+  return bidsPath.split("/").map(encodeURIComponent).join("/");
+}
+
+/**
+ * The decoded bids-path that follows `mount` (for example `[datasetId,
+ * version]`) in a raw URL pathname, or null when the pathname does not
+ * contain the mount.
+ *
+ * Mount segments are compared decoded, because Hono decodes route params
+ * while the pathname stays escaped (`v1%2E0%2E0` is the version `v1.0.0`).
+ * Used by the file and QA routes; the zarr route decodes on its own.
+ */
+export function bidsPathAfterMount(pathname: string, mount: readonly string[]): string | null {
+  const segments = pathname.split("/");
+  for (let i = 0; i + mount.length <= segments.length; i++) {
+    if (mount.every((m, j) => decodeSegment(segments[i + j] ?? "") === m)) {
+      return decodeBidsPath(segments.slice(i + mount.length).join("/"));
+    }
+  }
+  return null;
 }
 
 function normalizePath(rawPath: string): string | null {
@@ -1587,9 +1640,9 @@ ${removedFooter}<hr>
  */
 function renderVersionPicker(idHref: string, path: string, versions: VersionPickerEntry[]): string {
   // path is already a normalized BIDS path (no leading/trailing slashes).
-  // encodeURI preserves slashes between segments; the segments themselves
-  // come from manifest keys which are tightly constrained by BIDS naming.
-  const subPath = path === "" ? "" : `${encodeURI(path)}/`;
+  // encodeBidsPath keeps the slashes between segments and escapes `#`, `?`,
+  // `+` and `&` inside them, which encodeURI would leave to cut the link.
+  const subPath = path === "" ? "" : `${encodeBidsPath(path)}/`;
   const items = versions
     .map((v) => {
       const label = escapeHtml(v.version);
@@ -1611,7 +1664,7 @@ function renderVersionPicker(idHref: string, path: string, versions: VersionPick
  */
 function renderRemovedSinceFooter(idHref: string, path: string, note: RemovedSinceNote): string {
   const prevVersion = encodeURIComponent(note.lastSeenVersion);
-  const subPath = path === "" ? "" : `${encodeURI(path)}/`;
+  const subPath = path === "" ? "" : `${encodeBidsPath(path)}/`;
   const items = note.names
     .map((name) => {
       const href = `/${idHref}/${prevVersion}/${subPath}${encodeURIComponent(name)}`;

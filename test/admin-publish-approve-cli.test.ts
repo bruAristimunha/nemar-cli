@@ -1,5 +1,5 @@
 /**
- * `nemar admin publish approve` against the publication review (ADR 0102, sections 8 and 9).
+ * `nemar admin repo publish approve` against the publication review (ADR 0102, sections 8 and 9).
  *
  * The real command (`bun run src/index.ts ...`) against the real backend app, over a real D1
  * (`helpers/admin-publish-cli.ts`). What the command printed, what it posted and what the backend
@@ -121,7 +121,7 @@ const WHY_ACK = "Read the recording formats by hand, nothing to remove";
 const SHORT_RETRY = { NEMAR_APPROVE_RETRY_DELAY_MS: "0" };
 
 const approve = (flags: string[], opts: Parameters<typeof h.cli>[1] = {}) =>
-  h.cli(["admin", "publish", "approve", DATASET, ...flags], opts);
+  h.cli(["admin", "repo", "publish", "approve", DATASET, ...flags], opts);
 
 describe("the command decides: a pass", () => {
   test("approves, posts no override, and shows the screen and the review first", async () => {
@@ -168,7 +168,7 @@ describe("the command decides: a review that is not a pass", () => {
     expect(r.stdout).toContain("Not approved:");
     // The refusal says it in the gate's own words, then names the exact command.
     expect(r.stdout).toContain(reviewGateRefusalText("needs_override", DATASET));
-    expect(r.stdout).toContain(`nemar admin publish approve ${DATASET} --resume --force`);
+    expect(r.stdout).toContain(`nemar admin repo publish approve ${DATASET} --resume --force`);
     // The model's own words never reach the approval screen.
     expect(output(r)).not.toContain(SUMMARY_SENTINEL);
     expect(output(r)).not.toContain(NOTE_SENTINEL);
@@ -434,7 +434,7 @@ describe("the command decides: the screen's acknowledgment is its own flag", () 
 
     expect(r.exitCode).toBe(1);
     expect(r.stdout).toContain(
-      `nemar admin publish approve ${DATASET} --resume --acknowledge-identifier-screen "<reason>" --force`,
+      `nemar admin repo publish approve ${DATASET} --resume --acknowledge-identifier-screen "<reason>" --force`,
     );
     expect(h.posted).toEqual([]);
   });
@@ -489,7 +489,7 @@ describe("the command decides: a run that has started publishing", () => {
 
     expect(r.exitCode).toBe(1);
     expect(r.stdout).toContain("This approval has already started publishing.");
-    expect(r.stdout).toContain(`nemar admin publish approve ${DATASET} --resume`);
+    expect(r.stdout).toContain(`nemar admin repo publish approve ${DATASET} --resume`);
     expect(h.posted).toEqual([]);
   });
 
@@ -521,7 +521,7 @@ describe("the command decides: an approval that stopped behind a reason nothing 
       const r = await approve(flags);
 
       expect(r.exitCode).toBe(1);
-      const line = `${STOPPED} Deny it with a reason (nemar admin publish deny ${DATASET}); the depositor can request again.`;
+      const line = `${STOPPED} Deny it with a reason (nemar admin repo publish deny ${DATASET}); the depositor can request again.`;
       expect(r.stdout).toContain(line);
       // Under the review it belongs to, ahead of the standing line and the refusal.
       const at = (text: string) => r.stdout.indexOf(text);
@@ -559,7 +559,7 @@ describe("the command decides: the evidence behind a reason is read before the q
   const SHOWN =
     "Shown to the model: README withheld (finding), dataset_description.json sent (9 keys shown, 1 not), CHANGES absent, LICENSE sent (cut), participants.json withheld (finding)";
   const WITHHELD = "Withheld for findings: edf-patient-name 2, local-user-path 1";
-  const POINTER = `The whole review, with the model's questions and findings: nemar admin publish show ${DATASET}`;
+  const POINTER = `The whole review, with the model's questions and findings: nemar admin repo publish show ${DATASET}`;
   const text_withheld = REASONS.text_withheld.sentence.replace(/\.$/, "");
 
   /** Where `text` is in the output, which it must be: a missing marker is a failure of its own. */
@@ -610,7 +610,7 @@ describe("the command decides: the evidence behind a reason is read before the q
     seedReport(requestId, withheldReport());
 
     // They are in the review, and `show` prints them under their labels; `approve` does not.
-    const shown = await h.cli(["admin", "publish", "show", DATASET]);
+    const shown = await h.cli(["admin", "repo", "publish", "show", DATASET]);
     expect(shown.stdout).toContain(
       "Summary (written by the model; the depositor's text can steer it):",
     );
@@ -814,7 +814,7 @@ describe("approve --help-all names every reason nothing clears", () => {
   test("the table of words is the table of hard reasons, and the help says each", async () => {
     expect(Object.keys(WORDS).sort()).toEqual([...HARD_REASONS].sort());
 
-    const r = await h.cli(["admin", "publish", "approve", "--help-all"]);
+    const r = await h.cli(["admin", "repo", "publish", "approve", "--help-all"]);
 
     expect(r.exitCode).toBe(0);
     const help = r.stdout.replace(/\s+/g, " ");
@@ -857,7 +857,7 @@ describe("the command decides: a definitive answer to the read ends it before th
     seedReport(seedGolden());
 
     for (const flags of [["--yes"], ["--yes", "--force"], []]) {
-      const r = await h.cli(["admin", "publish", "approve", "nm0004", ...flags]);
+      const r = await h.cli(["admin", "repo", "publish", "approve", "nm0004", ...flags]);
 
       expect(r.exitCode).toBe(1);
       expect(r.stdout).toContain('"nm0004" is not a dataset id (like nm000108).');
@@ -997,7 +997,9 @@ describe("with the Worker's gate: what the Worker refuses is printed, and exits 
     // override and the Worker refuses with all three reasons in its body.
     const otherId = await h.admin("otheradmin", OTHER_ADMIN_KEY);
     setOverride(h.db, reviewId, otherId, ["question_failed", "text_withheld", "question_unknown"]);
-    const shown = JSON.parse((await h.cli(["admin", "publish", "show", DATASET, "--json"])).stdout);
+    const shown = JSON.parse(
+      (await h.cli(["admin", "repo", "publish", "show", DATASET, "--json"])).stdout,
+    );
 
     const r = await approve(["--resume", "--yes"], { as: "approveradmin" });
 
@@ -1064,7 +1066,7 @@ describe("with the Worker's gate: what the Worker refuses is printed, and exits 
     expect(r.exitCode).toBe(1);
     expect(output(r)).toContain(REVIEW_GATE_REFUSAL_TEXT.override_not_covering.split(" (nemar")[0]);
     expect(output(r)).toContain(REASONS.version_already_released.sentence);
-    expect(output(r)).toContain(`Next: nemar admin publish show ${DATASET}`);
+    expect(output(r)).toContain(`Next: nemar admin repo publish show ${DATASET}`);
     expect(h.requests.filter((c) => c.path === APPROVE_PATH).map((c) => c.status)).toEqual([409]);
     const row = h.db
       .query<{ override_by: number | null }, [number]>(
