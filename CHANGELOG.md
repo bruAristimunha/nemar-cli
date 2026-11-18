@@ -13,7 +13,7 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
-## Unreleased
+## 0.10.35 - 2026-11-18
 
 Release 0.10.35 is small: a CLI fix and the owner's switch for private-dataset semantic search.
 It has no migrations and adds one Worker variable, `VECTORIZE_VISIBILITY_FILTER`, in production only.
