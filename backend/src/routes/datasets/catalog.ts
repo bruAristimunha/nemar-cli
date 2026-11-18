@@ -1314,6 +1314,7 @@ export function registerCatalogRoutes(datasetRoutes: DatasetsRouter): void {
         // `no-store` above stays on EVERY response, because any of them may now
         // carry a private row.
         viewer: user ? { userId: user.id, isAdmin: hasRole(user.role, "admin") } : undefined,
+        vectorMetadataFilter: c.env.VECTORIZE_VISIBILITY_FILTER === "1",
       });
       return c.json(envelope);
     } catch (err) {

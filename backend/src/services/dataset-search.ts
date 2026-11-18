@@ -106,10 +106,10 @@ export const buildDatasetEmbedText = buildDatasetSummaryText;
 
 /**
  * Re-embed a single dataset's Vectorize vector from its current `datasets`
- * row (#646). The vector is **id-only**: it carries no metadata, so the upsert
- * overwrites any stale 6-field metadata from earlier phases with `{}`. Every
- * display field is hydrated from `datasets` by semanticSearchHydrated, so no
- * dataset fact is duplicated into the vector index.
+ * row (#646). The vector holds only routing labels (`visibility`, `dataset_id`),
+ * so the upsert overwrites any stale 6-field metadata from earlier phases.
+ * Every display field is hydrated from `datasets` by semanticSearchHydrated,
+ * so no dataset fact is duplicated into the vector index.
  *
  * Fire-once + fully guarded: returns false without throwing when AI/Vectorize
  * are unconfigured, the row is missing, or any step fails -- so it can be
@@ -128,9 +128,11 @@ export async function reembedDatasetVector(
   }
   try {
     const row = await db
-      .prepare(`SELECT ${DATASET_SUMMARY_SELECT_SQL} FROM datasets d WHERE d.dataset_id = ?`)
+      .prepare(
+        `SELECT ${DATASET_SUMMARY_SELECT_SQL}, d.visibility AS visibility FROM datasets d WHERE d.dataset_id = ?`,
+      )
       .bind(datasetId)
-      .first<DatasetEmbedRow>();
+      .first<DatasetEmbedRow & { visibility: string | null }>();
     if (!row) {
       console.warn(`[reembed] No datasets row for ${datasetId}, skipping`);
       return false;
@@ -147,8 +149,18 @@ export async function reembedDatasetVector(
       console.error(`[reembed] Empty embedding for ${datasetId}`);
       return false;
     }
-    // id-only vector: empty metadata clears any stale 6-field metadata.
-    await vectorize.upsert([{ id: datasetId, values, metadata: {} }]);
+    // The vector carries no dataset fact beyond two routing labels: `visibility`
+    // narrows the candidate set of an anonymous or signed-in query (layer 1),
+    // `dataset_id` lets a signed-in query name the private rows it may see.
+    // Both are hints. Every hit is re-checked against the live `datasets` row
+    // (layer 2), so a stale label can cost recall, never expose a dataset.
+    await vectorize.upsert([
+      {
+        id: datasetId,
+        values,
+        metadata: { visibility: row.visibility ?? "private", dataset_id: datasetId },
+      },
+    ]);
     // #646 Phase 4: the vector is now fresh, so clear the dirty flag. A failed
     // embed above leaves embedding_dirty=1 for the next drain. embedding_dirty
     // is in no trigger OF list, so this UPDATE doesn't re-fire the triggers.
@@ -385,14 +397,75 @@ async function embedAndQuery(
   vectorize: VectorizeIndex,
   query: string,
   topK: number,
+  scopes: VectorScope[] = [undefined],
 ): Promise<{ id: string; score: number }[]> {
   const embedding = await ai.run(EMBEDDING_MODEL, { text: [query] });
   const embeddingData = "data" in embedding ? embedding.data : undefined;
   if (!embeddingData?.[0]) {
     throw new Error("Failed to generate query embedding");
   }
-  const results = await vectorize.query(embeddingData[0], { topK, returnMetadata: "none" });
-  return results.matches.map((m) => ({ id: m.id, score: Math.round(m.score * 100) / 100 }));
+  const vector = embeddingData[0];
+  const one = async (filter: VectorScope) => {
+    if (!filter) return vectorize.query(vector, { topK, returnMetadata: "none" });
+    try {
+      return await vectorize.query(vector, { topK, returnMetadata: "none", filter });
+    } catch (err) {
+      // A filter the index cannot serve (no metadata index yet) degrades to the
+      // unfiltered query; the live D1 check below still decides visibility.
+      console.warn(
+        `[search] vector metadata filter failed, querying unfiltered: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return vectorize.query(vector, { topK, returnMetadata: "none" });
+    }
+  };
+  const best = new Map<string, number>();
+  for (const result of await Promise.all(scopes.map(one))) {
+    for (const m of result.matches) {
+      best.set(m.id, Math.max(best.get(m.id) ?? 0, m.score));
+    }
+  }
+  return [...best.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, topK)
+    .map(([id, score]) => ({ id, score: Math.round(score * 100) / 100 }));
+}
+
+/** A Vectorize metadata filter, or `undefined` for none. */
+type VectorScope = NonNullable<Parameters<VectorizeIndex["query"]>[1]>["filter"];
+
+/** Most values Vectorize accepts in one `$in` filter. */
+const VECTOR_IN_FILTER_MAX = 100;
+
+/**
+ * Layer 1 of search visibility: the metadata filters whose union is the
+ * candidate set a viewer could possibly see. An anonymous query never makes a
+ * private vector a candidate; a signed-in query adds the private ids it owns
+ * or collaborates on (resolved in D1 now); an admin is unfiltered. Vectorize
+ * cannot OR two fields in one filter, so a signed-in viewer gets two queries,
+ * merged by score. More private ids than one `$in` takes means unfiltered
+ * (over-fetch). The labels may be stale; see layer 2 in
+ * {@link hydrateDatasetsByIds}.
+ */
+export async function vectorScopesForViewer(
+  db: D1Database,
+  viewer: SearchViewer | undefined,
+): Promise<VectorScope[]> {
+  if (!viewer) return [{ visibility: "public" }];
+  if (viewer.isAdmin) return [undefined];
+  const { results } = await db
+    .prepare(
+      `SELECT d.dataset_id AS id FROM datasets d
+       WHERE d.visibility != 'public'
+         AND (d.owner_user_id = ?
+           OR EXISTS (SELECT 1 FROM dataset_collaborators dc WHERE dc.dataset_id = d.id AND dc.user_id = ?))
+       LIMIT ?`,
+    )
+    .bind(viewer.userId, viewer.userId, VECTOR_IN_FILTER_MAX + 1)
+    .all<{ id: string }>();
+  const ids = (results ?? []).map((r) => r.id);
+  if (ids.length === 0) return [{ visibility: "public" }];
+  if (ids.length > VECTOR_IN_FILTER_MAX) return [undefined];
+  return [{ visibility: "public" }, { dataset_id: { $in: ids } }];
 }
 
 /** Whether any filter in `filters` would actually narrow a query. Used only
@@ -438,11 +511,13 @@ export async function semanticSearchHydrated(
   topK = 20,
   filters: DatasetFilterOptions = {},
   viewer?: SearchViewer,
+  metadataFilter = false,
 ): Promise<SearchResult[]> {
   const k = Math.min(Math.max(topK, 1), 100);
   let ranked: { id: string; score: number }[];
   try {
-    ranked = await embedAndQuery(ai, vectorize, query, k);
+    const scopes = metadataFilter ? await vectorScopesForViewer(db, viewer) : [undefined];
+    ranked = await embedAndQuery(ai, vectorize, query, k, scopes);
   } catch (err) {
     // #1145 review I3: tag so executeDatasetSearch's catch can tell "Vectorize
     // itself is unavailable" (safe to fall back to text-only) apart from a
@@ -825,6 +900,7 @@ async function searchByRelevance(
   filters: DatasetFilterOptions,
   buildEnvelope: EnvelopeBuilder,
   viewer?: SearchViewer,
+  metadataFilter = false,
 ): Promise<DatasetSearchEnvelope | RelevanceFallback> {
   if (rerankSuspended()) return "rerank-failed";
 
@@ -835,7 +911,16 @@ async function searchByRelevance(
     [lexical, literal, semantic] = await Promise.all([
       ftsSearch(db, analysis.lexicalQuery, LEG_SIZE, {}, viewer),
       literalMatchSearch(db, analysis.informative, LEG_SIZE, {}, viewer),
-      semanticSearchHydrated(ai, vectorize, db, analysis.semanticQuery, SEMANTIC_TOPK, {}, viewer),
+      semanticSearchHydrated(
+        ai,
+        vectorize,
+        db,
+        analysis.semanticQuery,
+        SEMANTIC_TOPK,
+        {},
+        viewer,
+        metadataFilter,
+      ),
     ]);
   } catch (err) {
     if (!(err instanceof Error) || !err.message.startsWith("[embedding]")) throw err;
@@ -943,6 +1028,9 @@ export interface ExecuteDatasetSearchOptions {
   /** The caller, for the visibility rule of GET /datasets/:id. Omit for an
    *  anonymous (public-only) search. */
   viewer?: SearchViewer;
+  /** Layer 1: narrow the vector query by its `visibility`/`dataset_id` labels.
+   *  Off until the metadata index exists and every vector carries the labels. */
+  vectorMetadataFilter?: boolean;
 }
 
 /** Return shape of {@link executeDatasetSearch} -- the full GET
@@ -1044,7 +1132,7 @@ export async function executeDatasetSearch(
   vectorize: VectorizeIndex | undefined,
   opts: ExecuteDatasetSearchOptions,
 ): Promise<DatasetSearchEnvelope> {
-  const { filters, viewer } = opts;
+  const { filters, viewer, vectorMetadataFilter } = opts;
   // #1145 review S3: a cheap defensive clamp, not a substitute for real
   // validation upstream (parseSearchPagination already does that for the
   // HTTP path) -- this function is meant to be safely reusable directly.
@@ -1137,6 +1225,7 @@ export async function executeDatasetSearch(
         filters,
         buildEnvelope,
         viewer,
+        vectorMetadataFilter,
       );
       if (typeof byRelevance !== "string") return byRelevance;
       // An embedding that just failed is not tried a second time on this request.
@@ -1197,6 +1286,7 @@ export async function executeDatasetSearch(
         SEMANTIC_TOPK,
         filters,
         viewer,
+        vectorMetadataFilter,
       );
     } catch (embErr) {
       const embMsg = embErr instanceof Error ? embErr.message : String(embErr);

@@ -15,6 +15,10 @@ export interface Bindings {
   // Optional: deploy succeeds without index; runtime checks before use
   AI?: Ai;
   VECTORIZE?: VectorizeIndex;
+  // "1" narrows vector queries by their `visibility`/`dataset_id` metadata
+  // (needs the Vectorize metadata indexes and a reindex-all backfill first).
+  // Unset: queries are unfiltered and the live D1 check alone decides.
+  VECTORIZE_VISIBILITY_FILTER?: string;
 
   // Analytics Engine: write-only data-plane access counters (epic #695).
   // One data point per served archive download / zarr read; read by the
