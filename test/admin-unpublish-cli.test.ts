@@ -11,6 +11,7 @@
  */
 
 import { afterAll, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
+import { UNPUBLISH_CACHE_NOTE } from "../shared/contract/publication";
 import { type CliResult, startPublishCli } from "./helpers/admin-publish-cli";
 
 setDefaultTimeout(60_000);
@@ -122,5 +123,19 @@ describe("nemar admin repo unpublish", () => {
 
     expect(r.exitCode).toBe(0);
     expect(output(r)).toContain("Dataset not found");
+  });
+});
+
+describe("the cache note after an execute", () => {
+  test("a dry run does not print it (nothing changed, nothing to wait for)", async () => {
+    seedHalfState("nm000290");
+    const dry = await h.cli(["admin", "repo", "unpublish", "nm000290"]);
+    expect(output(dry)).not.toContain("cached at the edge");
+  });
+
+  test("the note says search is immediate and the page and list are edge-cached", () => {
+    expect(UNPUBLISH_CACHE_NOTE).toBe(
+      "Search reflects this at once; the public dataset page and catalog list are cached at the edge and can keep showing the dataset for several minutes.",
+    );
   });
 });
