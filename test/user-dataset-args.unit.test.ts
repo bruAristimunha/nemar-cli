@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { looksLikeDatasetId, resolveUserDatasetArgs } from "../src/lib/user-dataset-args.js";
+import { USER_DATASET_ARGS_ERROR, resolveUserDatasetArgs } from "../src/lib/user-dataset-args.js";
 
 describe("resolveUserDatasetArgs", () => {
   test("keeps the declared order", () => {
@@ -16,18 +16,39 @@ describe("resolveUserDatasetArgs", () => {
     });
   });
 
-  test("accepts ds and xx prefixes", () => {
-    expect(resolveUserDatasetArgs("xx099900", "alice").datasetId).toBe("xx099900");
-    expect(resolveUserDatasetArgs("alice", "ds004000").datasetId).toBe("ds004000");
+  test("normalizes an uppercase id in either slot", () => {
+    expect(resolveUserDatasetArgs("alice", "NM000289")).toEqual({
+      username: "alice",
+      datasetId: "nm000289",
+    });
+    expect(resolveUserDatasetArgs("NM000289", "alice")).toEqual({
+      username: "alice",
+      datasetId: "nm000289",
+    });
   });
 
-  test("throws when neither looks like a dataset id", () => {
-    expect(() => resolveUserDatasetArgs("alice", "bob")).toThrow("<username> <dataset-id>");
+  test("trims surrounding whitespace on the id", () => {
+    expect(resolveUserDatasetArgs("alice", "  xx099900 ")?.datasetId).toBe("xx099900");
   });
 
-  test("rejects malformed ids", () => {
-    expect(looksLikeDatasetId("nm00028")).toBe(false);
-    expect(looksLikeDatasetId("nm0002890")).toBe(false);
-    expect(looksLikeDatasetId("mordyan")).toBe(false);
+  test("keeps the declared order when both look like ids", () => {
+    expect(resolveUserDatasetArgs("nm000289", "xx099900")).toEqual({
+      username: "nm000289",
+      datasetId: "xx099900",
+    });
+  });
+
+  test("rejects out-of-bound, ds-prefixed, malformed and empty ids", () => {
+    expect(resolveUserDatasetArgs("alice", "nm900001")).toBeNull();
+    expect(resolveUserDatasetArgs("alice", "ds004000")).toBeNull();
+    expect(resolveUserDatasetArgs("alice", "nm00028")).toBeNull();
+    expect(resolveUserDatasetArgs("alice", "")).toBeNull();
+    expect(resolveUserDatasetArgs("", "")).toBeNull();
+    expect(resolveUserDatasetArgs("alice", "bob")).toBeNull();
+  });
+
+  test("the failure message names the expected form and an example id", () => {
+    expect(USER_DATASET_ARGS_ERROR).toContain("<username> <dataset-id>");
+    expect(USER_DATASET_ARGS_ERROR).toContain("nm000104");
   });
 });
