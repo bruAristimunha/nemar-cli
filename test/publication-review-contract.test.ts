@@ -3260,8 +3260,10 @@ describe("the sentences the Worker's tests import are pinned here, once", () => 
     ].map((match) => match[1]);
     expect(named.length).toBeGreaterThan(0);
     const registered =
-      adminCommand.commands.find((c) => c.name() === "publish")?.commands.map((c) => c.name()) ??
-      [];
+      adminCommand.commands
+        .find((c) => c.name() === "repo")
+        ?.commands.find((c) => c.name() === "publish")
+        ?.commands.map((c) => c.name()) ?? [];
     expect(registered.length).toBeGreaterThan(0);
     for (const name of named) expect(registered).toContain(name);
   });

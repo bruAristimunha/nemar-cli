@@ -72,6 +72,7 @@ const EXPECTED_EXPORTS = [
   "getFileContent",
   "getMainBranchSha",
   "getRepoDefaultBranch",
+  "getRepoPrivate",
   "getReviewRulesetInfo",
   "getTreeAtRef",
   "getWorkflowRuns",
