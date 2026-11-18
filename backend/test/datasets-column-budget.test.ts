@@ -99,7 +99,7 @@ describe("datasets column budget", () => {
     ]);
   });
 
-  test("trigger set is exactly the 6 after 0085", () => {
+  test("trigger set is exactly the 7 after 0145", () => {
     const names = (
       db
         .query(
@@ -114,6 +114,8 @@ describe("datasets column budget", () => {
       "datasets_anonymous_unpublished_ai",
       "datasets_anonymous_unpublished_au",
       "datasets_embed_dirty_au",
+      // 0145: a visibility or status change marks the vector stale.
+      "datasets_embed_dirty_visibility_au",
       "datasets_fts_ad",
       "datasets_fts_ai",
       "datasets_fts_au",

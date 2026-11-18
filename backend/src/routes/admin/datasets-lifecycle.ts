@@ -34,7 +34,7 @@ import {
   refreshDatasetMetadata,
   runEnrichmentForDataset,
 } from "../../services/dataset-reindex";
-import { reembedDatasetVector } from "../../services/dataset-search";
+import { embedsNonPublic, reembedDatasetVector } from "../../services/dataset-search";
 import { ProdRepoFenceError, deleteDatasetCascade } from "../../services/deletion";
 import { DOCTOR_CHECKS, getCheck, listChecks } from "../../services/doctor/registry";
 import type { CheckContext, Finding } from "../../services/doctor/types";
@@ -2041,6 +2041,9 @@ export function registerDatasetLifecycleRoutes(admin: AdminRouter): void {
    * POST /admin/vectorize/reindex-all - Re-embed datasets' vectors from the
    * `datasets` source of truth (#646 Phase 4). Fixes the stale-vector backlog.
    *
+   * Embeds public datasets only until VECTORIZE_VISIBILITY_FILTER=1, then
+   * every active dataset (see embedsNonPublic).
+   *
    * Keyset-paginated to stay within Worker limits: pass `after` = the previous
    * response's `last_id` and repeat until `has_more` is false.
    * Body: { limit?: number (1..500, default 200), after?: string, dry_run?: boolean }
@@ -2058,10 +2061,14 @@ export function registerDatasetLifecycleRoutes(admin: AdminRouter): void {
     const limit = Math.min(Math.max(Number(body.limit) || 200, 1), 500);
     const after = typeof body.after === "string" ? body.after : "";
     const startedAt = Date.now();
+    // Private rows are embedded only once VECTORIZE_VISIBILITY_FILTER=1 (see
+    // embedsNonPublic); until then this run only (re)labels public vectors.
+    const nonPublicToo = embedsNonPublic(c.env);
 
     const rows = await c.env.DB.prepare(
       `SELECT dataset_id FROM datasets
-     WHERE status = 'active' AND visibility = 'public'
+     WHERE status = 'active'
+       ${nonPublicToo ? "" : "AND visibility = 'public'"}
        AND (is_sandbox = 0 OR is_sandbox IS NULL OR ${exemplarOrFragment("")})
        AND dataset_id > ?
      ORDER BY dataset_id
@@ -2085,7 +2092,8 @@ export function registerDatasetLifecycleRoutes(admin: AdminRouter): void {
 
     let embedded = 0;
     for (const id of ids) {
-      if (await reembedDatasetVector(c.env.DB, c.env.AI, c.env.VECTORIZE, id)) embedded++;
+      if (await reembedDatasetVector(c.env.DB, c.env.AI, c.env.VECTORIZE, id, nonPublicToo))
+        embedded++;
     }
     return c.json({
       scanned: ids.length,

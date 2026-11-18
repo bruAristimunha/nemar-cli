@@ -71,7 +71,7 @@ import { sweepTenantJobs, tenantLogLine } from "./services/compute-tenant-sweep"
 import { isNemarWebOrigin, isOscOrigin } from "./services/cors-origins";
 import { sweepLogLines } from "./services/cron-sweep-log";
 import { fetchAndSyncDataPapers } from "./services/data-papers-sync";
-import { drainEmbeddingDirty } from "./services/dataset-search";
+import { drainEmbeddingDirty, embedsNonPublic } from "./services/dataset-search";
 import { DEV_EPHEMERAL_BAND_END, DEV_EPHEMERAL_BAND_START } from "./services/datasetId";
 import { deleteDatasetCascade } from "./services/deletion";
 import { reconcileReservedVersionDois } from "./services/doi-reconcile";
@@ -1386,7 +1386,7 @@ export default {
     // #646 Phase 4: drain stale vectors (embedding_dirty=1) — the backstop for
     // changes that don't go through the inline enrich/reindex re-embed.
     // Safe outside prod: writes only to the env-bound (dev) Vectorize index.
-    ctx.waitUntil(drainEmbeddingDirty(env.DB, env.AI, env.VECTORIZE));
+    ctx.waitUntil(drainEmbeddingDirty(env.DB, env.AI, env.VECTORIZE, 50, embedsNonPublic(env)));
 
     if (prodOnlyJobs) {
       // #736 Phase 3: backstop re-dispatch of still-failed archive generations
