@@ -299,7 +299,7 @@ Dataset Management:
   s3              - S3/IAM credential management
   doi             - Create and manage DOIs for datasets
   revert          - Revert dataset to previous version (via PR)
-  make-public     - Publish a dataset (permanent, irreversible)
+  make-public     - Publish a dataset (pull it back with 'repo unpublish')
   delete-dataset    - Delete a dataset and all associated resources
   import-openneuro  - Import an OpenNeuro dataset into NEMAR
 
@@ -3389,7 +3389,9 @@ adminCommand
 
 adminCommand
   .command("make-public")
-  .description("Publish a dataset (make repository and data public) - PERMANENT")
+  .description(
+    "Publish a dataset (make repository and data public); pull back with 'repo unpublish'",
+  )
   .argument("<dataset-id>", "Dataset ID (e.g., nm000104)")
   .addHelpText(
     "after",
@@ -3397,17 +3399,16 @@ adminCommand
 Description:
   Publish a dataset by making both the GitHub repository and S3 data publicly accessible.
 
-  ${chalk.yellow("WARNING: This operation is PERMANENT and IRREVERSIBLE")}
+  ${chalk.yellow("WARNING: Publication mints DOIs that stay registered even if the dataset is later pulled back with 'nemar admin repo unpublish'")}
 
   Once published:
   - GitHub repository will be publicly visible
   - S3 data files will be publicly downloadable
   - git-annex will use public URLs for downloads
 
-  Publishing cannot be undone because:
+  Publication leaves marks that unpublishing does not remove:
   - Data may be cached, indexed, or linked externally
-  - Unpublishing would create broken links
-  - Aligns with DOI permanence principles
+  - Minted DOIs stay registered (DOI permanence); 'repo unpublish' never calls the registrar
 
   Use this when:
   - Dataset has been reviewed and validated
@@ -3423,7 +3424,8 @@ Examples:
   $ nemar admin make-public nm000104
 
   This will prompt for confirmation by requiring you to type
-  the dataset ID to confirm the permanent action.
+  the dataset ID to confirm. Publication mints DOIs, which stay registered;
+  'nemar admin repo unpublish' pulls the dataset back to private afterwards.
 `,
   )
   .action(async (datasetIdArg: string) => {
@@ -3449,7 +3451,11 @@ Examples:
     }
 
     // Show warning and dataset info
-    console.log(chalk.yellow("\nWARNING: Publishing is PERMANENT and IRREVERSIBLE\n"));
+    console.log(
+      chalk.yellow(
+        "\nWARNING: Publishing mints DOIs that stay registered. The dataset can be pulled back to private with 'nemar admin repo unpublish', but its DOIs remain.\n",
+      ),
+    );
     console.log("This will:");
     console.log("  1. Make the GitHub repository PUBLIC");
     console.log("  2. Allow public S3 access to all dataset files");
@@ -3771,6 +3777,7 @@ function printUnpublishResult(tag: string, result: UnpublishResponse): void {
     `    DOIs left untouched: concept ${result.dois_untouched.concept ?? "none"}, ${result.dois_untouched.versions} version(s)`,
   );
   if (result.warning) console.log(chalk.yellow(`    warning: ${result.warning}`));
+  if (result.record_error) console.log(chalk.red(`    ${result.record_error}`));
 }
 
 repoCommand

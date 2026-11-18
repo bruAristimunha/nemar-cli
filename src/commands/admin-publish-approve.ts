@@ -204,8 +204,8 @@ Description:
   confirmation banner reads the pending request and lists what will actually
   run, so approve one and read the banner rather than this list.
 
-  WARNING: This action is PERMANENT. Published datasets cannot be unpublished.
-  Once a DOI is assigned, it is permanent and cannot be deleted.
+  WARNING: Once a DOI is assigned, it is permanent and cannot be deleted. A published
+  dataset can be pulled back to private with 'nemar admin repo unpublish', but its DOIs stay.
 
 Orchestrator Steps (execution order; shared/publication-steps.ts):
    1. CI Check          - Verify BIDS validation passes, deploy workflows if missing
