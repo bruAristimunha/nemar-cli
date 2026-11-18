@@ -548,6 +548,8 @@ describe("the claim", () => {
     const id = await dataset();
     const jobId = await dispatch(env, id);
     await sql("UPDATE datasets SET visibility = 'private' WHERE dataset_id = ?1", id);
+    // Past the sweep's minimum age (a job seconds old may still be linking its stamp).
+    await age(jobId, "created_at", "-11 minutes");
     expect(RunnerClaimResponseSchema.parse((await claim(r, 1)).body).jobs).toHaveLength(0);
     expect((await row(jobId)).runner_id).toBeNull();
     // The claim route's own sweep already ended it: a second sweep finds nothing.
@@ -2260,6 +2262,8 @@ describe("a waiting job that can never be claimed does not hold a slot", () => {
     const goneJob = await dispatch(env, gone);
     expect(await live()).toBe(2);
     await sql("UPDATE datasets SET visibility = 'private' WHERE dataset_id = ?1", gone);
+    await age(goneJob, "created_at", "-11 minutes");
+    await age(kept, "created_at", "-11 minutes");
     const swept = await sweepRunnerLeases(env);
     expect(swept.ineligible).toBe(1);
     expect(await row(goneJob)).toMatchObject({
@@ -2283,6 +2287,7 @@ describe("a waiting job that can never be claimed does not hold a slot", () => {
         "UPDATE datasets SET withdrawn_at = datetime('now') WHERE dataset_id = ?1",
         withdrawn,
       );
+      await age(fits.jobId, "created_at", "-11 minutes");
       expect((await sweepRunnerLeases(env)).ineligible).toBe(1);
       expect((await row(fits.jobId)).failure_detail).toBe("dataset_ineligible");
     }
@@ -2293,12 +2298,24 @@ describe("a waiting job that can never be claimed does not hold a slot", () => {
     const jobId = await dispatch(env, id);
     await sql("PRAGMA foreign_keys = OFF");
     await sql("DELETE FROM datasets WHERE dataset_id = ?1", id);
+    await age(jobId, "created_at", "-11 minutes");
     const swept = await sweepRunnerLeases(env);
     expect(swept.ineligible).toBe(1);
     expect(await row(jobId)).toMatchObject({
       state: "failed",
       failure_detail: "dataset_ineligible",
     });
+  });
+
+  test("a job seconds old with no stamp linked yet is being dispatched, not an orphan (MUTATION: drop the age guard)", async () => {
+    const jobId = await dispatch();
+    // The window between the job insert and LINK_STAMP_SQL: the job exists, no stamp names it yet.
+    await sql("UPDATE compute_pipeline_stamps SET job_id = NULL WHERE job_id = ?1", jobId);
+    expect((await sweepRunnerLeases(env)).ineligible).toBe(0);
+    expect((await row(jobId)).state).toBe("created");
+    // Once it is old enough to have been linked, an unlinked job is an orphan.
+    await age(jobId, "created_at", "-11 minutes");
+    expect((await sweepRunnerLeases(env)).ineligible).toBe(1);
   });
 
   test("a job waiting over a day is the runner_waiting_stale attention word; a fresh one is not", async () => {

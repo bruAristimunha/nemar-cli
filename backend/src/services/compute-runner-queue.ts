@@ -804,10 +804,16 @@ export const EXHAUSTED_ROWS_SQL = `SELECT id FROM compute_jobs
  * predicate (`eligible`, the same text the claim uses: production's, or the non-production widening). Such a job
  * holds a `runners.maxLiveJobs` slot for ever otherwise, since the claim only admits an eligible dataset.
  * They end `runner_lost` `dataset_ineligible`. `?1` the limit.
+ *
+ * Only a job at least `UNCLAIMABLE_MIN_AGE` old: the dispatch inserts the job, writes its records and only then
+ * links the stamp (`LINK_STAMP_SQL` in compute-pipeline.ts), and this sweep also runs on every runner poll, so a
+ * job seconds old with no stamp yet is a job being dispatched, not an orphan.
  */
+export const UNCLAIMABLE_MIN_AGE = "-10 minutes";
 const unclaimableRowsSql = (eligible: string): string => `SELECT j.id FROM compute_jobs j
   WHERE j.executor = 'runner' AND j.state = 'created' AND j.runner_claimed_at IS NULL
     AND j.cancel_requested_at IS NULL
+    AND j.created_at <= datetime('now', '${UNCLAIMABLE_MIN_AGE}')
     AND NOT EXISTS (SELECT 1 FROM compute_pipeline_stamps s JOIN datasets d ON d.dataset_id = s.dataset_id
                      WHERE s.job_id = j.id AND ${eligible})
   ORDER BY j.examined_at ASC, j.created_at ASC, j.id ASC LIMIT ?1`;
