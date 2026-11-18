@@ -15,16 +15,62 @@ earlier releases are described only by their generated notes.
 
 ## Unreleased
 
-Two blocks of compute work are unreleased: a tenant-wide ceiling on live compute jobs (#2126, phase P2 of issue #2121), and portable compute with workstation runners (epic #2145).
-The ceiling carries no migration and sets no Worker variable or secret, and it changes nothing in production while the compute switches are absent, because no job can exist then.
-The runners block ships migration 0140 (the runner registry tables and the executor, accounting and lease columns of `compute_jobs`) and sets no Worker variable or secret; creating a runner job and every runner claim stay behind the dark switch `COMPUTE_RUNNERS_ENABLED`, and an owner can register a runner while it is off (the registration is useless until the switch is on).
-Three of its changes run in production with no switch: the runner lease sweep (`sweepRunnerLeases`) on the 30-minute scheduled tick, which reads no switch; the refusal in `resolveApiKeyUser` of any key that starts with `nmr_` or `nmra_`, as a runner credential and never as an API key; and `runnerEndStatements`, which ends a person's runners in the account deletion, account revocation and role demotion paths.
-The production Worker configuration gains the derivative store's private bucket as the binding `COMPUTE_DERIVATIVES` and its name as the variable `COMPUTE_DERIVATIVES_BUCKET_NAME` (`nemar-compute-derivatives`; the dev Worker binds its own `nemar-compute-derivatives-dev`), and the bucket must exist before the release deploys, or the Worker deploy fails after the migrations have applied (it exists); with the binding, the store's daily pass runs in production with no switch, and it copies nothing until a pipeline job dispatched while `COMPUTE_ENABLED` is on has finished.
+Release 0.10.34 carries three blocks of work.
+The first is a repair of the dataset publication lifecycle (#2199, ADR 0125): a published dataset can now be pulled back to unpublished, and the commands that could leave one half published are gone.
+The second is search that returns every dataset the caller may see, private ones included (#2201, ADR 0126).
+The third is portable compute: a tenant-wide ceiling on live compute jobs (#2126, phase P2 of issue #2121) and workstation runners, a derivative store and runner reporting (epic #2145, ADR 0121 to ADR 0124).
+Two smaller fixes and a plan document ride along (#2139, #2163, #2197).
+The release has six migrations, 0140 to 0145, and sets no Worker variable or secret; the one change to the Worker configuration is the derivative store's bucket binding (see Deploy coupling).
+Compute stays dark in production: no job can be created while `COMPUTE_ENABLED` is absent, and no runner can claim work while `COMPUTE_RUNNERS_ENABLED` is absent.
+
+### Production behavior changes
+
+- **The administrator's publication and visibility commands moved under `nemar admin repo`, and two of them are gone (#2199, ADR 0125).**
+  `nemar admin repo publish` (with `list`, `show`, `start`, `next`, `approve`, `deny` and `screen`, options unchanged), `nemar admin repo unpublish`, `nemar admin repo withdraw` and `nemar admin repo restore` are the lifecycle commands.
+  The old top-level `nemar admin publish`, `nemar admin withdraw` and `nemar admin restore` are hidden stubs that do nothing and exit 1 with a pointer to the new name, so a script or runbook that calls one fails loudly until it is updated.
+  `nemar admin repo public` and `nemar admin repo private` are removed, because a bare visibility flip is how a dataset ends up public or private while its publication record says the opposite.
+  `nemar dataset publish` (the author's side) is unchanged.
+- **`PATCH /admin/datasets/:id/visibility` answers 409 in both directions (#2199).**
+  The route stays so that an old script gets a sentence naming `admin repo publish approve` or `admin repo unpublish`, not a bare 404.
+  Nothing changes visibility through it any more.
+- **Publication mail names the new command.**
+  The administrator notification that a publication request is waiting now says `nemar admin repo publish ...`.
+- **`GET /datasets/search` returns the datasets the caller can see (#2201, ADR 0126).**
+  An anonymous caller gets public datasets only, as before.
+  A signed-in caller also gets the private datasets they own or collaborate on, and an administrator or owner gets every dataset, the rule `GET /datasets/:id` already enforces.
+  Status, sandbox, exemplar and anonymous-deposit concealment are unchanged, and every search response stays `no-store`.
+  Private datasets are keyword-searchable for the people entitled to them as soon as this deploys; semantic search for them waits on the owner's rollout steps below.
+  The MCP `search_datasets` tool stays public: it never returns a private dataset.
+- **Three things run in production with no switch in the portable compute block.**
+  The runner lease sweep (`sweepRunnerLeases`) runs on the 30-minute scheduled tick; a credential that starts with `nmr_` or `nmra_` is refused by `resolveApiKeyUser` as a runner credential and never read as an API key; and `runnerEndStatements` ends a person's runners in the account deletion, account revocation and role demotion paths.
+  With no runner registered they have nothing to act on.
+- **The derivative store's daily pass runs in production,** because the bucket is now bound (see Deploy coupling).
+  It reads no switch, and it copies nothing until a pipeline job dispatched while `COMPUTE_ENABLED` is on has finished.
+- **Links to files whose names contain a reserved character now resolve (#2139).**
+  See Fixed.
 
 ### Added
 
-- The fixture id `nm099996` is declared dev-owned, so production stops claiming pushes to a repository by that name before anyone creates it.
-- **A ceiling on the live jobs of the whole tenant, checked in the statement that takes each job's hold, whoever submits it.**
+- **`nemar admin repo unpublish` (#2199, ADR 0125, migration 0144).**
+  It takes a published dataset back to an ordinary unpublished private dataset: private on GitHub and S3 and in D1, with the publication request that published it stamped with the new column `publication_requests.unpublished_at` (the request's status is not rewritten, so the record that the dataset was once published stays).
+  It is a dry run by default; `--execute --reason <text>` applies it after a confirmation, and `--json` is available.
+  The route is `POST /admin/datasets/:id/unpublish`, and the reason is written to the audit log as `dataset_unpublished`.
+  It never calls EZID, so the concept and version DOIs stay as they were, and it leaves `first_published_at` (anonymity stays unavailable), collaborators, access requests, version records and the tag ruleset alone.
+  The author's `nemar dataset publish status` reads a stamped request as none, and the dataset can be published again.
+  It repairs the half state a bare flip leaves: a dataset already private whose request still says `published`.
+  It refuses the live datasets nm000103 to nm000107, the reserved fixture band, exemplars, anonymous deposits, withdrawn datasets (use `restore`) and a dataset with an open publication request (deny it first).
+  A public dataset that was never published is simply made private.
+  `withdraw` is the other way back: it is for a broken or removed dataset, and it tombstones the DOIs.
+- **Search follows the viewer, with two layers of protection (#2201, ADR 0126, migration 0145).**
+  One shared predicate, `buildViewerVisibilitySql`, decides what a caller sees in every tier: exact identifier, full-text, literal match, vector-hit hydration, reranker text, counts and `excluded_unknown`.
+  Layer 2, always on: every hit is checked against the live `datasets` row, so a stale label never decides visibility.
+  Layer 1, behind `VECTORIZE_VISIBILITY_FILTER=1`: vectors carry two routing labels, `visibility` and `dataset_id`, and a vector query is narrowed by them (anonymous asks for public; a signed-in user adds the private datasets they own or collaborate on; administrators are unfiltered).
+  A rejected filter, or a filtered query with no match, falls back to an unfiltered query with a warning.
+  With the flag off, only public datasets are embedded, as before, and the labels are still written to public vectors.
+  With it on, the daily drain and `POST /admin/vectorize/reindex-all` embed private datasets too.
+  Migration 0145 adds a trigger that marks a dataset's embedding stale (`embedding_dirty = 2`) when its visibility or status changes, and the drain takes the highest value first, so a dataset just published or unpublished is relabeled ahead of any backlog.
+- **The fixture id `nm099996` is declared dev-owned (#2163),** so production stops claiming pushes to a repository by that name before anyone creates it.
+- **A ceiling on the live jobs of the whole tenant, checked in the statement that takes each job's hold, whoever submits it (#2126).**
   The owner's `tenant` policy key sets the ceiling and a floor of slots kept for people, for the pipelines and for partners; the schema refuses floors that add up to more than the ceiling, and a stored policy without the key falls back to the defaults, never to unlimited.
   A job that would take a slot owed to another class, or pass the ceiling, is refused with the new word `platform_busy` (409).
   It is not queued; a queue is a later phase.
@@ -32,15 +78,97 @@ The production Worker configuration gains the derivative store's private bucket 
   `platform_busy` stops a pipeline run and ends the daily dispatcher's run; `pipeline run` and its dry run are clamped to the tenant room.
   `nemar admin compute status` prints the occupied slots by class and the attention count `tenant_over_ceiling`, and the live tenant sweep logs `tenant_live` and `occupied` and warns when the live count passes the ceiling.
   The ceiling is checked on both database engines in tests (bun:sqlite and Miniflare D1), with racing requests for the last slots.
-- Registered workstation runners pull pipeline jobs over HTTPS behind the dark switch `COMPUTE_RUNNERS_ENABLED`.
-- A job records its executor and accounting class, and runner jobs write no ledger entry.
+  It carries no migration and sets no variable or secret.
+- **Workstation runners (epic #2145, ADR 0121 and ADR 0122, migration 0140).**
+  An owner registers a runner (`nemar admin compute runners register|list|revoke`), is shown its secret once, and the runner exchanges the secret for a 15-minute access token and pulls pipeline jobs over HTTPS (`/compute/runners/token`, `me`, `claim`, `heartbeat`, `complete`).
+  Migration 0140 adds the runner registry tables and twelve executor, accounting and lease columns on `compute_jobs`: a job records its executor (`tapis` or a runner) and its accounting class, and a runner job writes no ledger entry, because a runner-reported core-hour is never added to a service-unit total.
+  Leases expire and are swept, revoking a registration or ending its owner ends the runner's tokens and work in one batch, and a pipeline dispatch checks the Zarr copy's source commit first.
+  Creating a runner job and every runner claim stay behind the dark switch `COMPUTE_RUNNERS_ENABLED`; an owner can register a runner while it is off, and the registration does nothing until the switch is on.
+  A Tapis-executor pipeline run is refused `tapis_unconfigured` (503) before any write while Tapis is unconfigured, so `COMPUTE_ENABLED` may be set for runner jobs alone (ADR 0118 amendment, #2176); the Tapis go-live stays parked.
+  ADR 0122 records one container image that runs under Apptainer or Docker from one digest; Podman is unsupported.
+- **One `nemar-floor` recipe with two inputs (#2177, migration 0141).**
+  The recipe registry lists `nemar-floor` with inputs `bids` (on Tapis) and `zarr` (on a runner), and `nemar-floor-zarr` is removed.
+  A pipeline stamp now records the input, the reader, the engine and the digest of what the run read.
+  A dispatch whose input does not match its executor is refused `invalid_spec` with `field: "input"`.
+  A BIDS run's command and arguments are unchanged; a Zarr run's command is `nemar-recipe run nemar-floor --input zarr`.
+  The migration renames existing `nemar-floor-zarr` stamps to `nemar-floor` with input `zarr` and rebuilds the two live-stamp indexes; production holds no such stamps.
+- **Reports separate runner usage from service units (#2179, migration 0142).**
+  `nemar admin compute jobs list` takes `--executor`, `--accounting` and `--runner`; `jobs report` and `jobs record` show runner-reported usage, marked partial when the runner could not measure all of it, and never beside a service-unit figure.
+  `GET /admin/compute/report` counts service-unit jobs only in `totals` and `by_pool` and carries runner jobs in a separate `runner_totals`.
+  `nemar admin compute runners usage --from --to` (route `GET /admin/compute/reports/runners`, at most 366 days) reports each runner's jobs by state and its summed wall time, CPU time and largest resident memory.
+  Migration 0142 adds `compute_jobs.runner_usage_partial`.
+- **The derivative store (#2178, #2180, #2191, #2193, #2194, ADR 0123, migration 0143).**
+  A finished pipeline job's product is copied server side from the results bucket into a private derivatives bucket under `d/<key>/`, with a `derivative.json` that names what produced it, the source datasets (with the version DOI when one exists), the profile and every file with its size and SHA-256 digest.
+  The key is the SHA-256 of eight fields (dataset, version, recipe, recipe version, engine, input, profile and input digest), computed by `shared/contract/derivatives.ts`, which is import-free and has shared test vectors that a Python implementation reproduces.
+  A Zarr input's digest covers the electrode positions its recipe was handed (`nemar.input-digest.v2`), so a reconversion that changes only positions gets a new key.
+  Retention is by class: `canary` expires 30 days after it is stored, `catalog` is kept until a later catalog derivative of the same dataset, recipe, input and profile is promoted (then 30 days), and `published` is never expired, superseded or deleted by code and has no DOI minted by code.
+  Migration 0143 adds `compute_derivatives` and a skip log.
+  `nemar admin compute derivatives list|show|promote|sync` (routes under `/admin/compute/derivatives`; `published` is the owner's) manage it, and one daily production pass frees what is due and copies at most 100 objects.
+- **Architecture records and plans:** ADR 0121 to ADR 0124 (executor and accounting class, one image under two container runtimes, the keyed derivative store, reader conformance), the ADR 0118 amendment of 2026-11-14 on runner-only deployments (#2176), and the Brainlife indexing plan (#2197, documentation only).
+
+### Changed
+
+- **The Zarr converter records where a store's electrode positions came from (#2190).**
+  A store's root gains `electrode_positions_source` (`subject` or `dataset`), `electrode_positions_file` and, when one resolved, `electrode_coordsystem_file`, written only when positions are written.
+  Neither word means measured, and no template is ever written.
+  An `_electrodes.tsv` or `_coordsystem.json` named with the `space` entity now applies, and when the most specific files hold more than one `space` value the recording gets no positions and one warning names the files.
+  The change is in the converter script only: nothing is reconverted by this release, and a store carries the new attributes after its next conversion.
+- **Help text, README and the `repo` group description now use the new command names** ("Dataset publication lifecycle: publish, unpublish, withdraw, restore").
+
+### Fixed
+
+- **Files whose names contain a reserved character no longer 404 on `data.nemar.org` (#2139).**
+  `manifest.json` URLs encode each path segment, and the route decoded only part of the escapes, so `%2B`, `%23`, `%26` and the like never matched the manifest key (nm000454 v1.0.2 has 177 FreeSurfer `*+aseg.mgz` files that failed this way).
+  The route now decodes the pathname once per segment before the lookup; a literal `+` still resolves and decoded `..` segments are still refused.
+  Compact-manifest URLs have the same form and are fixed too.
+  The `/<id>/qa/*` route reads the path the same way and is not changed here.
+- **Converter defects found while adding provenance (#2190).**
+  A coordinate that parses to `NaN` or infinity (including an overflowing `1e999`) is skipped like `n/a`, where before it wrote a bare `NaN` token into the store's root `zarr.json`, which `JSON.parse` refuses.
+  An electrodes file that cannot be read now prints one warning naming it, instead of looking like a dataset that declares none.
+
+### Deploy coupling
+
+- **Migrations 0140 to 0145 apply with the Worker deploy,** before the Worker is deployed.
+  0140 adds the runner tables and `compute_jobs` columns, 0141 adds the stamp input columns and rebuilds two indexes, 0142 adds `runner_usage_partial`, 0143 adds the derivative tables and triggers, 0144 adds `publication_requests.unpublished_at`, and 0145 adds the trigger that marks an embedding stale when visibility or status changes.
+  Migrations 0131 to 0139 are unused; numbering continues above 0130 so a fresh replay and production agree.
+- **The derivative bucket `nemar-compute-derivatives` must exist before the release deploys** (it exists), or the Worker deploy fails after the migrations have applied and 0.10.33 keeps serving.
+  The dev Worker binds its own `nemar-compute-derivatives-dev`.
+  The production configuration gains the binding `COMPUTE_DERIVATIVES` and the variable `COMPUTE_DERIVATIVES_BUCKET_NAME`, and nothing else; no switch, secret or other variable changes.
+  The store reuses the compute token that already covers the other two compute buckets.
+- **Update scripts and runbooks that call `nemar admin publish`, `admin withdraw`, `admin restore`, `admin repo public` or `admin repo private`, or `PATCH /admin/datasets/:id/visibility`,** before or with the release.
+- **No website release is required.**
+  The website does not call the changed administrator commands, and search keeps its response shape.
+- **Run `bun run migrations:d1-check` before the release pull request.**
+- **Rolling back.**
+  The migrations add tables, columns, indexes and triggers that the 0.10.33 Worker ignores, so a rollback is safe for the schema.
+  Rolling a Worker back to a build from before the tenant block makes a stored policy that has the `tenant` key unreadable, and a build from before the runners block does the same for the `runners` key (the reader is strict and fails closed); turn runners off and drain them, and write a policy without the keys, before any rollback across them.
+
+### Owner steps after release
+
+None of these is done by the release.
+
+1. Repair nm000289, which a bare private flip on 2026-10-29 left private and still recorded as published.
+   Run `nemar admin repo unpublish nm000289` first (a dry run that changes nothing), then `nemar admin repo unpublish nm000289 --execute --reason "<why>"`.
+   Check `nemar dataset publish status nm000289` (no request, unpublished by an administrator) and `nemar dataset status nm000289` (found, DOIs still listed).
+   Then approve the pending access request with `nemar dataset access approve <user> nm000289`; `nemar dataset access list nm000289` shows it.
+   If the dataset is still not found, check that the CLI points at production (`nemar auth status`; unset any test API URL in the shell).
+2. Roll out semantic search for private datasets, after the deploy.
+   Create the Vectorize metadata indexes `visibility` (string) and `dataset_id` (string); metadata is indexed only for vectors written after the index exists.
+   Run `POST /admin/vectorize/reindex-all` repeatedly (keyset-paged with `after` and `last_id`) until `has_more` is false, which labels the public vectors.
+   Only then set `VECTORIZE_VISIBILITY_FILTER=1`, because unlabeled public vectors drop out of filtered queries.
+   Run `reindex-all` again to embed the private datasets, which the flag now includes.
+3. Verify re-publishing an unpublished dataset end to end on `nm099999` (#2202): unpublish, file a request, approve, and check the version and concept DOIs.
+4. `curl -s https://api.nemar.org/health | jq -r .version` prints `0.10.34`, and `nemar admin compute status --json | jq '.switches, .storage'` shows the compute switches false and the three bucket bindings true.
 
 ### Known limits
 
-- Rolling a Worker back to a build from before this change makes a stored policy that has the `tenant` key unreadable (the reader is strict and fails closed); write a policy without the key first.
-- Rolling a Worker back to a build from before the runners block makes a stored policy that has the `runners` key unreadable (the reader is strict and fails closed): before any rollback across it, turn runners off and drain them, and write a policy without the key first.
+- The list and facet endpoints show private datasets only to administrators; owners and collaborators do not yet see their own private rows there (#2203).
+- Re-publishing an unpublished dataset has not been exercised end to end: the orchestrator reuses the existing concept and version DOIs and handles an existing DOI, but a second publish of the same version number was not run against EZID (#2202).
+- `nemar admin make-public` is still a bare public flip with no publication request, the same class of half state that `repo public` was; it is not changed here.
+- Query spelling correction uses only the public vocabulary, so a misspelled word that appears only in private datasets is not corrected.
 - Counting the orphaned platform jobs scans `compute_jobs` once per hold, because an index for it would need a migration.
 - The pipelines' daily cap is still read before a run and not checked in the hold's statement (see 0.10.33).
+- The derivative store copies nothing in production until a pipeline job succeeds, which needs the compute switches the owner has not set.
 
 ## 0.10.33 - 2026-11-11
 
