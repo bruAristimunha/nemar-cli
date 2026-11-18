@@ -120,6 +120,9 @@ export const RUNNER_RECORDS_REPLAY_MINUTES = 5;
 /** A waiting runner row whose records could not be replayed in this many minutes ends `failed`. */
 export const RUNNER_RECORDS_GIVE_UP_MINUTES = 60;
 
+/** A runner job that has waited unclaimed this many hours is an attention count (`runner_waiting_stale`). */
+export const RUNNER_WAITING_ATTENTION_HOURS = 24;
+
 // --- The claim -----------------------------------------------------------------------------------
 
 /**
@@ -796,6 +799,29 @@ export const EXHAUSTED_ROWS_SQL = `SELECT id FROM compute_jobs
   ORDER BY examined_at ASC, created_at ASC, id ASC LIMIT ?2`;
 
 /**
+ * Waiting runner jobs that can never be claimed: unclaimed, no cancel recorded (a cancel has its own step), and
+ * either no stamp names the job or the dataset its stamp names is gone or fails the pipeline eligibility
+ * predicate (`eligible`, the same text the claim uses: production's, or the non-production widening). Such a job
+ * holds a `runners.maxLiveJobs` slot for ever otherwise, since the claim only admits an eligible dataset.
+ * They end `runner_lost` `dataset_ineligible`. `?1` the limit.
+ *
+ * Only a job at least `UNCLAIMABLE_MIN_AGE` old: the dispatch inserts the job, writes its records and only then
+ * links the stamp (`LINK_STAMP_SQL` in compute-pipeline.ts), and this sweep also runs on every runner poll, so a
+ * job seconds old with no stamp yet is a job being dispatched, not an orphan.
+ */
+export const UNCLAIMABLE_MIN_AGE = "-10 minutes";
+const unclaimableRowsSql = (eligible: string): string => `SELECT j.id FROM compute_jobs j
+  WHERE j.executor = 'runner' AND j.state = 'created' AND j.runner_claimed_at IS NULL
+    AND j.cancel_requested_at IS NULL
+    AND j.created_at <= datetime('now', '${UNCLAIMABLE_MIN_AGE}')
+    AND NOT EXISTS (SELECT 1 FROM compute_pipeline_stamps s JOIN datasets d ON d.dataset_id = s.dataset_id
+                     WHERE s.job_id = j.id AND ${eligible})
+  ORDER BY j.examined_at ASC, j.created_at ASC, j.id ASC LIMIT ?1`;
+
+export const UNCLAIMABLE_ROWS_SQL = unclaimableRowsSql(PIPELINE_ELIGIBLE_SQL);
+export const UNCLAIMABLE_ROWS_SQL_NONPROD = unclaimableRowsSql(PIPELINE_ELIGIBLE_SQL_NONPROD);
+
+/**
  * A started job whose lease expired is `unreported` and KEEPS its lease id (a partitioned runner may still
  * land its outputs); so is an unstarted claim whose outputs were declared (verified if they completed, given up
  * on like any silent job if not; never released). Only a job with no recorded cancel. `?1` the limit.
@@ -890,6 +916,16 @@ export const RUNNER_RECORDS_UNWRITTEN_SQL = `SELECT COUNT(*) AS n FROM compute_j
     AND records_written_at IS NULL
     AND created_at <= datetime('now', '-${RUNNER_RECORDS_GIVE_UP_MINUTES * 2} minutes')`;
 
+/**
+ * Waiting runner jobs (records landed, unclaimed, no cancel) older than {@link RUNNER_WAITING_ATTENTION_HOURS}:
+ * the count of `runner_waiting_stale`. A job that can never be claimed is ended by the sweep
+ * ({@link UNCLAIMABLE_ROWS_SQL}), so what is counted here is a job no runner has taken.
+ */
+export const RUNNER_WAITING_STALE_SQL = `SELECT COUNT(*) AS n FROM compute_jobs
+  WHERE executor = 'runner' AND state = 'created' AND runner_claimed_at IS NULL
+    AND records_written_at IS NOT NULL AND cancel_requested_at IS NULL
+    AND created_at <= datetime('now', '-${RUNNER_WAITING_ATTENTION_HOURS} hours')`;
+
 /** The runner attention counts, by their contract words. */
 export const RUNNER_ATTENTION_COUNTS: ReadonlyArray<
   readonly [word: (typeof COMPUTE_RUNNER_ATTENTION_WORDS)[number], sql: string]
@@ -897,6 +933,7 @@ export const RUNNER_ATTENTION_COUNTS: ReadonlyArray<
   ["runner_cancel_pending_failed", RUNNER_CANCEL_PENDING_FAILED_SQL],
   ["runner_copy_abandoned", RUNNER_COPY_ABANDONED_SQL],
   ["runner_records_unwritten", RUNNER_RECORDS_UNWRITTEN_SQL],
+  ["runner_waiting_stale", RUNNER_WAITING_STALE_SQL],
 ];
 
 export interface RunnerSweepResult {
@@ -905,6 +942,7 @@ export interface RunnerSweepResult {
   cancelled: number;
   released: number;
   exhausted: number;
+  ineligible: number;
   unreported: number;
   verified: number;
   lost_revoked: number;
@@ -922,6 +960,7 @@ const emptySweep = (): RunnerSweepResult => ({
   cancelled: 0,
   released: 0,
   exhausted: 0,
+  ineligible: 0,
   unreported: 0,
   verified: 0,
   lost_revoked: 0,
@@ -1039,6 +1078,7 @@ export interface SweepOptions {
  *   1. replay the records of waiting rows whose records never landed, and end the ones that cannot be;
  *   2. end every recorded cancel whose lease is not current (`cancelled`, or verified when outputs completed);
  *   3. release expired unstarted claims, and fail the ones with no claims left (`claims_exhausted`);
+ *   3b. fail waiting jobs whose dataset is gone or no longer eligible (`dataset_ineligible`);
  *   4. move started jobs (and unstarted ones with outputs) whose lease expired to `unreported`;
  *   5. settle `unreported` jobs: verify those with outputs, `runner_revoked` for a revoked runner, and
  *      `lease_expired` after the give-up wait;
@@ -1159,6 +1199,15 @@ export async function sweepRunnerLeases(
     await each(await ids(EXHAUSTED_ROWS_SQL, RUNNER_MAX_CLAIMS), async (job) => {
       if (await finishNow(job, { kind: "lost", detail: "claims_exhausted" })) r.exhausted++;
     });
+
+    // 3b. Waiting jobs whose dataset can never be claimed again (gone, unpublished, withdrawn, ...): ended, so
+    // they stop holding a live-job slot.
+    await each(
+      await ids(isNonProductionEnv(env) ? UNCLAIMABLE_ROWS_SQL_NONPROD : UNCLAIMABLE_ROWS_SQL),
+      async (job) => {
+        if (await finishNow(job, { kind: "lost", detail: "dataset_ineligible" })) r.ineligible++;
+      },
+    );
 
     // 4. Jobs with an expired lease, started or holding completed outputs.
     const moved = await db.prepare(UNREPORT_EXPIRED_SQL).bind(RUNNER_SWEEP_BATCH).run();

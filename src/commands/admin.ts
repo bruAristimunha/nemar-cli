@@ -48,6 +48,7 @@ import {
   neurobagelVerdictExitCode,
   neurobagelVerificationState,
 } from "../../shared/contract/neurobagel-admin.js";
+import { UNPUBLISH_CACHE_NOTE } from "../../shared/contract/publication.js";
 import { weeklyAttention } from "../../shared/contract/weekly-attention.js";
 import { isOpenNeuroTag } from "../../shared/openneuro-tag.js";
 import {
@@ -3778,6 +3779,9 @@ function printUnpublishResult(tag: string, result: UnpublishResponse): void {
   );
   if (result.warning) console.log(chalk.yellow(`    warning: ${result.warning}`));
   if (result.record_error) console.log(chalk.red(`    ${result.record_error}`));
+  // Only an execute changed anything: a dry run has nothing to wait for.
+  if (!tag && result.visibility.status !== "failed")
+    console.log(chalk.dim(`    ${UNPUBLISH_CACHE_NOTE}`));
 }
 
 repoCommand

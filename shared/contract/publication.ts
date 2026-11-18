@@ -302,3 +302,11 @@ export const backfillNameOutcomeSchema = z.enum([
   "write_failed",
 ]);
 export type BackfillNameOutcome = z.infer<typeof backfillNameOutcomeSchema>;
+
+/**
+ * What `nemar admin repo unpublish --execute` tells the administrator after it ends: the surfaces that read
+ * the live row (search) change at once, while the anonymous dataset page and the public catalog list are
+ * cached at the edge and can keep showing the dataset for several minutes.
+ */
+export const UNPUBLISH_CACHE_NOTE =
+  "Search reflects this at once; the public dataset page and catalog list are cached at the edge and can keep showing the dataset for several minutes.";

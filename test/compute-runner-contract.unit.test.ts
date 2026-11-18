@@ -152,12 +152,13 @@ describe("runner_lost", () => {
     expect((LAUNCHER_FAILURE_CODES as readonly string[]).includes("runner_lost")).toBe(false);
   });
 
-  test("its four details are the contract's, and each is a platform failure", () => {
+  test("its five details are the contract's, and each is a platform failure", () => {
     expect([...RUNNER_LOST_DETAILS]).toEqual([
       "lease_expired",
       "claims_exhausted",
       "deadline_exceeded",
       "runner_revoked",
+      "dataset_ineligible",
     ]);
     for (const d of RUNNER_LOST_DETAILS) expect(isPlatformFailure("runner_lost", d), d).toBe(true);
     expect(isPlatformFailure("runner_lost")).toBe(true);

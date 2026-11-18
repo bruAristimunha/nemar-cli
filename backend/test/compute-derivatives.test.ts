@@ -31,6 +31,7 @@ import {
 import { AUDIT_IF_PREVIOUS_CHANGED_SQL } from "../src/db/audit-log";
 import {
   ADVANCE_COPIED_SQL,
+  INSERT_DERIVATIVE_SQL,
   PROMOTE_CATALOG_SQL,
   SKIP_STAMP_SQL,
   STORE_ROW_SQL,
@@ -1420,14 +1421,15 @@ describe("every keying check of the ADR, each failed alone", () => {
       return made;
     }, "recipe_unknown"));
 
-  test("a stamp whose dataset is gone is dataset_gone, and no derivative is made for it (MUTATION: drop the dataset condition of the insert)", () =>
-    expectUnkeyable(async () => {
-      const made = await zarrJob();
-      const env = envOf();
-      await sql(env, "DELETE FROM dataset_versions WHERE dataset_id = ?1", made.id);
-      await sql(env, "DELETE FROM datasets WHERE dataset_id = ?1", made.id);
-      return made;
-    }, "dataset_gone"));
+  test("a stamp whose dataset is gone is never a candidate: no derivative, no skip, nothing read (MUTATION: drop the eligibility term of the scan)", async () => {
+    const made = await zarrJob();
+    const env = envOf();
+    await sql(env, "DELETE FROM dataset_versions WHERE dataset_id = ?1", made.id);
+    await sql(env, "DELETE FROM datasets WHERE dataset_id = ?1", made.id);
+    expect(await syncAll(env)).toMatchObject({ examined: 0, created: 0, errored: 0 });
+    expect(await all(env)).toHaveLength(0);
+    expect(copiesMade()).toBe(0);
+  });
 
   test("a bucket that throws leaves the stamp undecided and counted later, and the next sync keys it (MUTATION: decide a stamp from a read that failed)", async () => {
     const env = envOf();
@@ -2143,26 +2145,122 @@ describe("what an administrator reads and sends", () => {
   });
 });
 
-describe("the version DOI is read through the repository's one rule", () => {
-  test("a dataset that is anonymous has no DOI in its derivative's description or citation (MUTATION: read the version DOI by hand)", async () => {
+describe("an anonymous dataset has no derivative", () => {
+  test("an anonymous dataset is never keyed, so no description can carry a version identifier that does not resolve (MUTATION: drop the eligibility term of the scan)", async () => {
     const env = envOf();
     const made = await zarrJob();
-    // The dataset is an anonymous deposit (a published dataset cannot become one, so it is unpublished): its
-    // version identifier is reserved and does not resolve, and the rule withholds it.
     await sql(
       env,
       "UPDATE datasets SET first_published_at = NULL, anonymous = 1 WHERE dataset_id = ?1",
       made.id,
     );
-    expect(await syncAll(env)).toMatchObject({ created: 1, stored: 1 });
+    expect(await syncAll(env)).toMatchObject({ examined: 0, created: 0, stored: 0 });
+    expect(await all(env)).toHaveLength(0);
+  });
+});
+
+// --- A dataset that stopped being eligible ----------------------------------------------------------------------------
+
+describe("a dataset that is no longer eligible after its job finished", () => {
+  const unpublish = (id: string) =>
+    sql(envOf(), "UPDATE datasets SET visibility = 'private' WHERE dataset_id = ?1", id);
+  const publish = (id: string) =>
+    sql(envOf(), "UPDATE datasets SET visibility = 'public' WHERE dataset_id = ?1", id);
+
+  test("the scan neither keys nor copies it, and keys it once it is public again (MUTATION: drop the eligibility term of the scan)", async () => {
+    const env = envOf();
+    const made = await zarrJob();
+    await unpublish(made.id);
+    const first = await syncAll(env);
+    expect(first).toMatchObject({ examined: 0, created: 0 });
+    expect(await all(env)).toHaveLength(0);
+    await publish(made.id);
+    expect(await syncAll(env)).toMatchObject({ created: 1 });
+  });
+
+  test("the insert adds nothing for it (MUTATION: drop the eligibility term of the insert)", async () => {
+    const env = envOf();
+    const first = await zarrJob();
+    await syncAll(env);
     const row = await one(env);
-    const description = JSON.parse(
-      (await (await derivatives.get(`d/${row.key}/derivative.json`))?.text()) as string,
-    );
-    expect(description.SourceDatasets).toEqual([{ id: made.id, version: "v1.0.0", doi: null }]);
-    expect(description.Citation).toBe(
-      `Derived from ${made.id} version v1.0.0 by NEMAR's nemar-floor 1.0.0.`,
-    );
-    expect(JSON.stringify(description)).not.toContain("10.82901");
+    const second = await zarrJob();
+    await unpublish(second.id);
+    const insert = (key: string) =>
+      env.DB.prepare(INSERT_DERIVATIVE_SQL)
+        .bind(
+          key,
+          second.id,
+          second.version,
+          row.recipe,
+          row.recipe_version,
+          row.engine,
+          row.input,
+          row.profile,
+          row.input_digest,
+          row.image_digest,
+          second.jobId,
+          second.stampId,
+          1,
+          1,
+        )
+        .run();
+    expect((await insert("a".repeat(64))).meta.changes).toBe(0);
+    await publish(second.id);
+    expect((await insert("b".repeat(64))).meta.changes).toBe(1);
+    void first;
+  });
+
+  test("neither promotion takes it (MUTATION: drop the eligibility term of the live condition)", async () => {
+    const env = envOf();
+    const made = await zarrJob();
+    await syncAll(env);
+    const row = await one(env);
+    await unpublish(made.id);
+    expect((await retention(row.key, "admin", "catalog")).status).toBe(409);
+    expect(await one(env)).toMatchObject({ retention: "canary" });
+    await publish(made.id);
+    expect((await retention(row.key, "admin", "catalog")).status).toBe(200);
+    await unpublish(made.id);
+    expect((await retention(row.key, "owner", "published")).status).toBe(409);
+    expect(await one(env)).toMatchObject({ retention: "catalog" });
+    await publish(made.id);
+    expect((await retention(row.key, "owner", "published")).status).toBe(200);
+  });
+
+  test("unpublished between the scan and the insert, its stamp stays undecided and is keyed once public again (MUTATION: skip it as dataset_gone)", async () => {
+    const env = envOf();
+    const made = await zarrJob();
+    // The scan has read the stamp as eligible; keying it reads the job's records next, and the dataset goes
+    // private during that read, so the insert that follows adds nothing.
+    const records = env.COMPUTE_RECORDS;
+    let fired = false;
+    const during = envOf({
+      COMPUTE_RECORDS: new Proxy(records, {
+        get(target, prop) {
+          const value = Reflect.get(target, prop, target);
+          if (prop !== "get" || typeof value !== "function") {
+            return typeof value === "function" ? value.bind(target) : value;
+          }
+          return async (...a: unknown[]) => {
+            if (!fired) {
+              fired = true;
+              await unpublish(made.id);
+            }
+            return value.apply(target, a);
+          };
+        },
+      }),
+    });
+    expect(await syncAll(during)).toMatchObject({ examined: 1, created: 0, errored: 0 });
+    expect(fired).toBe(true);
+    expect(await all(env)).toHaveLength(0);
+    const skips = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM compute_derivative_skips WHERE stamp_id = ?1",
+    )
+      .bind(made.stampId)
+      .first<{ n: number }>();
+    expect(skips?.n).toBe(0);
+    await publish(made.id);
+    expect(await syncAll(env)).toMatchObject({ created: 1 });
   });
 });

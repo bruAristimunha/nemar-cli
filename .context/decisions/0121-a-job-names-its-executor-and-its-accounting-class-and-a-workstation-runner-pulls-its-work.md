@@ -32,7 +32,7 @@ Money must be counted only where an allocation exists, and every job, wherever i
    The runner's `started` heartbeat writes `created -> running`, its `uploading` heartbeat writes `running -> archiving`, and `finished` stands only after `verifyResults`.
    An unstarted lease that expires clears the claim, so no backward edge is needed; a started job whose lease expires becomes `unreported`.
    An `unreported` runner job whose outputs completed is verified like any other; otherwise it fails `runner_lost` `lease_expired` after a give-up wait (60 minutes at the time of writing).
-   `runner_lost` has four declared details: `lease_expired`, `claims_exhausted`, `deadline_exceeded` and `runner_revoked`; `runner_revoked` is written by `sweepRunnerLeases` for a revoked runner's started job whose outputs did not complete, and a job whose outputs completed is verified.
+   `runner_lost` has five declared details: `lease_expired`, `claims_exhausted`, `deadline_exceeded`, `runner_revoked` and `dataset_ineligible` (a waiting job whose dataset is gone or no longer eligible is ended by the sweep so it stops holding a live-job slot); `runner_revoked` is written by `sweepRunnerLeases` for a revoked runner's started job whose outputs did not complete, and a job whose outputs completed is verified.
    `submitted` and `queued` are never used by `runner/local`; whether `runner/slurm` uses `queued` is decided when that backend is built.
    The column is deliberately not #2121 phase P3's `admitted_at`, so either migration can land first.
 3. **Workstations pull; NEMAR never pushes.**

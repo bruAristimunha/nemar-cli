@@ -543,15 +543,21 @@ describe("the claim", () => {
     expect(RunnerClaimResponseSchema.parse((await claim(gpu, 1)).body).jobs).toHaveLength(0);
   });
 
-  test("a dataset made private after dispatch is not claimed, and is again once it is public (MUTATION: drop the eligibility term)", async () => {
+  test("a dataset made private after dispatch is not claimed, and its waiting job is ended by the sweep the claim runs (MUTATION: drop the eligibility term)", async () => {
     const r = await runner();
     const id = await dataset();
     const jobId = await dispatch(env, id);
     await sql("UPDATE datasets SET visibility = 'private' WHERE dataset_id = ?1", id);
+    // Past the sweep's minimum age (a job seconds old may still be linking its stamp).
+    await age(jobId, "created_at", "-11 minutes");
     expect(RunnerClaimResponseSchema.parse((await claim(r, 1)).body).jobs).toHaveLength(0);
     expect((await row(jobId)).runner_id).toBeNull();
-    await sql("UPDATE datasets SET visibility = 'public' WHERE dataset_id = ?1", id);
-    expect((await claimOne(r)).id).toBe(jobId);
+    // The claim route's own sweep already ended it: a second sweep finds nothing.
+    expect(await sweepRunnerLeases(env)).toMatchObject({ ineligible: 0 });
+    expect(await row(jobId)).toMatchObject({
+      state: "failed",
+      failure_detail: "dataset_ineligible",
+    });
   });
 
   test("a job whose cancel is recorded, or whose claims are used up, is not claimed", async () => {
@@ -2241,5 +2247,83 @@ describe("the lease statement is chosen fail-closed (a source search)", () => {
   test("commitTerminal carries the lease for anything that is not a Tapis row (MUTATION: === runner)", () => {
     const src = readFileSync(join(import.meta.dir, "../src/services/compute-lifecycle.ts"), "utf8");
     expect(src).toContain('const runnerRow = job.executor !== "tapis";');
+  });
+});
+
+describe("a waiting job that can never be claimed does not hold a slot", () => {
+  const live = () =>
+    count("SELECT COUNT(*) AS n FROM compute_jobs WHERE executor = 'runner' AND state = 'created'");
+
+  test("a dataset made private (or withdrawn) is ended dataset_ineligible, its slot freed; an eligible job is untouched", async () => {
+    await setPolicy(env.DB, ids.owner, { runners: { maxLiveJobs: { cpu: 2, gpu: 8 } } });
+    const gone = await dataset();
+    const withdrawn = await dataset();
+    const kept = await dispatch();
+    const goneJob = await dispatch(env, gone);
+    expect(await live()).toBe(2);
+    await sql("UPDATE datasets SET visibility = 'private' WHERE dataset_id = ?1", gone);
+    await age(goneJob, "created_at", "-11 minutes");
+    await age(kept, "created_at", "-11 minutes");
+    const swept = await sweepRunnerLeases(env);
+    expect(swept.ineligible).toBe(1);
+    expect(await row(goneJob)).toMatchObject({
+      state: "failed",
+      failure_code: "runner_lost",
+      failure_detail: "dataset_ineligible",
+      charged_milli: 0,
+    });
+    expect((await row(kept)).state).toBe("created");
+    // The slot is free again: a job over the (eligible) dataset fits.
+    const fits = await dispatchPipelineJob(env, {
+      recipe: "nemar-floor",
+      datasetId: withdrawn,
+      actor: { kind: "admin", userId: ids.admin },
+      executor: "runner",
+    });
+    expect(fits.ok).toBe(true);
+    // A withdrawn dataset is ended too.
+    if (fits.ok) {
+      await sql(
+        "UPDATE datasets SET withdrawn_at = datetime('now') WHERE dataset_id = ?1",
+        withdrawn,
+      );
+      await age(fits.jobId, "created_at", "-11 minutes");
+      expect((await sweepRunnerLeases(env)).ineligible).toBe(1);
+      expect((await row(fits.jobId)).failure_detail).toBe("dataset_ineligible");
+    }
+  });
+
+  test("a deleted dataset ends its waiting job on the next sweep", async () => {
+    const id = await dataset();
+    const jobId = await dispatch(env, id);
+    await sql("PRAGMA foreign_keys = OFF");
+    await sql("DELETE FROM datasets WHERE dataset_id = ?1", id);
+    await age(jobId, "created_at", "-11 minutes");
+    const swept = await sweepRunnerLeases(env);
+    expect(swept.ineligible).toBe(1);
+    expect(await row(jobId)).toMatchObject({
+      state: "failed",
+      failure_detail: "dataset_ineligible",
+    });
+  });
+
+  test("a job seconds old with no stamp linked yet is being dispatched, not an orphan (MUTATION: drop the age guard)", async () => {
+    const jobId = await dispatch();
+    // The window between the job insert and LINK_STAMP_SQL: the job exists, no stamp names it yet.
+    await sql("UPDATE compute_pipeline_stamps SET job_id = NULL WHERE job_id = ?1", jobId);
+    expect((await sweepRunnerLeases(env)).ineligible).toBe(0);
+    expect((await row(jobId)).state).toBe("created");
+    // Once it is old enough to have been linked, an unlinked job is an orphan.
+    await age(jobId, "created_at", "-11 minutes");
+    expect((await sweepRunnerLeases(env)).ineligible).toBe(1);
+  });
+
+  test("a job waiting over a day is the runner_waiting_stale attention word; a fresh one is not", async () => {
+    const stale = await dispatch();
+    await dispatch();
+    await age(stale, "created_at", "-25 hours");
+    const res = await admin("GET", "/compute/status");
+    expect(res.body.attention).toMatchObject({ runner_waiting_stale: 1 });
+    expect(ComputeStatusResponseSchema.safeParse(res.body).success).toBe(true);
   });
 });

@@ -439,6 +439,18 @@ describe("unpublish a published, public dataset", () => {
   });
 });
 
+describe("publish status of a dataset made public again", () => {
+  test("a published request with unpublished_at is not reported as unpublished once the dataset is public (MUTATION: drop the visibility term)", async () => {
+    seedPublished();
+    await unpublish(ID, { reason: "authors asked", dry_run: false });
+    expect((await call(`/datasets/${ID}/publish/status`, OWNER_KEY)).body.status).toBe("none");
+    // `make-public` after an unpublish: public again, the request row still dated.
+    db.run("UPDATE datasets SET visibility = 'public' WHERE dataset_id = ?", [ID]);
+    const status = await call(`/datasets/${ID}/publish/status`, OWNER_KEY);
+    expect(status.body.status).toBe("published");
+  });
+});
+
 describe("repair the half state nm000289 was left in", () => {
   test("a private dataset with a live published record is reset, and its visibility re-applied", async () => {
     seedMixedState();
