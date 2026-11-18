@@ -1,6 +1,6 @@
 /**
  * `nemar dataset publish withdraw`, and how a withdrawn request reads in
- * `publish status` and `admin publish list`, through the real CLI entry point.
+ * `publish status` and `admin repo publish list`, through the real CLI entry point.
  *
  * The HTTP server here is a stand-in that answers with the backend's response
  * shape. .rules/testing.md discourages stub services; this follows the sibling
@@ -204,8 +204,8 @@ describe("the help text", () => {
     expect(out).toContain(
       "an administrator may file a publication request on someone else's dataset",
     );
-    expect(out).toContain("nemar admin publish deny");
-    expect(out).toContain("not 'nemar admin withdraw'");
+    expect(out).toContain("nemar admin repo publish deny");
+    expect(out).toContain("not 'nemar admin repo withdraw'");
   });
 
   test("status lists denied, and says a withdrawn request is stored as denied", async () => {
@@ -314,10 +314,10 @@ describe("how a withdrawal reads", () => {
       "?status=denied&search=nm00010",
     ],
   ] as const) {
-    test(`admin publish list ${name} labels a withdrawn request as withdrawn and a denial as denied`, async () => {
+    test(`admin repo publish list ${name} labels a withdrawn request as withdrawn and a denial as denied`, async () => {
       const server = startServer({ "GET /admin/publish/requests": { body: LIST_BODY } });
       try {
-        const r = await runCli(["admin", "publish", "list", ...args], server.url);
+        const r = await runCli(["admin", "repo", "publish", "list", ...args], server.url);
         expect(r.exitCode).toBe(0);
         expect(server.queries).toEqual([query]);
         expect(r.stdout).toMatch(/nm000104\s+withdrawn\s+by alice\s+\S+ \S+\s+Motor imagery/);
@@ -328,12 +328,12 @@ describe("how a withdrawal reads", () => {
     });
   }
 
-  test("admin publish list by default asks only for the active states, so no withdrawn row is requested", async () => {
+  test("admin repo publish list by default asks only for the active states, so no withdrawn row is requested", async () => {
     const server = startServer({
       "GET /admin/publish/requests": { body: { count: 0, requests: [] } },
     });
     try {
-      const r = await runCli(["admin", "publish", "list"], server.url);
+      const r = await runCli(["admin", "repo", "publish", "list"], server.url);
       expect(r.exitCode).toBe(0);
       // The union first; its empty answer is then confirmed once per active status (a Worker
       // that cannot take a comma list answers the union with nothing). A withdrawn request is

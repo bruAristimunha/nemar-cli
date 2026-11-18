@@ -1,0 +1,12 @@
+-- An administrator pulled a published dataset back to the unpublished, private state.
+--
+-- The publication request that published it stays `status = 'published'`: it is the record
+-- that the dataset WAS published, its DOIs were minted under it, and the readers that ask
+-- "was this ever published" (the import recovery, the lifecycle counts) keep working. What
+-- changes is that the request no longer describes the dataset as it is now, and
+-- `unpublished_at` says so: the owner's `publish status` reads a request with it set as "no
+-- request", and a new request can be filed. NULL for every request that was not pulled back.
+--
+-- Nothing is rewritten: a `published` request only ever gains this stamp, so reversing the
+-- decision is `publish approve` on a new request, never an edit of this one.
+ALTER TABLE publication_requests ADD COLUMN unpublished_at TEXT;

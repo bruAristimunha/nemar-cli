@@ -47,6 +47,9 @@ async function runCli(
   return { stdout, stderr, exitCode };
 }
 
+// biome-ignore lint/suspicious/noControlCharactersInRegex: matching the escape byte is the point
+const stripAnsi = (text: string): string => text.replace(/\u001B\[[0-9;]*m/g, "");
+
 function setTestConfig(ctx: TestContext, config: Record<string, unknown>) {
   writeFileSync(ctx.configFile, JSON.stringify(config));
 }
@@ -76,12 +79,54 @@ describe("admin command restructure - help output", () => {
     expect(stdout).toContain("S3 and IAM credential management");
   });
 
-  test("admin repo --help shows public and private", async () => {
+  test("admin repo --help lists the lifecycle commands and no visibility flips", async () => {
     const { stdout, exitCode } = await runCli(["admin", "repo", "--help"]);
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("public");
-    expect(stdout).toContain("private");
-    expect(stdout).toContain("Repository visibility management");
+    const commands = stripAnsi(stdout)
+      .split("\n")
+      .map((l) => /^ {2}(\S+)/.exec(l)?.[1])
+      .filter(Boolean);
+    expect(commands).toContain("publish");
+    expect(commands).toContain("unpublish");
+    expect(commands).toContain("withdraw");
+    expect(commands).toContain("restore");
+    // A bare visibility flip made half states (published but private, public but unpublished).
+    expect(commands).not.toContain("public");
+    expect(commands).not.toContain("private");
+    expect(stdout).toContain("publication lifecycle");
+  });
+
+  test("admin repo unpublish --help says how it differs from withdraw", async () => {
+    const { stdout, exitCode } = await runCli(["admin", "repo", "unpublish", "--help"]);
+    expect(exitCode).toBe(0);
+    const text = stripAnsi(stdout).replace(/\s+/g, " ");
+    expect(text).toContain("DOIs untouched");
+    expect(text).toContain("'withdraw'");
+    expect(text).toContain("--execute");
+    expect(text).toContain("--reason");
+    const all = await runCli(["admin", "repo", "unpublish", "--help-all"]);
+    expect(stripAnsi(all.stdout).replace(/\s+/g, " ")).toContain("every DOI is tombstoned");
+  });
+
+  test.each(["public", "private"])("`admin repo %s` no longer exists", async (name) => {
+    const { stderr, exitCode } = await runCli(["admin", "repo", name, "nm000104", "-y"]);
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toContain("unknown command");
+  });
+
+  test.each([
+    ["withdraw", "nemar admin repo withdraw"],
+    ["restore", "nemar admin repo restore"],
+  ])("the old `admin %s` fails loudly and points at its new home", async (name, replacement) => {
+    const { stderr, exitCode } = await runCli(["admin", name, "nm000104", "--execute"]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain(replacement);
+  });
+
+  test("the old `admin withdraw` and `admin restore` are not listed in admin --help", async () => {
+    const { stdout } = await runCli(["admin", "--help"]);
+    const commandLines = stdout.split("\n").filter((l) => /^\s+(withdraw|restore)\s/.test(l));
+    expect(commandLines).toEqual([]);
   });
 
   test("admin ci --help shows check, add, sync, and validate", async () => {
@@ -109,15 +154,9 @@ describe("admin command restructure - help output", () => {
 // ============================================================================
 
 describe("admin commands - auth requirements", () => {
-  test("admin repo public requires auth", async () => {
+  test("admin repo unpublish requires auth", async () => {
     const ctx = createTestContext();
-    const { stdout } = await runCli(["admin", "repo", "public", "nm000104", "-y"], ctx);
-    expect(stdout).toContain("Not authenticated");
-  });
-
-  test("admin repo private requires auth", async () => {
-    const ctx = createTestContext();
-    const { stdout } = await runCli(["admin", "repo", "private", "nm000104", "-y"], ctx);
+    const { stdout } = await runCli(["admin", "repo", "unpublish", "nm000104", "-y"], ctx);
     expect(stdout).toContain("Not authenticated");
   });
 
@@ -173,21 +212,6 @@ describe("admin commands - non-admin rejection", () => {
     // Should not show success output (CI Status section)
     expect(stdout).not.toContain("CI Status:");
   });
-
-  test("non-admin user cannot use admin repo public", async () => {
-    if (!TEST_CONFIG.userApiKey) return;
-
-    const ctx = createTestContext();
-    setTestConfig(ctx, {
-      apiKey: TEST_CONFIG.userApiKey,
-      apiUrl: TEST_CONFIG.apiUrl,
-      username: "test-user",
-    });
-
-    const { stdout } = await runCli(["admin", "repo", "public", "nm000104", "-y"], ctx);
-    // Should not show success output
-    expect(stdout).not.toContain("is now public");
-  });
 });
 
 // ============================================================================
@@ -206,22 +230,6 @@ describe("admin commands - ci check with admin", () => {
     });
 
     const { stdout } = await runCli(["admin", "ci", "check", "nm999999"], ctx);
-    expect(stdout).toContain("Dataset not found");
-  });
-});
-
-describe("admin commands - repo visibility on non-existent dataset", () => {
-  test("admin repo public on non-existent dataset returns 404", async () => {
-    if (!TEST_CONFIG.adminApiKey) return;
-
-    const ctx = createTestContext();
-    setTestConfig(ctx, {
-      apiKey: TEST_CONFIG.adminApiKey,
-      apiUrl: TEST_CONFIG.apiUrl,
-      username: "test-admin",
-    });
-
-    const { stdout } = await runCli(["admin", "repo", "public", "nm999999", "-y"], ctx);
     expect(stdout).toContain("Dataset not found");
   });
 });

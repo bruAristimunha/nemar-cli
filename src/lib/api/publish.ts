@@ -96,6 +96,8 @@ export interface PublishRequestsResponse {
     requested_by_email: string;
     // Set when the depositor withdrew the request; its status is "denied".
     withdrawn_at?: string | null;
+    // Set when an administrator unpublished the dataset; the status stays "published" (ADR 0125).
+    unpublished_at?: string | null;
     dataset_name?: string | null;
     steps_completed: string[];
     current_step: string | null;

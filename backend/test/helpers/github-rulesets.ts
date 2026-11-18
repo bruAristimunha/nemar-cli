@@ -56,6 +56,11 @@ export interface RulesetStandIn {
    * default branch is renamed to `main`, which is what ensureMainBranch does then.
    */
   missingMain: Set<string>;
+  /**
+   * Whether each repository is private: a visibility PATCH writes it and `GET /repos/...` reads
+   * it back as `private`. A repository nobody set reads as private, as a new dataset repository is.
+   */
+  repoPrivate: Map<string, boolean>;
   /** The conclusion of the BIDS check on a repository's head ("success" if absent). */
   bidsConclusion: Map<string, string>;
   /**
@@ -236,6 +241,7 @@ export function startRulesetStandIn(): RulesetStandIn {
   const orgRulesets: RulesetRecord[] = [];
   const defaultBranches = new Map<string, string | null>();
   const bidsConclusion = new Map<string, string>();
+  const repoPrivate = new Map<string, boolean>();
   const missingMain = new Set<string>();
   const failures: Array<{ method: string; path: RegExp; status: number; remaining: number }> = [];
   const hooks: Array<{ method: string; path: RegExp; run: () => void }> = [];
@@ -258,13 +264,20 @@ export function startRulesetStandIn(): RulesetStandIn {
     const own = rulesets.get(repo) ?? [];
 
     if (rest === "") {
-      if (method === "GET") return Response.json({ name: repo, default_branch: branch });
+      if (method === "GET") {
+        return Response.json({
+          name: repo,
+          default_branch: branch,
+          private: repoPrivate.get(repo) ?? true,
+        });
+      }
       if (method === "PATCH") {
         // The one repository setting a test follows is the default branch, which is what
         // ensureMainBranch repoints; a visibility or auto-merge PATCH carries no such field.
         if (typeof body?.default_branch === "string") {
           defaultBranches.set(repo, body.default_branch);
         }
+        if (typeof body?.private === "boolean") repoPrivate.set(repo, body.private);
         return Response.json({ name: repo });
       }
     }
@@ -407,6 +420,7 @@ export function startRulesetStandIn(): RulesetStandIn {
     defaultBranches,
     missingMain,
     bidsConclusion,
+    repoPrivate,
     failNext(method, path, status, times = 1) {
       failures.push({ method, path, status, remaining: times });
     },
@@ -425,6 +439,7 @@ export function startRulesetStandIn(): RulesetStandIn {
       defaultBranches.clear();
       missingMain.clear();
       bidsConclusion.clear();
+      repoPrivate.clear();
       failures.length = 0;
       hooks.length = 0;
       lateFailures.length = 0;

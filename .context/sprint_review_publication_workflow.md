@@ -46,9 +46,9 @@ Complete tracking system with:
 **Files:** `src/commands/admin.ts`, `backend/src/routes/admin.ts`
 
 **Commands implemented:**
-- `nemar admin publish list [--pending|--approved|--denied]` - List all requests
-- `nemar admin publish approve <dataset-id> [--resume] [-y|--yes]` - Run orchestrator
-- `nemar admin publish deny <dataset-id> [--reason "..."]` - Deny request
+- `nemar admin repo publish list [--pending|--approved|--denied]` - List all requests
+- `nemar admin repo publish approve <dataset-id> [--resume] [-y|--yes]` - Run orchestrator
+- `nemar admin repo publish deny <dataset-id> [--reason "..."]` - Deny request
 
 **Features:**
 - Admin-only access enforced
@@ -132,8 +132,8 @@ nemar dataset publish status nm000104
 # Shows: "requested", waiting for admin
 
 # 4. Admin reviews and approves
-nemar admin publish list --pending
-nemar admin publish approve nm000104
+nemar admin repo publish list --pending
+nemar admin repo publish approve nm000104
 
 # 5. Orchestrator runs 5 steps:
 #    ✅ CI check passes
@@ -151,18 +151,18 @@ nemar admin publish approve nm000104
 # 1. Receive email: "New publication request from user X"
 
 # 2. Review requests
-nemar admin publish list --pending
+nemar admin repo publish list --pending
 
 # 3. Approve (runs orchestrator automatically)
-nemar admin publish approve nm000104
+nemar admin repo publish approve nm000104
 # Orchestrator handles all 5 steps
 
 # 4. If step fails (e.g., CI not passing):
-nemar admin publish approve nm000104 --resume
+nemar admin repo publish approve nm000104 --resume
 # Picks up from failed step
 
 # Or deny with reason:
-nemar admin publish deny nm000104 --reason "BIDS validation failing"
+nemar admin repo publish deny nm000104 --reason "BIDS validation failing"
 ```
 
 **Status:** ✅ All flows validated via tests
@@ -228,9 +228,9 @@ nemar admin publish deny nm000104 --reason "BIDS validation failing"
    nemar dataset publish status <dataset-id>
 
    # Admin: Approve publication
-   nemar admin publish list [--pending]
-   nemar admin publish approve <dataset-id>
-   nemar admin publish deny <dataset-id> --reason "..."
+   nemar admin repo publish list [--pending]
+   nemar admin repo publish approve <dataset-id>
+   nemar admin repo publish deny <dataset-id> --reason "..."
    ```
    ```
 

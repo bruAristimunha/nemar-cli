@@ -8,7 +8,7 @@
  * package's `scripts/` dir, so the old code resolved to a path outside
  * the installed package entirely and 404'd on every real run.
  *
- * PR #1223 review: `nemar admin withdraw` (`defaultWithdrawnDatasetsPath`,
+ * PR #1223 review: `nemar admin repo withdraw` (`defaultWithdrawnDatasetsPath`,
  * `scripts/withdrawn-datasets.json`) shares the exact same shape and had
  * the exact same bug, confirmed with `bun pm pack --dry-run` -- this file
  * covers both siblings.
@@ -18,7 +18,7 @@
  *    assertion is what a real `npm publish` would ship, not a re-read of
  *    package.json's "files" array.
  *  - the path-resolution assertions run the real `nemar admin recover` /
- *    `nemar admin withdraw` command as a subprocess, once from source
+ *    `nemar admin repo withdraw` command as a subprocess, once from source
  *    (`bun run src/index.ts`) and once from a real `bun build` bundle
  *    placed at the same repo-relative layout npm installs it at
  *    (dist/index.js next to scripts/), so the fallback branch in
@@ -97,7 +97,7 @@ function startNoticesStub(): { url: string; stop: () => void } {
 
 /** Same idea as startNoticesStub, but also answers `POST
  *  /admin/datasets/:id/withdraw` -- unlike recover's dry-run path,
- *  `nemar admin withdraw` (even with --execute omitted) calls the backend
+ *  `nemar admin repo withdraw` (even with --execute omitted) calls the backend
  *  once per target, since the dry-run logic lives server-side. Recording
  *  each request lets a test tell "the file loaded and every target
  *  reached the network step" apart from "the command never got that
@@ -238,21 +238,24 @@ describe("npm package includes scripts/withdrawn-datasets.json (PR #1223 review)
   });
 });
 
-describe("nemar admin withdraw resolves its default file from source (PR #1223 review)", () => {
+describe("nemar admin repo withdraw resolves its default file from source (PR #1223 review)", () => {
   // The list holds 11 entries and `--all` targets the 5 still down: an entry for a
   // dataset that was recovered and reinstated stays as the record of a withdrawal
   // that should not have happened (#1396), and re-targeting it would tombstone
   // content we proved is there. The assertion is on the TARGETS, which is the
   // number that matters, plus one id from each half.
-  test("`bun run src/index.ts admin withdraw --all --json` loads the real list and targets only what is still down", async () => {
+  test("`bun run src/index.ts admin repo withdraw --all --json` loads the real list and targets only what is still down", async () => {
     const configDir = mkdtempSync(join(tmpdir(), "nemar-withdraw-src-"));
     seedAuthenticatedConfig(configDir);
     const stub = startWithdrawStub();
     try {
-      const result = await run(["bun", "run", CLI_ENTRY, "admin", "withdraw", "--all", "--json"], {
-        NEMAR_CONFIG_DIR: configDir,
-        TEST_API_URL: stub.url,
-      });
+      const result = await run(
+        ["bun", "run", CLI_ENTRY, "admin", "repo", "withdraw", "--all", "--json"],
+        {
+          NEMAR_CONFIG_DIR: configDir,
+          TEST_API_URL: stub.url,
+        },
+      );
       expect(result.exitCode).toBe(0);
       const parsed = JSON.parse(result.stdout);
       expect(Array.isArray(parsed)).toBe(true);
@@ -270,7 +273,7 @@ describe("nemar admin withdraw resolves its default file from source (PR #1223 r
   });
 });
 
-describe("nemar admin withdraw resolves its default file from a published-layout dist bundle (PR #1223 review)", () => {
+describe("nemar admin repo withdraw resolves its default file from a published-layout dist bundle (PR #1223 review)", () => {
   test("a real `bun build` bundle at dist/index.js (sibling of scripts/, the npm-installed layout) finds the file", async () => {
     const build = await run([
       "bun",
@@ -288,10 +291,13 @@ describe("nemar admin withdraw resolves its default file from a published-layout
     seedAuthenticatedConfig(configDir);
     const stub = startWithdrawStub();
     try {
-      const result = await run(["bun", DIST_ENTRY, "admin", "withdraw", "--all", "--json"], {
-        NEMAR_CONFIG_DIR: configDir,
-        TEST_API_URL: stub.url,
-      });
+      const result = await run(
+        ["bun", DIST_ENTRY, "admin", "repo", "withdraw", "--all", "--json"],
+        {
+          NEMAR_CONFIG_DIR: configDir,
+          TEST_API_URL: stub.url,
+        },
+      );
       expect(result.exitCode).toBe(0);
       const parsed = JSON.parse(result.stdout);
       expect(Array.isArray(parsed)).toBe(true);

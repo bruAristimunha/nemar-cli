@@ -2009,7 +2009,7 @@ describe("describePublicationReview", () => {
         NOT_ASSESSED_LINE,
       ],
       summary: null,
-      next: "nemar admin publish show nm000123",
+      next: "nemar admin repo publish show nm000123",
     });
     expect(REVIEW_UNREADABLE_HEADLINE).toBe("Publication review: could not be read");
     // No dataset id to show, or one that is not one: no command, and nothing is quoted.
@@ -2035,7 +2035,7 @@ describe("describePublicationReview", () => {
       if (!startCure) expect(cureOf(code, "nm000123", false)).toBe(cureOf(code, "nm000123", true));
     }
     for (const code of START_CURE_REASONS) {
-      expect(cureOf(code, "nm000123", true)).toContain("nemar admin publish start nm000123");
+      expect(cureOf(code, "nm000123", true)).toContain("nemar admin repo publish start nm000123");
       const plain = cureOf(code, "nm000123", false);
       expect(plain).toBe(
         "A review starts only for a request that is waiting for its decision. An administrator may approve over it; the approval records the override (--force).",
@@ -2061,11 +2061,11 @@ describe("describePublicationReview", () => {
       }).next;
     const errored: ReviewRowView = { kind: "errored", detail: "model_refused" };
     const reasons = [R("review_could_not_run", "model_refused")];
-    expect(next(reasons, errored, true)).toBe("nemar admin publish start nm000123");
+    expect(next(reasons, errored, true)).toBe("nemar admin repo publish start nm000123");
     // Being approved: the approval is the next thing, with the override its reason needs.
-    expect(next(reasons, errored, false)).toBe("nemar admin publish approve nm000123 --force");
+    expect(next(reasons, errored, false)).toBe("nemar admin repo publish approve nm000123 --force");
     expect(next([R("review_not_started")], { kind: "none" }, false)).toBe(
-      "nemar admin publish approve nm000123 --force",
+      "nemar admin repo publish approve nm000123 --force",
     );
     // Blocked: a hard reason, so there is no command at all, startable or not.
     expect(next([R("request_blocked"), ...reasons], errored, false)).toBeNull();
@@ -2091,10 +2091,10 @@ describe("describePublicationReview", () => {
       report: PARSED_REPORTS[0].report,
       stored: "pass",
     };
-    expect(next([], reported)).toBe("nemar admin publish approve nm000123");
-    expect(next([R("review_not_started")])).toBe("nemar admin publish start nm000123");
+    expect(next([], reported)).toBe("nemar admin repo publish approve nm000123");
+    expect(next([R("review_not_started")])).toBe("nemar admin repo publish start nm000123");
     expect(next([R("review_running")], { kind: "dispatched", overdue: false })).toBe(
-      "nemar admin publish show nm000123",
+      "nemar admin repo publish show nm000123",
     );
     expect(
       next([R("review_could_not_run", "report_invalid")], {
@@ -2102,21 +2102,21 @@ describe("describePublicationReview", () => {
         report: null,
         stored: "pass",
       }),
-    ).toBe("nemar admin publish approve nm000123 --force");
+    ).toBe("nemar admin repo publish approve nm000123 --force");
     expect(next([R("identifier_screen_needs_acknowledgment")], reported)).toBe(
-      'nemar admin publish approve nm000123 --acknowledge-identifier-screen "<reason>"',
+      'nemar admin repo publish approve nm000123 --acknowledge-identifier-screen "<reason>"',
     );
     expect(
       next([R("identifier_screen_needs_acknowledgment"), R("version_missing")], reported),
     ).toBe(
-      'nemar admin publish approve nm000123 --acknowledge-identifier-screen "<reason>" --force',
+      'nemar admin repo publish approve nm000123 --acknowledge-identifier-screen "<reason>" --force',
     );
     expect(next([R("identifier_screen_stale"), R("review_not_started")])).toBe(
-      "nemar admin publish screen nm000123",
+      "nemar admin repo publish screen nm000123",
     );
     expect(next([R("request_blocked"), R("review_not_started")])).toBeNull();
     expect(next([R("review_not_started")], { kind: "none" }, `nm000123; ${SENTINEL}`)).toBe(
-      "nemar admin publish start <dataset>",
+      "nemar admin repo publish start <dataset>",
     );
     const lines = describePublicationReview({
       ...base,
@@ -2148,7 +2148,7 @@ describe("describePublicationReview", () => {
     expect(lines.join("\n")).toContain("ran out of room");
     expect(lines.join("\n")).toContain("the platform's daily limit");
     expect(lines.join("\n")).toContain("the name describes the dataset");
-    expect(lines.join("\n")).toContain("nemar admin publish start nm000123");
+    expect(lines.join("\n")).toContain("nemar admin repo publish start nm000123");
     expect(lines.join("\n")).not.toContain("<dataset>");
   });
 });
@@ -2675,7 +2675,7 @@ describe("startOffered is the rule next uses, not a second one", () => {
     for (const { reasons, row } of seen.values()) {
       for (const startable of [true, false]) {
         const next = nextOf(reasons, row, startable);
-        const wants = next?.startsWith("nemar admin publish start ") ?? false;
+        const wants = next?.startsWith("nemar admin repo publish start ") ?? false;
         const got = startOffered({ reasons, row, startable });
         const rule = oracle(reasons, row, startable);
         if (got) offered++;
@@ -2752,9 +2752,9 @@ describe("startOffered is the rule next uses, not a second one", () => {
     const reasons = [R("review_could_not_run", "model_refused")];
     const row: ReviewRowView = { kind: "errored", detail: "model_refused" };
     expect(startOffered({ reasons, row, startable: true })).toBe(true);
-    expect(nextOf(reasons, row, true)).toBe("nemar admin publish start nm000123");
+    expect(nextOf(reasons, row, true)).toBe("nemar admin repo publish start nm000123");
     expect(startOffered({ reasons, row, startable: false })).toBe(false);
-    expect(nextOf(reasons, row, false)).toBe("nemar admin publish approve nm000123 --force");
+    expect(nextOf(reasons, row, false)).toBe("nemar admin repo publish approve nm000123 --force");
   });
 });
 
@@ -2785,16 +2785,16 @@ describe("where an approval stands (describePublicationReview's approval input)"
 
   test("none, or no word at all, is what Phase 1 said: three cases byte for byte", () => {
     for (const approval of [undefined, "none"] as const) {
-      expect(describe_([], approval).next).toBe("nemar admin publish approve nm000123");
+      expect(describe_([], approval).next).toBe("nemar admin repo publish approve nm000123");
       expect(describe_([R("question_failed", "meets_standards")], approval).next).toBe(
-        "nemar admin publish approve nm000123 --force",
+        "nemar admin repo publish approve nm000123 --force",
       );
       expect(describe_([R(ACK), R("text_withheld", "readme,license")], approval).next).toBe(
-        'nemar admin publish approve nm000123 --acknowledge-identifier-screen "<reason>" --force',
+        'nemar admin repo publish approve nm000123 --acknowledge-identifier-screen "<reason>" --force',
       );
       expect(
         describe_([R("review_running")], approval, { kind: "dispatched", overdue: false }).next,
-      ).toBe("nemar admin publish show nm000123");
+      ).toBe("nemar admin repo publish show nm000123");
     }
     // Phase 1 gave `describe_(reasons)` and `describe_(reasons, "none")` the same lines too.
     const reasons = [R("question_failed", "meets_standards")];
@@ -2803,24 +2803,26 @@ describe("where an approval stands (describePublicationReview's approval input)"
   });
 
   test("stopped: a resume of a run that has not started publishing is gated like a fresh one, so the command is today's with --resume after the id", () => {
-    expect(describe_([], "stopped").next).toBe("nemar admin publish approve nm000123 --resume");
+    expect(describe_([], "stopped").next).toBe(
+      "nemar admin repo publish approve nm000123 --resume",
+    );
     expect(describe_([R("question_failed", "meets_standards")], "stopped").next).toBe(
-      "nemar admin publish approve nm000123 --resume --force",
+      "nemar admin repo publish approve nm000123 --resume --force",
     );
     expect(describe_([R(ACK), R("text_withheld", "readme,license")], "stopped").next).toBe(
-      'nemar admin publish approve nm000123 --resume --acknowledge-identifier-screen "<reason>" --force',
+      'nemar admin repo publish approve nm000123 --resume --acknowledge-identifier-screen "<reason>" --force',
     );
     expect(describe_([R(ACK)], "stopped").next).toBe(
-      'nemar admin publish approve nm000123 --resume --acknowledge-identifier-screen "<reason>"',
+      'nemar admin repo publish approve nm000123 --resume --acknowledge-identifier-screen "<reason>"',
     );
     // What is not an approval command stays what it was: the screen's cure, none, and the wait.
     expect(describe_([R("identifier_screen_stale")], "stopped").next).toBe(
-      "nemar admin publish screen nm000123",
+      "nemar admin repo publish screen nm000123",
     );
     expect(describe_([R("request_blocked")], "stopped").next).toBeNull();
     expect(
       describe_([R("review_running")], "stopped", { kind: "dispatched", overdue: false }).next,
-    ).toBe("nemar admin publish show nm000123");
+    ).toBe("nemar admin repo publish show nm000123");
     // The line about having started publishing is only for a run that has.
     expect(describe_([R("question_failed", "meets_standards")], "stopped").lines).not.toContain(
       STARTED,
@@ -2828,7 +2830,7 @@ describe("where an approval stands (describePublicationReview's approval input)"
   });
 
   test("publishing: the command is the resume whatever the reasons, a hard one included, and never --force", () => {
-    const resume = "nemar admin publish approve nm000123 --resume";
+    const resume = "nemar admin repo publish approve nm000123 --resume";
     expect(describe_([], "publishing").next).toBe(resume);
     for (const code of REASON_CODES) {
       for (const startable of [true, false]) {
@@ -2877,10 +2879,10 @@ describe("where an approval stands (describePublicationReview's approval input)"
       { kind: "none" },
       { startable: true },
     );
-    expect(fresh.next).toBe("nemar admin publish start nm000123");
+    expect(fresh.next).toBe("nemar admin repo publish start nm000123");
     expect(
       describe_([R("review_not_started")], "stopped", { kind: "none" }, { startable: true }).next,
-    ).toBe("nemar admin publish approve nm000123 --resume --force");
+    ).toBe("nemar admin repo publish approve nm000123 --resume --force");
   });
 
   test("publishing says why no gate applies, once, ahead of the standing line", () => {
@@ -2909,7 +2911,7 @@ describe("where an approval stands (describePublicationReview's approval input)"
     "identifier_screen_stale",
   ];
   const STOPPED_HARD =
-    "This approval stopped before it started publishing, and a reason that nothing clears now stands, so it cannot be resumed. Deny it with a reason (nemar admin publish deny nm000123); the depositor can request again.";
+    "This approval stopped before it started publishing, and a reason that nothing clears now stands, so it cannot be resumed. Deny it with a reason (nemar admin repo publish deny nm000123); the depositor can request again.";
 
   test("stopped behind a reason nothing clears says it cannot be resumed and how to end it, once, ahead of the standing line", () => {
     for (const code of DEPOSITOR_HARD) {
@@ -2959,7 +2961,7 @@ describe("where an approval stands (describePublicationReview's approval input)"
     }
     // The screen's gaps keep the command they had: the line never contradicts it.
     expect(describe_([R("identifier_screen_stale")], "stopped").next).toBe(
-      "nemar admin publish screen nm000123",
+      "nemar admin repo publish screen nm000123",
     );
     // Where nothing is gated the line is not said either: not applicable, the flag off, closed.
     const hard = [R("submission_minimum_failed")];
@@ -2986,7 +2988,7 @@ describe("where an approval stands (describePublicationReview's approval input)"
   test("a malformed dataset id is never quoted in the resume command", () => {
     for (const approval of ["stopped", "publishing"] as const) {
       const d = describe_([], approval, reported, { datasetId: `x ${SENTINEL}` });
-      expect(d.next).toBe("nemar admin publish approve <dataset> --resume");
+      expect(d.next).toBe("nemar admin repo publish approve <dataset> --resume");
       expect(JSON.stringify(d)).not.toContain("Zqxjvw");
     }
   });
@@ -3027,11 +3029,11 @@ describe("the approval gate's words", () => {
       if (quotes) expect(bad).toContain("<dataset>");
     }
     expect(reviewGateRefusalText("needs_override", "nm000123")).toContain(
-      "nemar admin publish show nm000123",
+      "nemar admin repo publish show nm000123",
     );
     expect(reviewGateRefusalText("needs_override", "nm000123")).toContain("--force");
     expect(reviewGateRefusalText("no_review_row", "nm000123")).toContain(
-      "nemar admin publish start nm000123",
+      "nemar admin repo publish start nm000123",
     );
   });
 
@@ -3243,7 +3245,7 @@ describe("the sentences the Worker's tests import are pinned here, once", () => 
 
   test("the sentence of a run that finds its request closed, under a word of its own", () => {
     expect(APPROVAL_CLOSED_DURING_RUN_MESSAGE).toBe(
-      "The request was closed while this approval was running (it was denied, blocked again or filed again), so the run did not mark it published. Its steps had already run, so the dataset may already be public. An approval cannot finish a closed request: check the dataset and the request (nemar admin publish list shows its status), then finish or repair it by hand.",
+      "The request was closed while this approval was running (it was denied, blocked again or filed again), so the run did not mark it published. Its steps had already run, so the dataset may already be public. An approval cannot finish a closed request: check the dataset and the request (nemar admin repo publish list shows its status), then finish or repair it by hand.",
     );
     // `request_changed` means that nothing ran, and this one says the steps did: not that word.
     expect([...APPROVAL_REFUSAL_ERROR_CODES]).toContain("approval_closed_during_run");
@@ -3254,12 +3256,14 @@ describe("the sentences the Worker's tests import are pinned here, once", () => 
     // real command tree, so renaming or removing the subcommand turns this red.
     expect(APPROVAL_CLOSED_DURING_RUN_MESSAGE).toContain("by hand");
     const named = [
-      ...APPROVAL_CLOSED_DURING_RUN_MESSAGE.matchAll(/nemar admin publish ([a-z][a-z-]*)/g),
+      ...APPROVAL_CLOSED_DURING_RUN_MESSAGE.matchAll(/nemar admin repo publish ([a-z][a-z-]*)/g),
     ].map((match) => match[1]);
     expect(named.length).toBeGreaterThan(0);
     const registered =
-      adminCommand.commands.find((c) => c.name() === "publish")?.commands.map((c) => c.name()) ??
-      [];
+      adminCommand.commands
+        .find((c) => c.name() === "repo")
+        ?.commands.find((c) => c.name() === "publish")
+        ?.commands.map((c) => c.name()) ?? [];
     expect(registered.length).toBeGreaterThan(0);
     for (const name of named) expect(registered).toContain(name);
   });

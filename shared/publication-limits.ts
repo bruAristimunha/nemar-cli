@@ -1,6 +1,6 @@
 /**
  * Limits and patterns of the publication approval path that the Worker enforces and the
- * `nemar admin publish` commands check before they send (ADR 0102). One definition each, so a
+ * `nemar admin repo publish` commands check before they send (ADR 0102). One definition each, so a
  * command's early refusal and the Worker's refusal cannot disagree about a number.
  */
 

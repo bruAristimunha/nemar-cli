@@ -6,7 +6,7 @@
  * these paths would put the review ruleset on the dataset it publishes before the canary and the
  * calibration gate have run. Three real paths are driven here, each with the switch off and on:
  *
- *   - PATCH /admin/datasets/:id/visibility, the visibility service (public and private);
+ *   - the visibility service, driven directly (public and private; the PATCH route that used to wrap it is retired);
  *   - POST /datasets/:id/publish, the direct publish route;
  *   - POST /admin/publish/:id/approve, the publication orchestrator, run on a request whose other
  *     steps are done so that the one step under test (`repo_public`) is the step that runs.
@@ -39,6 +39,7 @@ import {
   buildReviewRulesetPayload,
   ensureReviewRuleset,
 } from "../src/services/github";
+import { applyDatasetVisibility } from "../src/services/visibility";
 import type { Bindings, Variables } from "../src/types/bindings";
 import { freshDb, realD1 } from "./helpers/d1";
 import {
@@ -289,6 +290,20 @@ const visibilityPatches = () =>
     .map((c) => c.body?.private);
 
 async function request(path: string, method: string, body?: unknown): Promise<Response> {
+  // PATCH /admin/datasets/:id/visibility is retired (it answers 409, see fleet-visibility-route.test.ts),
+  // so a bare visibility flip is driven through the service the route used to call, which is
+  // what `unpublish` and `restore` run. Same answer shape as the route had.
+  if (method === "PATCH" && path.endsWith("/visibility")) {
+    const result = await applyDatasetVisibility(
+      env(),
+      path.split("/")[3],
+      (body as { visibility: "public" | "private" }).visibility,
+    );
+    return Response.json(
+      result.ok ? { spec_enforcement: result.specEnforcement?.steps } : { error: result.error },
+      { status: result.ok ? 200 : 500 },
+    );
+  }
   return app.request(
     path,
     {
@@ -329,7 +344,7 @@ describe("the guard on what reaches the S3 stand-in", () => {
   });
 });
 
-describe("PATCH /admin/datasets/:id/visibility (the visibility service)", () => {
+describe("the visibility service (public and private)", () => {
   const ID = "nm000501";
   const flip = async (visibility: "public" | "private") => {
     const res = await request(`/admin/datasets/${ID}/visibility`, "PATCH", { visibility });
@@ -346,6 +361,8 @@ describe("PATCH /admin/datasets/:id/visibility (the visibility service)", () => 
   function seedPublished(): void {
     seedDataset(ID, { visibility: "public", first_published_at: "2026-01-01 00:00:00" });
     s3.policy = buildPublicAccessPolicy(BUCKET, []);
+    // The repository is public too: the service reads what GitHub holds before it writes.
+    github.repoPrivate.set(ID, false);
   }
 
   test("off, making a reviewable dataset public writes no review ruleset and does the rest", async () => {

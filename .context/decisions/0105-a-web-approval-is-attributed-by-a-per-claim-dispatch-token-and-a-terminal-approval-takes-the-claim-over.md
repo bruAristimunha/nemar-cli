@@ -19,7 +19,7 @@ The analysis behind the choices is in [`.context/publication-review-design.md`](
 ## Context
 
 A click on Approve in the website does not run an approval.
-It claims the request (`approval_requested_by`, `approval_dispatched_at`) and dispatches an executor, a workflow that runs `nemar admin publish approve` on a runner under its own administrator key (ADR 0080).
+It claims the request (`approval_requested_by`, `approval_dispatched_at`) and dispatches an executor, a workflow that runs `nemar admin repo publish approve` on a runner under its own administrator key (ADR 0080).
 So the Worker sees an administrator key, and nothing in the call says whether it belongs to a web click.
 ADR 0080 decision 5 settled that by time: while the claim's lease is live, whoever calls is recorded as the clicker.
 It named the cost and accepted it: a person who runs `/approve` at a terminal inside a web run's lease is recorded as the clicker (#1604).

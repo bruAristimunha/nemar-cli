@@ -1,17 +1,11 @@
 /**
- * Real PATCH /admin/datasets/:id/visibility route tests (epic #967 phase 4,
- * #971, review-fix GROUP 2b).
+ * PATCH /admin/datasets/:id/visibility is refused in both directions.
  *
- * fleet.ts's PATCH /visibility handler used to build these JSON error shapes
- * inline; the phase 4 extraction turned it into a `switch (result.stage)`
- * over applyDatasetVisibility's structured result -- a REWRITE, not a
- * verbatim move, and had no dedicated test pinning the resulting HTTP status/
- * body. This covers the three branches reachable without any network call
- * (not_found/no_repo/invalid_repo, all returned by applyDatasetVisibility
- * before getDatasetsToken is called) via the real route (real adminRoutes +
- * realD1 + seeded admin token), mirroring backend/test/exemplar-endpoint.test.ts.
- * The github/s3/db branches need a real GitHub PAT + AWS credentials and are
- * out of reach here (same boundary as backend/test/visibility.test.ts).
+ * A bare flip made the half states: `private` on a published dataset left it
+ * published but unreachable (nm000289), and `public` made a dataset public with
+ * no publication. Each direction has its own operation that moves the catalog
+ * row, the publication record and the repository together (the publication
+ * flow, and unpublish). Real route, real adminRoutes, realD1, seeded admin token.
  */
 
 import type { Database } from "bun:sqlite";
@@ -70,24 +64,28 @@ beforeEach(async () => {
   await seedAdmin();
 });
 
-describe("PATCH /admin/datasets/:id/visibility (network-free stage branches)", () => {
-  test("not_found -> 404", async () => {
+describe("PATCH /admin/datasets/:id/visibility is refused", () => {
+  test.each(["private", "public"] as const)(
+    "%s is refused with a pointer, and changes nothing",
+    async (visibility) => {
+      seedDataset("on008115", "nemarDatasets/on008115");
+      const before = db
+        .query("SELECT visibility FROM datasets WHERE dataset_id = 'on008115'")
+        .get();
+      const res = await patch("/admin/datasets/on008115/visibility", { visibility });
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { code: string; publish: string; unpublish: string };
+      expect(body.code).toBe("visibility_change_refused");
+      expect(body.publish).toBe("/admin/publish/on008115/approve");
+      expect(body.unpublish).toBe("/admin/datasets/on008115/unpublish");
+      expect(
+        db.query("SELECT visibility FROM datasets WHERE dataset_id = 'on008115'").get(),
+      ).toEqual(before);
+    },
+  );
+
+  test("an unknown dataset gets the same refusal, not a 404 that invites a retry", async () => {
     const res = await patch("/admin/datasets/on999999/visibility", { visibility: "private" });
-    expect(res.status).toBe(404);
-    expect((await res.json()).error).toBe("Dataset not found");
-  });
-
-  test("no_repo -> 400", async () => {
-    seedDataset("on008115", null);
-    const res = await patch("/admin/datasets/on008115/visibility", { visibility: "private" });
-    expect(res.status).toBe(400);
-    expect((await res.json()).error).toBe("Dataset has no GitHub repository");
-  });
-
-  test("invalid_repo -> 500", async () => {
-    seedDataset("on008115", "not-a-slash-delimited-repo");
-    const res = await patch("/admin/datasets/on008115/visibility", { visibility: "private" });
-    expect(res.status).toBe(500);
-    expect((await res.json()).error).toBe("Invalid repository format");
+    expect(res.status).toBe(409);
   });
 });

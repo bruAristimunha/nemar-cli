@@ -376,29 +376,6 @@ export async function revokeKeyFor(username: string, id: number): Promise<{ ok: 
 // Admin - Repository Management
 // ============================================================================
 
-export interface VisibilityResponse {
-  message: string;
-  dataset_id: string;
-  visibility: "public" | "private";
-}
-
-/**
- * Change dataset repository visibility (admin only)
- */
-export async function changeVisibility(
-  datasetId: string,
-  visibility: "public" | "private",
-): Promise<VisibilityResponse> {
-  return request<VisibilityResponse>(
-    `/admin/datasets/${datasetId}/visibility`,
-    {
-      method: "PATCH",
-      body: JSON.stringify({ visibility }),
-    },
-    true,
-  );
-}
-
 export interface PublishDatasetResponse {
   success: boolean;
   message: string;
@@ -710,6 +687,42 @@ export async function restoreDataset(
     {
       method: "POST",
       body: JSON.stringify({ dry_run: opts.dryRun }),
+    },
+    true,
+  );
+}
+
+/** Mirrors backend/src/services/unpublish.ts's UnpublishResult. */
+export type UnpublishResponse =
+  | { dataset_id: string; dry_run: boolean; skipped: string }
+  | {
+      dataset_id: string;
+      dry_run: boolean;
+      case: "published" | "public-never-published" | "private-with-live-publication-record";
+      visibility: VisibilityStepResult;
+      publication_requests_reset: number;
+      dois_untouched: { concept: string | null; versions: number };
+      /** Repo-spec enforcement fell short, or the audit row was not written; the unpublish stands. */
+      warning?: string;
+      /** The visibility change was applied but the publication record was not reset; re-run. */
+      record_error?: string;
+    };
+
+/**
+ * Unpublish: take a dataset back to the unpublished, private state. DOIs are left
+ * untouched (EZID is never called) and the dataset can be published again. `dryRun`
+ * defaults to true server-side; pass `false` to execute (requires `reason`). Not
+ * `withdrawDataset`, which tombstones the DOIs of a broken dataset.
+ */
+export async function unpublishDataset(
+  datasetId: string,
+  opts: { reason?: string; dryRun: boolean },
+): Promise<UnpublishResponse> {
+  return request<UnpublishResponse>(
+    `/admin/datasets/${datasetId}/unpublish`,
+    {
+      method: "POST",
+      body: JSON.stringify({ reason: opts.reason, dry_run: opts.dryRun }),
     },
     true,
   );

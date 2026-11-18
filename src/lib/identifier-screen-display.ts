@@ -5,7 +5,7 @@
  * NOTHING IS DERIVED HERE. The backend sends `identifier_screen` as
  * `describeScreen` (shared/identifier-screen-report.ts) worded it: a headline, a
  * tone and count lines. This module owns only colour and indentation, so
- * `nemar dataset publish status`, `nemar admin publish list` and the admin email
+ * `nemar dataset publish status`, `nemar admin repo publish list` and the admin email
  * cannot say different things about one screen.
  *
  * The one thing set apart is the acquisition-date warning (ADR 0090): its lines are

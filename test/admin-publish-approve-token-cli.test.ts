@@ -1,10 +1,10 @@
 /**
- * `nemar admin publish approve` as the executor of a web approval (ADR 0105 decisions 3 to 5,
+ * `nemar admin repo publish approve` as the executor of a web approval (ADR 0105 decisions 3 to 5,
  * #1604).
  *
  * A click on the website claims the request and dispatches a runner, which is handed the claim's
  * dispatch token in the environment variable `NEMAR_APPROVAL_DISPATCH_TOKEN` and runs
- * `nemar admin publish approve <id> --resume --yes`. The command presents the token on every
+ * `nemar admin repo publish approve <id> --resume --yes`. The command presents the token on every
  * approval call of the run (a header the Worker checks against the claim), and the Worker records the
  * administrator who clicked as the approver. What these tests hold, against the real command and
  * the real backend app (`helpers/admin-publish-cli.ts`; the click is the real
@@ -147,7 +147,7 @@ const executor = (
   flags: string[] = [],
   env: Record<string, string> = {},
 ) =>
-  h.cli(["admin", "publish", "approve", DATASET, "--resume", "--yes", ...flags], {
+  h.cli(["admin", "repo", "publish", "approve", DATASET, "--resume", "--yes", ...flags], {
     as: "webexecutor",
     env: { ...env, ...(token === undefined ? {} : { [TOKEN_ENV]: token }) },
   });
@@ -326,7 +326,7 @@ describe("a person's shell variable", () => {
     seedReport(h.db, requestId);
     const stale = "a".repeat(64);
 
-    const r = await h.cli(["admin", "publish", "next", "--once", "--dataset", DATASET], {
+    const r = await h.cli(["admin", "repo", "publish", "next", "--once", "--dataset", DATASET], {
       as: "webexecutor",
       input: "y\n",
       env: { [TOKEN_ENV]: stale },
@@ -345,7 +345,7 @@ describe("a person's shell variable", () => {
     const requestId = seedUnstarted(h.db);
     seedReport(h.db, requestId);
     const r = await h.cli(
-      ["admin", "publish", "deny", DATASET, "--reason", "Add the README", "--yes"],
+      ["admin", "repo", "publish", "deny", DATASET, "--reason", "Add the README", "--yes"],
       {
         as: "webexecutor",
         env: { [TOKEN_ENV]: "b".repeat(64) },
@@ -574,7 +574,7 @@ describe("a variable left in a person's shell is not a silent trap", () => {
 
     // On a terminal the two streams share one transcript, so the order they were written in is
     // readable: the notice precedes the heading the command prints before it reads the request.
-    const r = await h.cli(["admin", "publish", "approve", DATASET, "--resume", "--yes"], {
+    const r = await h.cli(["admin", "repo", "publish", "approve", DATASET, "--resume", "--yes"], {
       as: "webexecutor",
       env: { [TOKEN_ENV]: token },
       terminal: async () => undefined,
@@ -702,7 +702,7 @@ describe("a variable left in a person's shell is not a silent trap", () => {
 
 describe("the help says the variable and the rule", () => {
   test("--help names the variable on the three flags it refuses, and --help-all says what it is and what it does", async () => {
-    const concise = await h.cli(["admin", "publish", "approve", "--help"]);
+    const concise = await h.cli(["admin", "repo", "publish", "approve", "--help"]);
     expect(concise.exitCode).toBe(0);
     const brief = concise.stdout.replace(/\s+/g, " ");
     // Both flags carry the rule where the option list shows it.
@@ -710,7 +710,7 @@ describe("the help says the variable and the rule", () => {
     expect(brief).toContain(`characters; refused while ${TOKEN_ENV} is set)`);
     expect(brief).toContain(`clears no review reason; refused while ${TOKEN_ENV} is set)`);
 
-    const all = await h.cli(["admin", "publish", "approve", "--help-all"]);
+    const all = await h.cli(["admin", "repo", "publish", "approve", "--help-all"]);
     expect(all.exitCode).toBe(0);
     const help = all.stdout.replace(/\s+/g, " ");
     expect(help).toContain(`${TOKEN_ENV}, and presents it on every approval call`);
@@ -752,7 +752,7 @@ describe("the token is a secret", () => {
     const logsBefore = debugLogs();
 
     const r = await h.cli(
-      ["--debug", "admin", "publish", "approve", DATASET, "--resume", "--yes"],
+      ["--debug", "admin", "repo", "publish", "approve", DATASET, "--resume", "--yes"],
       { as: "webexecutor", env: { [TOKEN_ENV]: token } },
     );
 

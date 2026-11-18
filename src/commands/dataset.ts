@@ -4909,12 +4909,12 @@ Description:
   you are ready ('nemar dataset publish request <dataset-id>', with or without
   --anonymous).
 
-  This is not 'nemar admin withdraw', which takes a broken published dataset
+  This is not 'nemar admin repo withdraw', which takes a broken published dataset
   out of the catalog.
 
   Only the dataset owner can withdraw the request, even though an administrator
   may file a publication request on someone else's dataset. An administrator
-  ends a request with 'nemar admin publish deny'.
+  ends a request with 'nemar admin repo publish deny'.
 
   It works while the request is waiting for review ("requested") or held on a
   fix ("blocked"), as long as publishing has not started. Once an administrator

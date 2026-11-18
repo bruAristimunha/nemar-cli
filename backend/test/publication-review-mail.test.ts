@@ -180,7 +180,7 @@ describe("the mail waits for a review that is in flight", () => {
       expect(mail).toHaveLength(1);
       const text = textOf(mail[0].html);
       expect(text).toContain("Publication review: pass");
-      expect(text).toContain(`nemar admin publish approve ${datasetId}`);
+      expect(text).toContain(`nemar admin repo publish approve ${datasetId}`);
       expect(text).toContain(NOT_ASSESSED_LINE);
       // The identifier screen's own section is still there, before the review's.
       expect(text.indexOf("Identifier screen")).toBeLessThan(text.indexOf("Publication review"));
@@ -204,7 +204,7 @@ describe("the mail waits for a review that is in flight", () => {
       headline: "Publication review: action required",
       reasons: ["review_could_not_run"],
       words: ["the review job failed before it finished"],
-      next: "nemar admin publish start",
+      next: "nemar admin repo publish start",
     },
     {
       name: "declined",
@@ -212,7 +212,7 @@ describe("the mail waits for a review that is in flight", () => {
       headline: "Publication review: action required",
       reasons: ["review_limit_reached"],
       words: ["this depositor's daily limit"],
-      next: "nemar admin publish start",
+      next: "nemar admin repo publish start",
     },
     {
       name: "unreported",
@@ -220,7 +220,7 @@ describe("the mail waits for a review that is in flight", () => {
       headline: "Publication review: action required",
       reasons: ["review_did_not_report"],
       words: [],
-      next: "nemar admin publish start",
+      next: "nemar admin repo publish start",
     },
     {
       // The mail goes once the lease frees it, at the 30-minute deadline, and says what is true
@@ -231,7 +231,7 @@ describe("the mail waits for a review that is in flight", () => {
       headline: "Publication review: action required",
       reasons: ["review_did_not_report"],
       words: [],
-      next: "nemar admin publish start",
+      next: "nemar admin repo publish start",
     },
     {
       name: "dispatched past the views' overdue bound",
@@ -239,7 +239,7 @@ describe("the mail waits for a review that is in flight", () => {
       headline: "Publication review: action required",
       reasons: ["review_did_not_report"],
       words: [],
-      next: "nemar admin publish start",
+      next: "nemar admin repo publish start",
     },
     {
       name: "reported with a failed question",
@@ -408,7 +408,7 @@ describe("with the review off, the mail is what it was before the review existed
           next: "next & step",
         },
       },
-      sha256: "5d95f3c4105c5351eea61a6e1bca201fa9cca342ea79f65d75dd9679d47b80b3",
+      sha256: "c79aa16abc08bc7197186fb6a0efd578d3fbec2d83980fc95e492022ae731462",
     },
     {
       name: "an anonymous release with a stopping screen",
@@ -416,12 +416,12 @@ describe("with the review off, the mail is what it was before the review existed
         anonymous: true,
         screen: { headline: "Identifier screen: FOUND IDENTIFIERS", tone: "stop", lines: [] },
       },
-      sha256: "1e491a8558d772d564d4a10d75f4ec55faff36170560048e28c0d4f0426a2a55",
+      sha256: "2b8bca75c90dadf8e41a789b329cca75d28cdc4bd083b6df5786dbae7b75d1a8",
     },
     {
       name: "no sections at all",
       opts: {},
-      sha256: "909739632837b8af2525ab29495747d8481ab0754304dd538aaf37350e2e9b8c",
+      sha256: "5fee69cd59b891dd97c7fb9fad9210605e05998e8a72e6df8aba320b9aed90fa",
     },
   ];
 
@@ -846,7 +846,7 @@ describe("the depositor's resend carries the review's section", () => {
       const mail = sends(calls);
       expect(mail).toHaveLength(1);
       expect(textOf(mail[0].html)).toContain("Publication review: pass");
-      expect(textOf(mail[0].html)).toContain(`nemar admin publish approve ${datasetId}`);
+      expect(textOf(mail[0].html)).toContain(`nemar admin repo publish approve ${datasetId}`);
       // Nothing waits for a review any more, so the watchdog must not send it again.
       expect(mailState(requestId).emailed).not.toBeNull();
       expect(await notifyAdminsOfScreen(env(), requestId)).toBe("not-claimed");
@@ -994,7 +994,7 @@ describe("what the mail may carry", () => {
       const text = textOf(sends(calls)[0].html);
       expect(text).toContain("Publication review: could not be read");
       expect(text).toContain("This is not a pass.");
-      expect(text).toContain(`nemar admin publish show ${datasetId}`);
+      expect(text).toContain(`nemar admin repo publish show ${datasetId}`);
       expect(text).toContain(NOT_ASSESSED_LINE);
       expect(text).not.toContain("Publication review: pass");
     });

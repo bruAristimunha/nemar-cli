@@ -61,7 +61,7 @@ The maintainer chose B on 2026-10-07 and asked that the warning be shown to the 
   It is part of `describeScreen` and `describePreflight`, which are already the one place the screen's words are made, so it appears wherever those words do and nowhere else:
   1. The uploader: the identifier preflight of `nemar dataset upload` (and `--dry-run`), printed under the verdict, and printed again if the second screen, right before the create call, counts a different number of dates than the first.
   2. The person who requests publication: `nemar dataset publish status`, which prints the request's screen as stored, and the mail that tells a requester a direct identifier blocked the request.
-  3. The administrator: the publication-request email, including a resend, and `nemar admin publish list`.
+  3. The administrator: the publication-request email, including a resend, and `nemar admin repo publish list`.
   The terminal prints the warning's lines in the warning color; which lines they are comes from `isDateWarningLine`, in the same module.
   No mail category, table or column is added.
 - **The weekly report is unchanged.**
@@ -89,7 +89,7 @@ The maintainer chose B on 2026-10-07 and asked that the warning be shown to the 
 - The Worker deploys before the CLI is published: a new CLI against a Worker that predates this prints the preflight warning (it is made locally) but not the one in `publish status` or `admin publish list`, which come from the Worker's lines.
   An older CLI against a newer Worker prints the same lines in dim, as it prints every line.
 - What an administrator can list today:
-  the publication mail and `nemar admin publish list` name the date kinds and counts of each request;
+  the publication mail and `nemar admin repo publish list` name the date kinds and counts of each request;
   the weekly report and `GET /admin/identifier-sweep` list every dataset whose last verdict is `review` with its kinds and counts, date kinds included (the first 50 by id in the mail, all in the route), and count the datasets that are `dates-only` without naming them.
   Naming the `dates-only` datasets, for example in the route's facts, is a small addition when it is wanted; the triage of the sixteen scrubbed datasets is done outside the repository.
 - The wording lives on `docs.nemar.org` too, in pages that are in a private repository and are not edited here; the pull request lists them.

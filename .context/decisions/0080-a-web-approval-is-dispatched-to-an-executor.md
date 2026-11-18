@@ -61,7 +61,7 @@ The website does not run an approval. It asks the backend to dispatch one.
    dispatches `repository_dispatch[approve-publication]` to `nemarDatasets/.github`,
    and answers 202.
    Today the one executor behind it is a workflow in that repository that runs
-   `nemar admin publish approve` on a GitHub runner, the same pattern as `onboard-openneuro.yml`.
+   `nemar admin repo publish approve` on a GitHub runner, the same pattern as `onboard-openneuro.yml`.
    `nemaring.ucsd.edu` is not an executor: it hosts other services and stays that way.
    The only code that knows GitHub is `triggerApprovePublication`; the route, the claim and the
    lease are executor-agnostic, so a second executor changes the dispatch and nothing else.

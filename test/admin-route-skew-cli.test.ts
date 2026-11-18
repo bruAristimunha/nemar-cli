@@ -56,7 +56,7 @@ describe("the 0.10.18 Worker: a route it does not have says so, and is an answer
   test("`show` says the backend does not support it, exit 1, no bug invitation", async () => {
     seed("nm000501");
 
-    const r = await onOld(["admin", "publish", "show", "nm000501"]);
+    const r = await onOld(["admin", "repo", "publish", "show", "nm000501"]);
 
     expect(r.exitCode).toBe(1);
     expect(output(r)).toContain("This NEMAR backend does not support this command yet.");
@@ -66,7 +66,7 @@ describe("the 0.10.18 Worker: a route it does not have says so, and is an answer
   test("`start` says the same", async () => {
     seed("nm000501");
 
-    const r = await onOld(["admin", "publish", "start", "nm000501"]);
+    const r = await onOld(["admin", "repo", "publish", "start", "nm000501"]);
 
     expect(r.exitCode).toBe(1);
     expect(output(r)).toContain("This NEMAR backend does not support this command yet.");
@@ -76,7 +76,7 @@ describe("the 0.10.18 Worker: a route it does not have says so, and is an answer
   test("`start --all` says the Worker is older than the review and starts nothing", async () => {
     seed("nm000501");
 
-    const r = await onOld(["admin", "publish", "start", "--all", "--yes"]);
+    const r = await onOld(["admin", "repo", "publish", "start", "--all", "--yes"]);
 
     expect(r.exitCode).toBe(1);
     expect(output(r)).toContain("older than the review");
@@ -111,9 +111,12 @@ describe("the 0.10.18 Worker: `approve` reads no review and asks the Worker to d
   test("it says there is no review, sends no identity and no override, and the approval runs", async () => {
     seedGolden(h.db);
 
-    const r = await h.cli(["admin", "publish", "approve", "nm000460", "--resume", "--yes"], {
-      apiUrl: old.url,
-    });
+    const r = await h.cli(
+      ["admin", "repo", "publish", "approve", "nm000460", "--resume", "--yes"],
+      {
+        apiUrl: old.url,
+      },
+    );
 
     expect(r.exitCode).toBe(0);
     expect(output(r)).toContain("This API has no publication review.");
@@ -137,7 +140,7 @@ describe("the 0.10.18 Worker: `approve` reads no review and asks the Worker to d
     seedGolden(h.db);
 
     const r = await h.cli(
-      ["admin", "publish", "approve", "nm000460", "--resume", "--yes", "--force"],
+      ["admin", "repo", "publish", "approve", "nm000460", "--resume", "--yes", "--force"],
       { apiUrl: old.url },
     );
 

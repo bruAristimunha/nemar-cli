@@ -1,5 +1,5 @@
 /**
- * Which publication requests `nemar admin publish list` asks for.
+ * Which publication requests `nemar admin repo publish list` asks for.
  *
  * The default is the requests that still need somebody: an administrator
  * reading the list wants what is open, not the history. A state flag narrows to

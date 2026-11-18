@@ -373,7 +373,7 @@ rm -rf $W/check
 1. The tooling PR and the docs PRs are merged, and the maintainer has said go for this dataset.
    The first dataset is also the first real run of every stage: take it slowly, and stop at the first word this runbook does not explain.
 2. The real-bucket checklist has been run with the current checkout, after the last change to an S3 call.
-3. The dataset is private with the bucket-policy exclusion (`nemar admin repo private $D` is the supported transition: the GitHub repository, the bucket policy and the catalog row), verified by C6: an anonymous `HEAD` of one of its objects answers 403, and a public control answers 200.
+3. The dataset is private with the bucket-policy exclusion (`nemar admin repo unpublish $D` is the supported transition: the GitHub repository, the bucket policy and the catalog row, with the DOIs left alone), verified by C6: an anonymous `HEAD` of one of its objects answers 403, and a public control answers 200.
 4. The uploader, and for a mirror the source archive, have been told and asked not to upload over it.
    Nothing here stops an upload: a push the uploader makes during the run is caught by the leases of step 9 (`remote-moved-since-clone`), and a recording written to S3 after the plan is caught by `delete-old` (`unplanned-recording`), as is any raw object (`raw-copy-not-in-plan`).
 5. **Read the member names, not the values, of the real Zarr stores**, so the lists in `scripts/scrub/s3/zarr-json.ts` are known to cover what the converter wrote.
@@ -1272,12 +1272,15 @@ Last, step 14b again.
 >
 > **Command.**
 > ```bash
-> nemar admin repo public $D
+> nemar admin repo public $D   # REMOVED from the CLI: see the note below
 > ```
 > It prompts for confirmation (`--yes` skips the prompt; use it only in a script).
+>
+> **Note (2026-11-17).** `nemar admin repo public` and `PATCH /admin/datasets/:id/visibility` were removed, because a bare flip makes a dataset public without a publication.
+> This step is held for an owner decision on how a scrubbed dataset goes public again (through the publication flow, or a purpose-built operation); until then do not run it.
 > The visibility change takes a few minutes to settle, as the 2026-10-04 change to private did.
 >
-> **If anything below fails**, make it private again (`nemar admin repo private $D`) and stop: the new objects were verified twice, so the fault is in a manifest, a cache or a route, not in the bytes.
+> **If anything below fails**, make it private again (`nemar admin repo unpublish $D`) and stop: the new objects were verified twice, so the fault is in a manifest, a cache or a route, not in the bytes.
 
 Wait a few minutes, then confirm with C6's two commands (the dataset's object must now answer 200).
 Then the archive that step 15c rebuilt (not for a dataset over the archive policy), which must now answer 200 anonymously (`$S3` as in C6, `$V` as in step 15c):

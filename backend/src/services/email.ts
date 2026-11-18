@@ -1771,13 +1771,13 @@ ${screenSection}${reviewSection}
   <p>Review the dataset and approve or deny the request:</p>
 
   <div style="background: #f4f4f5; padding: 16px; border-radius: 8px; font-family: monospace; font-size: 14px; margin: 16px 0;">
-    <span style="color: #16a34a;">nemar admin publish approve</span> ${escapeHtml(datasetId)}<br>
-    <span style="color: #dc2626;">nemar admin publish deny</span> ${escapeHtml(datasetId)} --reason "..."
+    <span style="color: #16a34a;">nemar admin repo publish approve</span> ${escapeHtml(datasetId)}<br>
+    <span style="color: #dc2626;">nemar admin repo publish deny</span> ${escapeHtml(datasetId)} --reason "..."
   </div>
 
   <p style="color: #666; font-size: 14px;">
     To see all pending requests:<br>
-    <code style="background: #f4f4f5; padding: 2px 6px; border-radius: 4px;">nemar admin publish list</code>
+    <code style="background: #f4f4f5; padding: 2px 6px; border-radius: 4px;">nemar admin repo publish list</code>
   </p>
 
   <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0;">

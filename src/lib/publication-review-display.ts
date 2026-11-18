@@ -1,6 +1,6 @@
 /**
  * How the terminal prints a publication request's review (ADR 0102, section 8): the one line of
- * `nemar admin publish list` and the whole of `nemar admin publish show`.
+ * `nemar admin repo publish list` and the whole of `nemar admin repo publish show`.
  *
  * NOTHING IS DECIDED HERE. The Worker sends the words: a headline and a tone, the reasons with
  * their sentences and cures, the next command. This module owns colour, indentation and the
@@ -55,6 +55,22 @@ export const NON_PRODUCTION_NOTE =
 /** The label every rendering of the model's words carries. */
 export const MODEL_WRITTEN_FINDINGS = "written by the model; the depositor's text can steer them";
 export const MODEL_WRITTEN_SUMMARY = "written by the model; the depositor's text can steer it";
+
+// ---------------------------------------------------------------------------------------------
+// A request's status, with the pull-back an administrator made
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A request's status as one list line says it. A `published` request an administrator pulled back
+ * with `nemar admin repo unpublish` (ADR 0125) keeps the status `published` and carries
+ * `unpublished_at`; printed bare, it reads as a live publication of a dataset that is private.
+ * The date is the day part of the stamp, which is all a person needs and is plain text.
+ */
+export function requestStatusLabel(status: string, unpublishedAt?: string | null): string {
+  const base = plain(status);
+  if (status !== "published" || !unpublishedAt) return base;
+  return `${base} (unpublished ${plain(unpublishedAt).slice(0, 10)})`;
+}
 
 // ---------------------------------------------------------------------------------------------
 // A start that went
@@ -244,7 +260,7 @@ export function approveEvidenceLines(
   return [
     shownLine(evidence),
     ...(withheld === null ? [] : [withheld]),
-    `The whole review, with the model's questions and findings: nemar admin publish show ${plain(datasetId)}`,
+    `The whole review, with the model's questions and findings: nemar admin repo publish show ${plain(datasetId)}`,
   ];
 }
 

@@ -1,5 +1,5 @@
 /**
- * The rules of `nemar admin publish next` (ADR 0102, section 8), apart from the terminal, so they
+ * The rules of `nemar admin repo publish next` (ADR 0102, section 8), apart from the terminal, so they
  * are tested without one.
  *
  * `next` walks the publication requests that need an administrator, oldest first, one card each,
@@ -132,10 +132,10 @@ export function yAnswer(
     };
   }
   if (decision.why === "needs_force") {
-    const approve = `nemar admin publish approve ${datasetId}${resume ? " --resume" : ""} --force`;
+    const approve = `nemar admin repo publish approve ${datasetId}${resume ? " --resume" : ""} --force`;
     return {
       offered: false,
-      why: `this review is not a pass. Run 'nemar admin publish next --force' to be asked about it, or approve it with '${approve}'.`,
+      why: `this review is not a pass. Run 'nemar admin repo publish next --force' to be asked about it, or approve it with '${approve}'.`,
     };
   }
   return { offered: false, why: decision.lines.map(plain).join(" ") };
