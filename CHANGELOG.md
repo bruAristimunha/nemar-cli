@@ -163,17 +163,16 @@ None of these is done by the release.
    Then approve the pending access request with `nemar dataset access approve <user> nm000289`; `nemar dataset access list nm000289` shows it.
    If the dataset is still not found, check that the CLI points at production (`nemar auth status`; unset any test API URL in the shell).
 2. Roll out semantic search for private datasets, after the deploy.
-   Create the Vectorize metadata indexes `visibility` (string) and `dataset_id` (string); metadata is indexed only for vectors written after the index exists.
-   Run `POST /admin/vectorize/reindex-all` repeatedly (keyset-paged with `after` and `last_id`) until `has_more` is false, which labels the public vectors.
-   Only then set `VECTORIZE_VISIBILITY_FILTER=1`, because unlabeled public vectors drop out of filtered queries.
-   Run `reindex-all` again to embed the private datasets, which the flag now includes.
+   Done on 2026-11-18: the Vectorize metadata indexes `visibility` (string) and `dataset_id` (string) were created, and `POST /admin/vectorize/reindex-all` relabeled all 910 public vectors (7 transient failures retried one by one).
+   `VECTORIZE_VISIBILITY_FILTER=1` is set in production `[vars]` by #2211, so it takes effect with the release that carries that pull request.
+   After that release deploys, run `reindex-all` again (keyset-paged until `has_more` is false) to embed the private datasets; otherwise the daily drain embeds them 50 at a time.
 3. Verify re-publishing an unpublished dataset end to end on `nm099999` (#2202): unpublish, file a request, approve, and check the version and concept DOIs.
 4. `curl -s https://api.nemar.org/health | jq -r .version` prints `0.10.34`, and `nemar admin compute status --json | jq '.switches, .storage'` shows the compute switches false and the three bucket bindings true.
 
 ### Known limits
 
 - After an unpublish or a withdraw, search reflects the change at once, but the anonymous dataset page and the public catalog list are cached at the edge and can keep showing the dataset for several minutes.
-- Vector labels refresh on the daily drain, so once `VECTORIZE_VISIBILITY_FILTER=1` is on, anonymous semantic search can miss a just-published dataset until then; keyword search finds it at once.
+- Vector labels refresh on the daily drain, so with `VECTORIZE_VISIBILITY_FILTER=1` on (production, from the release carrying #2211), anonymous semantic search can miss a just-published dataset until then; keyword search finds it at once.
 - The list and facet endpoints show private datasets only to administrators; owners and collaborators do not yet see their own private rows there (#2203).
 - Re-publishing an unpublished dataset has not been exercised end to end: the orchestrator reuses the existing concept and version DOIs and handles an existing DOI, but a second publish of the same version number was not run against EZID (#2202).
 - `nemar admin make-public` is still a bare public flip with no publication request, the same class of half state that `repo public` was; it is not changed here.
