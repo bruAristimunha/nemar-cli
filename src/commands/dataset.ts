@@ -296,7 +296,7 @@ import {
   createOrResumeDataset,
   initializeAnnexDataset,
 } from "../lib/upload/transfer.js";
-import { resolveUserDatasetArgs } from "../lib/user-dataset-args.js";
+import { requireUserDatasetArgs } from "../lib/user-dataset-args.js";
 import { isMirror, refuseMirrorMajor } from "../lib/version-policy.js";
 
 /**
@@ -4218,14 +4218,9 @@ Examples:
   .action(async (first, second) => {
     requireAuth();
 
-    let username: string;
-    let datasetId: string;
-    try {
-      ({ username, datasetId } = resolveUserDatasetArgs(first, second));
-    } catch (error) {
-      console.log(chalk.red(`✖ ${(error as Error).message}`));
-      process.exit(1);
-    }
+    const args = requireUserDatasetArgs(first, second);
+    if (!args) return;
+    const { username, datasetId } = args;
 
     const spinner = ora(`Inviting ${username} to ${datasetId}...`).start();
 
@@ -4422,14 +4417,9 @@ Examples:
   .action(async (first, second) => {
     requireAuth();
 
-    let username: string;
-    let datasetId: string;
-    try {
-      ({ username, datasetId } = resolveUserDatasetArgs(first, second));
-    } catch (error) {
-      console.log(chalk.red(`✖ ${(error as Error).message}`));
-      process.exit(1);
-    }
+    const args = requireUserDatasetArgs(first, second);
+    if (!args) return;
+    const { username, datasetId } = args;
 
     const spinner = ora(`Approving ${username} for ${datasetId}...`).start();
     try {
@@ -4465,14 +4455,9 @@ Examples:
   .action(async (first, second) => {
     requireAuth();
 
-    let username: string;
-    let datasetId: string;
-    try {
-      ({ username, datasetId } = resolveUserDatasetArgs(first, second));
-    } catch (error) {
-      console.log(chalk.red(`✖ ${(error as Error).message}`));
-      process.exit(1);
-    }
+    const args = requireUserDatasetArgs(first, second);
+    if (!args) return;
+    const { username, datasetId } = args;
 
     const spinner = ora(`Denying ${username} for ${datasetId}...`).start();
     try {
