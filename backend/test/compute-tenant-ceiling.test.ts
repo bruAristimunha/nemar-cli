@@ -380,6 +380,42 @@ describe("(b) a floor is unconditional", () => {
   });
 });
 
+describe("(b2) the default policy: no class takes a slot another class is owed", () => {
+  // Ceiling 20, floors 8 (people), 2 (pipelines), 0 (partner), straight from the shipped default.
+  onBoth(
+    "pipelines trying to take every slot stop at 12, and the 8 owed to people stay open (MUTATION: drop the floor term)",
+    async (w) => {
+      await tenant(w, TENANT_POLICY_DEFAULT);
+      const env = w.env();
+      const results: string[] = [];
+      for (let i = 0; i < 30; i++) results.push(word(await pipelineJob(env)));
+      expect(results.filter((r) => r === "ok")).toHaveLength(12);
+      expect(results.slice(12).every((r) => r === "platform_busy")).toBe(true);
+      const a = await person(w);
+      const people: string[] = [];
+      for (let i = 0; i < 12; i++) people.push(word(await personJob(env, a)));
+      expect(people.filter((r) => r === "ok")).toHaveLength(8);
+      expect(await counts(w)).toMatchObject({ people: 8, pipelines: 12, occupied: 20 });
+    },
+  );
+
+  onBoth(
+    "people trying to take every slot stop at 18, and the 2 owed to pipelines stay open",
+    async (w) => {
+      await tenant(w, TENANT_POLICY_DEFAULT);
+      const env = w.env();
+      const a = await person(w);
+      const people: string[] = [];
+      for (let i = 0; i < 25; i++) people.push(word(await personJob(env, a)));
+      expect(people.filter((r) => r === "ok")).toHaveLength(18);
+      const pipelines: string[] = [];
+      for (let i = 0; i < 5; i++) pipelines.push(word(await pipelineJob(env)));
+      expect(pipelines.filter((r) => r === "ok")).toHaveLength(2);
+      expect(await counts(w)).toMatchObject({ people: 18, pipelines: 2, occupied: 20 });
+    },
+  );
+});
+
 describe("(d) the edges", () => {
   onBoth("a ceiling of 0 admits nothing, whatever the class", async (w) => {
     await tenant(w, ceilingOf(0));
