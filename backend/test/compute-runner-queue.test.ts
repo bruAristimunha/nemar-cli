@@ -543,15 +543,19 @@ describe("the claim", () => {
     expect(RunnerClaimResponseSchema.parse((await claim(gpu, 1)).body).jobs).toHaveLength(0);
   });
 
-  test("a dataset made private after dispatch is not claimed, and is again once it is public (MUTATION: drop the eligibility term)", async () => {
+  test("a dataset made private after dispatch is not claimed, and its waiting job is ended by the sweep the claim runs (MUTATION: drop the eligibility term)", async () => {
     const r = await runner();
     const id = await dataset();
     const jobId = await dispatch(env, id);
     await sql("UPDATE datasets SET visibility = 'private' WHERE dataset_id = ?1", id);
     expect(RunnerClaimResponseSchema.parse((await claim(r, 1)).body).jobs).toHaveLength(0);
     expect((await row(jobId)).runner_id).toBeNull();
-    await sql("UPDATE datasets SET visibility = 'public' WHERE dataset_id = ?1", id);
-    expect((await claimOne(r)).id).toBe(jobId);
+    // The claim route's own sweep already ended it: a second sweep finds nothing.
+    expect(await sweepRunnerLeases(env)).toMatchObject({ ineligible: 0 });
+    expect(await row(jobId)).toMatchObject({
+      state: "failed",
+      failure_detail: "dataset_ineligible",
+    });
   });
 
   test("a job whose cancel is recorded, or whose claims are used up, is not claimed", async () => {
