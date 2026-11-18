@@ -361,6 +361,8 @@ describe("the visibility service (public and private)", () => {
   function seedPublished(): void {
     seedDataset(ID, { visibility: "public", first_published_at: "2026-01-01 00:00:00" });
     s3.policy = buildPublicAccessPolicy(BUCKET, []);
+    // The repository is public too: the service reads what GitHub holds before it writes.
+    github.repoPrivate.set(ID, false);
   }
 
   test("off, making a reviewable dataset public writes no review ruleset and does the rest", async () => {

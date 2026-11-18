@@ -8,7 +8,10 @@
  * repo-spec enforcement (public locks main, private opens it) -> collaborator
  * reconcile mirror. GitHub and S3 are reverted on a later-stage failure so the
  * three surfaces never end up disagreeing; D1 is the last write, so a D1
- * failure triggers reverting BOTH GitHub and S3.
+ * failure triggers reverting GitHub and S3. Each surface's prior state is read
+ * first: a surface already at the target is not written, and a revert restores
+ * only what this call changed, to its recorded prior value (ADR 0125: a dataset
+ * can be private on every surface already and still be run through here).
  *
  * Named `applyDatasetVisibility` (not `transitionDatasetVisibility`) because
  * s3.ts already has a private, differently-scoped function of that name (the
@@ -26,16 +29,23 @@
 import type { Bindings } from "../types/bindings.js";
 import { FIRST_PUBLICATION_STAMP_SQL, expectedRepoVisibility } from "./anonymity.js";
 import { getDatasetsToken } from "./github-auth.js";
-import { ensureRepoToSpec, setRepoVisibility } from "./github.js";
+import { ensureRepoToSpec, getRepoPrivate, setRepoVisibility } from "./github.js";
 import { readReviewIntent } from "./pr-review-eligibility.js";
 import { mirrorReconcileRemovals, resolveRepoCollaborators } from "./repo-spec.js";
-import { type PresignedUrlOptions, markDatasetPrivate, markDatasetPublic } from "./s3.js";
+import {
+  type PresignedUrlOptions,
+  hasPublicRead,
+  markDatasetPrivate,
+  markDatasetPublic,
+} from "./s3.js";
 
 export type VisibilityTransitionResult =
   | {
       ok: true;
       repoName: string;
       specEnforcement?: Awaited<ReturnType<typeof ensureRepoToSpec>>;
+      /** Set when repo-spec enforcement failed or did not run; the flip itself succeeded. */
+      specWarning?: string;
     }
   | { ok: false; stage: "not_found" | "no_repo" | "invalid_repo" | "github"; error: string }
   | { ok: false; stage: "s3"; error: string; githubReverted: boolean; revertError?: string }
@@ -114,48 +124,86 @@ export async function applyDatasetVisibility(
   // the drift report read.
   const isPrivate =
     expectedRepoVisibility({ visibility, anonymous: dataset.anonymous }) === "private";
-  // What the repository was BEFORE this call, for the revert paths below.
-  // Without anonymity that is the negation of the target, which is what this
-  // function has always assumed; for an anonymous deposit the repository is
-  // private in both states, and negating would publish it on the way back.
-  const revertPrivate = dataset.anonymous === 1 ? true : !isPrivate;
+  const targetS3Private = visibility === "private";
   const pat = await getDatasetsToken(env);
-  const ghResult = await setRepoVisibility(repoName, isPrivate, pat);
-  if (!ghResult.ok) {
+
+  // Read what each surface IS before changing any of it. The revert paths put back exactly what
+  // this call changed, to the value it had, and never infer a prior state from the target: a
+  // dataset left half-private by an earlier bare flip (nm000289) is private on GitHub and S3
+  // already, and "the opposite of the target" for it is public, which a revert must never reach.
+  const ghPrior = await getRepoPrivate(repoName, pat);
+  if (!ghPrior.ok) {
     return {
       ok: false,
       stage: "github",
-      error: `Failed to set repository to ${visibility}: ${ghResult.error}`,
+      error: `Failed to read the repository's current visibility: ${ghPrior.error}`,
     };
   }
-
+  const priorRepoPrivate = ghPrior.isPrivate;
+  let priorS3Private: boolean;
   try {
-    await setDatasetPublicity(env, datasetId, visibility);
-  } catch (s3Error) {
-    const s3Msg = s3Error instanceof Error ? s3Error.message : String(s3Error);
-    console.error(`WARNING: Failed to update S3 policy for ${datasetId}:`, s3Msg);
-    // GitHub visibility changed but S3 policy failed - revert GitHub.
-    const revertResult = await setRepoVisibility(repoName, revertPrivate, pat);
+    priorS3Private = !(await hasPublicRead(s3Options(env), datasetId));
+  } catch (s3ReadError) {
+    const msg = s3ReadError instanceof Error ? s3ReadError.message : String(s3ReadError);
+    // Nothing has been changed yet, so there is nothing to revert.
     return {
       ok: false,
       stage: "s3",
-      error: s3Msg,
-      githubReverted: revertResult.ok,
-      revertError: revertResult.ok ? undefined : revertResult.error,
+      error: `Failed to read the S3 policy: ${msg}`,
+      githubReverted: true,
     };
   }
 
-  // Helper to revert GitHub + S3 visibility changes on a D1 failure.
-  async function revertAfterDbFailure(errorDetails: string): Promise<VisibilityTransitionResult> {
-    const ghRevertResult = await setRepoVisibility(repoName, revertPrivate, pat);
+  let githubChanged = false;
+  if (priorRepoPrivate !== isPrivate) {
+    const ghResult = await setRepoVisibility(repoName, isPrivate, pat);
+    if (!ghResult.ok) {
+      return {
+        ok: false,
+        stage: "github",
+        error: `Failed to set repository to ${visibility}: ${ghResult.error}`,
+      };
+    }
+    githubChanged = true;
+  }
 
-    let s3Reverted = false;
+  let s3Changed = false;
+  if (priorS3Private !== targetS3Private) {
     try {
-      // We had applied `visibility`; revert to the opposite.
-      await setDatasetPublicity(env, datasetId, isPrivate ? "public" : "private");
-      s3Reverted = true;
-    } catch (s3RevertError) {
-      console.error(`S3 policy revert failed for ${datasetId}:`, s3RevertError);
+      await setDatasetPublicity(env, datasetId, visibility);
+      s3Changed = true;
+    } catch (s3Error) {
+      const s3Msg = s3Error instanceof Error ? s3Error.message : String(s3Error);
+      console.error(`WARNING: Failed to update S3 policy for ${datasetId}:`, s3Msg);
+      // The S3 write may have partly landed; GitHub is put back only if THIS call moved it.
+      const revertResult = githubChanged
+        ? await setRepoVisibility(repoName, priorRepoPrivate, pat)
+        : { ok: true as const, error: undefined };
+      return {
+        ok: false,
+        stage: "s3",
+        error: s3Msg,
+        githubReverted: revertResult.ok,
+        revertError: revertResult.ok ? undefined : revertResult.error,
+      };
+    }
+  }
+
+  // Revert only the stages this call changed, to their recorded prior values.
+  async function revertAfterDbFailure(errorDetails: string): Promise<VisibilityTransitionResult> {
+    const ghRevertResult = githubChanged
+      ? await setRepoVisibility(repoName, priorRepoPrivate, pat)
+      : { ok: true as const, error: undefined };
+
+    let s3Reverted = true;
+    if (s3Changed) {
+      s3Reverted = false;
+      try {
+        await setDatasetPublicity(env, datasetId, priorS3Private ? "private" : "public");
+        s3Reverted = true;
+      } catch (s3RevertError) {
+        console.error(`S3 policy revert failed for ${datasetId}:`, s3RevertError);
+      }
     }
 
     return {
@@ -168,36 +216,38 @@ export async function applyDatasetVisibility(
     };
   }
 
-  let dbUpdateResult: D1Result;
-  try {
-    dbUpdateResult = await db
-      .prepare(
-        // Stamping the first publication of the depositor's identity is part
-        // of the same statement that makes the row public: the triggers refuse
-        // a row that is both anonymous and stamped, and an anonymous deposit
-        // goes public without being attributed, which is what the CASE inside
-        // FIRST_PUBLICATION_STAMP_SQL expresses.
-        `UPDATE datasets SET visibility = ?${
-          visibility === "public" ? `, ${FIRST_PUBLICATION_STAMP_SQL}` : ""
-        } WHERE dataset_id = ?`,
-      )
-      .bind(visibility, datasetId)
-      .run();
+  // D1 is the last write; a row already at the target is left alone.
+  if (dataset.visibility !== visibility) {
+    try {
+      const dbUpdateResult = await db
+        .prepare(
+          // Stamping the first publication of the depositor's identity is part
+          // of the same statement that makes the row public: the triggers refuse
+          // a row that is both anonymous and stamped, and an anonymous deposit
+          // goes public without being attributed, which is what the CASE inside
+          // FIRST_PUBLICATION_STAMP_SQL expresses.
+          `UPDATE datasets SET visibility = ?${
+            visibility === "public" ? `, ${FIRST_PUBLICATION_STAMP_SQL}` : ""
+          } WHERE dataset_id = ?`,
+        )
+        .bind(visibility, datasetId)
+        .run();
 
-    if (!dbUpdateResult.success || dbUpdateResult.meta.changes === 0) {
-      const errorDetails =
-        dbUpdateResult.meta.changes === 0
-          ? "Dataset not found in database"
-          : "Database update did not succeed";
-      console.error(
-        `CRITICAL: Failed to update database visibility for ${datasetId}. GitHub is now ${visibility} but database is out of sync.`,
-      );
-      return await revertAfterDbFailure(errorDetails);
+      if (!dbUpdateResult.success || dbUpdateResult.meta.changes === 0) {
+        const errorDetails =
+          dbUpdateResult.meta.changes === 0
+            ? "Dataset not found in database"
+            : "Database update did not succeed";
+        console.error(
+          `CRITICAL: Failed to update database visibility for ${datasetId}. GitHub is now ${visibility} but database is out of sync.`,
+        );
+        return await revertAfterDbFailure(errorDetails);
+      }
+    } catch (dbError) {
+      const msg = dbError instanceof Error ? dbError.message : String(dbError);
+      console.error(`CRITICAL: Exception updating database visibility for ${datasetId}:`, msg);
+      return await revertAfterDbFailure(msg);
     }
-  } catch (dbError) {
-    const msg = dbError instanceof Error ? dbError.message : String(dbError);
-    console.error(`CRITICAL: Exception updating database visibility for ${datasetId}:`, msg);
-    return await revertAfterDbFailure(msg);
   }
 
   // Enforce the target repo spec for the new visibility (epic #713): public ->
@@ -206,6 +256,7 @@ export async function applyDatasetVisibility(
   // review follows the row (ADR 0107). Non-fatal: visibility is already changed
   // at GitHub/S3/D1.
   let specEnforcement: Awaited<ReturnType<typeof ensureRepoToSpec>> | undefined;
+  let specWarning: string | undefined;
   try {
     const { ownerLogin, approvedWriters } = await resolveRepoCollaborators(db, datasetId);
     specEnforcement = await ensureRepoToSpec(repoName, pat, {
@@ -226,9 +277,18 @@ export async function applyDatasetVisibility(
     });
   } catch (specError) {
     console.error(`Repo-spec enforcement failed for ${datasetId} (non-fatal):`, specError);
+    specWarning = `Repo-spec enforcement did not run: ${
+      specError instanceof Error ? specError.message : String(specError)
+    }`;
+  }
+  const failedSteps = Object.entries(specEnforcement?.steps ?? {})
+    .filter(([, step]) => step.status === "failed")
+    .map(([name, step]) => (step.detail ? `${name} (${step.detail})` : name));
+  if (failedSteps.length > 0) {
+    specWarning = `Repo-spec enforcement steps failed: ${failedSteps.join(", ")}`;
   }
   // Mirror reconcile removals into D1 (own try/catch; flags a divergence).
   await mirrorReconcileRemovals(db, datasetId, specEnforcement?.reconcile?.removed);
 
-  return { ok: true, repoName, specEnforcement };
+  return { ok: true, repoName, specEnforcement, specWarning };
 }

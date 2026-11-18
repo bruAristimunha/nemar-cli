@@ -22,8 +22,8 @@
  * pure `decideWithdrawAction` so "never attempted" (fresh), "interrupted,
  * needs finishing" (resume), "private for an unrelated reason" (skip), and
  * "already fully done" (skip) are all distinguishable. Every step re-run on
- * `resume` is independently idempotent (applyDatasetVisibility's own fast
- * path when already at the target state; EZID `makeUnavailable`/`makePublic`
+ * `resume` is independently idempotent (applyDatasetVisibility reads each
+ * surface's prior state and skips a stage already at the target; EZID `makeUnavailable`/`makePublic`
  * on an already-tombstoned/public identifier is a harmless no-op), so a
  * resumed run always converges without special-casing.
  *
