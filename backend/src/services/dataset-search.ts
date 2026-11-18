@@ -11,9 +11,10 @@ import { CONCEPT_DOI_SQL } from "./anonymity";
 import { buildExcludedUnknownBreakdownSql, isAnyFacetActive } from "./dataset-facets";
 import {
   type DatasetFilterOptions,
-  PUBLIC_SEARCHABLE_SQL,
+  type SearchViewer,
   buildDatasetFilterClauses,
   buildFtsMatch,
+  buildViewerVisibilitySql,
 } from "./dataset-filters";
 import {
   DATASET_SUMMARY_SELECT_SQL,
@@ -180,14 +181,16 @@ export async function drainEmbeddingDirty(
     return { scanned: 0, embedded: 0 };
   }
   try {
-    // Only embed searchable rows. A private/archived/sandbox dataset can be
-    // marked dirty by the metadata trigger; embedding it would put it in the
-    // (public) Vectorize index. They stay dirty until they become public.
+    // Embed every active, non-sandbox dataset, private included (every
+    // dataset is visible to someone). The vector is id-only; who may see a hit
+    // is decided against the live `datasets` row at query time (see
+    // buildViewerVisibilitySql), never by the index. Archived and sandbox
+    // rows stay dirty: search never returns them.
     const rows = await db
       .prepare(
         `SELECT dataset_id FROM datasets
          WHERE embedding_dirty = 1
-           AND status = 'active' AND visibility = 'public'
+           AND status = 'active'
            AND (is_sandbox = 0 OR is_sandbox IS NULL OR is_exemplar = 1)
          ORDER BY updated_at LIMIT ?`,
       )
@@ -302,15 +305,17 @@ const toResult = (row: HydrateRow, score: number, snippet?: string): SearchResul
 /** Hydrate ordered dataset ids from the `datasets` source of truth, preserving
  *  the input ranking and dropping ids with no live row. The actual bug fix:
  *  display fields come from the row, not stale Vectorize metadata. Filters to
- *  public/active/non-sandbox so a stale or mistakenly-embedded vector for a
- *  private/archived row can never surface in the (anonymous) search. */
+ *  active/non-sandbox rows the viewer may see (live visibility), so a vector
+ *  for a private row can never surface for a caller without access. */
 export async function hydrateDatasetsByIds(
   db: D1Database,
   ids: string[],
   filters: DatasetFilterOptions = {},
+  viewer?: SearchViewer,
 ): Promise<SearchResult[]> {
   if (ids.length === 0) return [];
   const params: (string | number)[] = [datasetIdListParam(ids)];
+  const visibility = buildViewerVisibilitySql(viewer, params);
   const filterClauses = buildDatasetFilterClauses(params, filters);
   const results = await db
     .prepare(
@@ -318,7 +323,7 @@ export async function hydrateDatasetsByIds(
               ${CONCEPT_DOI_SQL} AS doi, d.tasks, d.authors, d.has_hed
        FROM datasets d
        WHERE ${DATASET_ID_IN_JSON_LIST}
-         AND d.status = 'active' AND d.visibility = 'public'
+         AND d.status = 'active' AND ${visibility}
          AND (d.is_sandbox = 0 OR d.is_sandbox IS NULL OR d.is_exemplar = 1)${filterClauses}`,
     )
     .bind(...params)
@@ -331,18 +336,19 @@ export async function hydrateDatasetsByIds(
 }
 
 /** Exact dataset-id lookup from `datasets` for the search exact-id tier.
- *  Public + active only (the search endpoint is anonymous), so it can't leak a
- *  private/archived row. */
+ *  Active rows the viewer may see only, so it can't leak a private row. */
 export async function lookupDatasetById(
   db: D1Database,
   datasetId: string,
   filters: DatasetFilterOptions = {},
+  viewer?: SearchViewer,
 ): Promise<SearchResult | null> {
   // Match the dataset_id OR the source_id: an OpenNeuro source id (e.g.
   // ds005342) resolves to its managed mirror (on005342) even though the legacy
   // ds shadow row was deleted at import. Prefer a managed row (owner != -1) over
   // a legacy catalog shadow if both somehow match.
   const params: (string | number)[] = [datasetId, datasetId];
+  const visibility = buildViewerVisibilitySql(viewer, params);
   // #1145 review C4 correction: the exact-id tier did NOT previously ignore
   // filters entirely. The pre-#1145 handler ran `applyHasHed(applyModality(rows))`
   // over the exact-id hit too, so a filtered-out hit already came back as
@@ -360,7 +366,7 @@ export async function lookupDatasetById(
               ${CONCEPT_DOI_SQL} AS doi, d.tasks, d.authors, d.has_hed
        FROM datasets d
        WHERE (d.dataset_id = ? OR d.source_id = ?) AND d.status = 'active'
-         AND (d.is_sandbox = 0 OR d.is_sandbox IS NULL OR d.is_exemplar = 1) AND d.visibility = 'public'${filterClauses}
+         AND (d.is_sandbox = 0 OR d.is_sandbox IS NULL OR d.is_exemplar = 1) AND ${visibility}${filterClauses}
        ORDER BY (d.owner_user_id != -1) DESC
        LIMIT 1`,
     )
@@ -431,6 +437,7 @@ export async function semanticSearchHydrated(
   query: string,
   topK = 20,
   filters: DatasetFilterOptions = {},
+  viewer?: SearchViewer,
 ): Promise<SearchResult[]> {
   const k = Math.min(Math.max(topK, 1), 100);
   let ranked: { id: string; score: number }[];
@@ -456,6 +463,7 @@ export async function semanticSearchHydrated(
     db,
     ranked.map((r) => r.id),
     filters,
+    viewer,
   );
   // Vector ids with no live `datasets` row are dropped (correct: a vector for a
   // deleted dataset must not surface). Log when it happens so index drift /
@@ -493,10 +501,11 @@ export async function ftsSearch(
   query: string,
   limit = 20,
   filters: DatasetFilterOptions = {},
+  viewer?: SearchViewer,
 ): Promise<SearchResult[]> {
   const match = buildFtsMatch(query);
   if (!match) return [];
-  return ftsSearchByMatch(db, match, limit, filters);
+  return ftsSearchByMatch(db, match, limit, filters, viewer);
 }
 
 /** {@link ftsSearch} for a match expression the caller has already built. */
@@ -505,8 +514,10 @@ async function ftsSearchByMatch(
   match: string,
   limit: number,
   filters: DatasetFilterOptions,
+  viewer?: SearchViewer,
 ): Promise<SearchResult[]> {
   const params: (string | number)[] = [match];
+  const visibility = buildViewerVisibilitySql(viewer, params);
   const filterClauses = buildDatasetFilterClauses(params, filters);
   const results = await db
     .prepare(
@@ -517,7 +528,7 @@ async function ftsSearchByMatch(
        JOIN datasets d ON d.id = datasets_fts.rowid
        WHERE datasets_fts MATCH ?
          AND d.status = 'active' AND (d.is_sandbox = 0 OR d.is_sandbox IS NULL OR d.is_exemplar = 1)
-         AND d.visibility = 'public'${filterClauses}
+         AND ${visibility}${filterClauses}
        ORDER BY ${FTS_BM25}
        LIMIT ?`,
     )
@@ -538,21 +549,30 @@ export async function literalMatchSearch(
   terms: string[],
   limit: number,
   filters: DatasetFilterOptions = {},
+  viewer?: SearchViewer,
 ): Promise<SearchResult[]> {
   if (terms.length === 0) return [];
   const match = `{name authors tasks} : (${terms.map((t) => `"${t}"*`).join(" AND ")})`;
-  return ftsSearchByMatch(db, match, limit, filters);
+  return ftsSearchByMatch(db, match, limit, filters, viewer);
 }
 
 /** The text each dataset is judged as (see dataset-summary-text.ts), by dataset id. */
-async function fetchSummaryTexts(db: D1Database, ids: string[]): Promise<Map<string, string>> {
+async function fetchSummaryTexts(
+  db: D1Database,
+  ids: string[],
+  viewer?: SearchViewer,
+): Promise<Map<string, string>> {
   if (ids.length === 0) return new Map();
+  const params: (string | number)[] = [datasetIdListParam(ids)];
+  const visibility = buildViewerVisibilitySql(viewer, params);
   const { results } = await db
     .prepare(
       `SELECT d.dataset_id AS id, ${DATASET_SUMMARY_SELECT_SQL}
-       FROM datasets d WHERE ${DATASET_ID_IN_JSON_LIST} AND ${PUBLIC_SEARCHABLE_SQL}`,
+       FROM datasets d WHERE ${DATASET_ID_IN_JSON_LIST}
+         AND d.status = 'active' AND ${visibility}
+         AND (d.is_sandbox = 0 OR d.is_sandbox IS NULL OR d.is_exemplar = 1)`,
     )
-    .bind(datasetIdListParam(ids))
+    .bind(...params)
     .all<DatasetSummaryRow & { id: string }>();
   return new Map((results ?? []).map((row) => [row.id, buildDatasetSummaryText(row)]));
 }
@@ -580,6 +600,7 @@ export async function countSearchMatches(
   ftsMatch: string | null,
   semanticIds: string[],
   filters: DatasetFilterOptions = {},
+  viewer?: SearchViewer,
 ): Promise<number> {
   const disjuncts: string[] = [];
   const params: (string | number)[] = [];
@@ -592,13 +613,14 @@ export async function countSearchMatches(
     params.push(datasetIdListParam(semanticIds));
   }
   if (disjuncts.length === 0) return 0;
+  const visibility = buildViewerVisibilitySql(viewer, params);
   const filterClauses = buildDatasetFilterClauses(params, filters);
   const row = await db
     .prepare(
       `SELECT COUNT(*) AS total FROM datasets d
-       WHERE d.status = 'active' AND d.visibility = 'public'
+       WHERE d.status = 'active'
          AND (d.is_sandbox = 0 OR d.is_sandbox IS NULL OR d.is_exemplar = 1)
-         AND (${disjuncts.join(" OR ")})${filterClauses}`,
+         AND (${disjuncts.join(" OR ")}) AND ${visibility}${filterClauses}`,
     )
     .bind(...params)
     .first<{ total: number }>();
@@ -622,9 +644,10 @@ async function countSearchMatchesSafely(
   semanticIds: string[],
   filters: DatasetFilterOptions,
   pageLowerBound: number,
+  viewer?: SearchViewer,
 ): Promise<{ count: number; warning?: string }> {
   try {
-    return { count: await countSearchMatches(db, ftsMatch, semanticIds, filters) };
+    return { count: await countSearchMatches(db, ftsMatch, semanticIds, filters, viewer) };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(
@@ -657,6 +680,7 @@ async function countWidenedWithBreakdown(
   ftsMatch: string | null,
   semanticIds: string[],
   filters: DatasetFilterOptions,
+  viewer?: SearchViewer,
 ): Promise<{ total: number; byFacet: Record<string, number> } | null> {
   const disjuncts: string[] = [];
   const params: (string | number)[] = [];
@@ -669,15 +693,16 @@ async function countWidenedWithBreakdown(
     params.push(datasetIdListParam(semanticIds));
   }
   if (disjuncts.length === 0) return { total: 0, byFacet: {} };
+  const visibility = buildViewerVisibilitySql(viewer, params);
   const widenedFilters: DatasetFilterOptions = { ...filters, includeUnknown: true };
   const filterClauses = buildDatasetFilterClauses(params, widenedFilters);
   const breakdown = buildExcludedUnknownBreakdownSql(widenedFilters.facets);
   const row = await db
     .prepare(
       `SELECT COUNT(*) AS total${breakdown.selectFragment} FROM datasets d
-       WHERE d.status = 'active' AND d.visibility = 'public'
+       WHERE d.status = 'active'
          AND (d.is_sandbox = 0 OR d.is_sandbox IS NULL OR d.is_exemplar = 1)
-         AND (${disjuncts.join(" OR ")})${filterClauses}`,
+         AND (${disjuncts.join(" OR ")}) AND ${visibility}${filterClauses}`,
     )
     .bind(...params)
     .first<Record<string, number>>();
@@ -724,11 +749,12 @@ async function computeExcludedUnknownCount(
   filters: DatasetFilterOptions,
   actualCount: number,
   countSucceeded: boolean,
+  viewer?: SearchViewer,
 ): Promise<ExcludedUnknownResult | undefined> {
   if (!isAnyFacetActive(filters.facets)) return undefined;
   if (!countSucceeded) return undefined;
   try {
-    const widened = await countWidenedWithBreakdown(db, ftsMatch, semanticIds, filters);
+    const widened = await countWidenedWithBreakdown(db, ftsMatch, semanticIds, filters, viewer);
     if (!widened) return undefined;
     return {
       excludedUnknown: Math.max(0, widened.total - actualCount),
@@ -798,6 +824,7 @@ async function searchByRelevance(
   analysis: QueryAnalysis,
   filters: DatasetFilterOptions,
   buildEnvelope: EnvelopeBuilder,
+  viewer?: SearchViewer,
 ): Promise<DatasetSearchEnvelope | RelevanceFallback> {
   if (rerankSuspended()) return "rerank-failed";
 
@@ -806,9 +833,9 @@ async function searchByRelevance(
   let semantic: SearchResult[];
   try {
     [lexical, literal, semantic] = await Promise.all([
-      ftsSearch(db, analysis.lexicalQuery, LEG_SIZE),
-      literalMatchSearch(db, analysis.informative, LEG_SIZE),
-      semanticSearchHydrated(ai, vectorize, db, analysis.semanticQuery, SEMANTIC_TOPK),
+      ftsSearch(db, analysis.lexicalQuery, LEG_SIZE, {}, viewer),
+      literalMatchSearch(db, analysis.informative, LEG_SIZE, {}, viewer),
+      semanticSearchHydrated(ai, vectorize, db, analysis.semanticQuery, SEMANTIC_TOPK, {}, viewer),
     ]);
   } catch (err) {
     if (!(err instanceof Error) || !err.message.startsWith("[embedding]")) throw err;
@@ -830,6 +857,7 @@ async function searchByRelevance(
   const texts = await fetchSummaryTexts(
     db,
     pool.map((r) => r.id),
+    viewer,
   );
   const started = Date.now();
   let probabilities: number[];
@@ -863,7 +891,7 @@ async function searchByRelevance(
   const scoreById = new Map(kept.map((k) => [k.id, Math.round(k.score * 1000) / 1000]));
   const snippetById = new Map(pool.flatMap((r) => (r.snippet ? [[r.id, r.snippet] as const] : [])));
   // Every one of the request's filters, unknown rows excluded, is applied here.
-  const hydrated = await hydrateDatasetsByIds(db, keptIds, filters);
+  const hydrated = await hydrateDatasetsByIds(db, keptIds, filters, viewer);
   const results = hydrated.map((r) => ({
     ...r,
     score: scoreById.get(r.id) ?? 0,
@@ -876,6 +904,7 @@ async function searchByRelevance(
     filters,
     results.length,
     true,
+    viewer,
   );
   return {
     ...buildEnvelope(results, "semantic", results.length, undefined, excludedUnknown),
@@ -911,6 +940,9 @@ export interface ExecuteDatasetSearchOptions {
   limit: number;
   offset: number;
   minScore: number;
+  /** The caller, for the visibility rule of GET /datasets/:id. Omit for an
+   *  anonymous (public-only) search. */
+  viewer?: SearchViewer;
 }
 
 /** Return shape of {@link executeDatasetSearch} -- the full GET
@@ -1012,7 +1044,7 @@ export async function executeDatasetSearch(
   vectorize: VectorizeIndex | undefined,
   opts: ExecuteDatasetSearchOptions,
 ): Promise<DatasetSearchEnvelope> {
-  const { filters } = opts;
+  const { filters, viewer } = opts;
   // #1145 review S3: a cheap defensive clamp, not a substitute for real
   // validation upstream (parseSearchPagination already does that for the
   // HTTP path) -- this function is meant to be safely reusable directly.
@@ -1086,7 +1118,7 @@ export async function executeDatasetSearch(
       // of short-circuiting with an empty `exact_id` envelope (see the C4
       // correction on lookupDatasetById for what the prior behaviour
       // actually was).
-      const idHit = await lookupDatasetById(db, trimmed.toLowerCase(), filters);
+      const idHit = await lookupDatasetById(db, trimmed.toLowerCase(), filters, viewer);
       if (idHit) return buildEnvelope([idHit], "exact_id", 1);
     }
     // What the query is made of: the words that discriminate between datasets
@@ -1104,6 +1136,7 @@ export async function executeDatasetSearch(
         analysis,
         filters,
         buildEnvelope,
+        viewer,
       );
       if (typeof byRelevance !== "string") return byRelevance;
       // An embedding that just failed is not tried a second time on this request.
@@ -1120,6 +1153,7 @@ export async function executeDatasetSearch(
       analysis.lexicalQuery,
       SEARCH_CANDIDATE_CEILING,
       filters,
+      viewer,
     ).catch((ftsErr) => {
       console.error(
         `[search] FTS tier failed: ${ftsErr instanceof Error ? ftsErr.message : String(ftsErr)}`,
@@ -1136,6 +1170,7 @@ export async function executeDatasetSearch(
         [],
         filters,
         offset + page.length,
+        viewer,
       );
       const excludedUnknown = await computeExcludedUnknownCount(
         db,
@@ -1144,6 +1179,7 @@ export async function executeDatasetSearch(
         filters,
         count,
         warning === undefined,
+        viewer,
       );
       return buildEnvelope(lexical, method, count, warning, excludedUnknown);
     };
@@ -1160,6 +1196,7 @@ export async function executeDatasetSearch(
         analysis.semanticQuery,
         SEMANTIC_TOPK,
         filters,
+        viewer,
       );
     } catch (embErr) {
       const embMsg = embErr instanceof Error ? embErr.message : String(embErr);
@@ -1186,6 +1223,7 @@ export async function executeDatasetSearch(
       semanticIds,
       filters,
       offset + page.length,
+      viewer,
     );
     const excludedUnknown = await computeExcludedUnknownCount(
       db,
@@ -1194,6 +1232,7 @@ export async function executeDatasetSearch(
       filters,
       count,
       warning === undefined,
+      viewer,
     );
     return buildEnvelope(fused, "semantic", count, warning, excludedUnknown);
   } catch (err) {

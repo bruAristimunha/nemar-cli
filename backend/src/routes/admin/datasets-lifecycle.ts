@@ -2061,7 +2061,7 @@ export function registerDatasetLifecycleRoutes(admin: AdminRouter): void {
 
     const rows = await c.env.DB.prepare(
       `SELECT dataset_id FROM datasets
-     WHERE status = 'active' AND visibility = 'public'
+     WHERE status = 'active'
        AND (is_sandbox = 0 OR is_sandbox IS NULL OR ${exemplarOrFragment("")})
        AND dataset_id > ?
      ORDER BY dataset_id
