@@ -210,6 +210,64 @@ describe("GET /datasets/search caller visibility", () => {
     expect((await search(null, false, "ownerone")).ids).toEqual([]);
   });
 
+  test("owner and collaborator count and excluded_unknown match the visible hydrated set", async () => {
+    for (const [key, expected] of [
+      [OWNER_KEY, ["nm500001", "nm500002", "nm500003"]],
+      [COLLAB_KEY, ["nm500001", "nm500003"]],
+    ] as const) {
+      for (const withVectors of [false, true]) {
+        const { ids, body } = await search(key, withVectors);
+        expect(ids).toEqual([...expected]);
+        expect(body.count).toBe(expected.length);
+        expect(body.excluded_unknown ?? 0).toBe(0);
+      }
+    }
+    // A facet leaves a dataset without that fact out; excluded_unknown counts
+    // exactly the visible rows (never the other owner's nm500004 or the
+    // archived nm500005).
+    for (const [key, visible] of [
+      [OWNER_KEY, 3],
+      [COLLAB_KEY, 2],
+    ] as const) {
+      const res = await app.request(
+        "/search?q=quokka&min_score=0&subjects=10..",
+        { headers: { Authorization: `Bearer ${key}` } },
+        bindings(db, false),
+      );
+      const body = (await res.json()) as {
+        results: unknown[];
+        count: number;
+        excluded_unknown: number;
+      };
+      expect(body.results).toEqual([]);
+      expect(body.count).toBe(0);
+      expect(body.excluded_unknown).toBe(visible);
+    }
+  });
+
+  test("a private anonymous deposit seen by a collaborator has a null DOI and no owner fields", async () => {
+    insertDataset(db, "nm500007", {
+      visibility: "private",
+      owner_user_id: 21,
+      anonymous: 1,
+      concept_doi: "10.0000/reserved2",
+      name: "Quokka private anonymous deposit",
+    });
+    const shared = db.query("SELECT id FROM datasets WHERE dataset_id = 'nm500007'").get() as {
+      id: number;
+    };
+    db.query(
+      "INSERT INTO dataset_collaborators (dataset_id, user_id, access_type) VALUES (?, 22, 'invited')",
+    ).run(shared.id);
+    const { body } = await search(COLLAB_KEY, false);
+    const hit = (body.results as Record<string, unknown>[]).find((r) => r.id === "nm500007");
+    expect(hit).toBeDefined();
+    expect(hit?.doi === "" || hit?.doi == null).toBe(true);
+    expect(JSON.stringify(hit)).not.toContain("ownerone");
+    expect(JSON.stringify(hit)).not.toContain("owner");
+    expect(JSON.stringify(body)).not.toContain("reserved2");
+  });
+
   test("every response is no-store, anonymous and authenticated alike", async () => {
     for (const key of [null, OWNER_KEY, ADMIN_KEY]) {
       const { res } = await search(key, false);
@@ -221,21 +279,60 @@ describe("GET /datasets/search caller visibility", () => {
   });
 });
 
-describe("embedding drain covers private datasets", () => {
-  test("a dirty private dataset is embedded, an archived one is not", async () => {
-    const db = freshDb();
-    insertDataset(db, "nm510001", { visibility: "private", owner_user_id: 99, description: "x" });
-    insertDataset(db, "nm510002", { visibility: "private", status: "archived", description: "x" });
-    db.run("UPDATE datasets SET embedding_dirty = 1 WHERE dataset_id IN ('nm510001','nm510002')");
+describe("embedding drain and the visibility flag (I1, I2)", () => {
+  const ai = { run: async () => ({ data: [[0.1, 0.2]] }) } as unknown as Ai;
+  function recorder(): { upserted: string[]; vectorize: VectorizeIndex } {
     const upserted: string[] = [];
     const vectorize = {
       upsert: async (v: { id: string }[]) => {
         for (const x of v) upserted.push(x.id);
       },
     } as unknown as VectorizeIndex;
-    const ai = { run: async () => ({ data: [[0.1, 0.2]] }) } as unknown as Ai;
+    return { upserted, vectorize };
+  }
+  function seed(): Database {
+    const db = freshDb();
+    insertDataset(db, "nm510001", { visibility: "private", owner_user_id: 99, description: "x" });
+    insertDataset(db, "nm510002", { visibility: "private", status: "archived", description: "x" });
+    insertDataset(db, "nm510003", { visibility: "public", description: "x" });
+    db.run("UPDATE datasets SET embedding_dirty = 1");
+    return db;
+  }
+
+  test("flag on: a dirty private dataset is embedded, an archived one is not", async () => {
+    const db = seed();
+    const { upserted, vectorize } = recorder();
+    const out = await drainEmbeddingDirty(realD1(db), ai, vectorize, 50, true);
+    expect(upserted.sort()).toEqual(["nm510001", "nm510003"]);
+    expect(out.embedded).toBe(2);
+  });
+
+  test("flag off: only public datasets are embedded; private rows stay dirty", async () => {
+    const db = seed();
+    const { upserted, vectorize } = recorder();
     const out = await drainEmbeddingDirty(realD1(db), ai, vectorize);
-    expect(upserted).toEqual(["nm510001"]);
+    expect(upserted).toEqual(["nm510003"]);
     expect(out.embedded).toBe(1);
+    const dirty = db.query("SELECT dataset_id FROM datasets WHERE embedding_dirty >= 1").all();
+    expect(dirty).toContainEqual({ dataset_id: "nm510001" });
+  });
+
+  test("a freshly flipped row drains before an older backlog larger than the limit", async () => {
+    const db = freshDb();
+    for (let i = 0; i < 6; i++) {
+      insertDataset(db, `nm53000${i}`, {
+        description: "x",
+        updated_at: `2026-0${i + 1}-01 00:00:00`,
+      });
+    }
+    // The newest backlog row is dirty from a content edit (1); the oldest row
+    // is then published, which makes it 2 although its updated_at is oldest.
+    db.run("UPDATE datasets SET embedding_dirty = 1");
+    db.run("UPDATE datasets SET visibility = 'private' WHERE dataset_id = 'nm530000'");
+    db.run("UPDATE datasets SET visibility = 'public' WHERE dataset_id = 'nm530000'");
+    const { upserted, vectorize } = recorder();
+    await drainEmbeddingDirty(realD1(db), ai, vectorize, 2);
+    expect(upserted).toHaveLength(2);
+    expect(upserted).toContain("nm530000");
   });
 });

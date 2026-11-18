@@ -34,6 +34,17 @@ import {
 const EMBEDDING_MODEL = "@cf/baai/bge-small-en-v1.5";
 
 /**
+ * Whether non-public datasets are embedded. Tied to the layer-1 metadata
+ * filter on purpose: without it the unfiltered top-K vector pool (Vectorize
+ * caps it at 100) would fill with private candidates that layer 2 then drops,
+ * costing anonymous semantic recall. Public vectors are always embedded and
+ * labeled, so the relabel backfill can run before the flag goes on.
+ */
+export function embedsNonPublic(env: { VECTORIZE_VISIBILITY_FILTER?: string }): boolean {
+  return env.VECTORIZE_VISIBILITY_FILTER === "1";
+}
+
+/**
  * Fixed candidate-window ceilings for GET /datasets/search (#1145, epic #1144
  * phase 1). Both legs used to fetch `limit * 2` candidates, which made the
  * reported `count` a function of the caller's page size rather than a
@@ -115,12 +126,16 @@ export const buildDatasetEmbedText = buildDatasetSummaryText;
  * are unconfigured, the row is missing, or any step fails -- so it can be
  * awaited inline at the enrich/reindex hooks without ever failing the request.
  * Returns true only when the vector was upserted and the dirty flag cleared.
+ *
+ * A non-public row is skipped (false, flag untouched) unless `embedNonPublic`
+ * is set; see {@link embedsNonPublic}.
  */
 export async function reembedDatasetVector(
   db: D1Database,
   ai: Ai | undefined,
   vectorize: VectorizeIndex | undefined,
   datasetId: string,
+  embedNonPublic = false,
 ): Promise<boolean> {
   if (!ai || !vectorize) {
     console.log(`[reembed] AI/Vectorize not configured, skipping ${datasetId}`);
@@ -135,6 +150,9 @@ export async function reembedDatasetVector(
       .first<DatasetEmbedRow & { visibility: string | null }>();
     if (!row) {
       console.warn(`[reembed] No datasets row for ${datasetId}, skipping`);
+      return false;
+    }
+    if (!embedNonPublic && row.visibility !== "public") {
       return false;
     }
     const text = buildDatasetSummaryText(row);
@@ -179,7 +197,9 @@ export async function reembedDatasetVector(
 
 /**
  * #646 Phase 4 drain: re-embed the datasets whose vectors are stale
- * (embedding_dirty=1), oldest-updated first, up to `limit`. Each successful
+ * (embedding_dirty>=1), up to `limit`, most recently changed first: a
+ * visibility transition marks its row 2 (migration 0145), so a just-published
+ * dataset is relabeled ahead of any backlog. Each successful
  * reembedDatasetVector clears the flag; failures stay dirty for the next run.
  * Used by the scheduled() cron. Fully guarded (never throws).
  */
@@ -188,23 +208,26 @@ export async function drainEmbeddingDirty(
   ai: Ai | undefined,
   vectorize: VectorizeIndex | undefined,
   limit = 50,
+  embedNonPublic = false,
 ): Promise<{ scanned: number; embedded: number }> {
   if (!ai || !vectorize) {
     return { scanned: 0, embedded: 0 };
   }
   try {
-    // Embed every active, non-sandbox dataset, private included (every
-    // dataset is visible to someone). The vector is id-only; who may see a hit
-    // is decided against the live `datasets` row at query time (see
-    // buildViewerVisibilitySql), never by the index. Archived and sandbox
-    // rows stay dirty: search never returns them.
+    // Embed every active, non-sandbox dataset when `embedNonPublic` (every
+    // dataset is visible to someone), else only the public ones. The vector is
+    // id-only; who may see a hit is decided against the live `datasets` row at
+    // query time (see buildViewerVisibilitySql), never by the index. Archived,
+    // sandbox and (flag off) non-public rows stay dirty. embedding_dirty = 2
+    // (a visibility transition) sorts first.
     const rows = await db
       .prepare(
         `SELECT dataset_id FROM datasets
-         WHERE embedding_dirty = 1
+         WHERE embedding_dirty >= 1
            AND status = 'active'
+           ${embedNonPublic ? "" : "AND visibility = 'public'"}
            AND (is_sandbox = 0 OR is_sandbox IS NULL OR is_exemplar = 1)
-         ORDER BY updated_at LIMIT ?`,
+         ORDER BY embedding_dirty DESC, updated_at DESC LIMIT ?`,
       )
       .bind(limit)
       .all<{ dataset_id: string }>();
@@ -212,7 +235,7 @@ export async function drainEmbeddingDirty(
     let embedded = 0;
     const failed: string[] = [];
     for (const id of ids) {
-      if (await reembedDatasetVector(db, ai, vectorize, id)) embedded++;
+      if (await reembedDatasetVector(db, ai, vectorize, id, embedNonPublic)) embedded++;
       else failed.push(id);
     }
     console.log(`[embed-cron] drained ${embedded}/${ids.length} dirty vectors`);
@@ -408,7 +431,17 @@ async function embedAndQuery(
   const one = async (filter: VectorScope) => {
     if (!filter) return vectorize.query(vector, { topK, returnMetadata: "none" });
     try {
-      return await vectorize.query(vector, { topK, returnMetadata: "none", filter });
+      const filtered = await vectorize.query(vector, { topK, returnMetadata: "none", filter });
+      if (filtered.matches.length === 0) {
+        // Zero hits may mean "nothing matches" or "the metadata index does not
+        // exist yet" (Vectorize filters silently on an unindexed property).
+        // Retry unfiltered; layer 2 keeps the result visibility-safe.
+        console.warn(
+          "[search] filtered vector query returned no matches, retrying unfiltered (missing metadata index?)",
+        );
+        return vectorize.query(vector, { topK, returnMetadata: "none" });
+      }
+      return filtered;
     } catch (err) {
       // A filter the index cannot serve (no metadata index yet) degrades to the
       // unfiltered query; the live D1 check below still decides visibility.
@@ -540,19 +573,24 @@ export async function semanticSearchHydrated(
     filters,
     viewer,
   );
-  // Vector ids with no live `datasets` row are dropped (correct: a vector for a
-  // deleted dataset must not surface). Log when it happens so index drift /
-  // stale vectors are observable rather than silently shrinking results.
-  // #1145 review I2: when a filter is active, a dropped id might just have
-  // failed that filter rather than being genuinely stale -- qualify the
-  // warning rather than asserting a cause it can't establish.
+  // A vector id with no `datasets` row at all is stale (deleted dataset) and is
+  // dropped; log it so index drift is observable. Hits dropped because the
+  // caller may not see them (visibility), or because an active filter or the
+  // status excluded them, are expected and counted apart, never warned about.
   if (hydrated.length < ranked.length) {
-    const reason = hasActiveFilters(filters)
-      ? "stale vectors, recent deletes, or the active filter excluding some ids -- indistinguishable here"
-      : "stale vectors or recent deletes";
-    console.warn(
-      `[search] ${ranked.length - hydrated.length}/${ranked.length} vector ids had no datasets row (${reason})`,
-    );
+    const kept = new Set(hydrated.map((r) => r.id));
+    const dropped = ranked.map((r) => r.id).filter((id) => !kept.has(id));
+    const present = await db
+      .prepare(`SELECT d.dataset_id AS id FROM datasets d WHERE ${DATASET_ID_IN_JSON_LIST}`)
+      .bind(datasetIdListParam(dropped))
+      .all<{ id: string }>();
+    const have = new Set((present.results || []).map((r) => r.id));
+    const missing = dropped.filter((id) => !have.has(id)).length;
+    if (missing > 0) {
+      console.warn(
+        `[search] ${missing}/${ranked.length} vector ids had no datasets row (stale vectors or recent deletes); ${dropped.length - missing} more were not visible to the caller or excluded by status/filters`,
+      );
+    }
   }
   return hydrated.map((r) => ({ ...r, score: scoreById.get(r.id) ?? 0 }));
 }
