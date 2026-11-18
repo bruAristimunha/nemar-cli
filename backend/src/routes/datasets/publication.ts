@@ -731,9 +731,9 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
     const db = c.env.DB;
 
     const dataset = await db
-      .prepare("SELECT id, owner_user_id FROM datasets WHERE dataset_id = ?")
+      .prepare("SELECT id, owner_user_id, visibility FROM datasets WHERE dataset_id = ?")
       .bind(datasetId)
-      .first<{ id: number; owner_user_id: number }>();
+      .first<{ id: number; owner_user_id: number; visibility: string | null }>();
 
     if (!dataset) {
       return c.json({ error: "Dataset not found" }, 404);
@@ -789,8 +789,13 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
     }
 
     // An administrator pulled the dataset back to unpublished (ADR 0125): the request that
-    // published it is history, not the dataset's state, so a request can be made again.
-    if (request.status === "published" && request.unpublished_at) {
+    // published it is history, not the dataset's state, so a request can be made again. Not when the dataset
+    // is public again (an administrator's `make-public` after an unpublish): then the request stands.
+    if (
+      request.status === "published" &&
+      request.unpublished_at &&
+      dataset.visibility !== "public"
+    ) {
       return c.json({
         dataset_id: datasetId,
         status: "none",
