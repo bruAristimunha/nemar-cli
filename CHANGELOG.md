@@ -61,6 +61,8 @@ Compute stays dark in production: no job can be created while `COMPUTE_ENABLED` 
   It refuses the live datasets nm000103 to nm000107, the reserved fixture band, exemplars, anonymous deposits, withdrawn datasets (use `restore`) and a dataset with an open publication request (deny it first).
   A public dataset that was never published is simply made private.
   `withdraw` is the other way back: it is for a broken or removed dataset, and it tombstones the DOIs.
+  After an execute the command prints one line: search reflects the change at once, while the public dataset page and catalog list are cached at the edge and can keep showing the dataset for several minutes.
+  `nemar dataset publish status` reports a dataset that is public again (for example after `make-public`) by its request's own status, not as unpublished.
 - **Search follows the viewer, with two layers of protection (#2201, ADR 0126, migration 0145).**
   One shared predicate, `buildViewerVisibilitySql`, decides what a caller sees in every tier: exact identifier, full-text, literal match, vector-hit hydration, reranker text, counts and `excluded_unknown`.
   Layer 2, always on: every hit is checked against the live `datasets` row, so a stale label never decides visibility.
@@ -86,6 +88,10 @@ Compute stays dark in production: no job can be created while `COMPUTE_ENABLED` 
   Creating a runner job and every runner claim stay behind the dark switch `COMPUTE_RUNNERS_ENABLED`; an owner can register a runner while it is off, and the registration does nothing until the switch is on.
   A Tapis-executor pipeline run is refused `tapis_unconfigured` (503) before any write while Tapis is unconfigured, so `COMPUTE_ENABLED` may be set for runner jobs alone (ADR 0118 amendment, #2176); the Tapis go-live stays parked.
   ADR 0122 records one container image that runs under Apptainer or Docker from one digest; Podman is unsupported.
+- **A waiting runner job that can never be claimed is ended by the lease sweep.**
+  When its dataset is deleted or no longer passes the pipeline eligibility predicate (unpublished, withdrawn, anonymous, tombstoned), the job ends `runner_lost` with the new detail `dataset_ineligible`, so it stops holding a `runners.maxLiveJobs` slot; a job whose dataset is still eligible is untouched.
+  A runner job that has waited unclaimed for over a day is counted as the attention word `runner_waiting_stale`.
+  The runner routes other than the secret exchange are rate limited by client address, not by bearer, so a made-up bearer mints no bucket.
 - **One `nemar-floor` recipe with two inputs (#2177, migration 0141).**
   The recipe registry lists `nemar-floor` with inputs `bids` (on Tapis) and `zarr` (on a runner), and `nemar-floor-zarr` is removed.
   A pipeline stamp now records the input, the reader, the engine and the digest of what the run read.
@@ -99,6 +105,7 @@ Compute stays dark in production: no job can be created while `COMPUTE_ENABLED` 
   Migration 0142 adds `compute_jobs.runner_usage_partial`.
 - **The derivative store (#2178, #2180, #2191, #2193, #2194, ADR 0123, migration 0143).**
   A finished pipeline job's product is copied server side from the results bucket into a private derivatives bucket under `d/<key>/`, with a `derivative.json` that names what produced it, the source datasets (with the version DOI when one exists), the profile and every file with its size and SHA-256 digest.
+  A dataset that stopped being eligible after its job finished (unpublished, withdrawn, anonymous or tombstoned) is neither keyed, copied nor promoted.
   The key is the SHA-256 of eight fields (dataset, version, recipe, recipe version, engine, input, profile and input digest), computed by `shared/contract/derivatives.ts`, which is import-free and has shared test vectors that a Python implementation reproduces.
   A Zarr input's digest covers the electrode positions its recipe was handed (`nemar.input-digest.v2`), so a reconversion that changes only positions gets a new key.
   Retention is by class: `canary` expires 30 days after it is stored, `catalog` is kept until a later catalog derivative of the same dataset, recipe, input and profile is promoted (then 30 days), and `published` is never expired, superseded or deleted by code and has no DOI minted by code.
@@ -135,6 +142,7 @@ Compute stays dark in production: no job can be created while `COMPUTE_ENABLED` 
   The dev Worker binds its own `nemar-compute-derivatives-dev`.
   The production configuration gains the binding `COMPUTE_DERIVATIVES` and the variable `COMPUTE_DERIVATIVES_BUCKET_NAME`, and nothing else; no switch, secret or other variable changes.
   The store reuses the compute token that already covers the other two compute buckets.
+- **The central approval workflow change (nemarDatasets/.github#155) must merge before this release.**
 - **Update scripts and runbooks that call `nemar admin publish`, `admin withdraw`, `admin restore`, `admin repo public` or `admin repo private`, or `PATCH /admin/datasets/:id/visibility`,** before or with the release.
 - **No website release is required.**
   The website does not call the changed administrator commands, and search keeps its response shape.
@@ -142,6 +150,8 @@ Compute stays dark in production: no job can be created while `COMPUTE_ENABLED` 
 - **Rolling back.**
   The migrations add tables, columns, indexes and triggers that the 0.10.33 Worker ignores, so a rollback is safe for the schema.
   Rolling a Worker back to a build from before the tenant block makes a stored policy that has the `tenant` key unreadable, and a build from before the runners block does the same for the `runners` key (the reader is strict and fails closed); turn runners off and drain them, and write a policy without the keys, before any rollback across them.
+  Concretely, once the owner has run `nemar admin compute policy set` with the new `tenant` or `runners` keys, the older Worker reads the policy as unavailable: roll back only before the first policy set, or revert the policy first.
+  After a Worker rollback, rows with `embedding_dirty = 2` wait until the release is deployed again, since the older drain does not read that value.
 
 ### Owner steps after release
 
@@ -162,6 +172,8 @@ None of these is done by the release.
 
 ### Known limits
 
+- After an unpublish or a withdraw, search reflects the change at once, but the anonymous dataset page and the public catalog list are cached at the edge and can keep showing the dataset for several minutes.
+- Vector labels refresh on the daily drain, so once `VECTORIZE_VISIBILITY_FILTER=1` is on, anonymous semantic search can miss a just-published dataset until then; keyword search finds it at once.
 - The list and facet endpoints show private datasets only to administrators; owners and collaborators do not yet see their own private rows there (#2203).
 - Re-publishing an unpublished dataset has not been exercised end to end: the orchestrator reuses the existing concept and version DOIs and handles an existing DOI, but a second publish of the same version number was not run against EZID (#2202).
 - `nemar admin make-public` is still a bare public flip with no publication request, the same class of half state that `repo public` was; it is not changed here.
