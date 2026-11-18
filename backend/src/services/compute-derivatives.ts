@@ -62,7 +62,12 @@ import {
 import { AUDIT_IF_PREVIOUS_CHANGED_SQL, auditLogParams } from "../db/audit-log.js";
 import type { Bindings } from "../types/bindings.js";
 import { VERSION_DOI_SQL } from "./anonymity.js";
-import { VERSION_TAG_SQL } from "./compute-pipeline-eligibility.js";
+import {
+  PIPELINE_ELIGIBLE_SQL,
+  type PipelineEnv,
+  VERSION_TAG_SQL,
+  pipelineEligibleSql,
+} from "./compute-pipeline-eligibility.js";
 import { OUTPUTS_BODY_CEILING_BYTES } from "./compute-records.js";
 import {
   type ComputeS3,
@@ -512,29 +517,39 @@ export async function keyStamp(stores: Stores, stamp: CandidateStamp): Promise<K
 
 /**
  * The stamps to decide: succeeded, with a finished job, no derivative of their own and no decision in the
- * skip log, oldest first. `?1` the most to read.
+ * skip log, whose dataset STILL passes the pipeline eligibility predicate (one that was unpublished, withdrawn,
+ * made anonymous or tombstoned after its job finished is neither keyed nor copied), oldest first. `?1` the most
+ * to read.
  */
-export const CANDIDATE_STAMPS_SQL = `SELECT s.id, s.dataset_id, s.version, s.recipe, s.recipe_version, s.engine,
+const candidateStampsSql = (
+  eligible: string,
+): string => `SELECT s.id, s.dataset_id, s.version, s.recipe, s.recipe_version, s.engine,
        s.input, s.job_id, s.input_digest, j.spec_digest
   FROM compute_pipeline_stamps s JOIN compute_jobs j ON j.id = s.job_id
  WHERE s.state = 'succeeded' AND j.state = 'finished'
    AND NOT EXISTS (SELECT 1 FROM compute_derivatives d WHERE d.stamp_id = s.id)
    AND NOT EXISTS (SELECT 1 FROM compute_derivative_skips k WHERE k.stamp_id = s.id)
+   AND EXISTS (SELECT 1 FROM datasets d WHERE d.dataset_id = s.dataset_id AND ${eligible})
  ORDER BY s.id ASC LIMIT ?1`;
+
+/** The production text of the scan; an environment gets its own through {@link derivativeSql}. */
+export const CANDIDATE_STAMPS_SQL = candidateStampsSql(PIPELINE_ELIGIBLE_SQL);
 
 /**
  * Make a derivative's row: `?1` key, `?2` dataset, `?3` version, `?4` recipe, `?5` recipe version, `?6` engine,
  * `?7` input, `?8` profile, `?9` input digest, `?10` image digest, `?11` job, `?12` stamp, `?13` file count,
  * `?14` bytes. A second job with the same key adds nothing: the first derivative stands. And nothing is made
- * for a dataset that is gone (a deletion between the scan and the insert): a derivative of a deleted dataset
+ * for a dataset that is gone or no longer eligible (a deletion or an unpublish between the scan and the insert): a derivative of a deleted dataset
  * must not outlive the deletion's dating of its rows.
  */
-export const INSERT_DERIVATIVE_SQL = `INSERT INTO compute_derivatives
+const insertDerivativeSql = (eligible: string): string => `INSERT INTO compute_derivatives
   (key, dataset_id, version, recipe, recipe_version, engine, input, profile, input_digest, image_digest,
    job_id, stamp_id, object_count, bytes)
   SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
-   WHERE EXISTS (SELECT 1 FROM datasets WHERE dataset_id = ?2)
+   WHERE EXISTS (SELECT 1 FROM datasets d WHERE d.dataset_id = ?2 AND ${eligible})
   ON CONFLICT(key) DO NOTHING`;
+
+export const INSERT_DERIVATIVE_SQL = insertDerivativeSql(PIPELINE_ELIGIBLE_SQL);
 
 /**
  * Remember a stamp decided without a derivative. `?1` the stamp, `?2` the word. Not for a stamp that has a
@@ -605,17 +620,22 @@ export const STORE_ROW_SQL = `UPDATE compute_derivatives
 /**
  * A promotion needs a derivative that is still LIVE: a row whose date has passed (a canary past its 30 days
  * that the sync has not swept yet, or one a dataset's deletion dated to now) is already going and is never
- * kept by a promotion, and neither is a row whose dataset is gone. A canary always has a date, so for
+ * kept by a promotion, and neither is a row whose dataset is gone or no longer passes the pipeline eligibility
+ * predicate (unpublished, withdrawn, anonymous, tombstoned). A canary always has a date, so for
  * `catalog` the date must be in the future; `published` is raised from a catalog row, which has none or a
  * future one (a superseded row).
  */
-const LIVE_SQL =
-  "AND EXISTS (SELECT 1 FROM datasets d WHERE d.dataset_id = compute_derivatives.dataset_id)";
+const liveSql = (eligible: string): string =>
+  `AND EXISTS (SELECT 1 FROM datasets d WHERE d.dataset_id = compute_derivatives.dataset_id AND ${eligible})`;
 
 /** `canary` to `catalog`, only a stored canary row that is not yet due. `?1` key. */
-export const PROMOTE_CATALOG_SQL = `UPDATE compute_derivatives SET retention = 'catalog', expires_at = NULL
+const promoteCatalogSql = (
+  eligible: string,
+): string => `UPDATE compute_derivatives SET retention = 'catalog', expires_at = NULL
  WHERE key = ?1 AND retention = 'canary' AND state = 'stored'
-   AND expires_at > datetime('now') ${LIVE_SQL}`;
+   AND expires_at > datetime('now') ${liveSql(eligible)}`;
+
+export const PROMOTE_CATALOG_SQL = promoteCatalogSql(PIPELINE_ELIGIBLE_SQL);
 
 /**
  * A later `catalog` row supersedes every other one of its dataset, recipe, input and profile: it is dated
@@ -629,9 +649,28 @@ export const SUPERSEDE_CATALOG_SQL = `UPDATE compute_derivatives
    AND retention = 'catalog' AND superseded_at IS NULL AND key <> ?5 AND changes() > 0`;
 
 /** `catalog` to `published`, only a stored catalog row that is not due; it never expires after this. `?1` key. */
-export const PROMOTE_PUBLISHED_SQL = `UPDATE compute_derivatives SET retention = 'published', expires_at = NULL
+const promotePublishedSql = (
+  eligible: string,
+): string => `UPDATE compute_derivatives SET retention = 'published', expires_at = NULL
  WHERE key = ?1 AND retention = 'catalog' AND state = 'stored'
-   AND (expires_at IS NULL OR expires_at > datetime('now')) ${LIVE_SQL}`;
+   AND (expires_at IS NULL OR expires_at > datetime('now')) ${liveSql(eligible)}`;
+
+export const PROMOTE_PUBLISHED_SQL = promotePublishedSql(PIPELINE_ELIGIBLE_SQL);
+
+/**
+ * The four eligibility-bound statements of an environment: production's text, or, in a recognized
+ * non-production environment, the one over the widened predicate that lets the compute fixture through.
+ * Built per call from the (precomputed) predicate text; the exported constants are production's.
+ */
+export function derivativeSql(env: PipelineEnv) {
+  const eligible = pipelineEligibleSql(env);
+  return {
+    candidates: candidateStampsSql(eligible),
+    insert: insertDerivativeSql(eligible),
+    promoteCatalog: promoteCatalogSql(eligible),
+    promotePublished: promotePublishedSql(eligible),
+  };
+}
 
 const BY_KEY_SQL = `SELECT ${DERIVATIVE_COLUMNS} FROM compute_derivatives WHERE key = ?1`;
 
@@ -784,12 +823,14 @@ async function skipStamp(
 
 /** Decide up to `DERIVATIVE_STAMPS_PER_CALL` stamps, each in its own try so one bad one cannot hold the rest. */
 async function keyNewStamps(
+  env: Bindings,
   stores: Stores,
   db: D1Database,
   counts: DerivativeSyncCounts,
 ): Promise<void> {
+  const sql = derivativeSql(env);
   const candidates = (
-    await db.prepare(CANDIDATE_STAMPS_SQL).bind(DERIVATIVE_STAMPS_PER_CALL).all<CandidateStamp>()
+    await db.prepare(sql.candidates).bind(DERIVATIVE_STAMPS_PER_CALL).all<CandidateStamp>()
   ).results;
   for (const stamp of candidates) {
     counts.examined++;
@@ -807,7 +848,7 @@ async function keyNewStamps(
       let inserted: D1Result;
       try {
         inserted = await db
-          .prepare(INSERT_DERIVATIVE_SQL)
+          .prepare(sql.insert)
           .bind(
             decision.key,
             f.dataset,
@@ -1109,7 +1150,7 @@ export async function syncDerivatives(
 
   // 2. The stamps that have no derivative are decided, and a keyable one gets its row.
   try {
-    await keyNewStamps(stores, db, counts);
+    await keyNewStamps(env, stores, db, counts);
   } catch (err) {
     console.error(`[compute-derivatives] scan_failed error=${errorName(err)}`);
     counts.errored++;
@@ -1270,6 +1311,7 @@ export async function promoteDerivative(
   const from = input.to === "catalog" ? "canary" : "catalog";
   if (row.retention !== from || row.state !== "stored")
     return { ok: false, code: "not_promotable" };
+  const sql = derivativeSql(env);
   const audit = db.prepare(AUDIT_IF_PREVIOUS_CHANGED_SQL).bind(
     ...auditLogParams({
       userId: input.userId,
@@ -1282,13 +1324,13 @@ export async function promoteDerivative(
   const results =
     input.to === "catalog"
       ? await db.batch([
-          db.prepare(PROMOTE_CATALOG_SQL).bind(input.key),
+          db.prepare(sql.promoteCatalog).bind(input.key),
           audit,
           db
             .prepare(SUPERSEDE_CATALOG_SQL)
             .bind(row.dataset_id, row.recipe, row.input, row.profile, row.key),
         ])
-      : await db.batch([db.prepare(PROMOTE_PUBLISHED_SQL).bind(input.key), audit]);
+      : await db.batch([db.prepare(sql.promotePublished).bind(input.key), audit]);
   const now = await getDerivative(db, input.key);
   if ((results[0]?.meta?.changes ?? 0) === 0 || now === null) {
     return { ok: false, code: now === null ? "derivative_not_found" : "not_promotable" };
