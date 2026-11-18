@@ -33,6 +33,7 @@ import {
   approveEvidenceLines,
   evidenceLine,
   historyLines,
+  requestStatusLabel,
   reviewDetailLines,
   reviewListLine,
   screenViewLines,
@@ -729,5 +730,25 @@ describe("reviewDetailLines", () => {
     expect(lines.join("\n")).not.toContain("Questions:");
     expect(lines.join("\n")).not.toContain("Evidence:");
     expect(lines.at(-1)).toContain("Next:");
+  });
+});
+
+describe("requestStatusLabel (ADR 0125)", () => {
+  test("a published request an administrator pulled back says so, with the day", () => {
+    expect(requestStatusLabel("published", "2026-11-17 19:30:00")).toBe(
+      "published (unpublished 2026-11-17)",
+    );
+  });
+
+  test("a live published request and every other status are printed as they are", () => {
+    expect(requestStatusLabel("published", null)).toBe("published");
+    expect(requestStatusLabel("published")).toBe("published");
+    expect(requestStatusLabel("denied", "2026-11-17 19:30:00")).toBe("denied");
+    expect(requestStatusLabel("requested")).toBe("requested");
+  });
+
+  test("terminal escapes in the stamp or the status are removed", () => {
+    expect(requestStatusLabel("published", "2026-11-17\u001b[31m")).not.toContain("\u001b");
+    expect(requestStatusLabel("pub\u001b[2Jlished")).not.toContain("\u001b");
   });
 });

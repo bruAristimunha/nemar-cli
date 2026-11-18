@@ -57,6 +57,22 @@ export const MODEL_WRITTEN_FINDINGS = "written by the model; the depositor's tex
 export const MODEL_WRITTEN_SUMMARY = "written by the model; the depositor's text can steer it";
 
 // ---------------------------------------------------------------------------------------------
+// A request's status, with the pull-back an administrator made
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A request's status as one list line says it. A `published` request an administrator pulled back
+ * with `nemar admin repo unpublish` (ADR 0125) keeps the status `published` and carries
+ * `unpublished_at`; printed bare, it reads as a live publication of a dataset that is private.
+ * The date is the day part of the stamp, which is all a person needs and is plain text.
+ */
+export function requestStatusLabel(status: string, unpublishedAt?: string | null): string {
+  const base = plain(status);
+  if (status !== "published" || !unpublishedAt) return base;
+  return `${base} (unpublished ${plain(unpublishedAt).slice(0, 10)})`;
+}
+
+// ---------------------------------------------------------------------------------------------
 // A start that went
 // ---------------------------------------------------------------------------------------------
 

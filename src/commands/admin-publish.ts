@@ -36,7 +36,11 @@ import {
 import { markReportedExit } from "../lib/debug-log.js";
 import { LineReader } from "../lib/prompt-lines.js";
 import { readReview } from "../lib/publication-review-approve.js";
-import { reviewListLine, screenViewLines } from "../lib/publication-review-display.js";
+import {
+  requestStatusLabel,
+  reviewListLine,
+  screenViewLines,
+} from "../lib/publication-review-display.js";
 import { needsAdministrator } from "../lib/publication-review-queue.js";
 import {
   type ListFilterOptions,
@@ -158,7 +162,7 @@ Examples:
 
         for (const req of rows) {
           const statusColor =
-            req.status === "published"
+            req.status === "published" && !req.unpublished_at
               ? chalk.green
               : req.status === "denied"
                 ? chalk.red
@@ -182,7 +186,7 @@ Examples:
               ? `  ${chalk.yellow("(approval running)")}`
               : "";
           console.log(
-            `  ${chalk.bold(plain(req.dataset_id))}  ${withdrawn ? chalk.yellow("withdrawn") : statusColor(plain(req.status))}  by ${plain(req.requested_by_username)}  ${chalk.dim(plain(req.requested_at))}${name ? `  ${chalk.dim(name)}` : ""}${mark}`,
+            `  ${chalk.bold(plain(req.dataset_id))}  ${withdrawn ? chalk.yellow("withdrawn") : (req.unpublished_at ? chalk.yellow : statusColor)(requestStatusLabel(req.status, req.unpublished_at))}  by ${plain(req.requested_by_username)}  ${chalk.dim(plain(req.requested_at))}${name ? `  ${chalk.dim(name)}` : ""}${mark}`,
           );
           // #1408: an anonymous release and a publication reach this list
           // looking identical, and approving the wrong one is not reversible in
