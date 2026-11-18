@@ -158,7 +158,8 @@ const EXPECTED_ENTRIES: Record<string, number> = {
   "DELETE /zenodo/deposition/:id": 1,
 
   // Fleet governance / visibility / CI
-  "PATCH /datasets/:id/visibility": 2,
+  // Retired to a bare refusal (409): one handler, no validator.
+  "PATCH /datasets/:id/visibility": 1,
   "GET /fleet/drift": 1,
   "POST /datasets/:id/enforce": 2,
   "POST /datasets/:id/revalidate": 1,
@@ -383,7 +384,7 @@ describe("admin route inventory", () => {
   });
 
   test("entry total is pinned", () => {
-    expect(adminRoutes.routes.length).toBe(258);
+    expect(adminRoutes.routes.length).toBe(257);
   });
 
   // The count pin above can't see a SWAP of the router-level middleware

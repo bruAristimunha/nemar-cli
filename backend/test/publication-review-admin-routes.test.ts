@@ -1518,7 +1518,9 @@ describe("GET /admin/publish/:id/review", () => {
       const d = await detail(datasetId);
       // A run that has not started publishing is gated again when it resumes, so its command is
       // the resume (the approval of an `approving` request that has not started publishing).
-      expect(d.description.next).toBe(`nemar admin repo publish approve ${datasetId} --resume --force`);
+      expect(d.description.next).toBe(
+        `nemar admin repo publish approve ${datasetId} --resume --force`,
+      );
       // A request waiting for its decision is still told to start it.
       const open = request();
       seedPublicationReview(db, {
@@ -1986,7 +1988,9 @@ describe("the detail carries what approve and next show from one read", () => {
     const publishing = await detail(datasetId);
     expect(publishing.started_publishing).toBe(true);
     // No gate applies to a run that has started publishing: no --force, and the line says why.
-    expect(publishing.description.next).toBe(`nemar admin repo publish approve ${datasetId} --resume`);
+    expect(publishing.description.next).toBe(
+      `nemar admin repo publish approve ${datasetId} --resume`,
+    );
     expect(publishing.description.lines).toContain(APPROVAL_PUBLISHING_LINE);
     expect(publishing.description.lines.at(-1)).toBe(NOT_ASSESSED_LINE);
     // A request waiting for its decision is unchanged.

@@ -376,29 +376,6 @@ export async function revokeKeyFor(username: string, id: number): Promise<{ ok: 
 // Admin - Repository Management
 // ============================================================================
 
-export interface VisibilityResponse {
-  message: string;
-  dataset_id: string;
-  visibility: "public" | "private";
-}
-
-/**
- * Change dataset repository visibility (admin only)
- */
-export async function changeVisibility(
-  datasetId: string,
-  visibility: "public" | "private",
-): Promise<VisibilityResponse> {
-  return request<VisibilityResponse>(
-    `/admin/datasets/${datasetId}/visibility`,
-    {
-      method: "PATCH",
-      body: JSON.stringify({ visibility }),
-    },
-    true,
-  );
-}
-
 export interface PublishDatasetResponse {
   success: boolean;
   message: string;

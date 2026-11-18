@@ -382,8 +382,9 @@ nemar admin revoke <username>              # Revoke user access
 nemar admin role <username> <role>         # Change user role
 
 # Dataset management
-nemar admin repo public <id>               # Make repo public
-nemar admin repo private <id>              # Make repo private
+nemar admin repo unpublish <id>            # Authors pull a published dataset back to private (DOIs untouched, can publish again)
+nemar admin repo withdraw <id>             # Broken or removed dataset: private and DOIs tombstoned
+nemar admin repo restore <id>              # Reverse a withdraw
 nemar admin ci check <id>                  # Check CI status
 nemar admin ci add <id>                    # Deploy CI workflows
 nemar admin s3 regenerate-iam <user>       # Regenerate AWS credentials

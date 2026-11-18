@@ -10,10 +10,9 @@
  * - nemar admin revoke             - Revoke user access
  * - nemar admin role               - Change a user's role (owner only)
  * - nemar admin s3 regenerate-iam  - Regenerate AWS credentials for a user
- * - nemar admin repo public/unpublish/withdraw/restore - Repository visibility and lifecycle
+ * - nemar admin repo publish/unpublish/withdraw/restore - Dataset publication lifecycle
  * - nemar admin ci check/add       - Manage CI workflows
  * - nemar admin doi create/info/update/enrich - DOI management
- * - nemar admin repo publish list/show/start/next/approve/deny/screen - Publication workflow and its automated review
  * - nemar admin revert             - Revert dataset to a previous version
  * - nemar admin recover [status]   - Re-copy epic #967 imports whose upstream is accessible
  * - nemar admin email-preferences show/update - Email notification opt-out
@@ -123,7 +122,6 @@ import {
   backfillUsernames,
   bulkDeleteDatasets,
   changeUserRole,
-  changeVisibility,
   clearIdentityConflict,
   createConceptDoi,
   createExemplar,
@@ -294,7 +292,7 @@ User Management:
   role           - Change a user's role (owner only: owner > admin > member)
 
 Dataset Management:
-  repo            - Dataset visibility and lifecycle (public, unpublish, withdraw, restore)
+  repo            - Dataset publication lifecycle (publish, unpublish, withdraw, restore)
   ci              - Manage CI workflows (check status, deploy)
   s3              - S3/IAM credential management
   doi             - Create and manage DOIs for datasets
@@ -309,7 +307,7 @@ Examples:
   $ nemar admin approve john_doe           # Approve a user
   $ nemar admin approve --id 123           # Approve a web/ORCID user (no username)
   $ nemar admin role john_doe admin        # Promote user to admin (owner only)
-  $ nemar admin repo public nm000104       # Make dataset repo public
+  $ nemar admin repo unpublish nm000104    # Pull a published dataset back to private
   $ nemar admin ci check nm000104          # Check CI status
   $ nemar admin s3 regenerate-iam john_doe # Regenerate AWS credentials
   $ nemar admin doi create nm000104        # Create concept DOI`,
@@ -1886,68 +1884,8 @@ async function regenerateIamAction(_username: string, _options: ConfirmOptions) 
 // ============================================================================
 
 const repoCommand = new Command("repo").description(
-  "Dataset repository visibility and lifecycle: public, unpublish, withdraw, restore",
+  "Dataset publication lifecycle: publish, unpublish, withdraw, restore",
 );
-
-repoCommand
-  .command("public")
-  .description("Make a dataset repository public")
-  .argument("<dataset-id>", "Dataset ID (e.g., nm000104)")
-  .option(YES_OPTION, YES_DESCRIPTION)
-  .option(NO_OPTION, NO_DESCRIPTION)
-  .action(async (datasetId, options: ConfirmOptions) => {
-    if (!requireAuth()) return;
-
-    console.log(chalk.cyan(`\nMaking repository public: ${datasetId}\n`));
-    console.log(chalk.yellow("Warning: This will make the dataset visible to everyone."));
-    console.log();
-
-    const confirmResult = await confirm(`Make ${datasetId} public?`, options);
-    if (confirmResult !== "confirmed") {
-      console.log(chalk.dim(confirmResult === "declined" ? "Skipped" : "Cancelled"));
-      return;
-    }
-
-    const spinner = ora(`Setting ${datasetId} to public...`).start();
-    try {
-      await changeVisibility(datasetId, "public");
-      spinner.succeed(`Repository ${datasetId} is now public`);
-    } catch (error) {
-      handleCommandError(error, spinner, "Failed to change visibility", {
-        404: "Dataset not found",
-      });
-    }
-  });
-
-repoCommand
-  .command("private")
-  .description("Make a dataset repository private")
-  .argument("<dataset-id>", "Dataset ID (e.g., nm000104)")
-  .option(YES_OPTION, YES_DESCRIPTION)
-  .option(NO_OPTION, NO_DESCRIPTION)
-  .action(async (datasetId, options: ConfirmOptions) => {
-    if (!requireAuth()) return;
-
-    console.log(chalk.yellow(`\nMaking repository private: ${datasetId}\n`));
-    console.log("This will restrict access to collaborators only.");
-    console.log();
-
-    const confirmResult = await confirm(`Make ${datasetId} private?`, options);
-    if (confirmResult !== "confirmed") {
-      console.log(chalk.dim(confirmResult === "declined" ? "Skipped" : "Cancelled"));
-      return;
-    }
-
-    const spinner = ora(`Setting ${datasetId} to private...`).start();
-    try {
-      await changeVisibility(datasetId, "private");
-      spinner.succeed(`Repository ${datasetId} is now private`);
-    } catch (error) {
-      handleCommandError(error, spinner, "Failed to change visibility", {
-        404: "Dataset not found",
-      });
-    }
-  });
 
 adminCommand.addCommand(repoCommand);
 
