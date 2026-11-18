@@ -297,7 +297,7 @@ PR_REVIEW_ENABLED = "1"
 # and `dataset_id` metadata indexes were created and `POST /admin/vectorize/reindex-all` relabeled
 # every public vector. With it on, a vector query is narrowed by those labels, and the embed drain
 # and reindex-all embed private datasets too: after the deploy, run reindex-all once more to embed
-# them. Production only; staging stays off until its index is relabeled the same way.
+# them. Staging has it too ([env.dev.vars]), on from 2026-11-18 after its index was relabeled.
 VECTORIZE_VISIBILITY_FILTER = "1"
 # Support-ticket retention (epic #1893 phase 6a, ADR 0112): days a ticket's raw record is kept
 # before the daily purge keeps only its summary. Two years in production; staging uses 30 days,
@@ -848,6 +848,10 @@ PRESCREEN_ENABLED = "true"
 # unset or 0 value leaves its pull requests waiting for a check nothing posts. Take the ruleset
 # off first, in the order the note on [vars] gives.
 PR_REVIEW_ENABLED = "1"
+# Vector visibility filter (ADR 0126), on in staging from 2026-11-18, after the dev index got the
+# `visibility` and `dataset_id` metadata indexes and reindex-all relabeled its public vectors.
+# After the deploy, run reindex-all on staging once more to embed the private rows. See [vars].
+VECTORIZE_VISIBILITY_FILTER = "1"
 # PR_REVIEW_AUTO_REQUIRE is not set here either, and the same caveat holds: a Worker secret of
 # that name would turn it on in this environment without showing in this file. See the note on
 # [vars]; the owner turns it on in a reviewed change, and the value must be the quoted string "1".

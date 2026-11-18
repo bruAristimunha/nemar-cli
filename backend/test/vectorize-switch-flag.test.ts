@@ -1,11 +1,12 @@
 /**
  * Where the vector visibility filter's switch is set, and where it is not (ADR 0126).
  *
- * `VECTORIZE_VISIBILITY_FILTER` is set in exactly one table of `backend/wrangler-sccn.toml`: the
- * production `[vars]`, to "1". It is the owner's: turning it on lets non-public datasets into the vector
- * index, so the owner turned it on in a reviewed change (2026-11-18) after the public vectors were
- * relabeled. A line added anywhere else (staging included) or a changed value would turn it on or off
- * somewhere nobody decided, and that is what this test refuses; the owner's next change edits this test.
+ * `VECTORIZE_VISIBILITY_FILTER` is set in exactly two tables of `backend/wrangler-sccn.toml`: the
+ * production `[vars]` and the staging `[env.dev.vars]`, both to "1". It is the owner's: turning it on lets
+ * non-public datasets into the vector index, so the owner turned it on in reviewed changes (2026-11-18)
+ * after each index's public vectors were relabeled. A line added anywhere else or a changed value would
+ * turn it on or off somewhere nobody decided, and that is what this test refuses; the owner's next change
+ * edits this test.
  * The test reads the real file and walks every table of the parsed document; it covers the file and
  * nothing else (a Worker variable of the same name also takes effect).
  */
@@ -52,11 +53,15 @@ describe("backend/wrangler-sccn.toml and the vector visibility filter switch", (
     ).toEqual(["a.b[0].VECTORIZE_VISIBILITY_FILTER", "VECTORIZE_VISIBILITY_FILTER"]);
   });
 
-  test("the switch is set in production [vars] and nowhere else", () => {
-    expect(pathsOfNames(config)).toEqual(["vars.VECTORIZE_VISIBILITY_FILTER"]);
+  test("the switch is set in production [vars] and staging [env.dev.vars], nowhere else", () => {
+    expect(pathsOfNames(config)).toEqual([
+      "vars.VECTORIZE_VISIBILITY_FILTER",
+      "env.dev.vars.VECTORIZE_VISIBILITY_FILTER",
+    ]);
   });
 
-  test("the production value is exactly \"1\" (the only value the Worker reads as on)", () => {
+  test("both values are exactly \"1\" (the only value the Worker reads as on)", () => {
     expect(config.vars?.VECTORIZE_VISIBILITY_FILTER).toBe("1");
+    expect(config.env?.dev?.vars?.VECTORIZE_VISIBILITY_FILTER).toBe("1");
   });
 });

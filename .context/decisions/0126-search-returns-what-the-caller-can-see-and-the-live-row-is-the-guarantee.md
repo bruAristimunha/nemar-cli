@@ -31,7 +31,7 @@ A vector label (`visibility`) can be stale for as long as it takes the embed dra
 
 - Responses to `/datasets/search` are `no-store` for every caller.
 - Turning the flag on has an order: metadata indexes, deploy, `reindex-all` until `has_more` is false, flag on, `reindex-all` again to embed the private rows.
-- The owner followed that order in production on 2026-11-18: metadata indexes created, all 910 public vectors relabeled, and the flag set in production `[vars]` (PR #2211); staging stays off until its index is relabeled the same way.
+- The owner followed that order in production on 2026-11-18: metadata indexes created, all 910 public vectors relabeled, and the flag set in production `[vars]` (PR #2211), and the same day in staging `[env.dev.vars]` after the dev index was relabeled.
 - Anonymous deposits stay concealed (null DOI, no owner fields) in every viewer's results.
 
 ## Alternatives considered
