@@ -291,7 +291,7 @@ export function buildFilterOptions(
 }
 
 export async function searchDatasetsTool(
-  env: Pick<Bindings, "DB" | "AI" | "VECTORIZE">,
+  env: Pick<Bindings, "DB" | "AI" | "VECTORIZE" | "VECTORIZE_VISIBILITY_FILTER">,
   args: SearchDatasetsInput,
 ): Promise<ToolOutcome> {
   // Every filter `buildDatasetFilterClauses` understands, not a hand-picked
@@ -360,6 +360,9 @@ export async function searchDatasetsTool(
       limit: args.limit,
       offset: 0,
       minScore: DEFAULT_MIN_SCORE,
+      // The viewer stays anonymous (public rows only); the flag only narrows
+      // the vector candidate pool, as on GET /datasets/search.
+      vectorMetadataFilter: env.VECTORIZE_VISIBILITY_FILTER === "1",
     });
     if (envelope.method === "unavailable") {
       console.error("[search_datasets] search index unavailable (datasets_fts missing)");

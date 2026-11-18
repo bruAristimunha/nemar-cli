@@ -15,9 +15,14 @@ export interface Bindings {
   // Optional: deploy succeeds without index; runtime checks before use
   AI?: Ai;
   VECTORIZE?: VectorizeIndex;
-  // "1" narrows vector queries by their `visibility`/`dataset_id` metadata
-  // (needs the Vectorize metadata indexes and a reindex-all backfill first).
-  // Unset: queries are unfiltered and the live D1 check alone decides.
+  // "1" narrows vector queries by their `visibility`/`dataset_id` metadata AND
+  // makes the embed drain / reindex-all embed non-public datasets. Turn it on
+  // ONLY after (1) the `visibility` and `dataset_id` Vectorize metadata indexes
+  // exist and (2) reindex-all has relabeled the public vectors: a filter on an
+  // unindexed property matches nothing (search then retries unfiltered, with a
+  // warning), and unlabeled vectors would drop out of every filtered query.
+  // Unset: queries are unfiltered, only public datasets are embedded, and the
+  // live D1 check alone decides.
   VECTORIZE_VISIBILITY_FILTER?: string;
 
   // Analytics Engine: write-only data-plane access counters (epic #695).

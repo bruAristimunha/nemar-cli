@@ -10,6 +10,8 @@
 import type { Database } from "bun:sqlite";
 import { beforeEach, describe, expect, test } from "bun:test";
 import { Hono } from "hono";
+import type { SearchDatasetsInput } from "../../shared/contract/mcp";
+import { searchDatasetsTool } from "../src/mcp/tools/search-datasets";
 import { registerCatalogRoutes } from "../src/routes/datasets/catalog";
 import { drainEmbeddingDirty } from "../src/services/dataset-search";
 import { hashApiKey } from "../src/services/token";
@@ -65,7 +67,7 @@ describe("vector metadata filter (layer 1) and live re-check (layer 2)", () => {
   let stored: Stored[];
   let seen: Filter[];
 
-  function run(key: string | null, flag: boolean, index?: VectorizeIndex): Promise<Response> {
+  async function run(key: string | null, flag: boolean, index?: VectorizeIndex): Promise<Response> {
     const env = {
       DB: realD1(db),
       ENVIRONMENT: "development",
@@ -147,10 +149,68 @@ describe("vector metadata filter (layer 1) and live re-check (layer 2)", () => {
     expect(await ids(null, true, strict)).toEqual(["nm520001"]);
   });
 
+  test("a filtered query with zero matches retries unfiltered (missing metadata index), still visibility-safe", async () => {
+    // A property with no metadata index matches nothing instead of erroring.
+    const unindexed = {
+      query: async (_v: unknown, opts: { filter?: Filter }) => {
+        seen.push(opts.filter);
+        return { matches: opts.filter ? [] : stored.map((s) => ({ id: s.id, score: 0.9 })) };
+      },
+    } as unknown as VectorizeIndex;
+    expect(await ids(null, true, unindexed)).toEqual(["nm520001"]);
+    expect(seen).toEqual([{ visibility: "public" }, undefined]);
+    seen.length = 0;
+    expect(await ids(OWNER_KEY, true, unindexed)).toEqual(["nm520001", "nm520002"]);
+  });
+
+  test("MCP search_datasets passes the public filter behind the flag, viewer anonymous", async () => {
+    const outcomeIds = async (flag: boolean): Promise<string[]> => {
+      const outcome = await searchDatasetsTool(
+        {
+          DB: realD1(db),
+          AI: ai,
+          VECTORIZE: vectorIndex(stored, seen),
+          ...(flag ? { VECTORIZE_VISIBILITY_FILTER: "1" } : {}),
+        },
+        { query: "quokka", limit: 10 } as SearchDatasetsInput,
+      );
+      const text = (outcome.result.content as { text: string }[])[0].text;
+      return (JSON.parse(text) as { results: { dataset_id: string }[] }).results.map(
+        (r) => r.dataset_id,
+      );
+    };
+    expect(await outcomeIds(true)).toEqual(["nm520001"]);
+    expect(seen).toEqual([{ visibility: "public" }]);
+    seen.length = 0;
+    expect(await outcomeIds(false)).toEqual(["nm520001"]);
+    expect(seen).toEqual([undefined]);
+  });
+
+  test("hits dropped for visibility are not reported as missing rows; genuinely missing ones are", async () => {
+    const warnings: string[] = [];
+    const original = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    };
+    try {
+      // nm520003/4 are private (not visible to anonymous); nm529999 has no row.
+      await ids(null, false);
+      expect(warnings.filter((w) => w.includes("had no datasets row"))).toEqual([]);
+      stored.push({ id: "nm529999", metadata: { visibility: "public" } });
+      await ids(null, false);
+    } finally {
+      console.warn = original;
+    }
+    const missing = warnings.filter((w) => w.includes("had no datasets row"));
+    expect(missing).toHaveLength(1);
+    expect(missing[0]).toContain("1/5 vector ids had no datasets row");
+    expect(missing[0]).toContain("3 more were not visible");
+  });
+
   test("a visibility change marks the vector stale and re-embedding relabels it", async () => {
     db.run("UPDATE datasets SET embedding_dirty = 0");
     db.run("UPDATE datasets SET visibility = 'public' WHERE dataset_id = 'nm520004'");
-    expect(db.query("SELECT dataset_id FROM datasets WHERE embedding_dirty = 1").all()).toEqual([
+    expect(db.query("SELECT dataset_id FROM datasets WHERE embedding_dirty = 2").all()).toEqual([
       { dataset_id: "nm520004" },
     ]);
     const upserts: Stored[] = [];
