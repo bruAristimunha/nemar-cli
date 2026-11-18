@@ -857,7 +857,7 @@ export async function finalizeExemplar(
 
   if (!reindexOk) {
     throw new Error(
-      `Refusing to publish ${xxId}: metadata reindex did not fully succeed, so .nemar/metadata.json may still carry the source dataset's real identity. Re-run 'nemar admin reindex ${xxId}' until it succeeds, then 'nemar admin publish request/approve ${xxId}' to publish manually.`,
+      `Refusing to publish ${xxId}: metadata reindex did not fully succeed, so .nemar/metadata.json may still carry the source dataset's real identity. Re-run 'nemar admin reindex ${xxId}' until it succeeds, then 'nemar admin repo publish request/approve ${xxId}' to publish manually.`,
     );
   }
 
@@ -884,7 +884,7 @@ export async function finalizeExemplar(
         throw new Error(failMsg);
       }
       if (attempt === REQUEST_MAX_ATTEMPTS) {
-        const failMsg = `BIDS validation still running after ${REQUEST_MAX_ATTEMPTS} attempts. Re-run 'nemar admin publish request/approve ${xxId}' once validation completes.`;
+        const failMsg = `BIDS validation still running after ${REQUEST_MAX_ATTEMPTS} attempts. Re-run 'nemar admin repo publish request/approve ${xxId}' once validation completes.`;
         pubSpinner.fail(failMsg);
         throw new Error(failMsg);
       }

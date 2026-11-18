@@ -183,7 +183,9 @@ describe("getPublicationReview, against the real router", () => {
     expect(detail.identifier_screen.state).toBe("clean");
     expect(detail.reasons.map((r) => r.code)).toEqual(["question_failed"]);
     expect(detail.reasons[0].cleared_by).toBe("override");
-    expect(detail.description.next).toBe(`nemar admin publish approve ${PROD_DATASET} --force`);
+    expect(detail.description.next).toBe(
+      `nemar admin repo publish approve ${PROD_DATASET} --force`,
+    );
     expect(detail.review?.id).not.toBeNull();
   });
 

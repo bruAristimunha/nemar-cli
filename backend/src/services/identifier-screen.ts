@@ -148,11 +148,11 @@ function nextStep(gate: ScreenGate, datasetId: string): string | undefined {
     case "blocks":
       return "Approval is refused while this stands. The request is blocked and the depositor has been told to fix the data and request publication again, which re-runs the screen.";
     case "acknowledge":
-      return `Approval needs a recorded reason: nemar admin publish approve ${datasetId} --acknowledge-identifier-screen "<reason>"`;
+      return `Approval needs a recorded reason: nemar admin repo publish approve ${datasetId} --acknowledge-identifier-screen "<reason>"`;
     case "wait":
       return "The screen is still running; this request is mailed again when it finishes.";
     case "rerun":
-      return `Approval is held until the screen is re-run: nemar admin publish screen ${datasetId}`;
+      return `Approval is held until the screen is re-run: nemar admin repo publish screen ${datasetId}`;
   }
 }
 
@@ -885,7 +885,7 @@ export function screenStateGate(
         return { ok: true };
       }
       return refuse(
-        `${view.headline}. An admin must look at what the screen reported and approve with a recorded reason: nemar admin publish approve ${datasetId} --acknowledge-identifier-screen "<reason>".`,
+        `${view.headline}. An admin must look at what the screen reported and approve with a recorded reason: nemar admin repo publish approve ${datasetId} --acknowledge-identifier-screen "<reason>".`,
       );
     case "blocks":
       return refuse(
@@ -897,7 +897,7 @@ export function screenStateGate(
       );
     case "rerun":
       return refuse(
-        `${view.headline}. Approval waits for a screen that produced a verdict: run it again with nemar admin publish screen ${datasetId}.`,
+        `${view.headline}. Approval waits for a screen that produced a verdict: run it again with nemar admin repo publish screen ${datasetId}.`,
       );
   }
 }
@@ -926,7 +926,7 @@ export async function verifyScreenHead(
       error: "identifier_screen_not_clear",
       gate: "unverified",
       headline: view.headline,
-      message: `Could not verify that the identifier screen read the current content: ${why}. Approval is refused until it can be verified; try again, or re-run the screen with nemar admin publish screen ${datasetId}.`,
+      message: `Could not verify that the identifier screen read the current content: ${why}. Approval is refused until it can be verified; try again, or re-run the screen with nemar admin repo publish screen ${datasetId}.`,
     },
   });
   if (!report?.head) return unverified("the stored report names no commit");
@@ -958,7 +958,7 @@ export async function verifyScreenHead(
         error: "identifier_screen_not_clear",
         gate: "stale",
         headline: view.headline,
-        message: `The identifier screen read commit ${report.head.slice(0, 12)}, and main is now at ${head.slice(0, 12)}: its verdict is about content that has since changed. Re-run it with nemar admin publish screen ${datasetId}. If an approval already started and committed to the repository, continue it with --resume instead.`,
+        message: `The identifier screen read commit ${report.head.slice(0, 12)}, and main is now at ${head.slice(0, 12)}: its verdict is about content that has since changed. Re-run it with nemar admin repo publish screen ${datasetId}. If an approval already started and committed to the repository, continue it with --resume instead.`,
       },
     };
   }

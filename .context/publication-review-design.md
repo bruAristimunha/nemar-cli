@@ -43,7 +43,7 @@ the publication migrations (0005, 0028, 0045, 0086, 0090, 0091);
 `shared/identifier-screen-report.ts`,
 and the coverage rules in `shared/identifier-scan.ts` and `scripts/identifier-fleet-lib.ts`;
 `backend/wrangler-sccn.toml` for the flags.
-Through a read-only survey: `src/commands/admin.ts` (`nemar admin publish`) and `src/lib/api/publish.ts`.
+Through a read-only survey: `src/commands/admin.ts` (`nemar admin repo publish`) and `src/lib/api/publish.ts`.
 
 Deployed workflows in `nemarDatasets/.github`, read through the API on 2026-10-12:
 `run-prescreen.yml`, `run-identifier-screen.yml`, `approve-publication.yml`.
@@ -80,7 +80,7 @@ Each was checked against the code, or, where marked, reported by the review of #
    `PRESCREEN_ENABLED = "true"` appears only in `[env.dev.vars]` of the configuration file,
    but production has a Worker secret of that name, and the deployed `run-prescreen.yml` runs for production requests
    (verified by the maintainer's session, 2026-10-12).
-   It is advisory, and its result is shown to administrators (`nemar admin publish list` prints a concern).
+   It is advisory, and its result is shown to administrators (`nemar admin repo publish list` prints a concern).
    Its design is why it is replaced rather than extended:
    its callback address comes from the dispatch payload, the text it sends is not fenced by a nonce,
    its output is free text, and the request route dispatches it at the same moment as the identifier screen.
@@ -95,7 +95,7 @@ Each was checked against the code, or, where marked, reported by the review of #
    runs the screen gate (`checkApprovalScreenGate`) unless a resumed run has already started publishing,
    and then marks the request `approving`.
    Nothing in that path refuses a `blocked` request; the screen gate refuses one whose screen was reset by the block,
-   and `nemar admin publish screen` re-runs the screen on a `blocked` request (`RERUN_GUARD_SQL`).
+   and `nemar admin repo publish screen` re-runs the screen on a `blocked` request (`RERUN_GUARD_SQL`).
    So, by reading the code (not exercised), a terminal can approve a request blocked for `min_requirements_failed`
    once its screen has been re-run and is clear. `approve-dispatch` refuses a `blocked` request (`not_dispatchable`).
 6. **The request route cannot re-open a `requested` request.**
@@ -109,7 +109,7 @@ Each was checked against the code, or, where marked, reported by the review of #
    the old tag stays where it was, and the new content is published under it.
    `dataset_versions` is unique on `(dataset_id, version)`.
 8. **The web executor runs the command-line interface (CLI) with `--yes` and no `--force`.**
-   `approve-publication.yml` runs `nemar admin publish approve <id> --yes [--resume]` with a service key per environment,
+   `approve-publication.yml` runs `nemar admin repo publish approve <id> --yes [--resume]` with a service key per environment,
    so a gate that only the CLI enforced would refuse every web approval of a non-pass.
 9. **The CLI's approve command shows the steps but not the screen before its prompt, sends no request id,
    and exits 0 on every failure** except a bad `--acknowledge-identifier-screen` length (#1581).
@@ -206,7 +206,7 @@ admin mail: the screen section and the review section
    (production watchdog: unreported after 30 minutes, then mail; a late report re-arms it)
    |
    v
-nemar admin publish list | show | next | approve        website approval page
+nemar admin repo publish list | show | next | approve        website approval page
    |                                                      |
    v                                                      v
 POST /admin/publish/:id/approve  <-------------- approve-dispatch (override recorded) -> executor --yes -> /approve
@@ -535,8 +535,8 @@ Must not (kept): compute a verdict in the browser; offer Approve for a hard reas
 3. **Switch on.** After Phases 3 and 4 have shipped and the website is promoted, and after the docs change and the review's statement on the policy pages,
    add `PUBLICATION_REVIEW_ENABLED = "1"` to `[vars]` in a release; that same deploy stops the pre-screen.
    Then delete the production `PRESCREEN_ENABLED` secret, disable `run-prescreen.yml`,
-   remove the pre-screen's dispatch and callback code in the next change, and run `nemar admin publish start --all` once.
-   The release notes say how it is turned on and what to read first (`nemar admin publish list`, then `show` on one request).
+   remove the pre-screen's dispatch and callback code in the next change, and run `nemar admin repo publish start --all` once.
+   The release notes say how it is turned on and what to read first (`nemar admin repo publish list`, then `show` on one request).
 
 Must not: approve `nm099997` under a name; delete `PRESCREEN_CALLBACK_SECRET`.
 

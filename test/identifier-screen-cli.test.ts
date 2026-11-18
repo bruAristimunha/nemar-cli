@@ -400,7 +400,7 @@ describe("nemar dataset publish resend", () => {
   });
 });
 
-describe("nemar admin publish list", () => {
+describe("nemar admin repo publish list", () => {
   test("prints each request's screen under it", async () => {
     const server = startServer({
       "GET /admin/publish/requests": {
@@ -424,7 +424,7 @@ describe("nemar admin publish list", () => {
       },
     });
     try {
-      const r = await runCli(["admin", "publish", "list"], server.url);
+      const r = await runCli(["admin", "repo", "publish", "list"], server.url);
       expect(r.exitCode).toBe(0);
       expect(r.stdout).toContain("nm000104");
       expect(r.stdout).toContain("Identifier screen: FOUND IDENTIFIERS");
@@ -435,7 +435,7 @@ describe("nemar admin publish list", () => {
   });
 });
 
-describe("nemar admin publish approve --acknowledge-identifier-screen", () => {
+describe("nemar admin repo publish approve --acknowledge-identifier-screen", () => {
   const routes = {
     "GET /datasets/nm000104/publish/status": {
       body: { dataset_id: "nm000104", status: "requested", anonymous: false },
@@ -455,6 +455,7 @@ describe("nemar admin publish approve --acknowledge-identifier-screen", () => {
       const r = await runCli(
         [
           "admin",
+          "repo",
           "publish",
           "approve",
           "nm000104",
@@ -478,7 +479,10 @@ describe("nemar admin publish approve --acknowledge-identifier-screen", () => {
   test("without the flag the approval carries no acknowledgment", async () => {
     const server = startServer(routes);
     try {
-      const r = await runCli(["admin", "publish", "approve", "nm000104", "--yes"], server.url);
+      const r = await runCli(
+        ["admin", "repo", "publish", "approve", "nm000104", "--yes"],
+        server.url,
+      );
       expect(r.exitCode).toBe(0);
       const posted = server.requests.filter((q) => q.pathname.endsWith("/approve"));
       expect("acknowledge_identifier_screen" in JSON.parse(posted[0].body)).toBe(false);
@@ -493,6 +497,7 @@ describe("nemar admin publish approve --acknowledge-identifier-screen", () => {
       const r = await runCli(
         [
           "admin",
+          "repo",
           "publish",
           "approve",
           "nm000104",
@@ -519,20 +524,23 @@ describe("nemar admin publish approve --acknowledge-identifier-screen", () => {
           gate: "rerun",
           headline: "Identifier screen: DID NOT RUN",
           message:
-            "Identifier screen: DID NOT RUN. Approval waits for a screen that produced a verdict: run it again with nemar admin publish screen nm000104.",
+            "Identifier screen: DID NOT RUN. Approval waits for a screen that produced a verdict: run it again with nemar admin repo publish screen nm000104.",
         },
       },
     });
     try {
-      const r = await runCli(["admin", "publish", "approve", "nm000104", "--yes"], server.url);
-      expect(r.stdout + r.stderr).toContain("nemar admin publish screen nm000104");
+      const r = await runCli(
+        ["admin", "repo", "publish", "approve", "nm000104", "--yes"],
+        server.url,
+      );
+      expect(r.stdout + r.stderr).toContain("nemar admin repo publish screen nm000104");
     } finally {
       server.stop();
     }
   });
 });
 
-describe("nemar admin publish screen", () => {
+describe("nemar admin repo publish screen", () => {
   test("posts the re-run and says the admins are mailed when it reports", async () => {
     const server = startServer({
       "POST /admin/publish/nm000104/identifier-screen": {
@@ -551,7 +559,7 @@ describe("nemar admin publish screen", () => {
       },
     });
     try {
-      const r = await runCli(["admin", "publish", "screen", "nm000104"], server.url);
+      const r = await runCli(["admin", "repo", "publish", "screen", "nm000104"], server.url);
       expect(r.exitCode).toBe(0);
       expect(server.requests.map((q) => `${q.method} ${q.pathname}`)).toContain(
         "POST /admin/publish/nm000104/identifier-screen",
@@ -580,7 +588,7 @@ describe("nemar admin publish screen", () => {
       },
     });
     try {
-      const r = await runCli(["admin", "publish", "screen", "nm000104"], server.url);
+      const r = await runCli(["admin", "repo", "publish", "screen", "nm000104"], server.url);
       const out = r.stdout + r.stderr;
       expect(out).toContain("Identifier screen: DID NOT RUN");
       expect(out).toContain("GitHub refused to start the screen workflow");
@@ -641,7 +649,7 @@ describe("the acquisition-date warning in the terminal (ADR 0090)", () => {
     }
   });
 
-  test("nemar admin publish list prints it under each request that has dates", async () => {
+  test("nemar admin repo publish list prints it under each request that has dates", async () => {
     const server = startServer({
       "GET /admin/publish/requests": {
         body: {
@@ -664,7 +672,7 @@ describe("the acquisition-date warning in the terminal (ADR 0090)", () => {
       },
     });
     try {
-      const r = await runCli(["admin", "publish", "list"], server.url);
+      const r = await runCli(["admin", "repo", "publish", "list"], server.url);
       expect(r.exitCode).toBe(0);
       for (const line of WARNING) expect(r.stdout).toContain(line);
       expect(r.stdout).toContain("edf-startdate x4, acq-time-dated x2");

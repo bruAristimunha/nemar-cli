@@ -1,5 +1,5 @@
 /**
- * `nemar admin publish approve` of a request whose steps are all done (ADR 0105 decision 12,
+ * `nemar admin repo publish approve` of a request whose steps are all done (ADR 0105 decision 12,
  * #1730): what the operator is told when a tail job warned.
  *
  * A resumed run with every step already complete runs two tail jobs of a de-anonymization (the
@@ -77,7 +77,7 @@ const requestStatus = (id: number) =>
     .query<{ status: string }, [number]>("SELECT status FROM publication_requests WHERE id = ?")
     .get(id)?.status;
 
-const approve = () => h.cli(["admin", "publish", "approve", DATASET, "--resume", "--yes"]);
+const approve = () => h.cli(["admin", "repo", "publish", "approve", DATASET, "--resume", "--yes"]);
 
 describe("approving a request whose steps are all done", () => {
   test("a tail job's warning is printed, and the request it says to approve again is left approving", async () => {
@@ -92,7 +92,7 @@ describe("approving a request whose steps are all done", () => {
     expect(output(r)).toContain("All steps already completed");
     expect(output(r)).toContain("Not published yet");
     expect(output(r)).toContain("the request is approving");
-    expect(output(r)).toContain(`nemar admin publish approve ${DATASET} --resume`);
+    expect(output(r)).toContain(`nemar admin repo publish approve ${DATASET} --resume`);
     // The warning says what to do, and it is on the console: the operator is told, not left to
     // read a success line.
     const warning = output(r)

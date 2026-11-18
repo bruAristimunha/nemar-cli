@@ -1,5 +1,5 @@
 /**
- * What `nemar admin publish approve` decides before it asks (ADR 0102, sections 8 and 9).
+ * What `nemar admin repo publish approve` decides before it asks (ADR 0102, sections 8 and 9).
  *
  * **The Worker is the gate; this explains.** `POST /admin/publish/:id/approve` runs the review gate
  * (`backend/src/services/publication-review-gate.ts`) and refuses with the shared words, so a
@@ -211,7 +211,7 @@ function approveCommand(
   id: string,
   flags: { resume: boolean; acknowledge: boolean; force: boolean },
 ): string {
-  return `nemar admin publish approve ${id}${flags.resume ? " --resume" : ""}${
+  return `nemar admin repo publish approve ${id}${flags.resume ? " --resume" : ""}${
     flags.acknowledge ? ' --acknowledge-identifier-screen "<reason>"' : ""
   }${flags.force ? " --force" : ""}`;
 }
@@ -258,7 +258,7 @@ export function decideApproval(
         kind: "refuse",
         why: "needs_resume",
         lines: [
-          `This approval has already started publishing. Continue it with: nemar admin publish approve ${id} --resume`,
+          `This approval has already started publishing. Continue it with: nemar admin repo publish approve ${id} --resume`,
         ],
       };
     }

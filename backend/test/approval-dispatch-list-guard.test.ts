@@ -5,7 +5,7 @@
  * The list selects `pr.*`, so every column of `publication_requests` reaches the wire unless a
  * strip names it (the two callback nonces, the stored screen report). The dispatch token is a
  * credential-shaped value derived from the claim's own columns, and the list is read by every
- * administrator's page and printed by `nemar admin publish list`: a token in it would be the
+ * administrator's page and printed by `nemar admin repo publish list`: a token in it would be the
  * clicker's attribution handed to whoever reads the queue. No column holds the token, so nothing
  * strips it; this guard pins that NOTHING token-shaped leaves the list, by value (the token minted
  * for the claim, which is the one the dispatch carries) and by shape (no 64-hex string in any

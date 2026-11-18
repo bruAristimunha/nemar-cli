@@ -72,11 +72,11 @@ const ID = "nm000123";
 describe("the checker itself", () => {
   test("flags every kind of terminal text and spares the platform's name", () => {
     const flagged: Array<[string, string]> = [
-      ["nemar admin publish start nm000123", "a nemar command"],
-      ["Start it (nemar admin publish start nm000123).", "a nemar command"],
+      ["nemar admin repo publish start nm000123", "a nemar command"],
+      ["Start it (nemar admin repo publish start nm000123).", "a nemar command"],
       ["An administrator may approve over it (--force).", "a flag"],
       ['approve --acknowledge-identifier-screen "<reason>"', "a flag"],
-      ["nemar admin publish show <dataset>", "a placeholder"],
+      ["nemar admin repo publish show <dataset>", "a placeholder"],
       ["run `show`", "a backtick"],
       ["or approve it from a terminal", "the word terminal"],
       ["run this command", "the word command"],
@@ -203,7 +203,7 @@ describe("every reason, as the Worker sends it", () => {
 
               // What the page never prints: the command, and the line that holds it.
               expect(
-                view.command === null || view.command?.startsWith("nemar admin publish "),
+                view.command === null || view.command?.startsWith("nemar admin repo publish "),
               ).toBe(true);
               if (view.command !== null && view.command !== undefined) {
                 expect(view.cure, `cure of ${where}`).not.toContain(view.command);

@@ -601,7 +601,7 @@ describe("a request whose review passes", () => {
       const text = textOf(mails[0]?.html ?? "");
       expect(text).toContain("Publication review: pass");
       expect(text).toContain(NOT_ASSESSED_LINE);
-      expect(text).toContain(`nemar admin publish approve ${DATASET}`);
+      expect(text).toContain(`nemar admin repo publish approve ${DATASET}`);
       // The model's own words are not in the mail, and no token or nonce is.
       expect(text).not.toContain(MODEL_SUMMARY);
       expect(mails[0]?.html).not.toContain(String(dispatch.client_payload.callback_token));

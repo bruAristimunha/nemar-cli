@@ -13,7 +13,7 @@
  * - nemar admin repo public/unpublish/withdraw/restore - Repository visibility and lifecycle
  * - nemar admin ci check/add       - Manage CI workflows
  * - nemar admin doi create/info/update/enrich - DOI management
- * - nemar admin publish list/show/start/next/approve/deny/screen - Publication workflow and its automated review
+ * - nemar admin repo publish list/show/start/next/approve/deny/screen - Publication workflow and its automated review
  * - nemar admin revert             - Revert dataset to a previous version
  * - nemar admin recover [status]   - Re-copy epic #967 imports whose upstream is accessible
  * - nemar admin email-preferences show/update - Email notification opt-out
@@ -298,7 +298,6 @@ Dataset Management:
   ci              - Manage CI workflows (check status, deploy)
   s3              - S3/IAM credential management
   doi             - Create and manage DOIs for datasets
-  publish         - Publication workflow management
   revert          - Revert dataset to previous version (via PR)
   make-public     - Publish a dataset (permanent, irreversible)
   delete-dataset    - Delete a dataset and all associated resources
@@ -3159,7 +3158,7 @@ doiCommand
 
 adminCommand.addCommand(doiCommand);
 
-adminCommand.addCommand(publishCommand);
+repoCommand.addCommand(publishCommand);
 
 // ============================================================================
 // Revert (Admin Only)
@@ -4016,6 +4015,7 @@ repoCommand
 // commands that do nothing and exit nonzero, so a script that still calls them
 // fails loudly instead of silently running a different command.
 for (const [name, replacement] of [
+  ["publish", "nemar admin repo publish"],
   ["withdraw", "nemar admin repo withdraw"],
   ["restore", "nemar admin repo restore"],
 ] as const) {
@@ -4025,6 +4025,7 @@ for (const [name, replacement] of [
     .allowExcessArguments()
     .action(() => {
       console.error(chalk.red(`'nemar admin ${name}' moved to '${replacement}'. Nothing was run.`));
+      markReportedExit();
       process.exit(1);
     });
 }

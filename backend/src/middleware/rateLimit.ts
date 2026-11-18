@@ -139,7 +139,7 @@ const SITE_IP_MAX_REQUESTS = 2000;
 // of removing the floor.
 const SITE_UNATTRIBUTED_MAX_REQUESTS = 20_000;
 // Authenticated bucket. Originally sized for the heaviest single admin
-// orchestration: `nemar admin publish approve` on a 6500-object dataset
+// orchestration: `nemar admin repo publish approve` on a 6500-object dataset
 // makes ~65 sequential CLI→Worker HTTP calls (one batch per ~100-object
 // page) plus the surrounding orchestrator steps — call it ~165 total
 // requests counting orchestrator overhead. (Each Worker invocation

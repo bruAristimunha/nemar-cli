@@ -1,5 +1,5 @@
 /**
- * `nemar admin publish deny` names the request it denies (ADR 0105, decision 7; #1579).
+ * `nemar admin repo publish deny` names the request it denies (ADR 0105, decision 7; #1579).
  *
  * The Worker's `/deny` takes an optional `request_id` and refuses (409 `request_mismatch`) when it
  * is not the newest active request, but the command used to send none, so a request withdrawn or
@@ -39,6 +39,7 @@ beforeEach(async () => {
 const output = (r: CliResult) => `${r.stdout}\n${r.stderr}`;
 const denyArgs = (...extra: string[]) => [
   "admin",
+  "repo",
   "publish",
   "deny",
   DATASET,
@@ -136,6 +137,7 @@ describe("the reason is as long as the Worker takes", () => {
 
     const r = await h.cli([
       "admin",
+      "repo",
       "publish",
       "deny",
       DATASET,
@@ -155,6 +157,7 @@ describe("the reason is as long as the Worker takes", () => {
 
     const r = await h.cli([
       "admin",
+      "repo",
       "publish",
       "deny",
       DATASET,

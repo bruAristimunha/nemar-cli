@@ -39,13 +39,13 @@ const GOLDEN: Record<string, { startable: string; notStartable?: string }> = {
       "The depositor removes it and requests publication again, which runs the screen again.",
   },
   identifier_screen_not_run: {
-    startable: "An administrator runs the screen again: nemar admin publish screen nm000123.",
+    startable: "An administrator runs the screen again: nemar admin repo publish screen nm000123.",
   },
   identifier_screen_pending: {
     startable: "Wait for it to report; the review starts when it does.",
   },
   identifier_screen_stale: {
-    startable: "An administrator runs the screen again: nemar admin publish screen nm000123.",
+    startable: "An administrator runs the screen again: nemar admin repo publish screen nm000123.",
   },
   version_kept_after_anonymous_release: {
     startable:
@@ -53,7 +53,7 @@ const GOLDEN: Record<string, { startable: string; notStartable?: string }> = {
   },
   identifier_screen_needs_acknowledgment: {
     startable:
-      'An administrator reads what the screen reported and approves with a recorded reason: nemar admin publish approve nm000123 --acknowledge-identifier-screen "<reason>".',
+      'An administrator reads what the screen reported and approves with a recorded reason: nemar admin repo publish approve nm000123 --acknowledge-identifier-screen "<reason>".',
   },
   question_failed: { startable: `Read any findings and the dataset's text. ${TERM_OVERRIDE}` },
   steering_attempt: {
@@ -67,25 +67,25 @@ const GOLDEN: Record<string, { startable: string; notStartable?: string }> = {
   },
   version_malformed: { startable: `The depositor corrects Version. ${TERM_OVERRIDE}` },
   stored_verdict_fail: {
-    startable: `Read the review's record: nemar admin publish show nm000123. ${TERM_OVERRIDE}`,
+    startable: `Read the review's record: nemar admin repo publish show nm000123. ${TERM_OVERRIDE}`,
   },
   review_not_started: {
-    startable: `Start it: nemar admin publish start nm000123. ${TERM_OVERRIDE}`,
+    startable: `Start it: nemar admin repo publish start nm000123. ${TERM_OVERRIDE}`,
     notStartable: TERM_NOT_STARTABLE,
   },
   review_running: {
     startable: `Wait for it to report; it usually takes minutes. ${TERM_OVERRIDE}`,
   },
   review_did_not_report: {
-    startable: `Start it again: nemar admin publish start nm000123. ${TERM_OVERRIDE}`,
+    startable: `Start it again: nemar admin repo publish start nm000123. ${TERM_OVERRIDE}`,
     notStartable: TERM_NOT_STARTABLE,
   },
   review_limit_reached: {
-    startable: `Start it later: nemar admin publish start nm000123; an administrator's start is held by the platform's limit only. ${TERM_OVERRIDE}`,
+    startable: `Start it later: nemar admin repo publish start nm000123; an administrator's start is held by the platform's limit only. ${TERM_OVERRIDE}`,
     notStartable: TERM_NOT_STARTABLE,
   },
   review_could_not_run: {
-    startable: `Once the cause is fixed, start it again: nemar admin publish start nm000123. ${TERM_OVERRIDE}`,
+    startable: `Once the cause is fixed, start it again: nemar admin repo publish start nm000123. ${TERM_OVERRIDE}`,
     notStartable: TERM_NOT_STARTABLE,
   },
   text_withheld: { startable: `Read the withheld documents yourself. ${TERM_OVERRIDE}` },
@@ -236,10 +236,11 @@ const NEUTRAL: Record<string, { startable: string; notStartable?: string }> = {
   doi_state_unexpected: { startable: `Check the DOI record before approving. ${NEUTRAL_OVERRIDE}` },
 };
 
-const SCREEN_CMD = "nemar admin publish screen nm000123";
-const START_CMD = "nemar admin publish start nm000123";
-const SHOW_CMD = "nemar admin publish show nm000123";
-const ACK_CMD = 'nemar admin publish approve nm000123 --acknowledge-identifier-screen "<reason>"';
+const SCREEN_CMD = "nemar admin repo publish screen nm000123";
+const START_CMD = "nemar admin repo publish start nm000123";
+const SHOW_CMD = "nemar admin repo publish show nm000123";
+const ACK_CMD =
+  'nemar admin repo publish approve nm000123 --acknowledge-identifier-screen "<reason>"';
 
 /** The command each terminal cure names; every other code names none. */
 const COMMANDS: Record<string, string> = {
@@ -348,7 +349,7 @@ describe("the reasons table holds the split together", () => {
   test("I2: every command is an administrator's publish command", () => {
     for (const code of codes) {
       const { command } = REASONS[code];
-      if (command !== undefined) expect(command).toStartWith("nemar admin publish ");
+      if (command !== undefined) expect(command).toStartWith("nemar admin repo publish ");
     }
   });
 
@@ -374,7 +375,7 @@ describe("the reasons table holds the split together", () => {
 
   test("I5: the start codes are exactly the codes whose command is the start command", () => {
     const byCommand = codes.filter(
-      (c) => REASONS[c].command === "nemar admin publish start <dataset>",
+      (c) => REASONS[c].command === "nemar admin repo publish start <dataset>",
     );
     expect([...START_CURE_REASONS].sort()).toEqual([...byCommand].sort());
     expect(START_CURE_REASONS.length).toBe(4);
@@ -474,7 +475,7 @@ describe("a reason's command is the command `next` names", () => {
     // two agree for the plain case above and `next` is the longer one in these.
     const ack = commandOf("identifier_screen_needs_acknowledgment", ID, true);
     expect(ack).toBe(
-      `nemar admin publish approve ${ID} --acknowledge-identifier-screen "<reason>"`,
+      `nemar admin repo publish approve ${ID} --acknowledge-identifier-screen "<reason>"`,
     );
     const stopped = describePublicationReview({
       ...common,
@@ -484,7 +485,7 @@ describe("a reason's command is the command `next` names", () => {
       approval: "stopped",
     }).next;
     expect(stopped).toBe(
-      `nemar admin publish approve ${ID} --resume --acknowledge-identifier-screen "<reason>"`,
+      `nemar admin repo publish approve ${ID} --resume --acknowledge-identifier-screen "<reason>"`,
     );
     const forced = describePublicationReview({
       ...common,
@@ -504,19 +505,19 @@ describe("the sentences built from the command constants keep their text", () =>
   // said before, so moving a constant's spelling cannot move a sentence silently.
   test("the gate's refusal sentences and the stopped-approval line", () => {
     expect(REVIEW_GATE_REFUSAL_TEXT.needs_override).toBe(
-      "The publication review is not a pass. Read it (nemar admin publish show <dataset>), then approve over it with --force, which records the override with your account.",
+      "The publication review is not a pass. Read it (nemar admin repo publish show <dataset>), then approve over it with --force, which records the override with your account.",
     );
     expect(REVIEW_GATE_REFUSAL_TEXT.override_not_covering).toBe(
-      "The review now gives a reason the override was not given for. Read it again (nemar admin publish show <dataset>) before approving.",
+      "The review now gives a reason the override was not given for. Read it again (nemar admin repo publish show <dataset>) before approving.",
     );
     expect(REVIEW_GATE_REFUSAL_TEXT.review_changed).toBe(
-      "The review the override was given for is no longer the review of this request, or it changed while the approval was being checked. Read it again (nemar admin publish show <dataset>) before approving.",
+      "The review the override was given for is no longer the review of this request, or it changed while the approval was being checked. Read it again (nemar admin repo publish show <dataset>) before approving.",
     );
     expect(REVIEW_GATE_REFUSAL_TEXT.no_review_row).toBe(
-      "No review of this commit is on record to attach the override to. Start it (nemar admin publish start <dataset>), or approve from a terminal with --force.",
+      "No review of this commit is on record to attach the override to. Start it (nemar admin repo publish start <dataset>), or approve from a terminal with --force.",
     );
     expect(APPROVAL_STOPPED_HARD_LINE).toBe(
-      "This approval stopped before it started publishing, and a reason that nothing clears now stands, so it cannot be resumed. Deny it with a reason (nemar admin publish deny <dataset>); the depositor can request again.",
+      "This approval stopped before it started publishing, and a reason that nothing clears now stands, so it cannot be resumed. Deny it with a reason (nemar admin repo publish deny <dataset>); the depositor can request again.",
     );
   });
 

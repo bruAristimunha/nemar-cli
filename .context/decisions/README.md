@@ -230,7 +230,7 @@ invisible one — which is why it is checked rather than trusted.
   the administrator's recorded override for everything else, bound to the review and the reasons shown);
   `publication_reviews` with a one-shot claim, a callback, a production-only watchdog, caps of 5 per depositor and 50 per platform per day,
   and no write to GitHub; the admin mail waits for the review;
-  `nemar admin publish list|show|next|start|approve` follow ADR 0093, except that every non-pass needs the force path;
+  `nemar admin repo publish list|show|next|start|approve` follow ADR 0093, except that every non-pass needs the force path;
   the Worker is the gate in `/approve` and `approve-dispatch`; the approver is the administrator who passed the gate, made exact in Phase 3;
   mirrors and exemplars are not reviewed; the live advisory pre-screen of ADR 0014 retires when the review is switched on;
   `PUBLICATION_REVIEW_ENABLED` switches the model review and its gate, while the mechanical refusals are unconditional;

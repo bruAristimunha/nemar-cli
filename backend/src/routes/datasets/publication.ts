@@ -921,7 +921,7 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
       return c.json(
         {
           error:
-            "Only the dataset owner can withdraw a publication request. An administrator ends one with 'nemar admin publish deny'.",
+            "Only the dataset owner can withdraw a publication request. An administrator ends one with 'nemar admin repo publish deny'.",
         },
         403,
       );

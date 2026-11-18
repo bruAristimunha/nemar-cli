@@ -1,5 +1,5 @@
 /**
- * Every failure of `nemar admin publish` exits non-zero (#1581, ADR 0102 section 8).
+ * Every failure of `nemar admin repo publish` exits non-zero (#1581, ADR 0102 section 8).
  *
  * `list`, `deny`, `screen` and `approve` used to print what went wrong and exit 0 for most of it:
  * a refused approval, an API error, a missing key. A script that approved a dataset could not tell
@@ -73,10 +73,10 @@ const WHY = ["--reason", "Please add the participants file"];
 
 /** The four commands, each with the arguments that get it past its own argument checks. */
 const COMMANDS: ReadonlyArray<{ name: string; args: string[] }> = [
-  { name: "list", args: ["admin", "publish", "list"] },
-  { name: "deny", args: ["admin", "publish", "deny", DATASET, ...WHY, "--yes"] },
-  { name: "screen", args: ["admin", "publish", "screen", DATASET] },
-  { name: "approve", args: ["admin", "publish", "approve", DATASET, "--resume", "--yes"] },
+  { name: "list", args: ["admin", "repo", "publish", "list"] },
+  { name: "deny", args: ["admin", "repo", "publish", "deny", DATASET, ...WHY, "--yes"] },
+  { name: "screen", args: ["admin", "repo", "publish", "screen", DATASET] },
+  { name: "approve", args: ["admin", "repo", "publish", "approve", DATASET, "--resume", "--yes"] },
 ];
 
 describe("not signed in", () => {
@@ -156,7 +156,7 @@ describe("a call the Worker refuses", () => {
       requestId,
     ]);
 
-    const r = await h.cli(["admin", "publish", "approve", DATASET, "--resume", "--yes"]);
+    const r = await h.cli(["admin", "repo", "publish", "approve", DATASET, "--resume", "--yes"]);
 
     expect(r.exitCode).toBe(1);
     expect(output(r)).not.toContain(BUG_HINT);
@@ -172,7 +172,7 @@ describe("a call the Worker refuses", () => {
     h.setEnv({ PRESCREEN_CALLBACK_SECRET: undefined });
     seedGolden(h.db);
 
-    const r = await h.cli(["admin", "publish", "screen", DATASET]);
+    const r = await h.cli(["admin", "repo", "publish", "screen", DATASET]);
 
     expect(h.requests.at(-1)?.status).toBe(202);
     expect(r.exitCode).toBe(1);
@@ -188,7 +188,7 @@ describe("a call the Worker refuses", () => {
     const requestId = seedGolden(h.db);
     markScreen(h.db, requestId, DATASET, { status: "direct-identifiers" });
 
-    const r = await h.cli(["admin", "publish", "approve", DATASET, "--resume", "--yes"]);
+    const r = await h.cli(["admin", "repo", "publish", "approve", DATASET, "--resume", "--yes"]);
 
     expect(r.exitCode).toBe(1);
     expect(output(r)).not.toContain(BUG_HINT);
@@ -199,7 +199,7 @@ describe("a call the Worker refuses", () => {
     const requestId = seedGolden(h.db);
     h.mainHead.value = "fedcba9876543210fedcba9876543210fedcba98";
 
-    const r = await h.cli(["admin", "publish", "approve", DATASET, "--resume", "--yes"]);
+    const r = await h.cli(["admin", "repo", "publish", "approve", DATASET, "--resume", "--yes"]);
 
     expect(r.exitCode).toBe(1);
     expect(output(r)).not.toContain(BUG_HINT);
@@ -213,7 +213,7 @@ describe("a call the Worker refuses", () => {
     const { requestId } = seedScreenedRequest(h.db, { datasetId: DATASET });
     h.bidsConclusion.value = "failure";
 
-    const r = await h.cli(["admin", "publish", "approve", DATASET, "--yes"]);
+    const r = await h.cli(["admin", "repo", "publish", "approve", DATASET, "--yes"]);
 
     expect(r.exitCode).toBe(1);
     expect(output(r)).not.toContain(BUG_HINT);
@@ -226,6 +226,7 @@ describe("a call the Worker refuses", () => {
 
     const r = await h.cli([
       "admin",
+      "repo",
       "publish",
       "approve",
       DATASET,
@@ -245,7 +246,7 @@ describe("a call the Worker refuses", () => {
     const requestId = seedGolden(h.db);
 
     // The command asks for the reason on standard input; an empty line is no reason.
-    const r = await h.cli(["admin", "publish", "deny", DATASET, "--yes"], { input: "\n" });
+    const r = await h.cli(["admin", "repo", "publish", "deny", DATASET, "--yes"], { input: "\n" });
 
     expect(r.exitCode).toBe(1);
     expect(output(r)).not.toContain(BUG_HINT);
@@ -257,8 +258,8 @@ describe("a call the Worker refuses", () => {
 
 describe("a confirmation that is declined or cannot be asked", () => {
   const DECLINED: ReadonlyArray<{ name: string; args: string[] }> = [
-    { name: "deny", args: ["admin", "publish", "deny", DATASET, ...WHY, "--no"] },
-    { name: "approve", args: ["admin", "publish", "approve", DATASET, "--resume", "--no"] },
+    { name: "deny", args: ["admin", "repo", "publish", "deny", DATASET, ...WHY, "--no"] },
+    { name: "approve", args: ["admin", "repo", "publish", "approve", DATASET, "--resume", "--no"] },
   ];
   for (const { name, args } of DECLINED) {
     test(`${name} --no exits 1, says Skipped and posts nothing`, async () => {
@@ -273,8 +274,8 @@ describe("a confirmation that is declined or cannot be asked", () => {
   }
 
   const UNASKED: ReadonlyArray<{ name: string; args: string[] }> = [
-    { name: "deny", args: ["admin", "publish", "deny", DATASET, ...WHY] },
-    { name: "approve", args: ["admin", "publish", "approve", DATASET, "--resume"] },
+    { name: "deny", args: ["admin", "repo", "publish", "deny", DATASET, ...WHY] },
+    { name: "approve", args: ["admin", "repo", "publish", "approve", DATASET, "--resume"] },
   ];
   for (const { name, args } of UNASKED) {
     test(`${name} with no terminal and no --yes exits 1 and posts nothing`, async () => {
@@ -292,8 +293,8 @@ describe("a confirmation that is declined or cannot be asked", () => {
 
 describe("a mistyped dataset id is refused before any request is made", () => {
   const MISTYPED: ReadonlyArray<{ name: string; args: string[] }> = [
-    { name: "deny", args: ["admin", "publish", "deny", "nm0004", ...WHY, "--yes"] },
-    { name: "screen", args: ["admin", "publish", "screen", "nm0004"] },
+    { name: "deny", args: ["admin", "repo", "publish", "deny", "nm0004", ...WHY, "--yes"] },
+    { name: "screen", args: ["admin", "repo", "publish", "screen", "nm0004"] },
   ];
   for (const { name, args } of MISTYPED) {
     test(`${name} nm0004 exits 1 and sends nothing`, async () => {
@@ -313,7 +314,7 @@ describe("deny with no reason and nothing to ask on", () => {
   // stack trace (the case `confirm()` already guards), so the reason prompt is guarded the same way.
   test("a closed stdin exits 1 with a sentence, no stack trace and nothing posted", async () => {
     const requestId = seedGolden(h.db);
-    const r = await h.cli(["admin", "publish", "deny", DATASET, "--yes"]);
+    const r = await h.cli(["admin", "repo", "publish", "deny", DATASET, "--yes"]);
     expect(r.exitCode).toBe(1);
     expect(output(r)).toContain("Reason is required");
     expect(output(r)).toContain("--reason");
@@ -325,7 +326,7 @@ describe("deny with no reason and nothing to ask on", () => {
   });
 
   test("--help-all says where the reason comes from, and that a script passes --reason", async () => {
-    const r = await h.cli(["admin", "publish", "deny", "--help-all"]);
+    const r = await h.cli(["admin", "repo", "publish", "deny", "--help-all"]);
     expect(r.exitCode).toBe(0);
     const text = output(r).replace(/\s+/g, " ");
     expect(text).toContain(
@@ -336,7 +337,7 @@ describe("deny with no reason and nothing to ask on", () => {
 
   test("a reason piped in is read as the reason, and nothing is asked", async () => {
     const requestId = seedUnstarted(h.db);
-    const r = await h.cli(["admin", "publish", "deny", DATASET, "--yes"], {
+    const r = await h.cli(["admin", "repo", "publish", "deny", DATASET, "--yes"], {
       input: "Please add the participants file\n",
     });
     expect(r.exitCode).toBe(0);
@@ -346,7 +347,7 @@ describe("deny with no reason and nothing to ask on", () => {
   describe.skipIf(process.platform === "win32")("on a terminal", () => {
     test("the reason is asked for, and an empty one is refused", async () => {
       const requestId = seedGolden(h.db);
-      const r = await h.cli(["admin", "publish", "deny", DATASET, "--yes"], {
+      const r = await h.cli(["admin", "repo", "publish", "deny", DATASET, "--yes"], {
         terminal: async (t) => {
           const asked = await t.waitFor("Reason for denial:");
           t.type("\n");
@@ -360,7 +361,7 @@ describe("deny with no reason and nothing to ask on", () => {
 
     test("a typed reason is sent", async () => {
       const requestId = seedUnstarted(h.db);
-      const r = await h.cli(["admin", "publish", "deny", DATASET, "--yes"], {
+      const r = await h.cli(["admin", "repo", "publish", "deny", DATASET, "--yes"], {
         terminal: async (t) => {
           const asked = await t.waitFor("Reason for denial:");
           t.type("Please add the participants file\n");
@@ -375,10 +376,10 @@ describe("deny with no reason and nothing to ask on", () => {
 
 describe("under --json a failure goes to standard error and standard output stays empty", () => {
   const JSON_COMMANDS: ReadonlyArray<{ name: string; args: string[] }> = [
-    { name: "list", args: ["admin", "publish", "list", "--json"] },
-    { name: "show", args: ["admin", "publish", "show", DATASET, "--json"] },
-    { name: "start", args: ["admin", "publish", "start", DATASET, "--json"] },
-    { name: "start --all", args: ["admin", "publish", "start", "--all", "--json"] },
+    { name: "list", args: ["admin", "repo", "publish", "list", "--json"] },
+    { name: "show", args: ["admin", "repo", "publish", "show", DATASET, "--json"] },
+    { name: "start", args: ["admin", "repo", "publish", "start", DATASET, "--json"] },
+    { name: "start --all", args: ["admin", "repo", "publish", "start", "--all", "--json"] },
   ];
 
   for (const { name, args } of JSON_COMMANDS) {
@@ -421,7 +422,7 @@ describe("under --json a failure goes to standard error and standard output stay
         if (/FROM publication_requests/.test(sql)) throw new Error("simulated read failure");
       },
     });
-    const r = await h.cli(["admin", "publish", "list", "--json"]);
+    const r = await h.cli(["admin", "repo", "publish", "list", "--json"]);
     expect(r.exitCode).toBe(1);
     expect(r.stdout).toBe("");
     expect(r.stderr).not.toBe("");
@@ -433,7 +434,7 @@ describe("whether a 5xx may be a bug: the Worker's closed word makes it an answe
   test("start of a Worker with no way to dispatch (502, dispatch_unconfigured) exits 1, no bug-report hint", async () => {
     h.setEnv({ PUBLICATION_REVIEW_ENABLED: "1", PRESCREEN_CALLBACK_SECRET: undefined });
     seedScreenedRequest(h.db, { datasetId: DATASET });
-    const r = await h.cli(["admin", "publish", "start", DATASET]);
+    const r = await h.cli(["admin", "repo", "publish", "start", DATASET]);
     expect(r.exitCode).toBe(1);
     expect(h.requests.at(-1)?.status).toBe(502);
     expect(output(r)).toContain("(dispatch_unconfigured)");
@@ -443,7 +444,7 @@ describe("whether a 5xx may be a bug: the Worker's closed word makes it an answe
   test("a comment the Worker could not mail (502, comment_not_sent) exits 1, no bug-report hint", async () => {
     h.setEnv({ PUBLICATION_REVIEW_ENABLED: "1" });
     seedGolden(h.db);
-    const r = await h.cli(["admin", "publish", "next"], {
+    const r = await h.cli(["admin", "repo", "publish", "next"], {
       input: "c\nCould you check the README?\n",
       resend: { status: 422 },
     });
@@ -462,7 +463,7 @@ describe("whether a 5xx may be a bug: the Worker's closed word makes it an answe
         if (/FROM publication_reviews/.test(sql)) throw new Error("simulated read failure");
       },
     });
-    const r = await h.cli(["admin", "publish", "show", DATASET]);
+    const r = await h.cli(["admin", "repo", "publish", "show", DATASET]);
     expect(r.exitCode).toBe(1);
     expect(h.requests.at(-1)?.status).toBe(500);
     expect(output(r)).toContain(BUG_HINT);
@@ -472,34 +473,34 @@ describe("whether a 5xx may be a bug: the Worker's closed word makes it an answe
 describe("success still exits 0", () => {
   test("list of requests", async () => {
     seedGolden(h.db);
-    const r = await h.cli(["admin", "publish", "list"]);
+    const r = await h.cli(["admin", "repo", "publish", "list"]);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain(DATASET);
   });
 
   test("list when there are none", async () => {
-    const r = await h.cli(["admin", "publish", "list"]);
+    const r = await h.cli(["admin", "repo", "publish", "list"]);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("No active requests found");
   });
 
   test("deny --yes of an active request", async () => {
     const requestId = seedUnstarted(h.db);
-    const r = await h.cli(["admin", "publish", "deny", DATASET, ...WHY, "--yes"]);
+    const r = await h.cli(["admin", "repo", "publish", "deny", DATASET, ...WHY, "--yes"]);
     expect(r.exitCode).toBe(0);
     expect(requestStatus(requestId)).toBe("denied");
   });
 
   test("approve --resume --yes of a golden-path request", async () => {
     const requestId = seedGolden(h.db);
-    const r = await h.cli(["admin", "publish", "approve", DATASET, "--resume", "--yes"]);
+    const r = await h.cli(["admin", "repo", "publish", "approve", DATASET, "--resume", "--yes"]);
     expect(r.exitCode).toBe(0);
     expect(requestStatus(requestId)).toBe("published");
   });
 
   test("screen dispatches the identifier screen again", async () => {
     seedGolden(h.db);
-    const r = await h.cli(["admin", "publish", "screen", DATASET]);
+    const r = await h.cli(["admin", "repo", "publish", "screen", DATASET]);
     expect(r.exitCode).toBe(0);
     expect(output(r)).toContain(`Identifier screen dispatched for ${DATASET}`);
     expect(h.github.dispatches).toHaveLength(1);

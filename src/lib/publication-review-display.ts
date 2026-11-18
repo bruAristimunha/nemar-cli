@@ -1,6 +1,6 @@
 /**
  * How the terminal prints a publication request's review (ADR 0102, section 8): the one line of
- * `nemar admin publish list` and the whole of `nemar admin publish show`.
+ * `nemar admin repo publish list` and the whole of `nemar admin repo publish show`.
  *
  * NOTHING IS DECIDED HERE. The Worker sends the words: a headline and a tone, the reasons with
  * their sentences and cures, the next command. This module owns colour, indentation and the
@@ -244,7 +244,7 @@ export function approveEvidenceLines(
   return [
     shownLine(evidence),
     ...(withheld === null ? [] : [withheld]),
-    `The whole review, with the model's questions and findings: nemar admin publish show ${plain(datasetId)}`,
+    `The whole review, with the model's questions and findings: nemar admin repo publish show ${plain(datasetId)}`,
   ];
 }
 

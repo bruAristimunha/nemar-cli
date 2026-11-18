@@ -1,5 +1,5 @@
 /**
- * `nemar admin publish list | show | start` with the publication review (ADR 0102, section 8),
+ * `nemar admin repo publish list | show | start` with the publication review (ADR 0102, section 8),
  * the real command against the real backend app (`helpers/admin-publish-cli.ts`).
  *
  * Every answer a test reads is one the Worker itself made from rows seeded the way the Worker
@@ -122,7 +122,7 @@ function seedPassing(datasetId: string) {
   return { requestId, reviewId };
 }
 
-const LIST = ["admin", "publish", "list"];
+const LIST = ["admin", "repo", "publish", "list"];
 
 // ---------------------------------------------------------------------------------------------
 // list
@@ -192,7 +192,9 @@ describe("list with the review", () => {
     expect(blockOf(r.stdout, "nm000483")[0]).toContain("(approval running)");
 
     expect(r.stdout).toContain("7 requests, 3 you can act on.");
-    expect(r.stdout).toContain("nemar admin publish next | show <dataset> | approve <dataset>");
+    expect(r.stdout).toContain(
+      "nemar admin repo publish next | show <dataset> | approve <dataset>",
+    );
     // The review is on, so nothing says it is off.
     expect(r.stdout).not.toContain("The automated review is off");
   });
@@ -427,7 +429,7 @@ function seedRich(datasetId: string): { requestId: number; reviewId: number } {
 
 /** The detail as the Worker answered it: the oracle for the words `show` must print as they are. */
 async function detailOf(datasetId: string): Promise<PublicationReviewDetail> {
-  const r = await h.cli(["admin", "publish", "show", datasetId, "--json"]);
+  const r = await h.cli(["admin", "repo", "publish", "show", datasetId, "--json"]);
   expect(r.exitCode).toBe(0);
   return JSON.parse(r.stdout) as PublicationReviewDetail;
 }
@@ -451,7 +453,7 @@ describe("show", () => {
     expect(detail.description.next).not.toBeNull();
 
     const before = h.requests.length;
-    const r = await h.cli(["admin", "publish", "show", "nm000480"]);
+    const r = await h.cli(["admin", "repo", "publish", "show", "nm000480"]);
 
     expect(r.exitCode).toBe(0);
     const questionFailed = REASONS.question_failed.sentence.replace(/\.$/, "");
@@ -497,7 +499,7 @@ describe("show", () => {
   test("the model's words are printed once, under their labels, and nowhere else", async () => {
     seedRich("nm000480");
 
-    const r = await h.cli(["admin", "publish", "show", "nm000480"]);
+    const r = await h.cli(["admin", "repo", "publish", "show", "nm000480"]);
 
     const lines = r.stdout.split("\n");
     expect(lines.filter((l) => l.includes(SUMMARY_SENTINEL))).toHaveLength(1);
@@ -515,7 +517,7 @@ describe("show", () => {
   test("a passing review prints its pass, no findings and no reason, and the approve command", async () => {
     seedPassing("nm000484");
 
-    const r = await h.cli(["admin", "publish", "show", "nm000484"]);
+    const r = await h.cli(["admin", "repo", "publish", "show", "nm000484"]);
 
     expect(r.exitCode).toBe(0);
     const detail = await detailOf("nm000484");
@@ -541,7 +543,7 @@ describe("show", () => {
     h.setEnv({ PUBLICATION_REVIEW_ENABLED: "0" });
     seedScreenedRequest(h.db, { datasetId: "nm000480" });
 
-    const r = await h.cli(["admin", "publish", "show", "nm000480"]);
+    const r = await h.cli(["admin", "repo", "publish", "show", "nm000480"]);
 
     expect(r.exitCode).toBe(0);
     const detail = await detailOf("nm000480");
@@ -561,7 +563,7 @@ describe("show", () => {
       blockReason: "min_requirements_failed",
     });
 
-    const r = await h.cli(["admin", "publish", "show", "nm000480"]);
+    const r = await h.cli(["admin", "repo", "publish", "show", "nm000480"]);
 
     expect(r.stdout).toContain("blocked (min_requirements_failed)");
   });
@@ -569,7 +571,7 @@ describe("show", () => {
   test("an anonymous release says so up front", async () => {
     seedScreenedRequest(h.db, { datasetId: "nm000480", anonymous: true });
 
-    const r = await h.cli(["admin", "publish", "show", "nm000480"]);
+    const r = await h.cli(["admin", "repo", "publish", "show", "nm000480"]);
 
     expect(r.stdout.split("\n")[1]).toContain("ANONYMOUS RELEASE");
   });
@@ -578,7 +580,7 @@ describe("show", () => {
     h.setEnv({ ENVIRONMENT: "staging" });
     seedScreenedRequest(h.db, { datasetId: "nm000480" });
 
-    const r = await h.cli(["admin", "publish", "show", "nm000480"]);
+    const r = await h.cli(["admin", "repo", "publish", "show", "nm000480"]);
 
     expect(r.stdout).toContain("This is the non-production Worker.");
     const production = await h.cli(LIST);
@@ -588,7 +590,7 @@ describe("show", () => {
   test("--json prints the detail and nothing else", async () => {
     seedRich("nm000480");
 
-    const r = await h.cli(["admin", "publish", "show", "nm000480", "--json"]);
+    const r = await h.cli(["admin", "repo", "publish", "show", "nm000480", "--json"]);
 
     expect(r.exitCode).toBe(0);
     const body = JSON.parse(r.stdout) as PublicationReviewDetail;
@@ -618,7 +620,7 @@ describe("show", () => {
       claimed: true,
     });
 
-    const r = await h.cli(["admin", "publish", "show", "nm000480"]);
+    const r = await h.cli(["admin", "repo", "publish", "show", "nm000480"]);
 
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("Summary (written by the model;");
@@ -630,7 +632,7 @@ describe("show", () => {
   test("a dataset with no active request exits 1 with the Worker's sentence and no bug-report hint", async () => {
     seedScreenedRequest(h.db, { datasetId: "nm000480", requestStatus: "published" });
 
-    const r = await h.cli(["admin", "publish", "show", "nm000480"]);
+    const r = await h.cli(["admin", "repo", "publish", "show", "nm000480"]);
 
     expect(r.exitCode).toBe(1);
     expect(output(r)).toContain("nm000480 has no active publication request.");
@@ -639,7 +641,7 @@ describe("show", () => {
   });
 
   test("a malformed id exits 1 before any request is made", async () => {
-    const r = await h.cli(["admin", "publish", "show", "not-a-dataset"]);
+    const r = await h.cli(["admin", "repo", "publish", "show", "not-a-dataset"]);
 
     expect(r.exitCode).toBe(1);
     expect(output(r)).toContain('"not-a-dataset" is not a dataset id');
@@ -650,11 +652,11 @@ describe("show", () => {
   test("signed out exits 1 and says so on standard output, or on standard error under --json", async () => {
     seedScreenedRequest(h.db, { datasetId: "nm000480" });
 
-    const text = await h.cli(["admin", "publish", "show", "nm000480"], { signedOut: true });
+    const text = await h.cli(["admin", "repo", "publish", "show", "nm000480"], { signedOut: true });
     expect(text.exitCode).toBe(1);
     expect(text.stdout).toContain("Not authenticated");
 
-    const json = await h.cli(["admin", "publish", "show", "nm000480", "--json"], {
+    const json = await h.cli(["admin", "repo", "publish", "show", "nm000480", "--json"], {
       signedOut: true,
     });
     expect(json.exitCode).toBe(1);
@@ -671,7 +673,7 @@ describe("show", () => {
       },
     });
 
-    const r = await h.cli(["admin", "publish", "show", "nm000484"]);
+    const r = await h.cli(["admin", "repo", "publish", "show", "nm000484"]);
 
     expect(r.exitCode).toBe(1);
     expect(h.requests.at(-1)?.status).toBe(500);
@@ -684,7 +686,7 @@ describe("show", () => {
 // start
 // ---------------------------------------------------------------------------------------------
 
-const START = ["admin", "publish", "start"];
+const START = ["admin", "repo", "publish", "start"];
 
 /** The reviews of the platform's database, newest last. */
 const reviewRows = () =>
@@ -730,7 +732,7 @@ describe("start", () => {
 
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("nm000480: review started.");
-    expect(r.stdout).toContain("nemar admin publish show nm000480");
+    expect(r.stdout).toContain("nemar admin repo publish show nm000480");
     expect(dispatchedDatasets()).toEqual(["nm000480"]);
     const rows = reviewRows();
     expect(rows).toHaveLength(1);

@@ -55,10 +55,10 @@ Six facts, each checked on 2026-10-12, shape the answer.
   A pull request is approved on GitHub with the administrator's own token (ADR 0093).
   A publication is approved by calling `POST /admin/publish/:id/approve`,
   which runs the sixteen-step orchestrator, and its `publish_doi` step cannot be undone.
-  The web executor (`approve-publication.yml`) runs `nemar admin publish approve <id> --yes`,
+  The web executor (`approve-publication.yml`) runs `nemar admin repo publish approve <id> --yes`,
   so any gate has to live where `/approve` is answered, not only in a client.
 - **The surfaces disagree already.**
-  `nemar admin publish approve` lists its steps but not the screen before its prompt,
+  `nemar admin repo publish approve` lists its steps but not the screen before its prompt,
   so a screen refusal arrives after the administrator confirmed, and it exits 0 when an approval fails (#1581).
   The website sends a fixed empty body and shows no screen,
   so it can approve a request whose screen needs an acknowledgment only if the same administrator recorded that reason from a terminal first.
@@ -433,7 +433,7 @@ the authors half of its question is answered by the fact that ADR 0065's inverte
 
 ### 8. What the administrator sees and may do
 
-`nemar admin publish` takes the shape of `nemar admin pr-reviews` (ADR 0093).
+`nemar admin repo publish` takes the shape of `nemar admin pr-reviews` (ADR 0093).
 
 - **`list`** keeps its filters and shows the review's headline and its reason codes on a line of their own under the screen's;
   `--needs-me` keeps the requests an administrator can act on (the ones the list marks `*`), and `--json` prints the response and nothing else on standard output.
@@ -695,7 +695,7 @@ The maintainer decided all twelve on 2026-10-12, as recommended, and amended cal
    (today it records the question and that it is undecided).
 8. Ship Phases 3 and 4, then add `PUBLICATION_REVIEW_ENABLED = "1"` to `[vars]`,
    delete the `PRESCREEN_ENABLED` secret and disable `run-prescreen.yml` (section 10),
-   and run `nemar admin publish start --all` once for the requests already open.
+   and run `nemar admin repo publish start --all` once for the requests already open.
 
 ## Receipts
 
@@ -716,7 +716,7 @@ The maintainer decided all twelve on 2026-10-12, as recommended, and amended cal
 
 ## Amendment 2026-10-13 (#1729): Phase 2, what the approval gate and the commands decided
 
-Phase 2 built the Worker's approval gate and `nemar admin publish list|show|start|approve|next`.
+Phase 2 built the Worker's approval gate and `nemar admin repo publish list|show|start|approve|next`.
 The text above was corrected in place where the built behavior made a sentence false or stale
 (sections 5, 7, 8 and 9, the consequences, judgment calls 5 and 10, the receipts, and "Before it is switched on", which gained its item 7);
 this amendment states the decisions it does not otherwise carry.
@@ -815,7 +815,7 @@ Where the two differ, this is the later text.
    and a run that has started publishing is never gated again, so its reasons decide nothing.
    The detail, the list and the gate read a row one way, because the gate derives through the detail's own read (`readReviewContext`, `derivePublicationReview`);
    the admin mail alone reads the deadline itself (section 6).
-   A run that has started publishing is told so, in the shared words, and its next command is `nemar admin publish approve <dataset> --resume`.
+   A run that has started publishing is told so, in the shared words, and its next command is `nemar admin repo publish approve <dataset> --resume`.
    The detail's `started_publishing` is true for such a run, including one that the owner-name check has walked back to `blocked`.
    A `blocked` request counts as having started publishing only when its block reason is the owner-name one (`owner_name_missing`) and a step after the validation-only ones has completed.
    A `blocked` request with any other reason is refused `request_blocked` however stale its recorded steps,
@@ -926,7 +926,7 @@ Where the two differ, this is the later text.
    Only `skip_ci_check: true` counts: an explicit `false` is allowed, because the CLI sends it on every call.
    A skipped CI check is one of them because it is recorded under the approver, which for a token call is the clicker, and the click did not skip it.
    The executor workflow sends none of the three.
-   `nemar admin publish approve` refuses `--force`, `--acknowledge-identifier-screen` and `--skip-ci-check` while `NEMAR_APPROVAL_DISPATCH_TOKEN` is set, before it sends anything.
+   `nemar admin repo publish approve` refuses `--force`, `--acknowledge-identifier-screen` and `--skip-ci-check` while `NEMAR_APPROVAL_DISPATCH_TOKEN` is set, before it sends anything.
    `next` never reads the variable.
 3. **The order of the checks changes.**
    In `/approve` it is now: the outdated-client refusal (426), the request read (404), `request_mismatch`, `request_blocked`,
@@ -1097,7 +1097,7 @@ A sentence is called web-safe here when it names no terminal command, flag or pl
    Mailing the depositor a comment from the page is not done.
    The strict parity path was left out of the continuous integration workflow until the website file was on `staging`; it is there now (#1787).
    The executor workflow edit of Phase 3 stays the maintainer's, as the Phase 3 amendment says.
-   `description.next` shows `nemar admin publish start <id>` for a clean sandbox (`xx`) request, although `start_offered` is false for it and the route refuses a start there.
+   `description.next` shows `nemar admin repo publish start <id>` for a clean sandbox (`xx`) request, although `start_offered` is false for it and the route refuses a start there.
    That is CLI behavior from before this phase, tracked in #1773, and the page never prints `description.next`.
    The neutral cure of a reason whose cure is "start it" has the same limit, because the cure and `command` decide from whether the request is `requested` alone, while `start_offered` also needs a restartable row, no hard reason standing, and a screen with a clear or acknowledgeable result and a head.
    So the cure can say to start the review while `start_offered` is false: beside any standing hard reason (the commonest case: `review_not_started` beside `submission_minimum_failed` or `identifier_screen_pending`), for a report that no longer parses (`review_could_not_run`, whose stored review is no longer restartable), for a sandbox request, and for a screen with no head.
@@ -1125,7 +1125,7 @@ Where the two differ, this is the later text.
 3. **A failed dispatch claim is released on every way out.**
    The web approval's claim is released if anything throws between the claim and the dispatch (a failed acknowledgment or override write, a failed read), not only on the failures the route names.
    From the moment the dispatch is attempted a throw keeps the claim, because the event may be queued.
-4. **`nemar admin publish screen` exits 1 when the Worker answers 202 with status `error`.**
+4. **`nemar admin repo publish screen` exits 1 when the Worker answers 202 with status `error`.**
    The screen could not be started, nothing is running, and item 12 of the Phase 2 amendment (every failure exits non-zero) holds for it.
    The text no longer says the admins have been mailed this result as a fact about the call.
 5. **An approval that leaves the request `approving` is not a success.**

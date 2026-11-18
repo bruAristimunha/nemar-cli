@@ -1085,11 +1085,11 @@ const NOT_STARTABLE = `A review starts only for a request that is waiting for it
 // state asks for them, and the `--force` of the gate's own sentences, which are prose about a flag
 // rather than a command to run. `COMMAND_ACKNOWLEDGE` is `next` only when neither of those two is
 // appended, so the one is not a prefix check of the other.
-const COMMAND_SCREEN = "nemar admin publish screen <dataset>";
-const COMMAND_START = "nemar admin publish start <dataset>";
-const COMMAND_SHOW = "nemar admin publish show <dataset>";
-const COMMAND_APPROVE = "nemar admin publish approve <dataset>";
-const COMMAND_DENY = "nemar admin publish deny <dataset>";
+const COMMAND_SCREEN = "nemar admin repo publish screen <dataset>";
+const COMMAND_START = "nemar admin repo publish start <dataset>";
+const COMMAND_SHOW = "nemar admin repo publish show <dataset>";
+const COMMAND_APPROVE = "nemar admin repo publish approve <dataset>";
+const COMMAND_DENY = "nemar admin repo publish deny <dataset>";
 const ACKNOWLEDGE_FLAG = '--acknowledge-identifier-screen "<reason>"';
 const COMMAND_ACKNOWLEDGE = `${COMMAND_APPROVE} ${ACKNOWLEDGE_FLAG}`;
 

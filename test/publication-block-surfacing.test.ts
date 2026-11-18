@@ -4,7 +4,7 @@
  * The owner_name_missing refusals carry a short label in `error` and the
  * ACTIONABLE sentence in `message`. The CLI's client preferred `error`, so all
  * a user saw was "Owner has no researcher name on file" -- true, and useless.
- * Worse, `nemar admin publish approve` pinned the fixed 422 hint "Fix the CI
+ * Worse, `nemar admin repo publish approve` pinned the fixed 422 hint "Fix the CI
  * issues and retry with --resume" onto this case, sending an admin to look at
  * a workflow run that is perfectly healthy.
  *

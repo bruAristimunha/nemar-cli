@@ -1952,7 +1952,7 @@ describe("what the gate cannot decide it refuses", () => {
     if (out.ok) return;
     expect(out.body).toMatchObject({ refusal: "hard_reason" });
     expect(out.body.message).toBe(
-      `The publication review gives a reason that no override clears, so the approval is refused. The identifier screen has no verdict about the current commit. An administrator runs the screen again: nemar admin publish screen ${DATASET}.`,
+      `The publication review gives a reason that no override clears, so the approval is refused. The identifier screen has no verdict about the current commit. An administrator runs the screen again: nemar admin repo publish screen ${DATASET}.`,
     );
   });
 

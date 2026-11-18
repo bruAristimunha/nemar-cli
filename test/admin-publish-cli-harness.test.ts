@@ -1,5 +1,5 @@
 /**
- * The harness every CLI test of `nemar admin publish` runs on (`helpers/admin-publish-cli.ts`),
+ * The harness every CLI test of `nemar admin repo publish` runs on (`helpers/admin-publish-cli.ts`),
  * tested on its own so a later suite can trust what it reads from it.
  *
  * The claims, each against the real command and the real backend app:
@@ -66,7 +66,7 @@ describe("the real command against the real backend", () => {
     const { requestId } = seedScreenedRequest(h.db, { datasetId: DATASET });
     seedScreenedRequest(h.db, { datasetId: "nm000461", status: "review" });
 
-    const r = await h.cli(["admin", "publish", "list"]);
+    const r = await h.cli(["admin", "repo", "publish", "list"]);
 
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("Publication Requests (2, active requests)");
@@ -85,7 +85,7 @@ describe("the real command against the real backend", () => {
     seedScreenedRequest(h.db, { datasetId: DATASET });
     seedScreenedRequest(h.db, { datasetId: "nm000461", requestStatus: "denied" });
 
-    const r = await h.cli(["admin", "publish", "list", "--status", "denied"]);
+    const r = await h.cli(["admin", "repo", "publish", "list", "--status", "denied"]);
 
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("Publication Requests (1, requests with status denied)");
@@ -111,7 +111,7 @@ describe("the real command against the real backend", () => {
     test("a bare list is the active requests: published, denied and withdrawn ones are history", async () => {
       seedHistory();
 
-      const r = await h.cli(["admin", "publish", "list"]);
+      const r = await h.cli(["admin", "repo", "publish", "list"]);
 
       expect(r.exitCode).toBe(0);
       expect(r.stdout).toContain("Publication Requests (1, active requests)");
@@ -126,7 +126,7 @@ describe("the real command against the real backend", () => {
     test("--all shows every request, and a withdrawn one reads as withdrawn, not as a refusal", async () => {
       seedHistory();
 
-      const r = await h.cli(["admin", "publish", "list", "--all"]);
+      const r = await h.cli(["admin", "repo", "publish", "list", "--all"]);
 
       expect(r.exitCode).toBe(0);
       expect(r.stdout).toContain("Publication Requests (4, all requests)");
@@ -142,9 +142,9 @@ describe("the real command against the real backend", () => {
     test("state flags and -s name the same states, and --denied lists the withdrawn request too", async () => {
       seedHistory();
 
-      const flag = await h.cli(["admin", "publish", "list", "--denied"]);
-      const short = await h.cli(["admin", "publish", "list", "-s", "denied"]);
-      const both = await h.cli(["admin", "publish", "list", "--published", "--denied"]);
+      const flag = await h.cli(["admin", "repo", "publish", "list", "--denied"]);
+      const short = await h.cli(["admin", "repo", "publish", "list", "-s", "denied"]);
+      const both = await h.cli(["admin", "repo", "publish", "list", "--published", "--denied"]);
 
       for (const r of [flag, short]) {
         expect(r.exitCode).toBe(0);
@@ -159,7 +159,15 @@ describe("the real command against the real backend", () => {
     test("--search finds a dataset by id, name or depositor, in the states being shown", async () => {
       seedHistory();
 
-      const byId = await h.cli(["admin", "publish", "list", "--search", "nm000461", "--all"]);
+      const byId = await h.cli([
+        "admin",
+        "repo",
+        "publish",
+        "list",
+        "--search",
+        "nm000461",
+        "--all",
+      ]);
       expect(byId.stdout).toContain("Publication Requests (1, all requests)");
       expect(byId.stdout).toContain("nm000461");
       // The dataset's name rides along on the wire and is printed beside the row.
@@ -167,6 +175,7 @@ describe("the real command against the real backend", () => {
 
       const byUser = await h.cli([
         "admin",
+        "repo",
         "publish",
         "list",
         "--search",
@@ -178,7 +187,7 @@ describe("the real command against the real backend", () => {
 
       // Inside the default scope an id of a request in history is not found, and the line says
       // how to widen the search.
-      const hidden = await h.cli(["admin", "publish", "list", "--search", "nm000461"]);
+      const hidden = await h.cli(["admin", "repo", "publish", "list", "--search", "nm000461"]);
       expect(hidden.exitCode).toBe(0);
       expect(hidden.stdout).toContain('No active requests found matching "nm000461".');
       expect(hidden.stdout).toContain("Use --all");
@@ -187,7 +196,7 @@ describe("the real command against the real backend", () => {
     test("--needs-me keeps its meaning under the default scope", async () => {
       seedHistory();
 
-      const r = await h.cli(["admin", "publish", "list", "--needs-me"]);
+      const r = await h.cli(["admin", "repo", "publish", "list", "--needs-me"]);
 
       expect(r.exitCode).toBe(0);
       expect(r.stdout).toContain("Publication Requests (1, active requests)");
@@ -201,6 +210,7 @@ describe("the real command against the real backend", () => {
 
     const r = await h.cli([
       "admin",
+      "repo",
       "publish",
       "deny",
       DATASET,
@@ -221,7 +231,7 @@ describe("the real command against the real backend", () => {
   test("a golden-path approval reaches `published` through the real orchestrator", async () => {
     const requestId = seedGolden(h.db);
 
-    const r = await h.cli(["admin", "publish", "approve", DATASET, "--resume", "--yes"]);
+    const r = await h.cli(["admin", "repo", "publish", "approve", DATASET, "--resume", "--yes"]);
 
     expect(r.exitCode).toBe(0);
     expect(requestRow(requestId)?.status).toBe("published");
@@ -238,7 +248,7 @@ describe("the stand-ins record what they were sent", () => {
   test("the GitHub stand-in records the gate's one read, made with the Worker's own token", async () => {
     seedGolden(h.db);
 
-    await h.cli(["admin", "publish", "approve", DATASET, "--resume", "--yes"]);
+    await h.cli(["admin", "repo", "publish", "approve", DATASET, "--resume", "--yes"]);
 
     const reads = h.github.seen.filter((c) => c.path.endsWith("/git/ref/heads/main"));
     expect(reads).toHaveLength(1);
@@ -255,7 +265,7 @@ describe("the stand-ins record what they were sent", () => {
     const requestId = seedGolden(h.db);
     h.mainHead.value = "fedcba9876543210fedcba9876543210fedcba98";
 
-    const r = await h.cli(["admin", "publish", "approve", DATASET, "--resume", "--yes"]);
+    const r = await h.cli(["admin", "repo", "publish", "approve", DATASET, "--resume", "--yes"]);
 
     // Refused by the Worker's screen gate (the screened commit is no longer main), not by the
     // harness: the request never started approving and nothing was published.
@@ -267,7 +277,7 @@ describe("the stand-ins record what they were sent", () => {
     const requestId = seedScreenedRequest(h.db, { datasetId: DATASET }).requestId;
     h.bidsConclusion.value = "failure";
 
-    const r = await h.cli(["admin", "publish", "approve", DATASET, "--yes"]);
+    const r = await h.cli(["admin", "repo", "publish", "approve", DATASET, "--yes"]);
 
     // The run stopped at the validation step the stand-in failed, a 422 the CLI does not retry.
     expect(output(r)).toContain("Fix the CI issues and retry with --resume");
@@ -280,7 +290,7 @@ describe("the stand-ins record what they were sent", () => {
   test("a mail the Worker sends reaches the Resend stand-in and nowhere else", async () => {
     seedScreenedRequest(h.db, { datasetId: DATASET });
 
-    await h.cli(["admin", "publish", "deny", DATASET, "-r", "Needs a README", "-y"]);
+    await h.cli(["admin", "repo", "publish", "deny", DATASET, "-r", "Needs a README", "-y"]);
 
     const sends = h.mail.filter((c) => c.path === "/emails");
     expect(sends).toHaveLength(1);
@@ -293,9 +303,12 @@ describe("the stand-ins record what they were sent", () => {
   test("a refusing Resend still lets the denial stand, and the stand-in saw the attempt", async () => {
     const { requestId } = seedScreenedRequest(h.db, { datasetId: DATASET });
 
-    const r = await h.cli(["admin", "publish", "deny", DATASET, "-r", "Needs a README", "-y"], {
-      resend: { status: 422 },
-    });
+    const r = await h.cli(
+      ["admin", "repo", "publish", "deny", DATASET, "-r", "Needs a README", "-y"],
+      {
+        resend: { status: 422 },
+      },
+    );
 
     expect(r.exitCode).toBe(0);
     expect(h.mail.filter((c) => c.path === "/emails")).toHaveLength(1);
@@ -312,7 +325,7 @@ describe("the account and the configuration a command runs under", () => {
     const { requestId } = seedScreenedRequest(h.db, { datasetId: DATASET });
 
     // The last account seeded is the default; `as` picks another.
-    await h.cli(["admin", "publish", "deny", DATASET, "-r", "Not ready yet", "-y"], {
+    await h.cli(["admin", "repo", "publish", "deny", DATASET, "-r", "Not ready yet", "-y"], {
       as: "harnessadmin",
     });
 
@@ -324,7 +337,7 @@ describe("the account and the configuration a command runs under", () => {
     const second = await h.admin("secondadmin", OTHER_ADMIN_KEY);
     const { requestId } = seedScreenedRequest(h.db, { datasetId: DATASET });
 
-    await h.cli(["admin", "publish", "deny", DATASET, "-r", "Not ready yet", "-y"]);
+    await h.cli(["admin", "repo", "publish", "deny", DATASET, "-r", "Not ready yet", "-y"]);
 
     expect(requestRow(requestId)?.denied_by).toBe(second);
   });
@@ -332,26 +345,28 @@ describe("the account and the configuration a command runs under", () => {
   test("a member's key reaches the backend as a member's, and is refused there", async () => {
     await h.user("harnessmember", "member", "harness-member-key-0123456789abcdef0123456789");
 
-    const r = await h.cli(["admin", "publish", "list"]);
+    const r = await h.cli(["admin", "repo", "publish", "list"]);
 
     expect(output(r)).toContain("This command requires admin privileges");
     expect(h.requests).toEqual([{ method: "GET", path: "/admin/publish/requests", status: 403 }]);
   });
 
   test("an account that was never seeded is refused loudly, not run as nobody", async () => {
-    await expect(h.cli(["admin", "publish", "list"], { as: "ghost" })).rejects.toThrow(
+    await expect(h.cli(["admin", "repo", "publish", "list"], { as: "ghost" })).rejects.toThrow(
       'no account "ghost"',
     );
   });
 
   test("two commands at once are refused rather than interleaved", async () => {
-    const first = h.cli(["admin", "publish", "list"]);
-    await expect(h.cli(["admin", "publish", "list"])).rejects.toThrow("one command at a time");
+    const first = h.cli(["admin", "repo", "publish", "list"]);
+    await expect(h.cli(["admin", "repo", "publish", "list"])).rejects.toThrow(
+      "one command at a time",
+    );
     expect((await first).exitCode).toBe(0);
   });
 
   test("signed out, the command is stopped before it reaches the backend", async () => {
-    const r = await h.cli(["admin", "publish", "list"], { signedOut: true });
+    const r = await h.cli(["admin", "repo", "publish", "list"], { signedOut: true });
 
     expect(r.stdout).toContain("Not authenticated");
     expect(h.requests).toEqual([]);
@@ -381,7 +396,7 @@ describe("what a test can change between a command's read and its write", () => 
       ]);
     });
 
-    const r = await h.cli(["admin", "publish", "approve", DATASET, "--resume", "--yes"]);
+    const r = await h.cli(["admin", "repo", "publish", "approve", DATASET, "--resume", "--yes"]);
 
     expect(output(r)).toContain("Identifier screen: DID NOT RUN");
     expect(requestRow(requestId)).toMatchObject({
@@ -400,7 +415,7 @@ describe("what a test can change between a command's read and its write", () => 
       h.db.run("UPDATE publication_requests SET status = 'denied' WHERE id = ?", [requestId]);
     });
 
-    const r = await h.cli(["admin", "publish", "list"]);
+    const r = await h.cli(["admin", "repo", "publish", "list"]);
 
     // The list was read while the request was still waiting; the hook ran after, so the row
     // the administrator saw is one the database no longer holds.
@@ -415,8 +430,8 @@ describe("what a test can change between a command's read and its write", () => 
       ran++;
     });
 
-    await h.cli(["admin", "publish", "list"]);
-    await h.cli(["admin", "publish", "list"]);
+    await h.cli(["admin", "repo", "publish", "list"]);
+    await h.cli(["admin", "repo", "publish", "list"]);
 
     expect(ran).toBe(1);
   });
@@ -429,7 +444,7 @@ describe("what a test can change between a command's read and its write", () => 
       },
     });
 
-    const r = await h.cli(["admin", "publish", "list"]);
+    const r = await h.cli(["admin", "repo", "publish", "list"]);
 
     expect(h.requests).toEqual([{ method: "GET", path: "/admin/publish/requests", status: 500 }]);
     expect(r.stdout).not.toContain("Publication Requests");
@@ -443,7 +458,7 @@ describe("what a test can change between a command's read and its write", () => 
       }
     });
 
-    const rewritten = await h.cli(["admin", "publish", "list"]);
+    const rewritten = await h.cli(["admin", "repo", "publish", "list"]);
     expect(rewritten.exitCode).toBe(0);
     expect(rewritten.stdout).toContain("renamed_by_the_test");
     expect(h.requests).toEqual([{ method: "GET", path: "/admin/publish/requests", status: 200 }]);
@@ -452,7 +467,7 @@ describe("what a test can change between a command's read and its write", () => 
     h.reset();
     await h.admin("harnessadmin", ADMIN_KEY);
     seedScreenedRequest(h.db, { datasetId: DATASET });
-    const plain = await h.cli(["admin", "publish", "list"]);
+    const plain = await h.cli(["admin", "repo", "publish", "list"]);
     expect(plain.stdout).not.toContain("renamed_by_the_test");
     expect(plain.stdout).toContain("depositor_nm000460");
   });
@@ -461,7 +476,7 @@ describe("what a test can change between a command's read and its write", () => 
     const requestId = seedGolden(h.db);
     markScreen(h.db, requestId, DATASET, { status: "review" });
 
-    const r = await h.cli(["admin", "publish", "approve", DATASET, "--resume", "--yes"]);
+    const r = await h.cli(["admin", "repo", "publish", "approve", DATASET, "--resume", "--yes"]);
 
     expect(output(r)).toContain("--acknowledge-identifier-screen");
     expect(requestRow(requestId)?.status).toBe("requested");
@@ -473,7 +488,7 @@ describe("input and isolation", () => {
     const { requestId } = seedScreenedRequest(h.db, { datasetId: DATASET });
 
     // With no --reason the command asks for one on standard input.
-    const r = await h.cli(["admin", "publish", "deny", DATASET, "--yes"], {
+    const r = await h.cli(["admin", "repo", "publish", "deny", DATASET, "--yes"], {
       input: "The participants file is missing\n",
     });
 
@@ -483,7 +498,7 @@ describe("input and isolation", () => {
 
   test("reset gives the next test a fresh database, no accounts and empty records", async () => {
     seedScreenedRequest(h.db, { datasetId: DATASET });
-    await h.cli(["admin", "publish", "list"]);
+    await h.cli(["admin", "repo", "publish", "list"]);
     h.setEnv({ PUBLICATION_REVIEW_ENABLED: "1" });
     h.mainHead.value = "0000000000000000000000000000000000000000";
     expect(h.env().PUBLICATION_REVIEW_ENABLED).toBe("1");
@@ -499,11 +514,11 @@ describe("input and isolation", () => {
     expect(h.mainHead.value).toBe(SCREENED_HEAD);
     expect(h.env().PUBLICATION_REVIEW_ENABLED).toBeUndefined();
     // With the accounts gone the command is signed out, and the old account cannot be named.
-    const r = await h.cli(["admin", "publish", "list"]);
+    const r = await h.cli(["admin", "repo", "publish", "list"]);
     expect(r.stdout).toContain("Not authenticated");
-    await expect(h.cli(["admin", "publish", "list"], { as: "harnessadmin" })).rejects.toThrow(
-      'no account "harnessadmin"',
-    );
+    await expect(
+      h.cli(["admin", "repo", "publish", "list"], { as: "harnessadmin" }),
+    ).rejects.toThrow('no account "harnessadmin"');
   });
 
   test("stop closes both servers and puts the GitHub address back", async () => {
@@ -546,7 +561,9 @@ describe.skipIf(process.platform === "win32")("a command run on a terminal", () 
     seedMany(250);
 
     // The driver does nothing: the command writes everything and exits before it is looked at.
-    const r = await h.cli(["admin", "publish", "list"], { terminal: async () => undefined });
+    const r = await h.cli(["admin", "repo", "publish", "list"], {
+      terminal: async () => undefined,
+    });
 
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("nm001249");
@@ -558,7 +575,7 @@ describe.skipIf(process.platform === "win32")("a command run on a terminal", () 
   test("waitFor still finds the last line of a command that has already exited", async () => {
     seedMany(250);
 
-    const r = await h.cli(["admin", "publish", "list"], {
+    const r = await h.cli(["admin", "repo", "publish", "list"], {
       terminal: async (t) => {
         await Bun.sleep(1_500);
         await t.waitFor("so no review gates an approval.");
@@ -571,7 +588,7 @@ describe.skipIf(process.platform === "win32")("a command run on a terminal", () 
   test("waitFor says the command ended when the text never comes, and shows what it wrote", async () => {
     seedScreenedRequest(h.db, { datasetId: DATASET });
 
-    const run = h.cli(["admin", "publish", "list"], {
+    const run = h.cli(["admin", "repo", "publish", "list"], {
       terminal: async (t) => {
         await t.waitFor("a line the command never writes");
       },
@@ -583,7 +600,7 @@ describe.skipIf(process.platform === "win32")("a command run on a terminal", () 
   test("standard output can be a pipe while standard input and standard error stay the terminal", async () => {
     seedScreenedRequest(h.db, { datasetId: DATASET });
 
-    const ok = await h.cli(["admin", "publish", "list"], {
+    const ok = await h.cli(["admin", "repo", "publish", "list"], {
       terminal: async () => undefined,
       pipeStdout: true,
     });
@@ -592,7 +609,7 @@ describe.skipIf(process.platform === "win32")("a command run on a terminal", () 
     expect(ok.stderr).not.toContain(DATASET);
 
     // An error under --json is written to standard error, which is the terminal here.
-    const failed = await h.cli(["admin", "publish", "list", "--json"], {
+    const failed = await h.cli(["admin", "repo", "publish", "list", "--json"], {
       terminal: async () => undefined,
       pipeStdout: true,
       signedOut: true,
