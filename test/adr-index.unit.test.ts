@@ -35,7 +35,8 @@ function indexedFiles(readme: string): string[] {
  * branch, and delete it in the first change that brings the file.
  */
 // 0120: reserved for the collaborator's reader epic; delete this entry when that ADR lands
-const TOLERATED_GAPS: ReadonlySet<number> = new Set([120]);
+// 0127: reserved for PR #2210 (pull request review regardless of owner role); delete this entry when that ADR lands
+const TOLERATED_GAPS: ReadonlySet<number> = new Set([120, 127]);
 
 /** The numbers missing between 1 and the highest one present, ascending. */
 function findGaps(nums: number[]): number[] {
