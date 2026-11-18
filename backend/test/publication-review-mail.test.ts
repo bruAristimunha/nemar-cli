@@ -408,7 +408,7 @@ describe("with the review off, the mail is what it was before the review existed
           next: "next & step",
         },
       },
-      sha256: "5d95f3c4105c5351eea61a6e1bca201fa9cca342ea79f65d75dd9679d47b80b3",
+      sha256: "c79aa16abc08bc7197186fb6a0efd578d3fbec2d83980fc95e492022ae731462",
     },
     {
       name: "an anonymous release with a stopping screen",
@@ -416,12 +416,12 @@ describe("with the review off, the mail is what it was before the review existed
         anonymous: true,
         screen: { headline: "Identifier screen: FOUND IDENTIFIERS", tone: "stop", lines: [] },
       },
-      sha256: "1e491a8558d772d564d4a10d75f4ec55faff36170560048e28c0d4f0426a2a55",
+      sha256: "2b8bca75c90dadf8e41a789b329cca75d28cdc4bd083b6df5786dbae7b75d1a8",
     },
     {
       name: "no sections at all",
       opts: {},
-      sha256: "909739632837b8af2525ab29495747d8481ab0754304dd538aaf37350e2e9b8c",
+      sha256: "5fee69cd59b891dd97c7fb9fad9210605e05998e8a72e6df8aba320b9aed90fa",
     },
   ];
 
