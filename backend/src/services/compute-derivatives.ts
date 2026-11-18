@@ -876,11 +876,21 @@ async function keyNewStamps(
         counts.created++;
         continue;
       }
-      // Nothing was added: the key is held by a first derivative, or the dataset is gone.
+      // Nothing was added: the key is held by a first derivative, the dataset is gone, or the dataset became
+      // ineligible (unpublished or withdrawn) between the scan and this insert. Only the first two are final: an
+      // ineligible dataset can become eligible again, so its stamp is left undecided for a later scan, which
+      // applies the same eligibility rule and keys it once the dataset qualifies.
       const held = await db
         .prepare("SELECT 1 AS held FROM compute_derivatives WHERE key = ?1")
         .bind(decision.key)
         .first<{ held: number }>();
+      if (!held) {
+        const exists = await db
+          .prepare("SELECT 1 AS present FROM datasets WHERE dataset_id = ?1")
+          .bind(stamp.dataset_id)
+          .first<{ present: number }>();
+        if (exists) continue;
+      }
       await skipStamp(db, stamp, held ? "duplicate_key" : "dataset_gone", counts);
     } catch (err) {
       console.error(`[compute-derivatives] stamp_failed stamp=${stamp.id} error=${errorName(err)}`);

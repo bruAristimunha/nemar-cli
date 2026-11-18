@@ -2226,4 +2226,41 @@ describe("a dataset that is no longer eligible after its job finished", () => {
     await publish(made.id);
     expect((await retention(row.key, "owner", "published")).status).toBe(200);
   });
+
+  test("unpublished between the scan and the insert, its stamp stays undecided and is keyed once public again (MUTATION: skip it as dataset_gone)", async () => {
+    const env = envOf();
+    const made = await zarrJob();
+    // The scan has read the stamp as eligible; keying it reads the job's records next, and the dataset goes
+    // private during that read, so the insert that follows adds nothing.
+    const records = env.COMPUTE_RECORDS;
+    let fired = false;
+    const during = envOf({
+      COMPUTE_RECORDS: new Proxy(records, {
+        get(target, prop) {
+          const value = Reflect.get(target, prop, target);
+          if (prop !== "get" || typeof value !== "function") {
+            return typeof value === "function" ? value.bind(target) : value;
+          }
+          return async (...a: unknown[]) => {
+            if (!fired) {
+              fired = true;
+              await unpublish(made.id);
+            }
+            return value.apply(target, a);
+          };
+        },
+      }),
+    });
+    expect(await syncAll(during)).toMatchObject({ examined: 1, created: 0, errored: 0 });
+    expect(fired).toBe(true);
+    expect(await all(env)).toHaveLength(0);
+    const skips = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM compute_derivative_skips WHERE stamp_id = ?1",
+    )
+      .bind(made.stampId)
+      .first<{ n: number }>();
+    expect(skips?.n).toBe(0);
+    await publish(made.id);
+    expect(await syncAll(env)).toMatchObject({ created: 1 });
+  });
 });
