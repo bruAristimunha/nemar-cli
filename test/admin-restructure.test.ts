@@ -87,12 +87,25 @@ describe("admin command restructure - help output", () => {
       .map((l) => /^ {2}(\S+)/.exec(l)?.[1])
       .filter(Boolean);
     expect(commands).toContain("publish");
+    expect(commands).toContain("unpublish");
     expect(commands).toContain("withdraw");
     expect(commands).toContain("restore");
     // A bare visibility flip made half states (published but private, public but unpublished).
     expect(commands).not.toContain("public");
     expect(commands).not.toContain("private");
     expect(stdout).toContain("publication lifecycle");
+  });
+
+  test("admin repo unpublish --help says how it differs from withdraw", async () => {
+    const { stdout, exitCode } = await runCli(["admin", "repo", "unpublish", "--help"]);
+    expect(exitCode).toBe(0);
+    const text = stripAnsi(stdout).replace(/\s+/g, " ");
+    expect(text).toContain("DOIs untouched");
+    expect(text).toContain("'withdraw'");
+    expect(text).toContain("--execute");
+    expect(text).toContain("--reason");
+    const all = await runCli(["admin", "repo", "unpublish", "--help-all"]);
+    expect(stripAnsi(all.stdout).replace(/\s+/g, " ")).toContain("every DOI is tombstoned");
   });
 
   test.each(["public", "private"])("`admin repo %s` no longer exists", async (name) => {
@@ -141,6 +154,12 @@ describe("admin command restructure - help output", () => {
 // ============================================================================
 
 describe("admin commands - auth requirements", () => {
+  test("admin repo unpublish requires auth", async () => {
+    const ctx = createTestContext();
+    const { stdout } = await runCli(["admin", "repo", "unpublish", "nm000104", "-y"], ctx);
+    expect(stdout).toContain("Not authenticated");
+  });
+
   test("admin ci check requires auth", async () => {
     const ctx = createTestContext();
     const { stdout } = await runCli(["admin", "ci", "check", "nm000104"], ctx);

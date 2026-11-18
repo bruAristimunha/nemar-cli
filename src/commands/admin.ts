@@ -106,6 +106,7 @@ import {
   type ReviewRulesetOutcome,
   type SignalDefaultsSweepBatchResponse,
   type SummaryVersionCoverage,
+  type UnpublishResponse,
   type UpstreamBackfillResponse,
   type UserListItem,
   type WeeklySummaryResponse,
@@ -177,6 +178,7 @@ import {
   signalDefaultsSweep,
   signalDefaultsSweepReset,
   syncCi,
+  unpublishDataset,
   updateDoi,
   updateEmailPreferences,
   uploadTierOf,
@@ -3739,6 +3741,114 @@ function printTransitionResult(
     console.log(chalk.yellow(`    warning: ${result.warning}`));
   }
 }
+
+/** Print one unpublish result (the plan on a dry run, the outcome on an execute). */
+function printUnpublishResult(tag: string, result: UnpublishResponse): void {
+  if ("skipped" in result) {
+    console.log(`  ${chalk.yellow("skipped".padEnd(8))} ${result.dataset_id}: ${result.skipped}`);
+    return;
+  }
+  const caseNote: Record<typeof result.case, string> = {
+    published: "published and public",
+    "public-never-published": "public, never published",
+    "private-with-live-publication-record":
+      "already private, but a publication record still says published (a repair)",
+  };
+  console.log(chalk.bold(`  ${tag}${result.dataset_id}: ${caseNote[result.case]}`));
+  const v = result.visibility;
+  console.log(
+    `    visibility: ${v.status === "failed" ? chalk.red(v.status) : chalk.green(v.status)}`,
+  );
+  if (v.status === "failed") {
+    console.log(chalk.red(`      stage=${v.stage}: ${v.error}`));
+    if ("githubReverted" in v) {
+      const s3Bit = "s3Reverted" in v ? ` s3Reverted=${v.s3Reverted}` : "";
+      console.log(chalk.dim(`      githubReverted=${v.githubReverted}${s3Bit}`));
+    }
+  }
+  console.log(`    publication requests reset: ${result.publication_requests_reset}`);
+  console.log(
+    `    DOIs left untouched: concept ${result.dois_untouched.concept ?? "none"}, ${result.dois_untouched.versions} version(s)`,
+  );
+  if (result.warning) console.log(chalk.yellow(`    warning: ${result.warning}`));
+}
+
+repoCommand
+  .command("unpublish")
+  .description(
+    "Authors pull a dataset back: private everywhere, publication state reset, DOIs untouched, can be published again. A broken or removed dataset is 'withdraw' instead. Dry-run by default.",
+  )
+  .argument("<dataset-id>", "Dataset id (e.g., nm000104)")
+  .option("--reason <reason>", "Why it is being unpublished (required with --execute)")
+  .option("--execute", "Actually apply the unpublish (default is a dry run)")
+  .option(YES_OPTION, YES_DESCRIPTION)
+  .option(NO_OPTION, NO_DESCRIPTION)
+  .option("--json", "Output raw JSON")
+  .addHelpText(
+    "after",
+    `
+Unpublish versus withdraw:
+  unpublish  the authors asked to take a dataset back. It becomes a private, unpublished
+             dataset again: the owner, admins and collaborators see it, share it, edit it,
+             and can request publication later. The DOIs are NOT touched (EZID is not called).
+  withdraw   the dataset is broken or removed. It is made private AND every DOI is tombstoned.
+             Undo with 'restore'.
+
+Also repairs a dataset that was made private by a bare visibility change and still carries a
+publication record. Making a dataset public is what publishing does ('admin repo publish').
+
+Examples:
+  $ nemar admin repo unpublish nm000123                                      # dry run
+  $ nemar admin repo unpublish nm000123 --execute --reason "authors request"`,
+  )
+  .action(
+    async (
+      datasetId: string,
+      options: { reason?: string; execute?: boolean; json?: boolean } & ConfirmOptions,
+    ) => {
+      if (!requireAuth()) return;
+
+      const dryRun = !options.execute;
+      if (!dryRun && !options.reason) {
+        console.log(chalk.red("Error: --reason is required with --execute"));
+        process.exit(1);
+      }
+
+      if (!dryRun) {
+        console.log(
+          chalk.yellow(
+            `\n${datasetId} will become private everywhere and its publication state will be reset. Its DOIs are not touched.`,
+          ),
+        );
+        const confirmResult = await confirm(`Unpublish ${datasetId}?`, options);
+        if (confirmResult !== "confirmed") {
+          console.log(chalk.dim(confirmResult === "declined" ? "Skipped" : "Cancelled"));
+          return;
+        }
+      }
+
+      const spinner = ora(`${dryRun ? "Planning" : "Unpublishing"} ${datasetId}...`).start();
+      let result: UnpublishResponse;
+      try {
+        result = await unpublishDataset(datasetId, { reason: options.reason, dryRun });
+        spinner.stop();
+      } catch (error) {
+        handleCommandError(error, spinner, "Failed to unpublish", { 404: "Dataset not found" });
+        return;
+      }
+
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log();
+        printUnpublishResult(dryRun ? "[dry-run] " : "", result);
+        if (dryRun && !("skipped" in result)) {
+          console.log(chalk.dim("\nNothing was changed. Re-run with --execute --reason <why>."));
+        }
+      }
+      if (!("skipped" in result) && result.visibility.status === "failed") process.exit(1);
+    },
+  );
 
 repoCommand
   .command("withdraw")
