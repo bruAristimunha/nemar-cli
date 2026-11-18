@@ -1224,7 +1224,8 @@ export function registerPublicationRoutes(datasetRoutes: DatasetsRouter): void {
    * (publish/request -> admin approval -> orchestrator); as a direct flip of
    * GitHub/S3/D1 visibility it skips DOI minting, manifest generation, and the
    * submission-minimums gate, so owners must go through publish/request instead.
-   * One-way operation: Cannot unpublish
+   * An administrator can pull the dataset back to private afterwards with
+   * `POST /admin/datasets/:id/unpublish` (ADR 0125); its DOIs stay registered.
    *
    * Effects:
    * 1. Changes GitHub repo from private to public

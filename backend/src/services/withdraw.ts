@@ -499,7 +499,8 @@ export async function withdrawDataset(
  * flip visibility back to public, then makePublic the concept DOI and every
  * version DOI. Requires the dataset to actually be withdrawn
  * (`withdrawn_at` set); restore is not a generic "make public" -- that's
- * `PATCH /admin/datasets/:id/visibility` + `doi/update --make-public`.
+ * publishing (`POST /admin/publish/:id/approve` or `make-public`) + `doi/update --make-public`;
+ * `PATCH /admin/datasets/:id/visibility` is refused with 409 (ADR 0125).
  *
  * Unlike withdrawDataset, restore's precondition already keys on
  * `withdrawn_at` (the column the operation itself clears LAST, on success),
