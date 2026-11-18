@@ -332,6 +332,7 @@ describe("the caps", () => {
       PRIVATE_GRANT_MAX_REQUESTS: 10,
       OIDC_AUTHORIZE_MAX_REQUESTS: 30,
       OAUTH_MAX_REQUESTS: 2000,
+      RUNNER_MAX_REQUESTS: 2000,
       WINDOW_SIZE: 60,
     });
   });
