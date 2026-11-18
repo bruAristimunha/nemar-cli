@@ -1,12 +1,13 @@
 /**
  * Where the vector visibility filter's switch is set, and where it is not (ADR 0126).
  *
- * `VECTORIZE_VISIBILITY_FILTER` appears in no table of `backend/wrangler-sccn.toml`. It is the owner's:
- * turning it on lets non-public datasets into the vector index, so the owner adds it in a reviewed change
- * after the labels have been refreshed by the daily drain; a line added by any other change would turn it
- * on somewhere nobody decided it should be, and that is what this test refuses. It is pinned until that
- * change, which edits this test. The test reads the real file and walks every table of the parsed document;
- * it covers the file and nothing else (a Worker variable of the same name also takes effect).
+ * `VECTORIZE_VISIBILITY_FILTER` is set in exactly one table of `backend/wrangler-sccn.toml`: the
+ * production `[vars]`, to "1". It is the owner's: turning it on lets non-public datasets into the vector
+ * index, so the owner turned it on in a reviewed change (2026-11-18) after the public vectors were
+ * relabeled. A line added anywhere else (staging included) or a changed value would turn it on or off
+ * somewhere nobody decided, and that is what this test refuses; the owner's next change edits this test.
+ * The test reads the real file and walks every table of the parsed document; it covers the file and
+ * nothing else (a Worker variable of the same name also takes effect).
  */
 
 import { describe, expect, test } from "bun:test";
@@ -51,7 +52,11 @@ describe("backend/wrangler-sccn.toml and the vector visibility filter switch", (
     ).toEqual(["a.b[0].VECTORIZE_VISIBILITY_FILTER", "VECTORIZE_VISIBILITY_FILTER"]);
   });
 
-  test("the switch is not set in any table of the file", () => {
-    expect(pathsOfNames(config)).toEqual([]);
+  test("the switch is set in production [vars] and nowhere else", () => {
+    expect(pathsOfNames(config)).toEqual(["vars.VECTORIZE_VISIBILITY_FILTER"]);
+  });
+
+  test("the production value is exactly \"1\" (the only value the Worker reads as on)", () => {
+    expect(config.vars?.VECTORIZE_VISIBILITY_FILTER).toBe("1");
   });
 });
