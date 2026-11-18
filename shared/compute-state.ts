@@ -256,13 +256,17 @@ export type PlatformFailureCode = (typeof PLATFORM_FAILURE_CODES)[number];
  * Why a runner job ended `runner_lost`, recorded as its failure detail: its lease ran out with no
  * outputs (`lease_expired`), it was claimed the most times a job may be and never finished
  * (`claims_exhausted`), it ran past its deadline (`deadline_exceeded`), or its runner's registration
- * was revoked (`runner_revoked`). The numbers behind them are in `shared/contract/compute-runner.ts`.
+ * was revoked (`runner_revoked`). A fifth, `dataset_ineligible`, ends a waiting job that can never be claimed
+ * because its dataset is gone or no longer passes the pipeline eligibility predicate (unpublished, withdrawn,
+ * anonymous or tombstoned), so it stops holding a live-job slot. The numbers behind them are in
+ * `shared/contract/compute-runner.ts`.
  */
 export const RUNNER_LOST_DETAILS = [
   "lease_expired",
   "claims_exhausted",
   "deadline_exceeded",
   "runner_revoked",
+  "dataset_ineligible",
 ] as const;
 
 export type RunnerLostDetail = (typeof RUNNER_LOST_DETAILS)[number];

@@ -88,6 +88,8 @@ const ATTENTION_HINTS: Readonly<Record<string, string>> = {
     " (a terminal runner job's launcher files were never copied into the records and no longer will be)",
   runner_records_unwritten:
     " (a waiting runner job's records never landed and the lease sweep has neither replayed nor ended it: the sweep is not running or is starved)",
+  runner_waiting_stale:
+    " (a runner job has waited unclaimed for over a day: no runner of its pool is polling, or none has room for it)",
 };
 
 /** One pool on one line, in SU. Everything the Worker sent is made plain first. */

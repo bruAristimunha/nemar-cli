@@ -2243,3 +2243,66 @@ describe("the lease statement is chosen fail-closed (a source search)", () => {
     expect(src).toContain('const runnerRow = job.executor !== "tapis";');
   });
 });
+
+describe("a waiting job that can never be claimed does not hold a slot", () => {
+  const live = () =>
+    count("SELECT COUNT(*) AS n FROM compute_jobs WHERE executor = 'runner' AND state = 'created'");
+
+  test("a dataset made private (or withdrawn) is ended dataset_ineligible, its slot freed; an eligible job is untouched", async () => {
+    await setPolicy(env.DB, ids.owner, { runners: { maxLiveJobs: { cpu: 2, gpu: 8 } } });
+    const gone = await dataset();
+    const withdrawn = await dataset();
+    const kept = await dispatch();
+    const goneJob = await dispatch(env, gone);
+    expect(await live()).toBe(2);
+    await sql("UPDATE datasets SET visibility = 'private' WHERE dataset_id = ?1", gone);
+    const swept = await sweepRunnerLeases(env);
+    expect(swept.ineligible).toBe(1);
+    expect(await row(goneJob)).toMatchObject({
+      state: "failed",
+      failure_code: "runner_lost",
+      failure_detail: "dataset_ineligible",
+      charged_milli: 0,
+    });
+    expect((await row(kept)).state).toBe("created");
+    // The slot is free again: a job over the (eligible) dataset fits.
+    const fits = await dispatchPipelineJob(env, {
+      recipe: "nemar-floor",
+      datasetId: withdrawn,
+      actor: { kind: "admin", userId: ids.admin },
+      executor: "runner",
+    });
+    expect(fits.ok).toBe(true);
+    // A withdrawn dataset is ended too.
+    if (fits.ok) {
+      await sql(
+        "UPDATE datasets SET withdrawn_at = datetime('now') WHERE dataset_id = ?1",
+        withdrawn,
+      );
+      expect((await sweepRunnerLeases(env)).ineligible).toBe(1);
+      expect((await row(fits.jobId)).failure_detail).toBe("dataset_ineligible");
+    }
+  });
+
+  test("a deleted dataset ends its waiting job on the next sweep", async () => {
+    const id = await dataset();
+    const jobId = await dispatch(env, id);
+    await sql("PRAGMA foreign_keys = OFF");
+    await sql("DELETE FROM datasets WHERE dataset_id = ?1", id);
+    const swept = await sweepRunnerLeases(env);
+    expect(swept.ineligible).toBe(1);
+    expect(await row(jobId)).toMatchObject({
+      state: "failed",
+      failure_detail: "dataset_ineligible",
+    });
+  });
+
+  test("a job waiting over a day is the runner_waiting_stale attention word; a fresh one is not", async () => {
+    const stale = await dispatch();
+    await dispatch();
+    await age(stale, "created_at", "-25 hours");
+    const res = await admin("GET", "/compute/status");
+    expect(res.body.attention).toMatchObject({ runner_waiting_stale: 1 });
+    expect(ComputeStatusResponseSchema.safeParse(res.body).success).toBe(true);
+  });
+});

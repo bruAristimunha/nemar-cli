@@ -447,12 +447,15 @@ export type ComputeJobAdminResponse = z.infer<typeof ComputeJobAdminResponseSche
  * `runner_cancel_pending_failed` (a live runner job whose recorded cancel is more than 60 minutes old: its
  * runner never took it) and `runner_copy_abandoned` (a terminal runner job whose records copy never happened
  * and no longer will) and `runner_records_unwritten` (a waiting runner job whose records never landed and were
- * neither replayed nor given up on well past the window: the lease sweep is not running or is starved).
+ * neither replayed nor given up on well past the window: the lease sweep is not running or is starved) and
+ * `runner_waiting_stale` (a runner job that has waited unclaimed for more than a day: no runner of its pool
+ * is polling, or none fits it).
  */
 export const COMPUTE_RUNNER_ATTENTION_WORDS = [
   "runner_cancel_pending_failed",
   "runner_copy_abandoned",
   "runner_records_unwritten",
+  "runner_waiting_stale",
 ] as const;
 
 /**
