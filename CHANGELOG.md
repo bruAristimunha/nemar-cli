@@ -13,6 +13,13 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
+## Unreleased
+
+### Staging
+
+- **Staging semantic search has the vector visibility filter on too (ADR 0126).**
+  `VECTORIZE_VISIBILITY_FILTER = "1"` is set in `[env.dev.vars]`, after the dev index got the `visibility` and `dataset_id` metadata indexes and its public vectors were relabeled; production is unchanged (on since 0.10.35).
+
 ## 0.10.35 - 2026-11-18
 
 Release 0.10.35 is small: a CLI fix and the owner's switch for private-dataset semantic search.
