@@ -294,6 +294,7 @@ nemar dataset clone <id>       # Clone metadata only (--host <origin> for an aut
 nemar dataset get [files]      # Download annexed data files
 nemar dataset drop [files]     # Free local copies of data
 nemar dataset list             # List all datasets (--mine for own)
+nemar dataset search <query>   # Search every dataset you can see: public ones, plus your own and collaborated private datasets when signed in, and all datasets for administrators
 nemar dataset status <id>      # Check dataset status
 nemar dataset release <id>     # Create version bump PR
 nemar dataset update [path]    # Push local changes via PR (needs -m title and --description)
@@ -388,7 +389,7 @@ nemar admin repo restore <id>              # Reverse a withdraw
 nemar admin ci check <id>                  # Check CI status
 nemar admin ci add <id>                    # Deploy CI workflows
 nemar admin s3 regenerate-iam <user>       # Regenerate AWS credentials
-nemar admin make-public <id>               # Publish dataset (permanent)
+nemar admin make-public <id>               # Make a dataset public (publication can be pulled back with `repo unpublish`)
 nemar admin delete-dataset <id>            # Delete dataset
 
 # DOI management
