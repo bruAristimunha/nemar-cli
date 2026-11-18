@@ -702,7 +702,10 @@ export type UnpublishResponse =
       visibility: VisibilityStepResult;
       publication_requests_reset: number;
       dois_untouched: { concept: string | null; versions: number };
+      /** Repo-spec enforcement fell short, or the audit row was not written; the unpublish stands. */
       warning?: string;
+      /** The visibility change was applied but the publication record was not reset; re-run. */
+      record_error?: string;
     };
 
 /**

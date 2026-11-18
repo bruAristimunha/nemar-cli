@@ -21,6 +21,7 @@ import { statusForVisibilityStage } from "./withdraw";
 
 function statusForResult(result: UnpublishResult): 200 | 400 | 404 | 500 {
   if ("skipped" in result) return 200;
+  if (result.record_error) return 500;
   if (result.visibility.status === "failed") {
     return statusForVisibilityStage(result.visibility.stage) as 400 | 404 | 500;
   }
@@ -33,23 +34,37 @@ export function registerUnpublishRoutes(admin: AdminRouter): void {
     dry_run: z.boolean().optional(),
   });
 
-  admin.post("/datasets/:id/unpublish", zValidator("json", unpublishSchema), async (c) => {
-    const datasetId = c.req.param("id");
-    const body = c.req.valid("json");
-    const dryRun = body.dry_run !== false;
+  admin.post(
+    "/datasets/:id/unpublish",
+    zValidator("json", unpublishSchema, (result, c) => {
+      if (!result.success) {
+        const why = result.error.issues
+          .map((i) => `${i.path.join(".") || "body"}: ${i.message}`)
+          .join("; ");
+        return c.json({ error: `Invalid request body: ${why}` }, 400);
+      }
+    }),
+    async (c) => {
+      const datasetId = c.req.param("id");
+      const body = c.req.valid("json");
+      const dryRun = body.dry_run !== false;
 
-    if (!dryRun && !body.reason) {
-      return c.json({ error: "reason is required to execute an unpublish" }, 400);
-    }
+      if (!dryRun && !body.reason) {
+        return c.json({ error: "reason is required to execute an unpublish" }, 400);
+      }
 
-    const result = await unpublishDataset(c.env, datasetId, body.reason ?? "", {
-      dryRun,
-      actorUserId: c.get("user").id,
-    });
-    const status = statusForResult(result);
-    if (!("skipped" in result) && result.visibility.status === "failed") {
-      return c.json({ ...result, error: result.visibility.error }, status);
-    }
-    return c.json(result, status);
-  });
+      const result = await unpublishDataset(c.env, datasetId, body.reason ?? "", {
+        dryRun,
+        actorUserId: c.get("user").id,
+      });
+      const status = statusForResult(result);
+      if (!("skipped" in result) && result.visibility.status === "failed") {
+        return c.json({ ...result, error: result.visibility.error }, status);
+      }
+      if (!("skipped" in result) && result.record_error) {
+        return c.json({ ...result, error: result.record_error }, status);
+      }
+      return c.json(result, status);
+    },
+  );
 }

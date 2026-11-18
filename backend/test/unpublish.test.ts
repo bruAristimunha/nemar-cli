@@ -45,6 +45,10 @@ type Json = Record<string, any>;
 interface S3PolicyStandIn {
   url: string;
   policy: BucketPolicy | null;
+  /** Answer every policy PUT with a 500 (an S3 outage on writes). */
+  failPuts: boolean;
+  /** Every policy written, in order, so a transient "public" is visible after a revert. */
+  puts: BucketPolicy[];
   calls: Array<{ method: string; path: string; search: string }>;
   reset(): void;
   stop(): void;
@@ -55,9 +59,13 @@ function startS3PolicyStandIn(): S3PolicyStandIn {
   const standIn: S3PolicyStandIn = {
     url: "",
     policy: null,
+    failPuts: false,
+    puts: [],
     calls: [],
     reset() {
       standIn.policy = null;
+      standIn.failPuts = false;
+      standIn.puts.length = 0;
       standIn.calls.length = 0;
     },
     stop() {
@@ -76,7 +84,10 @@ function startS3PolicyStandIn(): S3PolicyStandIn {
             : new Response("<Error><Code>NoSuchBucketPolicy</Code></Error>", { status: 404 });
         }
         if (req.method === "PUT") {
+          if (standIn.failPuts)
+            return new Response("<Error><Code>InternalError</Code></Error>", { status: 500 });
           standIn.policy = JSON.parse(await req.text()) as BucketPolicy;
+          standIn.puts.push(standIn.policy);
           return new Response(null, { status: 204 });
         }
       }
@@ -225,6 +236,7 @@ function seedDataset(id: string, o: SeedOptions): void {
     `INSERT INTO datasets (${keys.join(", ")}) VALUES (${keys.map(() => "?").join(", ")})`,
     keys.map((k) => cols[k]) as never[],
   );
+  github.repoPrivate.set(id, o.visibility === "private");
   if (o.doi !== false) {
     db.run(
       "INSERT INTO dataset_versions (dataset_id, version, doi, ezid_status) VALUES (?, 'v1.0.1', ?, 'public')",
@@ -449,6 +461,9 @@ describe("repair the half state nm000289 was left in", () => {
       ezid_status: "public",
     });
     expect(isDatasetPrivate(s3.policy, BUCKET, ID)).toBe(true);
+    // Every surface was private already: nothing on GitHub or S3 is rewritten.
+    expect(visibilityPatches()).toEqual([]);
+    expect(s3.puts).toEqual([]);
     expect((await call(`/datasets/${ID}/publish/status`, OWNER_KEY)).body.status).toBe("none");
     expect(versions()).toEqual([{ doi: VERSION_DOI, ezid_status: "public" }]);
   });
@@ -556,6 +571,193 @@ describe("a failure at a visibility stage writes nothing else", () => {
     expect(
       db.query("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'dataset_unpublished'").get(),
     ).toEqual({ n: 0 });
+  });
+});
+
+/** Nothing in the call made the dataset public, even for a moment, on any surface. */
+function expectNeverPublic(): void {
+  expect(visibilityPatches()).not.toContain(false);
+  expect(github.repoPrivate.get(ID)).toBe(true);
+  for (const policy of s3.puts) expect(isDatasetPrivate(policy, BUCKET, ID)).toBe(true);
+  expect(isDatasetPrivate(s3.policy, BUCKET, ID)).toBe(true);
+}
+
+describe("a failure never reverts a surface to public (the already-private repair)", () => {
+  test("already private on every surface, S3 writes failing: nothing is written, nothing goes public", async () => {
+    seedMixedState();
+    s3.failPuts = true;
+
+    const r = await unpublish(ID, { reason: "repair", dry_run: false });
+
+    expect(r.status).toBe(200);
+    expect(r.body.visibility).toEqual({ status: "ok" });
+    expectNeverPublic();
+    expect(requests()[0].unpublished_at).not.toBeNull();
+  });
+
+  test("GitHub private but S3 and D1 still public, S3 write fails: GitHub is not reverted to public", async () => {
+    seedDataset(ID, { visibility: "public", publishedRequest: true });
+    s3.policy = buildPublicAccessPolicy(BUCKET, []);
+    github.repoPrivate.set(ID, true);
+    s3.failPuts = true;
+
+    const r = await unpublish(ID, { reason: "repair", dry_run: false });
+
+    expect(r.status).toBe(500);
+    expect(r.body.visibility).toMatchObject({
+      status: "failed",
+      stage: "s3",
+      githubReverted: true,
+    });
+    // GitHub was already private, so it was neither changed nor reverted.
+    expect(visibilityPatches()).toEqual([]);
+    expect(github.repoPrivate.get(ID)).toBe(true);
+    expect(row()?.visibility).toBe("public");
+    expect(requests()[0].unpublished_at).toBeNull();
+  });
+
+  test("GitHub private, S3 and D1 public, D1 write fails: S3 is put back to its prior state, GitHub is untouched", async () => {
+    seedDataset(ID, { visibility: "public", publishedRequest: true });
+    s3.policy = buildPublicAccessPolicy(BUCKET, []);
+    github.repoPrivate.set(ID, true);
+    db.run(
+      `CREATE TRIGGER force_visibility_failure BEFORE UPDATE OF visibility ON datasets
+       BEGIN SELECT RAISE(ABORT, 'forced D1 failure'); END`,
+    );
+
+    const r = await unpublish(ID, { reason: "repair", dry_run: false });
+
+    expect(r.status).toBe(500);
+    expect(r.body.visibility).toMatchObject({
+      status: "failed",
+      stage: "db",
+      githubReverted: true,
+      s3Reverted: true,
+    });
+    // GitHub: no write at all. S3: made private, then restored to what it was (public).
+    expect(visibilityPatches()).toEqual([]);
+    expect(github.repoPrivate.get(ID)).toBe(true);
+    expect(isDatasetPrivate(s3.policy, BUCKET, ID)).toBe(false);
+    expect(row()?.visibility).toBe("public");
+  });
+
+  test("a public dataset whose D1 write fails is restored to public on both surfaces it moved", async () => {
+    seedPublished();
+    db.run(
+      `CREATE TRIGGER force_visibility_failure BEFORE UPDATE OF visibility ON datasets
+       BEGIN SELECT RAISE(ABORT, 'forced D1 failure'); END`,
+    );
+
+    const r = await unpublish(ID, { reason: "x", dry_run: false });
+
+    expect(r.status).toBe(500);
+    expect(r.body.visibility).toMatchObject({
+      stage: "db",
+      githubReverted: true,
+      s3Reverted: true,
+    });
+    expect(github.repoPrivate.get(ID)).toBe(false);
+    expect(isDatasetPrivate(s3.policy, BUCKET, ID)).toBe(false);
+  });
+
+  test("already private on every surface, D1 forced to fail on the record reset: structured failure, nothing public", async () => {
+    seedMixedState();
+    db.run(
+      `CREATE TRIGGER force_reset_failure BEFORE UPDATE ON publication_requests
+       BEGIN SELECT RAISE(ABORT, 'forced D1 failure'); END`,
+    );
+
+    const r = await unpublish(ID, { reason: "repair", dry_run: false });
+
+    expect(r.status).toBe(500);
+    expect(r.body.error).toContain("publication record not reset");
+    expect(r.body.error).toContain("re-run unpublish");
+    expect(r.body.visibility).toEqual({ status: "ok" });
+    expect(r.body.publication_requests_reset).toBe(0);
+    expectNeverPublic();
+    // The batch is atomic: the request is not stamped, and a re-run finishes the job.
+    expect(requests()[0].unpublished_at).toBeNull();
+    db.run("DROP TRIGGER force_reset_failure");
+    const again = await unpublish(ID, { reason: "repair", dry_run: false });
+    expect(again.status).toBe(200);
+    expect(requests()[0].unpublished_at).not.toBeNull();
+  });
+});
+
+describe("more refusals", () => {
+  test.each(["requested", "approving", "blocked"])(
+    "an open publication request (%s) is refused with the deny hint",
+    async (status) => {
+      seedDataset(ID, { visibility: "private", doi: false });
+      db.run(
+        "INSERT INTO publication_requests (dataset_id, requested_by, status) VALUES (?, ?, ?)",
+        [ID, ownerId, status],
+      );
+      db.run("UPDATE datasets SET visibility = 'public' WHERE dataset_id = ?", [ID]);
+
+      const r = await unpublish(ID, { reason: "x", dry_run: false });
+
+      expect(r.status).toBe(200);
+      expect(r.body.skipped).toContain("publication request is open");
+      expect(r.body.skipped).toContain("nemar admin repo publish deny");
+      expect(github.calls).toEqual([]);
+      expect(row()?.visibility).toBe("public");
+    },
+  );
+
+  test.each(["nm099900", "nm099950", "nm099999", "xx099900", "xx099999"])(
+    "the reserved fixture %s is never unpublished",
+    async (id) => {
+      seedDataset(id, { visibility: "public", doi: false });
+      const r = await unpublish(id, { reason: "x", dry_run: false });
+      expect(r.body.skipped).toContain("reserved fixture band");
+      expect(github.calls).toEqual([]);
+    },
+  );
+
+  test("an anonymous deposit is never unpublished", async () => {
+    seedDataset(ID, { visibility: "public", doi: false, source: { anonymous: 1 } });
+    github.repoPrivate.set(ID, true);
+    const r = await unpublish(ID, { reason: "x", dry_run: false });
+    expect(r.body.skipped).toContain("anonymous deposit");
+    expect(github.writes()).toEqual([]);
+    expect(row()?.visibility).toBe("public");
+  });
+
+  test("a body that fails the schema returns { error } as a string", async () => {
+    seedPublished();
+    const bad = await unpublish(ID, { dry_run: "yes" });
+    expect(bad.status).toBe(400);
+    expect(typeof bad.body.error).toBe("string");
+    expect(bad.body.error).toContain("dry_run");
+  });
+});
+
+describe("spec enforcement failures are surfaced as a warning", () => {
+  test("a failed ruleset step appears in the result and the audit row", async () => {
+    seedPublished();
+    github.failNext("DELETE", /\/rulesets\/\d+$/, 403, 10);
+    // Give the repository a branch ruleset for enforcement to remove (and fail to).
+    github.rulesets.set(ID, [
+      {
+        id: 4242,
+        name: "NEMAR branch protection",
+        source_type: "Repository",
+        body: { name: "NEMAR branch protection", target: "branch", enforcement: "active" },
+      },
+    ]);
+
+    const r = await unpublish(ID, { reason: "x", dry_run: false });
+
+    expect(r.status).toBe(200);
+    expect(r.body.visibility).toEqual({ status: "ok" });
+    expect(r.body.warning).toContain("Repo-spec enforcement steps failed");
+    const audit = db
+      .query<{ details: string }, []>(
+        "SELECT details FROM audit_log WHERE action = 'dataset_unpublished'",
+      )
+      .get();
+    expect(JSON.parse(audit?.details ?? "{}").spec_warning).toContain("steps failed");
   });
 });
 

@@ -17,8 +17,10 @@
  * status` reported a finished publication of a dataset nobody could reach.
  *
  * What it does, in order, for a dataset that is public or carries a live publication record:
- *   1. refuses what it must not touch: a live dataset (nm000103-nm000107), an exemplar, a
- *      withdrawn dataset (that is `restore`), a dataset that is private with nothing to reset;
+ *   1. refuses what it must not touch: a live dataset (nm000103-nm000107), a reserved fixture
+ *      (ADR 0068), an anonymous deposit (ADR 0065), an exemplar, a withdrawn dataset (that is
+ *      `restore`), a dataset with an open publication request (deny it first), a dataset that is
+ *      private with nothing to reset;
  *   2. applyDatasetVisibility(private): GitHub repository, S3 policy, D1 `visibility`, repo spec
  *      (the branch ruleset comes off so the owner can push again), collaborator reconcile, with
  *      revert-on-failure at each stage. It is idempotent, so a dataset that is ALREADY private
@@ -38,6 +40,8 @@
 import { isLiveDataset } from "../constants.js";
 import { auditLogStatement } from "../db/audit-log.js";
 import type { Bindings } from "../types/bindings.js";
+import { OPEN_REQUEST_STATUSES_SQL } from "./approval-dispatch.js";
+import { isReservedFixtureId } from "./datasetId.js";
 import { applyDatasetVisibility } from "./visibility.js";
 import { toFailedVisibilityStep } from "./withdraw.js";
 import type { VisibilityStepResult } from "./withdraw.js";
@@ -62,8 +66,13 @@ export type UnpublishResult =
       publication_requests_reset: number;
       /** The DOIs left exactly as they were; EZID is never called. */
       dois_untouched: { concept: string | null; versions: number };
-      /** Set when the audit-log write failed; the operation itself still succeeded. */
+      /** Set when the audit-log write failed or repo-spec enforcement fell short; the operation itself still succeeded. */
       warning?: string;
+      /**
+       * Set when the visibility change was applied but the publication record could not be
+       * reset. The dataset is private; re-running unpublish finishes the reset.
+       */
+      record_error?: string;
     };
 
 export interface UnpublishOptions {
@@ -78,6 +87,7 @@ interface UnpublishCandidate {
   concept_doi: string | null;
   withdrawn_at: string | null;
   is_exemplar: number | null;
+  anonymous: number | null;
 }
 
 function errMsg(err: unknown): string {
@@ -93,11 +103,25 @@ export function decideUnpublish(input: {
   visibility: string;
   withdrawnAt: string | null;
   isExemplar: boolean;
+  anonymous?: boolean;
+  /** Requests still `requested`, `approving` or `blocked`. */
+  openRequests?: number;
   liveRequests: number;
 }): { case: UnpublishCase } | { skipped: string } {
   if (isLiveDataset(input.datasetId)) {
     return {
       skipped: `${input.datasetId} is a live dataset (AGENTS.md: nm000103-nm000107); it is never unpublished by a tool`,
+    };
+  }
+  if (isReservedFixtureId(input.datasetId)) {
+    return {
+      skipped: `${input.datasetId} is in the reserved fixture band (ADR 0068); a standing fixture is never unpublished by a tool`,
+    };
+  }
+  if (input.anonymous) {
+    return {
+      skipped:
+        "Dataset is an anonymous deposit (public in the catalog, private on GitHub); unpublishing it would expose or disturb the concealed record (ADR 0065)",
     };
   }
   if (input.isExemplar) {
@@ -107,6 +131,12 @@ export function decideUnpublish(input: {
     return {
       skipped:
         "Dataset is withdrawn (its DOIs are tombstoned); reverse that with 'nemar admin repo restore', not unpublish",
+    };
+  }
+  if ((input.openRequests ?? 0) > 0) {
+    return {
+      skipped:
+        "A publication request is open; deny it first with `nemar admin repo publish deny <dataset> -r <reason>`, then unpublish",
     };
   }
   if (input.visibility === "public") {
@@ -129,7 +159,7 @@ export async function unpublishDataset(
 
   const dataset = await db
     .prepare(
-      `SELECT dataset_id, visibility, concept_doi, withdrawn_at, is_exemplar
+      `SELECT dataset_id, visibility, concept_doi, withdrawn_at, is_exemplar, anonymous
        FROM datasets WHERE dataset_id = ?`,
     )
     .bind(datasetId)
@@ -144,12 +174,21 @@ export async function unpublishDataset(
     .bind(datasetId)
     .first<{ n: number }>();
   const liveRequests = live?.n ?? 0;
+  const open = await db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM publication_requests
+       WHERE dataset_id = ? AND status IN ${OPEN_REQUEST_STATUSES_SQL}`,
+    )
+    .bind(datasetId)
+    .first<{ n: number }>();
 
   const decision = decideUnpublish({
     datasetId,
     visibility: dataset.visibility,
     withdrawnAt: dataset.withdrawn_at,
     isExemplar: dataset.is_exemplar === 1,
+    anonymous: dataset.anonymous === 1,
+    openRequests: open?.n ?? 0,
     liveRequests,
   });
   if ("skipped" in decision) {
@@ -189,18 +228,35 @@ export async function unpublishDataset(
     };
   }
 
-  const reset = await db
-    .prepare(
-      `UPDATE publication_requests
-       SET unpublished_at = datetime('now'), updated_at = datetime('now')
-       WHERE dataset_id = ? AND status = 'published' AND unpublished_at IS NULL`,
-    )
-    .bind(datasetId)
-    .run();
-  await db
-    .prepare("UPDATE datasets SET updated_at = datetime('now') WHERE dataset_id = ?")
-    .bind(datasetId)
-    .run();
+  // The visibility change is made and cannot be rolled back from here, so a failure of the
+  // record reset is reported as exactly that, with the way out, and not as a bare 500.
+  let resetChanges: number;
+  try {
+    const [reset] = await db.batch([
+      db
+        .prepare(
+          `UPDATE publication_requests
+           SET unpublished_at = datetime('now'), updated_at = datetime('now')
+           WHERE dataset_id = ? AND status = 'published' AND unpublished_at IS NULL`,
+        )
+        .bind(datasetId),
+      db
+        .prepare("UPDATE datasets SET updated_at = datetime('now') WHERE dataset_id = ?")
+        .bind(datasetId),
+    ]);
+    resetChanges = reset.meta.changes;
+  } catch (resetError) {
+    console.error(`Unpublish record reset failed for ${datasetId}:`, resetError);
+    return {
+      dataset_id: datasetId,
+      dry_run: false,
+      case: decision.case,
+      visibility: { status: "ok" },
+      publication_requests_reset: 0,
+      dois_untouched,
+      record_error: `Visibility applied, publication record not reset (${errMsg(resetError)}); re-run unpublish to finish`,
+    };
+  }
 
   let warning: string | undefined;
   try {
@@ -212,7 +268,8 @@ export async function unpublishDataset(
       details: JSON.stringify({
         reason,
         case: decision.case,
-        publication_requests_reset: reset.meta.changes,
+        publication_requests_reset: resetChanges,
+        spec_warning: flip.specWarning ?? null,
         concept_doi: dataset.concept_doi,
         version_dois: dois_untouched.versions,
         ezid_called: false,
@@ -220,15 +277,17 @@ export async function unpublishDataset(
     }).run();
   } catch (auditError) {
     console.error(`Audit log write failed for dataset_unpublished on ${datasetId}:`, auditError);
-    warning = `Audit log write failed: ${errMsg(auditError)}. Operation succeeded but was not logged for compliance.`;
+    const auditWarning = `Audit log write failed: ${errMsg(auditError)}. Operation succeeded but was not logged for compliance.`;
+    warning = flip.specWarning ? `${flip.specWarning}; ${auditWarning}` : auditWarning;
   }
+  if (!warning) warning = flip.specWarning;
 
   return {
     dataset_id: datasetId,
     dry_run: false,
     case: decision.case,
     visibility: { status: "ok" },
-    publication_requests_reset: reset.meta.changes,
+    publication_requests_reset: resetChanges,
     dois_untouched,
     warning,
   };
