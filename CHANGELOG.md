@@ -15,6 +15,30 @@ earlier releases are described only by their generated notes.
 
 ## Unreleased
 
+Release 0.10.35 is small: a CLI fix and the owner's switch for private-dataset semantic search.
+It has no migrations and adds one Worker variable, `VECTORIZE_VISIBILITY_FILTER`, in production only.
+
+### Production behavior changes
+
+- **Semantic search narrows by visibility labels, and private datasets get embedded (#2211, ADR 0126, now accepted).**
+  `VECTORIZE_VISIBILITY_FILTER = "1"` is set in production `[vars]`; staging stays off until its index is relabeled.
+  The metadata indexes and the relabel of all 910 public vectors were done on 2026-11-18, before this release.
+  Results stay limited to what the caller may see: every hit is still checked against the live `datasets` row.
+
+### CLI
+
+- **`nemar dataset invite`, `nemar dataset access approve` and `nemar dataset access deny` accept the username and the dataset id in either order (#2208).**
+  Before, `nemar dataset invite nm000289 alice` sent `alice` as the dataset id and failed with a misleading "Dataset not found".
+  The id is matched case-insensitively against the same bounded rule as the other admin commands; when neither argument is a dataset id, the CLI stops before calling the API and says what it expected.
+
+### Owner steps after release
+
+1. Run `POST /admin/vectorize/reindex-all` (keyset-paged with `after` and `last_id`) until `has_more` is false, to embed the private datasets; read `failed` in each answer and retry any failed id with `{"limit": 1, "after": "<the id before it>"}`.
+   Until it runs, the daily drain embeds them 50 at a time.
+   Then close #2200.
+
+## 0.10.34 - 2026-11-18
+
 Release 0.10.34 carries three blocks of work.
 The first is a repair of the dataset publication lifecycle (#2199, ADR 0125): a published dataset can now be pulled back to unpublished, and the commands that could leave one half published are gone.
 The second is search that returns every dataset the caller may see, private ones included (#2201, ADR 0126).
