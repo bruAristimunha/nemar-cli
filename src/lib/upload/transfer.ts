@@ -80,9 +80,12 @@ import {
   DEFAULT_MAX_REFRESHES,
   DEFAULT_REFRESH_MARGIN_MS,
   MAX_FRUITLESS_REFRESHES,
+  RENEW_ATTEMPTS,
   isExpiredCredentialError,
+  isTransientRenewError,
   leaseFromResponse,
   planCopyBatches,
+  renewRetryDelayMs,
 } from "./s3-copy-session.js";
 import { type DatasetInfo, FAIL, type Step, ok } from "./types.js";
 
@@ -969,10 +972,17 @@ async function renewUploadCredentials(
   if (session.refreshes >= DEFAULT_MAX_REFRESHES) {
     return `Upload credentials were renewed ${session.refreshes} times and the ${operation} is still not done; re-run the command to continue`;
   }
-  try {
-    session.lease = await session.renewLease();
-  } catch (error) {
-    return `Could not renew upload credentials (${reason}): ${errorDetail(error)}`;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      session.lease = await session.renewLease();
+      break;
+    } catch (error) {
+      if (attempt >= RENEW_ATTEMPTS || !isTransientRenewError(error)) {
+        const tries = attempt > 1 ? ` after ${attempt} tries` : "";
+        return `Could not renew upload credentials (${reason})${tries}: ${errorDetail(error)}`;
+      }
+      await new Promise((resolve) => setTimeout(resolve, renewRetryDelayMs(attempt)));
+    }
   }
   session.refreshes++;
   session.onCredentialsRenewed?.(session.refreshes, reason);

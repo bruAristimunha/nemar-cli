@@ -15,6 +15,14 @@ earlier releases are described only by their generated notes.
 
 ## Unreleased
 
+### CLI
+
+- **One transient error while renewing upload credentials no longer ends the upload.**
+  `nemar dataset upload` renews its 2 h S3 credentials before they expire; a single HTTP 500 (or no answer,
+  408 or 429) from `POST /datasets/:id/upload-credentials` used to fail the whole attempt. The renewal is now
+  tried up to 8 times, waiting 5 s and doubling to at most 60 s (about 4 min, inside the 20 min renewal margin).
+  A real refusal (401, 403, 404, ...) still fails at once with the same message as before.
+
 ### Staging
 
 - **Staging semantic search has the vector visibility filter on too (ADR 0126).**

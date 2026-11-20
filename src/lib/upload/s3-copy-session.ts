@@ -7,6 +7,7 @@
  * durable upload progress.
  */
 
+import { ApiError } from "../api/errors.js";
 import type { S3Credentials } from "../git-annex/s3-remote.js";
 
 /** Credentials plus the wall-clock instant (ms) they stop working. */
@@ -22,6 +23,44 @@ export const DEFAULT_BATCH_MAX_FILES = 200;
 export const DEFAULT_BATCH_MAX_BYTES = 50 * 1024 ** 3;
 /** Upper bound on credential renewals in one upload (~2 h each). */
 export const DEFAULT_MAX_REFRESHES = 48;
+/**
+ * Tries of ONE credential renewal before the upload gives up. Renewal starts
+ * `DEFAULT_REFRESH_MARGIN_MS` (20 min) plus the longest batch before expiry, so
+ * the waits between tries (5, 10, 20, 40, then 60 s: about 4 min in all) fit
+ * inside the lease that is still valid.
+ */
+export const RENEW_ATTEMPTS = 8;
+/** First wait between renewal tries; it doubles each try, up to `RENEW_RETRY_MAX_DELAY_MS`. */
+export const RENEW_RETRY_DELAY_MS = 5_000;
+export const RENEW_RETRY_MAX_DELAY_MS = 60_000;
+
+/**
+ * Whether a failed renewal is worth trying again: no answer (statusCode 0), a
+ * timeout (408), rate limiting (429) or a server error (5xx). One HTTP 500 from
+ * `POST /datasets/:id/upload-credentials` used to end an upload of many hours.
+ * Anything else (401, 403, 404, ...) is the server's real answer and is final.
+ */
+export function isTransientRenewError(error: unknown): boolean {
+  if (!(error instanceof ApiError)) return false;
+  const status = error.statusCode;
+  return status === 0 || status === 408 || status === 429 || (status >= 500 && status < 600);
+}
+
+/**
+ * The wait after renewal try `attempt` (1-based). `NEMAR_RENEW_RETRY_DELAY_MS`, a
+ * whole number of milliseconds, can only SHORTEN the first wait (tests use 0); any
+ * other value leaves the default.
+ */
+export function renewRetryDelayMs(attempt: number): number {
+  const raw = process.env.NEMAR_RENEW_RETRY_DELAY_MS;
+  let base = RENEW_RETRY_DELAY_MS;
+  if (raw !== undefined && /^\d+$/.test(raw)) {
+    const ms = Number(raw);
+    if (Number.isSafeInteger(ms) && ms <= RENEW_RETRY_DELAY_MS) base = ms;
+  }
+  return Math.min(base * 2 ** (attempt - 1), RENEW_RETRY_MAX_DELAY_MS);
+}
+
 /** Stop after repeated expired-credential retries without a smaller pending set. */
 export const MAX_FRUITLESS_REFRESHES = 2;
 /** Conservative lease when the server omits an expiration timestamp. */
